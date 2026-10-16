@@ -216,6 +216,8 @@ impl Rect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logo: bool,
     pub id: String,
     pub kind: Kind,
     pub rect: Rect,
@@ -723,6 +725,7 @@ impl Pack {
         run
     }
     fn validate_component_screen(&self, screen: ScreenId, c: &Component) -> Result<()> {
+        ensure!(!c.logo || c.kind == Kind::Text && matches!(c.binding, Some(Binding::Title | Binding::SelectedTitle)), "Logo opt-in requires title text");
         let allowed = match c.kind {
             Kind::Background | Kind::Panel | Kind::Text | Kind::AssetImage => true,
             Kind::Overlay => self.ink(),
@@ -852,7 +855,7 @@ impl Pack {
             fields.remove(field);
         }
         let extras: &[&str] = match c.kind {
-            Kind::Text => &["layout", "gap", "radius"],
+            Kind::Text => &["layout", "gap", "radius", "logo"],
             Kind::Image => &["role", "color", "blur_radius"],
             Kind::Entries | Kind::SettingsRows | Kind::Navigation | Kind::Keyboard => &["color"],
             Kind::Status | Kind::DialogActions => &["align", "radius", "color"],
@@ -1158,6 +1161,7 @@ impl Pack {
             Kind::Progress => &["binding", "color", "radius"],
         };
         let mut object = v.as_object().unwrap().clone();
+        object.remove("logo");
         for extension in ["blur_radius", "mask_asset_id", "clip_shape"] {
             if object.remove(extension).is_some() {
                 ensure!(

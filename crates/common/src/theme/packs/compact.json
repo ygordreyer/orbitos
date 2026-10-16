@@ -233,7 +233,8 @@
           "color": "text",
           "max_lines": 3,
           "overflow": "wrap",
-          "align": "left"
+          "align": "left",
+          "logo": true
         },
         {
           "id": "metadata",
@@ -1502,7 +1503,8 @@
           "color": "text",
           "max_lines": 1,
           "overflow": "ellipsis",
-          "align": "left"
+          "align": "left",
+          "logo": true
         },
         {
           "id": "rows",
@@ -1844,7 +1846,8 @@
           "color": "text",
           "max_lines": 1,
           "overflow": "ellipsis",
-          "align": "left"
+          "align": "left",
+          "logo": true
         },
         {
           "id": "rows",
@@ -2411,7 +2414,8 @@
           "color": "text",
           "max_lines": 2,
           "overflow": "wrap",
-          "align": "left"
+          "align": "left",
+          "logo": true
         },
         {
           "id": "cover",

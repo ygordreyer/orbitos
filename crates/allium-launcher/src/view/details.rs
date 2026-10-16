@@ -22,13 +22,83 @@ pub(crate) struct Details {
 impl Details {
     pub fn new(game: &Game, platform: &str) -> Self {
         let fallback = fallback(game);
-        Self::from_metadata(game, platform, synopsis(&game.path), fallback.as_ref())
+        let metadata = common::media::metadata(&game.path);
+        let description = (!metadata.desc.trim().is_empty())
+            .then(|| metadata.desc.clone())
+            .or_else(|| synopsis(&game.path));
+        Self::build(game, platform, &metadata, description, fallback.as_ref())
     }
+    pub(crate) fn cached(game: &Game, platform: &str) -> Self {
+        let metadata = common::media::cached_metadata(&game.path);
+        let fallback = METADATA_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            cache.sources.iter().find_map(|source| match &source.value {
+                CachedValue::Catalog(catalog) => matching_entry(catalog, &game.path),
+                _ => None,
+            })
+        });
+        let description = (!metadata.desc.trim().is_empty()).then(|| metadata.desc.clone());
+        Self::build(game, platform, &metadata, description, fallback.as_ref())
+    }
+    fn build(
+        game: &Game,
+        platform: &str,
+        metadata: &common::media::Metadata,
+        description: Option<String>,
+        fallback: Option<&MetadataEntry>,
+    ) -> Self {
+        let mut game = game.clone();
+        if !metadata.releasedate.is_empty() {
+            game.release_date =
+                chrono::NaiveDateTime::parse_from_str(&metadata.releasedate, "%Y%m%dT%H%M%S")
+                    .ok()
+                    .map(|d| d.date());
+        }
+        if !metadata.developer.is_empty() {
+            game.developer = Some(metadata.developer.clone());
+        }
+        if !metadata.publisher.is_empty() {
+            game.publisher = Some(metadata.publisher.clone());
+        }
+        if !metadata.genre.is_empty() {
+            game.genres = metadata
+                .genre
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if !metadata.rating.is_empty() {
+            game.rating = metadata
+                .rating
+                .parse::<f32>()
+                .ok()
+                .map(|n| (n.clamp(0., 1.) * 10.) as u8);
+        }
+        Self::from_metadata_shared(&game, platform, description, fallback, metadata)
+    }
+    #[cfg(test)]
     fn from_metadata(
         game: &Game,
         platform: &str,
         local_synopsis: Option<String>,
         fallback: Option<&MetadataEntry>,
+    ) -> Self {
+        Self::from_metadata_shared(
+            game,
+            platform,
+            local_synopsis,
+            fallback,
+            &common::media::Metadata::default(),
+        )
+    }
+    fn from_metadata_shared(
+        game: &Game,
+        platform: &str,
+        local_synopsis: Option<String>,
+        fallback: Option<&MetadataEntry>,
+        shared: &common::media::Metadata,
     ) -> Self {
         let mut fields = vec![platform.to_owned()];
         if let Some(date) = game.release_date {
@@ -71,6 +141,9 @@ impl Details {
         } else {
             fields.push("Genre: unavailable".into());
         }
+        if !shared.players.is_empty() {
+            fields.push(format!("Players: {}", shared.players));
+        }
         if let Some(value) = game.rating {
             fields.push(format!("Metadata rating: {value}/10"));
         }
@@ -95,7 +168,9 @@ impl Details {
         } else {
             format!("{facts}\n\n{synopsis}")
         };
-        if let Some(entry) = fallback {
+        if !shared.scraper.is_empty() {
+            full_text.push_str(&format!("\n\nMetadata source: {}", shared.scraper));
+        } else if let Some(entry) = fallback {
             full_text.push_str(&format!(
                 "\n\nFirst release: {}\nMetadata source: {}\n{}",
                 entry.first_release_year,
@@ -112,17 +187,59 @@ impl Details {
         } else {
             full_text.push_str("\n\nMetadata source: unavailable\nLicense: unavailable");
         }
-        let mut fact_runs=vec![];
-        if let Some(value)=game.developer.as_deref().filter(|v|!v.is_empty()).or_else(||fallback.map(|e|e.developer.as_str())) {fact_runs.push(("Developer".into(),value.into()));}
-        if let Some(value)=game.publisher.as_deref().filter(|v|!v.is_empty()).or_else(||fallback.map(|e|e.publisher.as_str())) {fact_runs.push(("Publisher".into(),value.into()));}
-        if !genres.is_empty(){fact_runs.push(("Genres".into(),genres.join(", ")));}
-        if let Some(entry)=fallback {fact_runs.push(("First release".into(),entry.first_release_year.to_string()));}
-        let source=fallback.map(|e|format!("Source: {}",e.source.title)).unwrap_or_default();
-        let ink_body=if facts.is_empty(){full_text.clone()}else{full_text.strip_prefix(&(facts+"\n\n")).unwrap_or(&full_text).into()};
+        let mut fact_runs = vec![];
+        if let Some(value) = game
+            .developer
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .or_else(|| fallback.map(|e| e.developer.as_str()))
+        {
+            fact_runs.push(("Developer".into(), value.into()));
+        }
+        if let Some(value) = game
+            .publisher
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .or_else(|| fallback.map(|e| e.publisher.as_str()))
+        {
+            fact_runs.push(("Publisher".into(), value.into()));
+        }
+        if !genres.is_empty() {
+            fact_runs.push(("Genres".into(), genres.join(", ")));
+        }
+        if let Some(entry) = fallback {
+            fact_runs.push(("First release".into(), entry.first_release_year.to_string()));
+        }
+        if !shared.players.is_empty() {
+            fact_runs.push(("Players".into(), shared.players.clone()));
+        }
+        let source = if !shared.scraper.is_empty() {
+            format!("Source: {}", shared.scraper)
+        } else {
+            fallback
+                .map(|e| format!("Source: {}", e.source.title))
+                .unwrap_or_default()
+        };
+        let ink_body = if facts.is_empty() {
+            full_text.clone()
+        } else {
+            full_text
+                .strip_prefix(&(facts + "\n\n"))
+                .unwrap_or(&full_text)
+                .into()
+        };
         Self {
             metadata,
-            metadata_runs: vec![("Platform".into(),platform.into()),("Released".into(),fields[1].trim_start_matches("Released ").into())],
-            facts: fact_runs, source, ink_body,
+            metadata_runs: vec![
+                ("Platform".into(), platform.into()),
+                (
+                    "Released".into(),
+                    fields[1].trim_start_matches("Released ").into(),
+                ),
+            ],
+            facts: fact_runs,
+            source,
+            ink_body,
             blurb,
             pages: pages(&full_text),
             page: 0,
@@ -146,12 +263,29 @@ impl Details {
         };
         let role = slot.role.unwrap();
         let style = handle.component_text_style(slot, common::display::color::Color::new(0, 0, 0));
-        let line=if handle.pack().ink(){slot.paint.as_ref().and_then(|p|p.run.as_ref()).and_then(|r|r.line_height).unwrap_or(handle.pack().tokens.typography[&role].line_height)}else{handle.pack().tokens.typography[&role].line_height};
+        let line = if handle.pack().ink() {
+            slot.paint
+                .as_ref()
+                .and_then(|p| p.run.as_ref())
+                .and_then(|r| r.line_height)
+                .unwrap_or(handle.pack().tokens.typography[&role].line_height)
+        } else {
+            handle.pack().tokens.typography[&role].line_height
+        };
         let limit = (slot.rect.3 / line)
             .min(slot.max_lines.unwrap())
             .saturating_sub(1)
             .max(1) as usize;
-        let body=if handle.pack().ink()&&handle.pack().screens[&ScreenId::GameDetail].components.iter().any(|c|c.binding==Some(Binding::SelectedFacts)){&self.ink_body}else{&self.full_text};
+        let body = if handle.pack().ink()
+            && handle.pack().screens[&ScreenId::GameDetail]
+                .components
+                .iter()
+                .any(|c| c.binding == Some(Binding::SelectedFacts))
+        {
+            &self.ink_body
+        } else {
+            &self.full_text
+        };
         let lines = common::theme::render::wrap(&style, body, slot.rect.2, 8192);
         self.pages = pages_from_lines(lines, limit, 480);
         if self.pages.is_empty() {
@@ -880,7 +1014,10 @@ mod tests {
     fn paging_is_bounded_utf8_and_clamped() {
         let mut detail = Details {
             metadata: String::new(),
-            metadata_runs: vec![], facts: vec![], source: String::new(), ink_body: String::new(),
+            metadata_runs: vec![],
+            facts: vec![],
+            source: String::new(),
+            ink_body: String::new(),
             blurb: String::new(),
             pages: pages(&"é".repeat(10000)),
             page: 0,
@@ -999,5 +1136,40 @@ mod cache_tests {
                 .iter()
                 .any(|source| source.path == Path::new("/large/gamelist.xml"))
         );
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    #[test]
+    fn details_reads_gamelist_metadata_with_no_unavailable_placeholders() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/tests/fixtures/media-sd/Roms/TEST")
+            .canonicalize()
+            .unwrap();
+        let game = Game::new(root.join("Complete.sfc"));
+        let details = Details::new(&game, "Fixture console");
+        assert!(details.metadata.contains("1998"));
+        assert_eq!(details.blurb, "A & B race.");
+        for value in [
+            "Fixture studio",
+            "Fixture publisher",
+            "Racing, Arcade",
+            "Players: 1-2",
+            "Metadata rating: 8/10",
+            "Metadata source: Fixture scraper",
+        ] {
+            assert!(
+                details.full_text.contains(value),
+                "missing {value}: {}",
+                details.full_text
+            );
+        }
+        assert!(!details.full_text.contains("unavailable"));
+        assert_eq!(details.source, "Source: Fixture scraper");
+        let missing = Details::new(&Game::new(root.join("Missing.sfc")), "Fixture console");
+        assert!(missing.metadata.contains("Year unavailable"));
+        assert!(missing.full_text.contains("Synopsis unavailable"));
     }
 }

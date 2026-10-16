@@ -215,6 +215,7 @@ pub fn drawn_frame() {
             return;
         };
         let line = serde_json::json!({
+            "frontend_io_ops": FRONTEND_IO_OPS.with(std::cell::Cell::get),
             "text_hits":trace.counts[0], "text_misses":trace.counts[1], "text_evictions":trace.counts[2],
             "blit_map_builds":trace.counts[3], "copied_pixels":trace.counts[4], "flushed_pixels":trace.counts[5],
             "composed_pixels": trace.counts[6], "ink_bitmap_pixels": trace.counts[13], "legacy_composed_pixels": trace.counts[6].saturating_sub(trace.counts[13]), "converted_pixels": trace.counts[7],

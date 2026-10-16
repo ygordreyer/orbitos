@@ -29,6 +29,11 @@ pub struct Apps {
 }
 
 impl Apps {
+    pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {
+        self.list
+            .idle_media_step(handle, common::theme::pack::ScreenId::Apps)
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         self.list.root_tab_navigation_ready()
     }

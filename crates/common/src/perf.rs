@@ -3,6 +3,7 @@ use std::cell::Cell;
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Counts {
     pub read_attempts: u64,
+    pub media_io: u64,
     pub decodes: u64,
     pub art_resizes: u64,
     pub fits: u64,
@@ -13,6 +14,7 @@ pub struct Counts {
 
 pub enum Op {
     Read,
+    MediaIo,
     Decode,
     ArtResize,
     Fit,
@@ -29,6 +31,7 @@ pub fn hit(op: Op) {
     COUNTS.with(|cell| {
         let mut c = cell.get();
         match op {
+            Op::MediaIo => c.media_io += 1,
             Op::Read => c.read_attempts += 1,
             Op::Decode => c.decodes += 1,
             Op::ArtResize => c.art_resizes += 1,

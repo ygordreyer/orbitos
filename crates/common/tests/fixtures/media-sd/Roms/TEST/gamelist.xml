@@ -1,0 +1,5 @@
+<gameList>
+  <game><path>./Complete.sfc</path><name>Complete game</name><desc>A &amp; B race.</desc><releasedate>19981203T000000</releasedate><developer>Fixture studio</developer><publisher>Fixture publisher</publisher><genre>Racing, Arcade</genre><players>1-2</players><rating>0.8</rating><scraper>Fixture scraper</scraper><unknown><nested>Ignored</nested></unknown></game>
+  <game><path>./Missing.sfc</path><name>Missing fields</name><future-tag>preserved by writers</future-tag></game>
+  <game><path>./Override.sfc</path><name>XML override</name><image>./overrides/image.png</image><thumbnail>./overrides/thumbnail.png</thumbnail><marquee>./overrides/marquee.png</marquee><fanart>./overrides/fanart.png</fanart></game>
+</gameList>

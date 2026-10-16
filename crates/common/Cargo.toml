@@ -37,6 +37,7 @@ rusqlite_migration.workspace = true
 rusttype.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+quick-xml = { workspace = true, features = ["serialize"] }
 sha2.workspace = true
 libc = "=0.2.186"
 png = "=0.18.1"

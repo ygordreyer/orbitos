@@ -346,6 +346,7 @@ where
         let game = self.res.get::<GameInfo>();
         let mut input = FrameInputs::new(ScreenId::IngameMenu);
         input.text.insert(Binding::Title, game.name.clone());
+        input.art.selected_logo = common::media::load_logo(&game.path);
         let rows = self
             .entries
             .iter()

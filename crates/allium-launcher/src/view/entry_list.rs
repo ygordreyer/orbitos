@@ -43,10 +43,11 @@ pub struct CoreSelection {
     cores: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SelectedInfo {
     path: std::path::PathBuf,
     generation: u64,
+    media_generation: u64,
     metadata: String,
     metadata_runs: Vec<(String, String)>,
     blurb: String,
@@ -58,14 +59,16 @@ impl SelectedInfo {
         platform: &str,
     ) -> &'a Self {
         let generation = crate::view::details::metadata_generation();
-        if slot
-            .as_ref()
-            .is_none_or(|info| info.path != game.path || info.generation != generation)
-        {
-            let details = crate::view::details::Details::new(game, platform);
+        if slot.as_ref().is_none_or(|info| {
+            info.path != game.path
+                || info.generation != generation
+                || info.media_generation != common::media::generation()
+        }) {
+            let details = crate::view::details::Details::cached(game, platform);
             *slot = Some(Self {
                 path: game.path.clone(),
                 generation,
+                media_generation: common::media::generation(),
                 metadata: details.metadata,
                 metadata_runs: details.metadata_runs,
                 blurb: details.blurb,
@@ -95,6 +98,8 @@ where
     disc_picker: Option<DiscPicker>,
     details: Option<crate::view::details::Details>,
     semantic_info: Option<SelectedInfo>,
+    idle_media_key: Option<(usize, usize, usize, u64, bool, bool)>,
+    idle_media_work: VecDeque<super::orbit::WarmArt>,
     detail_action: usize,
 }
 
@@ -192,6 +197,8 @@ where
             disc_picker: None,
             details: None,
             semantic_info: None,
+            idle_media_key: None,
+            idle_media_work: VecDeque::new(),
             detail_action: 0,
         };
 
@@ -260,6 +267,69 @@ where
         }
     }
 
+    pub(crate) fn idle_media_step(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+        screen: common::theme::pack::ScreenId,
+    ) -> bool {
+        use super::orbit::WarmArt;
+        if let Some(child) = self.child.as_mut() {
+            return child.idle_media_step(handle, screen);
+        }
+        if self.entries.is_empty() {
+            return false;
+        }
+        let selected = self.list.selected();
+        let first = self.list.window_start();
+        let count =
+            crate::theme_adapter::capacity(handle, screen, common::theme::pack::Binding::Entries);
+        let ink = handle.pack().ink();
+        let tall = handle
+            .pack()
+            .alignment
+            .as_ref()
+            .is_some_and(|a| a.cover_shape == "tall");
+        let key = (
+            selected,
+            first,
+            count,
+            common::media::generation(),
+            ink,
+            tall,
+        );
+        if self.idle_media_key != Some(key) {
+            self.idle_media_key = Some(key);
+            self.idle_media_work =
+                Orbit::navigation_art_work(&self.entries, selected, first, count);
+            for i in [
+                (selected + self.entries.len() - 1) % self.entries.len(),
+                (selected + 1) % self.entries.len(),
+                selected,
+            ] {
+                let e = self.entries[i].clone();
+                self.idle_media_work.extend([
+                    WarmArt::Metadata(e.clone()),
+                    WarmArt::Cover(e.clone()),
+                    WarmArt::Hero(e.clone()),
+                    WarmArt::Logo(e.clone()),
+                    WarmArt::OtherCover(e),
+                ]);
+            }
+        }
+        if self.idle_media_work.is_empty() {
+            return false;
+        }
+        let orbit = self.orbit.get_or_insert_with(Orbit::new);
+        orbit.set_ink_art(ink);
+        orbit.set_cover_shape(tall);
+        orbit.warm_art_step(&mut self.idle_media_work);
+        if self.idle_media_work.is_empty() {
+            self.semantic_info = None;
+            self.set_should_draw();
+        }
+        true
+    }
+
     pub(crate) fn navigation_warm_ready(&self) -> bool {
         self.menu.is_none()
             && self.core.is_none()
@@ -297,15 +367,6 @@ where
         if self.entries.len() < 2 || !self.root_tab_navigation_ready() {
             return Ok(None);
         }
-        let components = &handle.pack().screens[&ScreenId::Library].components;
-        if components.iter().any(|c| {
-            matches!(
-                c.binding,
-                Some(Binding::SelectedMetadata | Binding::SelectedBlurb)
-            )
-        }) {
-            return Ok(None);
-        }
         let count = crate::theme_adapter::capacity(handle, ScreenId::Library, Binding::Entries);
         let selected = (self.list.selected() as isize + direction)
             .rem_euclid(self.entries.len() as isize) as usize;
@@ -337,9 +398,42 @@ where
         input
             .text
             .insert(Binding::SelectedTitle, entry.name().into());
+        if let Entry::Game(game) = entry {
+            let platform = self
+                .res
+                .get::<ConsoleMapper>()
+                .get_console(entry.path())
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let _ = crate::view::details::Details::new(game, &platform);
+            let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
+            input
+                .text
+                .insert(Binding::SelectedMetadata, info.metadata.clone());
+            input
+                .text
+                .insert(Binding::SelectedBlurb, info.blurb.clone());
+            input.metadata = info.metadata_runs.clone();
+        }
+        let mut artwork = Orbit::navigation_art_work(&self.entries, selected, first, count);
+        // Prime the current selection and both neighbours before the next input.
+        let current = self.list.selected();
+        for i in [
+            current,
+            (current + 1) % self.entries.len(),
+            (current + self.entries.len() - 1) % self.entries.len(),
+        ] {
+            let e = self.entries[i].clone();
+            artwork.extend([
+                super::orbit::WarmArt::Cover(e.clone()),
+                super::orbit::WarmArt::OtherCover(e.clone()),
+                super::orbit::WarmArt::Hero(e.clone()),
+                super::orbit::WarmArt::Logo(e),
+            ]);
+        }
         Ok(Some(NavigationWarm {
             input,
-            artwork: Orbit::navigation_art_work(&self.entries, selected, first, count),
+            artwork,
             selected,
             first,
             count,
@@ -453,7 +547,9 @@ where
                 && needs_info
             {
                 let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
-                if handle.pack().ink(){ input.metadata=info.metadata_runs.clone(); }
+                if handle.pack().ink() {
+                    input.metadata = info.metadata_runs.clone();
+                }
                 input
                     .text
                     .insert(Binding::SelectedMetadata, info.metadata.clone());
@@ -473,12 +569,19 @@ where
         }
         drop(locale);
         let needs_art = self.details.is_some()
-            || handle.pack().screens[&screen]
-                .components
-                .iter()
-                .any(|c| c.kind == common::theme::pack::Kind::Image || c.art_size.unwrap_or(0) > 0);
+            || self.menu.is_some()
+            || handle.pack().screens[&screen].components.iter().any(|c| {
+                c.kind == common::theme::pack::Kind::Image || c.logo || c.art_size.unwrap_or(0) > 0
+            });
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
         orbit.set_ink_art(handle.pack().ink());
+        orbit.set_cover_shape(
+            handle
+                .pack()
+                .alignment
+                .as_ref()
+                .is_some_and(|a| a.cover_shape == "tall"),
+        );
         if needs_art {
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art(&self.entries, selected, first, count);
@@ -495,17 +598,61 @@ where
                 .text
                 .insert(Binding::SelectedMetadata, details.metadata.clone());
             if handle.pack().ink() {
-                detail.metadata=details.metadata_runs.clone(); detail.facts=details.facts.clone();
-                detail.text.insert(Binding::SelectedSource, details.source.clone());
-                detail.text.insert(Binding::Pagination,format!("{} / {}",details.page+1,details.pages.len()));
-                detail.text.insert(Binding::SelectedBlurb,details.pages[details.page].clone());
-            } else { detail.text.insert(Binding::SelectedBlurb, details.text()); }
+                detail.metadata = details.metadata_runs.clone();
+                detail.facts = details.facts.clone();
+                detail
+                    .text
+                    .insert(Binding::SelectedSource, details.source.clone());
+                detail.text.insert(
+                    Binding::Pagination,
+                    format!("{} / {}", details.page + 1, details.pages.len()),
+                );
+                detail
+                    .text
+                    .insert(Binding::SelectedBlurb, details.pages[details.page].clone());
+            } else {
+                detail.text.insert(Binding::SelectedBlurb, details.text());
+            }
             detail.art = models[0].art.clone();
             detail.rows.insert(Binding::Entries, vec![]);
-            detail.rows.insert(Binding::Actions, if handle.pack().ink(){
-                vec![Row{id:"play".into(),label:"Play".into(),value:String::new(),enabled:true},Row{id:"back".into(),label:"Back".into(),value:String::new(),enabled:true}]
-            }else{vec![]});
-            if handle.pack().ink(){detail.focus=Focus{component:crate::theme_adapter::component_id(handle,ScreenId::GameDetail,Binding::Actions),item:Some(if self.detail_action==0{"play"}else{"back"}.into())};}
+            detail.rows.insert(
+                Binding::Actions,
+                if handle.pack().ink() {
+                    vec![
+                        Row {
+                            id: "play".into(),
+                            label: "Play".into(),
+                            value: String::new(),
+                            enabled: true,
+                        },
+                        Row {
+                            id: "back".into(),
+                            label: "Back".into(),
+                            value: String::new(),
+                            enabled: true,
+                        },
+                    ]
+                } else {
+                    vec![]
+                },
+            );
+            if handle.pack().ink() {
+                detail.focus = Focus {
+                    component: crate::theme_adapter::component_id(
+                        handle,
+                        ScreenId::GameDetail,
+                        Binding::Actions,
+                    ),
+                    item: Some(
+                        if self.detail_action == 0 {
+                            "play"
+                        } else {
+                            "back"
+                        }
+                        .into(),
+                    ),
+                };
+            }
             detail.hints = vec![
                 Hint {
                     button: "A".into(),
@@ -528,6 +675,9 @@ where
             menu.set_visible_count_override(Some(count))?;
             let locale = self.res.get::<Locale>();
             let mut modal = FrameInputs::new(ScreenId::ContextMenu);
+            modal.art.selected_logo = models
+                .first()
+                .and_then(|model| model.art.selected_logo.clone());
             modal.text.insert(
                 Binding::Title,
                 self.entries
@@ -558,7 +708,17 @@ where
                 ),
                 item: Some(format!("menu-{}", menu.selected())),
             };
-            if handle.pack().ink(){modal.rows.insert(Binding::Actions,vec![Row{id:"back".into(),label:"Close".into(),value:String::new(),enabled:false}]);}
+            if handle.pack().ink() {
+                modal.rows.insert(
+                    Binding::Actions,
+                    vec![Row {
+                        id: "back".into(),
+                        label: "Close".into(),
+                        value: String::new(),
+                        enabled: false,
+                    }],
+                );
+            }
             modal.hints = vec![
                 Hint {
                     button: "A".into(),
@@ -618,7 +778,17 @@ where
                         .into_owned()
                 }),
             );
-            if handle.pack().ink(){modal.rows.insert(Binding::Actions,vec![Row{id:"back".into(),label:"Cancel".into(),value:String::new(),enabled:false}]);}
+            if handle.pack().ink() {
+                modal.rows.insert(
+                    Binding::Actions,
+                    vec![Row {
+                        id: "back".into(),
+                        label: "Cancel".into(),
+                        value: String::new(),
+                        enabled: false,
+                    }],
+                );
+            }
             modal.hints = vec![
                 Hint {
                     button: "A".into(),
@@ -754,6 +924,8 @@ where
     }
 
     fn load_entries(&mut self) -> Result<()> {
+        self.idle_media_key = None;
+        self.idle_media_work.clear();
         crate::view::details::invalidate_metadata();
         self.semantic_info = None;
         self.entries = self
@@ -1032,14 +1204,25 @@ where
             }
         } else if self.details.is_some() && self.disc_picker.is_none() {
             match event {
-                KeyEvent::Pressed(Key::Left | Key::Right) if crate::theme_adapter::snapshot(&self.res).is_some_and(|h|h.pack().ink()) => {self.detail_action=1-self.detail_action;self.set_should_draw();}
+                KeyEvent::Pressed(Key::Left | Key::Right)
+                    if crate::theme_adapter::snapshot(&self.res)
+                        .is_some_and(|h| h.pack().ink()) =>
+                {
+                    self.detail_action = 1 - self.detail_action;
+                    self.set_should_draw();
+                }
                 KeyEvent::Pressed(Key::B) => {
                     self.details = None;
                     self.set_should_draw();
                 }
                 KeyEvent::Pressed(Key::A) => {
                     self.details = None;
-                    if self.detail_action==0 || !crate::theme_adapter::snapshot(&self.res).is_some_and(|h|h.pack().ink()){self.select_entry(commands).await?;}
+                    if self.detail_action == 0
+                        || !crate::theme_adapter::snapshot(&self.res)
+                            .is_some_and(|h| h.pack().ink())
+                    {
+                        self.select_entry(commands).await?;
+                    }
                     self.set_should_draw();
                 }
                 KeyEvent::Pressed(Key::Up | Key::Down)
@@ -1330,7 +1513,7 @@ where
                         if let Some(handle) = crate::theme_adapter::snapshot(&self.res) {
                             details.reflow(&handle);
                         }
-                        self.detail_action=0;
+                        self.detail_action = 0;
                         self.details = Some(details);
                         self.set_should_draw();
                     }
@@ -1445,6 +1628,7 @@ mod perf_fix_tests {
         .unwrap();
         let mut slot = None;
         crate::view::details::invalidate_metadata();
+        common::media::check_directory(&root);
         let first = SelectedInfo::get(&mut slot, &game, "PlayStation");
         let generation = first.generation;
         assert_eq!(first.blurb, "First");
@@ -1460,6 +1644,7 @@ mod perf_fix_tests {
             "First"
         );
         crate::view::details::invalidate_metadata();
+        common::media::check_directory(&root);
         let updated = SelectedInfo::get(&mut slot, &game, "PlayStation");
         assert_ne!(updated.generation, generation);
         assert_eq!(updated.blurb, "Replacement");
@@ -1504,10 +1689,116 @@ mod perf_fix_tests {
         list.semantic_info = Some(SelectedInfo {
             path: "Game.chd".into(),
             generation: 0,
+            media_generation: common::media::generation(),
             metadata: "metadata".into(),
             metadata_runs: vec![],
             blurb: "blurb".into(),
         });
+    }
+    #[test]
+    fn review_selected_info_tracks_media_generation() {
+        let root =
+            std::env::temp_dir().join(format!("allium-review-selected-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let xml = root.join("gamelist.xml");
+        std::fs::write(
+            &xml,
+            "<gameList><game><path>./G.sfc</path><desc>Before</desc></game></gameList>",
+        )
+        .unwrap();
+        common::media::invalidate();
+        let game = crate::entry::game::Game::new(root.join("G.sfc"));
+        let _ = common::media::metadata(&game.path);
+        let mut info = None;
+        assert_eq!(SelectedInfo::get(&mut info, &game, "Test").blurb, "Before");
+        std::fs::write(
+            &xml,
+            "<gameList><game><path>./G.sfc</path><desc>After</desc></game></gameList>",
+        )
+        .unwrap();
+        common::media::check_directory(&root);
+        let after = SelectedInfo::get(&mut info, &game, "Test").blurb.clone();
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+        assert_eq!(after, "After");
+    }
+    #[tokio::test]
+    #[cfg(feature = "perf-bench")]
+    async fn review_right_over_cached_games_performs_zero_media_io() {
+        use common::theme::{
+            ThemeHandle, fonts::FontBank, frame::FrameInputs, pack::ScreenId,
+            runtime::ThemeSnapshot,
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/tests/fixtures/media-sd/Roms/TEST");
+        common::media::invalidate();
+        common::media::check_directory(&root);
+        let bank = FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        for id in [
+            "orbit-hero",
+            "orbit-hero-tall",
+            "orbit-row",
+            "orbit-row-tall",
+            "big-picture",
+            "big-picture-tall",
+            "compact-plus",
+            "compact-plus-tall",
+        ] {
+            let snapshot = ThemeSnapshot::load(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../themes")
+                    .join(id)
+                    .canonicalize()
+                    .unwrap(),
+            )
+            .unwrap();
+            let handle = ThemeHandle::prepare(snapshot, &bank, 991).unwrap();
+            let mut list = list();
+            list.res.insert(Some(handle.clone()));
+            list.entries = ["Complete.sfc", "Legacy.sfc"]
+                .into_iter()
+                .map(|p| Entry::Game(crate::entry::game::Game::new(root.join(p))))
+                .collect();
+            list.list
+                .set_items(vec!["Complete".into(), "Legacy".into()], false);
+            list.enable_orbit();
+            list.theme_models(ScreenId::Library, &handle).unwrap();
+            for direction in [1, -1] {
+                let mut plan = list
+                    .navigation_warm_model(&handle, direction, FrameInputs::new(ScreenId::Library))
+                    .unwrap()
+                    .expect("metadata themes must support prefetch");
+                while !list.navigation_warm_art_step(&mut plan) {}
+            }
+            common::perf::take();
+            let before = common::perf_trace::frontend_io_ops();
+            let (send, _recv) = tokio::sync::mpsc::channel(4);
+            list.handle_key_event(KeyEvent::Pressed(Key::Right), send, &mut VecDeque::new())
+                .await
+                .unwrap();
+            list.theme_models(ScreenId::Library, &handle).unwrap();
+            list.theme_models(ScreenId::Library, &handle).unwrap();
+            let (send, _recv) = tokio::sync::mpsc::channel(4);
+            list.handle_key_event(KeyEvent::Pressed(Key::Right), send, &mut VecDeque::new())
+                .await
+                .unwrap();
+            let models = list.theme_models(ScreenId::Library, &handle).unwrap();
+            assert!(
+                models[0].art.selected_logo.is_some(),
+                "{id}: prefetched logo missing on returning Right"
+            );
+            let counts = common::perf::take();
+            assert_eq!(
+                (counts.media_io, counts.read_attempts, counts.decodes),
+                (0, 0, 0),
+                "{id}: {counts:?}"
+            );
+            assert_eq!(
+                common::perf_trace::frontend_io_ops(),
+                before,
+                "{id}: frontend filesystem operation"
+            );
+        }
     }
     #[tokio::test]
     async fn semantic_info_is_cleared_when_entering_child_directory() {

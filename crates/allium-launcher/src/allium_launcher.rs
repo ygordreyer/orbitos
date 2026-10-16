@@ -55,6 +55,9 @@ impl AlliumLauncher<DefaultPlatform> {
 
         let mut res = TypeMap::new();
         let database = Database::new()?;
+        if let Err(error)=crate::media_refresh::consume(&ALLIUM_SD_ROOT, &database, &console_mapper, &Locale::new(&LocaleSettings::load()?.lang)) {
+            warn!("Media refresh will be retried: {error:#}");
+        }
         crate::network_runtime::refresh_history(&database)?;
         res.insert(database);
         res.insert(console_mapper);
@@ -108,6 +111,7 @@ impl AlliumLauncher<DefaultPlatform> {
         let mut overlay_was_drawn = true;
         let mut warm_steps = 0;
         let mut warm_work = None;
+        let mut media_poll = Instant::now();
         loop {
             crate::network_runtime::trace_loop("loop_iteration", "before_poll");
             let network_job_active = crate::network_runtime::active();
@@ -222,9 +226,22 @@ impl AlliumLauncher<DefaultPlatform> {
                         navigation_warm_tests::handled_input();
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(if warm_work.is_some() { 1 } else { 10 })), if warm_steps < 2 && warm_allowed => {
-                    if self.view.prewarm_navigation_step(&mut warm_work, if warm_steps == 0 { 1 } else { -1 })? {
-                        warm_steps += 1;
+                _ = tokio::time::sleep(std::time::Duration::from_millis(if warm_work.is_some() {1} else {10})), if keys.values().all(|pressed| !pressed) && rx.is_empty() => {
+                    if self.view.idle_media_step() {continue;}
+                    if warm_steps<2 && warm_allowed {
+                        if self.view.prewarm_navigation_step(&mut warm_work,if warm_steps==0 {1} else {-1})? {warm_steps+=1;self.view.set_should_draw();}
+                    }
+                    if media_poll.elapsed()>=std::time::Duration::from_secs(1) {
+                        match crate::media_refresh::consume(&ALLIUM_SD_ROOT,&self.res.get::<Database>(),&self.res.get::<ConsoleMapper>(),&self.res.get::<Locale>()) {
+                            Ok(true)=>{
+                                self.view.save()?;
+                                self.view=App::load_or_new(self.display.bounding_box(),self.res.clone(),self.platform.battery()?)?;
+                                warm_work=None;warm_steps=0;overlay_was_drawn=true;
+                                media_poll=Instant::now();
+                            },
+                            Ok(false)=>{if !crate::media_refresh::pending() {media_poll=Instant::now();}},
+                            Err(error)=>{warn!("Media refresh: {error:#}");media_poll=Instant::now();},
+                        }
                     }
                 }
                 else => { crate::network_runtime::trace_wake("other"); }
@@ -801,6 +818,8 @@ mod orbit_proof {
         press(&mut app, Key::A, &tx).await;
         render_theme(&mut app);
         assert!(state(&app)["games"]["child"].is_object());
+        while app.view.idle_media_step() {}
+        render_theme(&mut app);
         assert_eq!(app.view.proof_game_theme_inputs()[0].art.entries.len(), 3);
         let library = state(&app)["games"].clone();
         assert!(

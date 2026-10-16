@@ -90,7 +90,7 @@ impl Directory {
         self.image.image()
     }
 
-    fn parse_game_list(&self, game_list: &Path) -> Result<Vec<Entry>> {
+    pub(crate) fn parse_game_list(&self, game_list: &Path) -> Result<Vec<Entry>> {
         let mut file = File::open(game_list)?;
         let mut s = String::with_capacity(1024);
         file.read_to_string(&mut s)?;
@@ -128,7 +128,7 @@ impl Directory {
                     {
                         LazyImage::Found(path)
                     } else {
-                        LazyImage::Unknown(self.path.clone())
+                        LazyImage::Unknown(path.clone())
                     }
                 }
                 None => LazyImage::Unknown(path.clone()),
@@ -171,6 +171,7 @@ impl Directory {
         console_mapper: &ConsoleMapper,
         #[allow(unused)] locale: &Locale,
     ) -> Result<Vec<Entry>> {
+        common::media::check_directory(&self.path);
         let mut entries: Vec<Entry> = Vec::with_capacity(64);
         debug!("Populating entries for directory: {:?}", self.path);
 
@@ -186,13 +187,13 @@ impl Directory {
                     debug!("Failed to get gamelist metadata, don't parse.");
                     return Ok(false);
                 };
-                let file_size = metadata.len() as i64;
-                if file_size == fingerprint {
-                    debug!("Same gamelist size, not parsing.");
+                let current_fingerprint = common::media::fingerprint(&metadata);
+                if current_fingerprint == fingerprint {
+                    debug!("Same gamelist fingerprint, not parsing.");
                     return Ok(false);
                 }
-                database.set_gamelist_fingerprint(&self.path, file_size)?;
-                debug!("Different gamelist size, parse gamelist.");
+                database.set_gamelist_fingerprint(&self.path, current_fingerprint)?;
+                debug!("Changed gamelist fingerprint, parse gamelist.");
                 Ok(true)
             } else {
                 debug!("No gamelist fingerprint, parse gamelist.");
@@ -200,14 +201,15 @@ impl Directory {
                     debug!("Failed to get gamelist metadata, don't parse.");
                     return Ok(false);
                 };
-                let file_size = metadata.len() as i64;
-                database.set_gamelist_fingerprint(&self.path, file_size)?;
+                let current_fingerprint = common::media::fingerprint(&metadata);
+                database.set_gamelist_fingerprint(&self.path, current_fingerprint)?;
                 Ok(true)
             }
         };
 
         let gamelist = self.path.join("gamelist.xml");
         if should_parse_gamelist(&gamelist)? {
+            crate::view::details::invalidate_metadata();
             debug!("Parsing gamelist.xml at {:?}", gamelist);
             #[cfg(feature = "miyoo")]
             {
@@ -262,6 +264,7 @@ impl Directory {
         } else if !gamelist.exists() {
             let gamelist = self.path.join("miyoogamelist.xml");
             if should_parse_gamelist(&gamelist)? {
+                crate::view::details::invalidate_metadata();
                 debug!("Parsing miyoogamelist.xml at {:?}", gamelist);
                 #[cfg(feature = "miyoo")]
                 {

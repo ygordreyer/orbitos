@@ -452,6 +452,26 @@ where
             })
     }
 
+    pub(crate) fn idle_media_step(&mut self) -> bool {
+        let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
+            return false;
+        };
+        let worked = if let Some(search) = self.search_results.as_mut() {
+            search.idle_media_step(&handle)
+        } else {
+            match self.selected {
+                0 => self.views.0.idle_media_step(&handle),
+                1 => self.views.1.idle_media_step(&handle),
+                2 => self.views.2.idle_media_step(&handle),
+                _ => false,
+            }
+        };
+        if worked {
+            self.theme_dirty = true;
+        }
+        worked
+    }
+
     pub(crate) fn navigation_warm_ready(&self) -> bool {
         self.selected == 1
             && self.single_game_list()
@@ -568,9 +588,19 @@ where
                 self.status_bar.theme_inputs()
             };
             prepare_theme_inputs(&mut models, &self.res, self.selected, &status);
-            if handle.pack().ink() && models.len()>1 && models.last().is_some_and(|m| handle.pack().screens[&m.screen].components.iter().any(|c|c.kind==common::theme::pack::Kind::Hints)) {
-                let underlay=models.len()-1;
-                for model in &mut models[..underlay] {model.hints.clear();}
+            if handle.pack().ink()
+                && models.len() > 1
+                && models.last().is_some_and(|m| {
+                    handle.pack().screens[&m.screen]
+                        .components
+                        .iter()
+                        .any(|c| c.kind == common::theme::pack::Kind::Hints)
+                })
+            {
+                let underlay = models.len() - 1;
+                for model in &mut models[..underlay] {
+                    model.hints.clear();
+                }
             }
             let mut previous = self
                 .theme_scene

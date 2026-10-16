@@ -33,6 +33,7 @@ pub struct Hint {
 }
 #[derive(Clone, Default)]
 pub struct Art {
+    pub selected_logo: Option<Arc<Pixmap>>,
     pub selected_cover: Option<Arc<Pixmap>>,
     pub next_cover: Option<Arc<Pixmap>>,
     pub selected_hero: Option<Arc<Pixmap>>,
@@ -64,7 +65,8 @@ impl PartialEq for Art {
                 _ => false,
             }
         }
-        same(&self.selected_cover, &other.selected_cover)
+        same(&self.selected_logo, &other.selected_logo)
+            && same(&self.selected_cover, &other.selected_cover)
             && same(&self.next_cover, &other.next_cover)
             && same(&self.selected_hero, &other.selected_hero)
             && self.entries.len() == other.entries.len()
@@ -228,6 +230,7 @@ impl FrameInputs {
             .selected_cover
             .iter()
             .chain(self.art.selected_hero.iter())
+            .chain(self.art.selected_logo.iter())
             .chain(self.art.next_cover.iter())
             .chain(self.art.entries.values())
         {

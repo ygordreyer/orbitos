@@ -13,7 +13,7 @@ use std::{
 use tiny_skia::Pixmap;
 
 const MAGIC: &[u8; 8] = b"ALORART\0";
-const TRANSFORM_VERSION: u32 = 2;
+const TRANSFORM_VERSION: u32 = 3;
 const HEADER_BYTES: usize = 84;
 const DISK_BYTES: u64 = 16 * 1024 * 1024;
 use crate::network_library::RESERVE_BYTES;

@@ -620,6 +620,11 @@ ON CONFLICT(path) DO UPDATE SET play_count = play_count + 1;",
         Ok(matches!(value.as_deref(), Some("1")))
     }
 
+    pub fn invalidate_gamelists(&self) -> Result<()> {
+        self.conn.as_ref().unwrap().execute("UPDATE directories SET gamelist_fingerprint = NULL", [])?;
+        Ok(())
+    }
+
     pub fn set_gamelist_fingerprint(&self, path: &Path, fingerprint: i64) -> Result<()> {
         trace!("set_gamelist_fingerprint({:?}, {})", path, fingerprint);
         self.conn.as_ref().unwrap().execute(

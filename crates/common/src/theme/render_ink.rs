@@ -766,6 +766,7 @@ impl PreparedFrame {
                 self.ink_surface(c.rect, c, c.color, false, None)
             }
             Kind::Text => {
+                if c.logo && self.logo(c, input)? { return Ok(()); }
                 let mut value = match c.binding.unwrap() {
                     Binding::ThemeName => self.theme.pack().name.trim_end_matches(" Tall").into(),
                     Binding::SelectedEyebrow => input
@@ -845,6 +846,7 @@ impl PreparedFrame {
             }
             Kind::Image => {
                 if c.binding == Some(Binding::SelectedLogo) {
+                    if self.logo(c, input)? { return Ok(()); }
                     let title = input
                         .text
                         .get(&Binding::SelectedTitle)
@@ -869,10 +871,8 @@ impl PreparedFrame {
                     };
                     if let Some(source) = src {
                         let mut image_c = c.clone();
-                        if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square"
-                            && c.binding != Some(Binding::SelectedHero)
-                        {
-                            image_c.fit = Some(crate::theme::pack::Fit::Cover);
+                        if c.binding != Some(Binding::SelectedHero) {
+                            image_c.fit = Some(if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {crate::theme::pack::Fit::Cover} else {crate::theme::pack::Fit::Contain});
                         }
                         let image = self.image_pixels(c.rect, source, &image_c)?;
                         self.draw_image(c.rect, &image);

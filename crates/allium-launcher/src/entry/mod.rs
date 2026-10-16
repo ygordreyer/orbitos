@@ -45,7 +45,8 @@ impl Entry {
             .to_owned();
 
         // Exclude Imgs and Guide directories
-        if file_name == "Imgs"
+        if file_name == "media"
+            || file_name == "Imgs"
             || file_name == "Guides"
             || file_name == "gamelist.xml"
             || file_name == "miyoogamelist.xml"

@@ -677,12 +677,28 @@ impl PreparedFrame {
             1.0,
         );
     }
+    fn logo(&mut self, c: &Component, input: &FrameInputs) -> Result<bool> {
+        let Some(source) = input.art.selected_logo.as_ref() else { return Ok(false); };
+        let scale = (c.rect.2 as f32 / source.width() as f32).min(c.rect.3 as f32 / source.height() as f32);
+        let width = (source.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (source.height() as f32 * scale).round().max(1.0) as u32;
+        let align = c.align.or_else(|| c.paint.as_ref().and_then(|p| p.anchor)).unwrap_or(Align::Left);
+        let x = c.rect.0 + match align { Align::Left => 0, Align::Center => (c.rect.2-width)/2, Align::Right => c.rect.2-width };
+        let rect = Rect(x, c.rect.1 + (c.rect.3-height)/2, width, height);
+        let mut slot=c.clone();
+        slot.fit=Some(super::pack::Fit::Contain);
+        slot.radius=Some(0);
+        let pixels=self.image_pixels(rect, source, &slot)?;
+        self.draw_image(rect, &pixels);
+        Ok(true)
+    }
     fn component(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
         match c.kind {
             Kind::Background | Kind::Panel | Kind::Overlay => {
                 self.panel(c.rect, c.color.unwrap(), c.radius.unwrap())
             }
             Kind::Text => {
+                if c.logo && self.logo(c, input)? { return Ok(()); }
                 let value = if c.binding == Some(Binding::ThemeName) {
                     self.theme.pack().name.clone()
                 } else {
