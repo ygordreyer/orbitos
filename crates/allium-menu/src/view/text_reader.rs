@@ -15,8 +15,8 @@ use common::resources::Resources;
 use common::stylesheet::Stylesheet;
 use common::theme::{
     ThemeHandle,
-    frame::{FrameInputs, Hint, Row as ThemeRow, Status},
-    pack::{Binding, NavGroup, Role, ScreenId},
+    frame::{FrameInputs, Hint, Status},
+    pack::{Binding, Role, ScreenId},
     render::PreparedFrame,
 };
 use common::view::{ButtonHint, ButtonHints, Keyboard, View};
@@ -692,16 +692,7 @@ impl TextReader {
             ];
             input
         };
-        input.navigation.insert(
-            NavGroup::Primary,
-            vec![ThemeRow {
-                subtitle: String::new(),
-                id: "guide".into(),
-                label: locale.t("ingame-menu-guide"),
-                value: String::new(),
-                enabled: true,
-            }],
-        );
+        super::guide_shell(&mut input, &locale);
         input.status = self.status.clone();
         drop(locale);
         self.theme_frame = Some(PreparedFrame::prepare(theme, &input)?);
@@ -1248,7 +1239,7 @@ mod theme_adapter_tests {
     use common::{constants::ALLIUM_FONTS_DIR, geom::Size, theme::ThemeRuntime};
     use type_map::TypeMap;
 
-    fn themed_resources(root: &Path) -> Resources {
+    pub(super) fn themed_resources(root: &Path) -> Resources {
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
         let mut runtime =
@@ -2440,5 +2431,51 @@ mod theme_adapter_tests {
             513
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parity_b_tests {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/parity-b-support.rs"
+    ));
+    #[test]
+    fn parity_b_reader_and_keyboard() {
+        let temp =
+            std::env::temp_dir().join(format!("allium-parity-b-reader-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("Real Racing Roots.txt");
+        fs::write(
+            &path,
+            "Your saved notes for this game appear here.\nA readable guide page.",
+        )
+        .unwrap();
+        for (variant, theme) in parity_variants() {
+            let res = super::theme_adapter_tests::themed_resources(&temp);
+            res.insert(Some(theme));
+            let mut reader = TextReader::new(Rect::new(0, 0, 640, 480), res.clone(), path.clone());
+            let status = Status {
+                clock: Some("12:34".into()),
+                battery: Some(82),
+                network: Some("online".into()),
+                ..Default::default()
+            };
+            reader.refresh_theme(status.clone()).unwrap();
+            parity_save(
+                &variant,
+                "text_reader",
+                reader.theme_frame.as_ref().unwrap().pixels(),
+            );
+            reader.keyboard = Some(Keyboard::new(res, "Search".into(), false));
+            reader.refresh_theme(status).unwrap();
+            parity_save(
+                &variant,
+                "keyboard",
+                reader.theme_frame.as_ref().unwrap().pixels(),
+            );
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 }

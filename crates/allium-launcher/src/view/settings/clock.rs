@@ -296,6 +296,12 @@ impl View for Clock {
 }
 
 impl SettingsChild for Clock {
+    fn clear_theme(&mut self) -> Result<()> { self.list.set_visible_count_override(None) }
+    fn theme_models(&mut self, handle: &common::theme::ThemeHandle)
+        -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        Ok(Some(super::page_models(&mut self.list, handle, "settings-clock")?))
+    }
+
     fn save(&self) -> ChildState {
         ChildState {
             selected: self.list.selected(),

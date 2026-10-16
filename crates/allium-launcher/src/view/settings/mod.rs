@@ -201,8 +201,11 @@ impl Settings {
             "settings-about",
         ]);
         let mut input = FrameInputs::new(screen);
-        input.pagination = Some(common::theme::frame::Pagination {page: self.list.selected()/count.max(1)+1,total: keys.len().max(1).div_ceil(count.max(1))});
-        input.text.insert(Binding::Title, locale.t("tab-settings"));
+        input.pagination = Some(common::theme::frame::Pagination {
+            page: self.list.selected() / count.max(1) + 1,
+            total: keys.len().max(1).div_ceil(count.max(1)),
+        });
+        input.text.insert(Binding::Title, common::product::NAME.into());
         input.rows.insert(
             Binding::SettingsRows,
             keys.iter()
@@ -372,3 +375,68 @@ impl View for Settings {
         unimplemented!()
     }
 }
+
+fn page_models(
+    list: &mut common::view::SettingsList,
+    handle: &common::theme::ThemeHandle,
+    title_key: &str,
+) -> Result<Vec<common::theme::frame::FrameInputs>> {
+    use common::theme::{
+        frame::{Focus, FrameInputs, Hint},
+        pack::{Binding, ScreenId},
+    };
+    let screen = ScreenId::SettingsPage;
+    let count = crate::theme_adapter::capacity(handle, screen, Binding::SettingsRows);
+    list.set_visible_count_override(Some(count))?;
+    let locale = list.resources().get::<Locale>();
+    let mut input = FrameInputs::new(screen);
+    let title = if title_key == "settings-about" {
+        common::product::NAME.to_owned()
+    } else {
+        locale.t(title_key)
+    };
+    input.text.insert(Binding::Title, title.clone());
+    input.rows.insert(Binding::SettingsRows, list.theme_rows());
+    input.focus = Focus {
+        component: crate::theme_adapter::component_id(handle, screen, Binding::SettingsRows),
+        item: Some(format!("setting-{}", list.selected())),
+    };
+    let editable = title_key != "settings-about"
+        && !(title_key == "settings-display" && list.selected() == 0)
+        && !(title_key == "settings-wifi" && list.selected() == 1);
+    if editable {
+        input.hints.push(Hint {
+            button: "A".into(),
+            label: locale.t("button-edit"),
+        });
+    }
+    input.hints.push(Hint {
+        button: "B".into(),
+        label: locale.t("button-back"),
+    });
+    let mut models = vec![input];
+    if let Some(capture) = list.theme_keyboard() {
+        let mut keyboard = FrameInputs::new(ScreenId::Keyboard);
+        keyboard.text.insert(Binding::Title, title);
+        keyboard
+            .text
+            .insert(Binding::KeyboardValue, capture.display_value);
+        keyboard.keyboard = capture.labels;
+        keyboard.keyboard_cursor = capture.cursor;
+        keyboard.hints = vec![
+            Hint {
+                button: "START".into(),
+                label: locale.t("button-select"),
+            },
+            Hint {
+                button: "B".into(),
+                label: locale.t("button-back"),
+            },
+        ];
+        models.push(keyboard);
+    }
+    Ok(models)
+}
+
+#[cfg(test)]
+mod parity_b_tests;

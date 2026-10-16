@@ -76,7 +76,7 @@ for script in "$ROOT"/.allium/migrations/*; do
         touch "$script/.done"
     fi
 done
-show -c
+show -c "$ROOT/.allium/images/orbitos-splash.png"
 
 # run Allium
 RUST_LOG=info "$ROOT"/.allium/bin/alliumd >"$ROOT"/allium.log 2>&1

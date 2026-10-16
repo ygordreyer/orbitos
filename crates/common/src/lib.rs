@@ -13,6 +13,7 @@ pub mod media;
 pub mod platform;
 pub mod perf_trace;
 pub mod power;
+pub mod product;
 pub mod resources;
 pub mod retroarch;
 pub mod stylesheet;

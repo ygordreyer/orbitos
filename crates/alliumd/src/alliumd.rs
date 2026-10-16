@@ -662,7 +662,7 @@ impl AlliumD<DefaultPlatform> {
                     let game_info = GameInfo::load()?;
                     let name = match game_info.as_ref() {
                         Some(game_info) => game_info.name.as_str(),
-                        None => "Allium",
+                        None => common::product::NAME,
                     };
                     let file_name = format!(
                         "{}-{}.png",

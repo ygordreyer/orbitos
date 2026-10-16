@@ -395,6 +395,7 @@ fn prepare_frame(
         .text
         .insert(Binding::Title, title.chars().take(512).collect());
     input.progress = Some(fraction.clamp(0.0, 1.0));
+    input.hints.push(common::theme::frame::Hint { button: "B".into(), label: "Back".into() });
     PreparedFrame::prepare(theme, &input)
 }
 fn prepare_overlay(
@@ -490,5 +491,38 @@ mod theme_overlay_tests {
                 .unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parity_b_tests {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/parity-b-support.rs"
+    ));
+    #[test]
+    fn parity_b_osd_footer() {
+        for (variant, theme) in parity_variants() {
+            for (kind, name, title) in [
+                (OsdKind::Volume, "osd_volume", "Volume"),
+                (OsdKind::Brightness, "osd_brightness", "Brightness"),
+            ] {
+                let frame = prepare_frame(theme.clone(), kind, title, 0.6).unwrap();
+                parity_save_overlay(&variant, name, &frame);
+                let hints = theme.pack().screens[&kind.screen()]
+                    .components
+                    .iter()
+                    .find(|c| c.kind == common::theme::pack::Kind::Hints)
+                    .unwrap();
+                let r = hints.rect;
+                assert!(
+                    (r.1..r.1 + r.3).any(|y| (r.0..r.0 + r.2)
+                        .any(|x| frame.pixels().pixels()[(y * 640 + x) as usize].alpha() > 0)),
+                    "{variant} footer missing"
+                );
+                assert!(frame.into_overlay().is_ok());
+            }
+        }
     }
 }

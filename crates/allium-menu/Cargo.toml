@@ -23,6 +23,7 @@ debug-ui = ["common/debug-ui"] # Draw bounding boxes
 [dependencies]
 anyhow.workspace = true
 tiny-skia.workspace = true
+image.workspace = true
 lazy_static.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -162,6 +162,16 @@ impl SettingsList {
         Ok(())
     }
 
+    pub fn theme_rows(&self) -> Vec<crate::theme::frame::Row> {
+        self.labels.iter().zip(&self.right).enumerate()
+            .skip(self.top).take(self.visible_count()).map(|(index, (label, value))| {
+                crate::theme::frame::Row { id: format!("setting-{index}"),
+                    label: label.clone(), subtitle: String::new(), value: value.theme_value(), enabled: true }
+            }).collect()
+    }
+
+    pub fn resources(&self) -> &Resources { &self.res }
+
     pub fn window_start(&self) -> usize {
         self.top
     }

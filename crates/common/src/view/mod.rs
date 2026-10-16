@@ -66,6 +66,15 @@ pub trait View {
         }
     }
 
+    fn theme_value(&self) -> String {
+        self.children().iter().map(|child| child.theme_value())
+            .filter(|value| !value.is_empty()).collect::<Vec<_>>().join(" ")
+    }
+
+    fn theme_keyboard(&self) -> Option<KeyboardThemeInputs> {
+        self.children().iter().find_map(|child| child.theme_keyboard())
+    }
+
     fn theme_status(&self) -> Option<crate::theme::frame::Status> {
         None
     }
@@ -166,6 +175,10 @@ pub fn draw_debug_bounds(
 
 #[async_trait(?Send)]
 impl View for Box<dyn View> {
+    fn theme_value(&self) -> String { (**self).theme_value() }
+
+    fn theme_keyboard(&self) -> Option<KeyboardThemeInputs> { (**self).theme_keyboard() }
+
     fn stop_workers(&mut self) {
         (**self).stop_workers()
     }

@@ -113,10 +113,10 @@ impl SystemUpdate {
         let mut values: Vec<Box<dyn View>> = vec![];
 
         // Current Version
-        labels.push(locale.t("settings-system-allium-version"));
+        labels.push(locale.t("settings-about-version"));
         values.push(Box::new(Label::new(
             Point::zero(),
-            ALLIUM_VERSION.clone(),
+            common::product::VERSION.to_owned(),
             Alignment::Right,
             None,
         )));
@@ -553,6 +553,13 @@ impl View for SystemUpdate {
 }
 
 impl SettingsChild for SystemUpdate {
+    fn clear_theme(&mut self) -> Result<()> { self.list.set_visible_count_override(None) }
+    fn theme_models(&mut self, handle: &common::theme::ThemeHandle)
+        -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        self.check_background_tasks();
+        Ok(Some(super::page_models(&mut self.list, handle, "settings-system-update-menu")?))
+    }
+
     fn save(&self) -> ChildState {
         ChildState {
             selected: self.list.selected(),

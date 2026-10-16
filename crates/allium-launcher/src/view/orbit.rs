@@ -665,18 +665,38 @@ fn art_path(entry: &Entry, kind: &str) -> PathBuf {
         .join(filename)
 }
 
+const MAX_MEDIA_DIMENSION: u32 = 2048;
+const MAX_MEDIA_PIXELS: u64 = 2048 * 2048;
+
+#[cfg(test)]
+thread_local! {
+    static MEDIA_DECODE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn media_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() as u64 > MAX_PNG_BYTES {
+        return None;
+    }
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format().ok()?.into_dimensions().ok()?;
+    (width > 0 && height > 0
+        && width <= MAX_MEDIA_DIMENSION && height <= MAX_MEDIA_DIMENSION
+        && u64::from(width) * u64::from(height) <= MAX_MEDIA_PIXELS)
+        .then_some((width, height))
+}
+
 fn decode_art_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
     let _stage = common::perf_trace::stage(common::perf_trace::Stage::Decode);
     if bytes.starts_with(b"\x89PNG") {
         return decode_png_bytes(bytes, dimensions);
     }
+    media_dimensions(bytes)?;
     #[cfg(feature = "perf-bench")]
     common::perf::hit(common::perf::Op::Decode);
     common::perf_trace::hit(common::perf_trace::ArtHit::Decode);
+    #[cfg(test)]
+    MEDIA_DECODE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     let image = image::load_from_memory(bytes).ok()?;
-    if image.width() > 2048 || image.height() > 2048 {
-        return None;
-    }
     let rgba = image.to_rgba8();
     let mut pixels = Pixmap::new(rgba.width(), rgba.height())?;
     for (src, dst) in rgba.pixels().zip(pixels.pixels_mut()) {
@@ -725,17 +745,10 @@ fn load_prepared_art(
     }
     common::perf_trace::frontend_io_op();
     let bytes = read_png_bytes(file)?;
+    let (sw, sh) = media_dimensions(&bytes)?;
     let (width, height) = if crop {
         (width, height)
     } else {
-        let (sw, sh) = image::ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format()
-            .ok()?
-            .into_dimensions()
-            .ok()?;
-        if sw == 0 || sh == 0 || sw > 2048 || sh > 2048 {
-            return None;
-        }
         let scale = (width as f32 / sw as f32).min(height as f32 / sh as f32);
         (
             (sw as f32 * scale).round().max(1.0) as u32,
@@ -809,7 +822,13 @@ fn decode_png_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
     } else if (width, height) != dimensions {
         return None;
     }
+    if width > MAX_MEDIA_DIMENSION || height > MAX_MEDIA_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_MEDIA_PIXELS {
+        return None;
+    }
     common::perf_trace::hit(common::perf_trace::ArtHit::Decode);
+    #[cfg(test)]
+    MEDIA_DECODE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     let image = Pixmap::decode_png(&bytes).ok()?;
     #[cfg(feature = "perf-bench")]
     common::perf::hit(common::perf::Op::Decode);
@@ -826,6 +845,9 @@ fn resize_art(image: Pixmap, width: u32, height: u32, crop: bool) -> Option<Pixm
     };
     let resized_width = (image.width() as f32 * scale).round().max(1.0) as u32;
     let resized_height = (image.height() as f32 * scale).round().max(1.0) as u32;
+    if u64::from(resized_width) * u64::from(resized_height) > MAX_MEDIA_PIXELS {
+        return None;
+    }
     let resized = image::imageops::resize(
         &pixels,
         resized_width,
@@ -1851,5 +1873,59 @@ mod latency_tests {
                 + second.source_bytes().saturating_sub(BASE_CACHE_BYTES);
             assert!(added <= 4 * 1024 * 1024);
         }
+    }
+}
+
+#[cfg(test)]
+mod media_dimension_review_tests {
+    use super::*;
+
+    #[test]
+    fn tiny_huge_jpeg_is_rejected_before_every_media_decode() {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[0, 0, 0], 1, 1, image::ExtendedColorType::Rgb8).unwrap();
+        let sof = bytes.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        bytes[sof + 5..sof + 7].copy_from_slice(&8192u16.to_be_bytes());
+        bytes[sof + 7..sof + 9].copy_from_slice(&8192u16.to_be_bytes());
+        assert!(bytes.len() < 1024);
+        assert_eq!(image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format().unwrap().into_dimensions().unwrap(), (8192, 8192));
+        let path = std::env::temp_dir().join(format!("allium-huge-header-{}.jpg", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+        assert!(decode_art_bytes(&bytes, (0, 0)).is_none());
+        for (w, h, crop) in [(140, 140, false), (176, 264, false), (390, 189, true), (480, 200, false)] {
+            assert!(load_prepared_art(&path, (0, 0), w, h, crop).is_none());
+        }
+        assert!(load_ink_cover(&path).is_none());
+        MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 0));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn hero_crop_bounds_intermediate_pixels_for_extreme_aspect_ratio() {
+        assert!(resize_art(Pixmap::new(2048, 1).unwrap(), 390, 189, true).is_none());
+    }
+
+    #[test]
+    fn huge_png_cannot_bypass_limit_with_matching_requested_dimensions() {
+        let mut bytes = Pixmap::new(1, 1).unwrap().encode_png().unwrap();
+        bytes[16..20].copy_from_slice(&8192u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&8192u32.to_be_bytes());
+        let mut crc = !0u32;
+        for byte in &bytes[12..29] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320u32 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        assert_eq!(image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format().unwrap().into_dimensions().unwrap(), (8192, 8192));
+        MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+        assert!(decode_art_bytes(&bytes, (8192, 8192)).is_none());
+        assert!(decode_png_bytes(&bytes, (8192, 8192)).is_none());
+        MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 0));
     }
 }

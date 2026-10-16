@@ -13,7 +13,7 @@ use common::stylesheet::Stylesheet;
 use common::theme::{
     ThemeHandle,
     frame::{Focus, FrameInputs, Hint, Row as ThemeRow, Status},
-    pack::{Binding, NavGroup, ScreenId},
+    pack::{Binding, ScreenId},
     render::PreparedFrame,
 };
 use common::view::{ButtonHint, ButtonHints, ScrollList, View};
@@ -185,6 +185,7 @@ impl GuideSelector {
         input
             .text
             .insert(Binding::Title, locale.t("ingame-menu-guide"));
+        super::game_context(&mut input, &self.res, &theme);
         input.rows.insert(
             Binding::Guides,
             self.guides
@@ -193,13 +194,17 @@ impl GuideSelector {
                 .skip(first)
                 .take(count)
                 .map(|(index, path)| ThemeRow {
-                    subtitle: String::new(),
                     id: format!("guide-{index}"),
                     label: path
-                        .file_name()
+                        .file_stem()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
+                    subtitle: {
+                        let cursor = self.res.get::<common::database::Database>().get_guide_cursor(path).unwrap_or(0).max(0);
+                        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0).max(1);
+                        format!("Bookmark · {:.0}%", (cursor as f64 / bytes as f64 * 100.0).clamp(0.0, 100.0))
+                    },
                     value: String::new(),
                     enabled: true,
                 })
@@ -213,16 +218,7 @@ impl GuideSelector {
         input
             .selected
             .insert(Binding::Guides, format!("guide-{selected}"));
-        input.navigation.insert(
-            NavGroup::Primary,
-            vec![ThemeRow {
-                subtitle: String::new(),
-                id: "guide".into(),
-                label: locale.t("ingame-menu-guide"),
-                value: String::new(),
-                enabled: true,
-            }],
-        );
+        super::guide_shell(&mut input, &locale);
         input.hints = vec![
             Hint {
                 button: "MENU".into(),
