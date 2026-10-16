@@ -27,6 +27,7 @@ fn dl12_host_render_microbench() {
         .iter()
         .enumerate()
         .map(|(i, name)| Row {
+            subtitle: String::new(),
             id: i.to_string(),
             label: (*name).into(),
             value: "NAS".into(),
@@ -74,6 +75,7 @@ fn dl12_host_render_microbench() {
         .iter()
         .enumerate()
         .map(|(i, name)| Row {
+            subtitle: String::new(),
             id: i.to_string(),
             label: (*name).into(),
             value: "".into(),

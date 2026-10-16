@@ -354,6 +354,7 @@ where
             .skip(first)
             .take(count)
             .map(|(_, entry)| ThemeRow {
+                subtitle: String::new(),
                 id: entry.theme_id().into(),
                 label: entry.as_str(&locale),
                 value: self.entry_value(*entry, &locale),

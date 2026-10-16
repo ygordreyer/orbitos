@@ -40,18 +40,21 @@ fn frame(screen: ScreenId) -> FrameInputs {
     }
     let games = vec![
         Row {
+            subtitle: String::new(),
             id: "wipeout".into(),
             label: "WipEout 3".into(),
             value: "".into(),
             enabled: true,
         },
         Row {
+            subtitle: String::new(),
             id: "r4".into(),
             label: "R4 - Ridge Racer Type 4".into(),
             value: "".into(),
             enabled: true,
         },
         Row {
+            subtitle: String::new(),
             id: "ctr".into(),
             label: "Crash Team Racing".into(),
             value: "".into(),
@@ -62,6 +65,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::SettingsRows,
         vec![Row {
+            subtitle: String::new(),
             id: "theme".into(),
             label: "Theme".into(),
             value: "Preset".into(),
@@ -72,6 +76,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
         Binding::Discs,
         (1..=4)
             .map(|i| Row {
+                subtitle: String::new(),
                 id: format!("disc-{i}"),
                 label: format!("Disc {i}"),
                 value: format!("game-disc-{i}.chd"),
@@ -82,6 +87,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::StorageEntries,
         vec![Row {
+            subtitle: String::new(),
             id: "cached".into(),
             label: "Large cached game".into(),
             value: "1.4 GiB".into(),
@@ -91,6 +97,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::Guides,
         vec![Row {
+            subtitle: String::new(),
             id: "guide".into(),
             label: "Guidebook".into(),
             value: "".into(),
@@ -101,12 +108,14 @@ fn frame(screen: ScreenId) -> FrameInputs {
         Binding::Actions,
         vec![
             Row {
+                subtitle: String::new(),
                 id: "confirm".into(),
                 label: "Confirm".into(),
                 value: "".into(),
                 enabled: true,
             },
             Row {
+                subtitle: String::new(),
                 id: "cancel".into(),
                 label: "Back".into(),
                 value: "".into(),
@@ -119,6 +128,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
         ["Recents", "Library", "Apps", "Settings"]
             .into_iter()
             .map(|s| Row {
+                subtitle: String::new(),
                 id: s.to_lowercase(),
                 label: s.into(),
                 value: "".into(),
@@ -542,6 +552,7 @@ fn theme_foundation_invalid_font_model_names_nav_and_caption_metrics() {
     assert!(f.validate(&theme).is_err());
     f.text.remove(&Binding::ThemeName);
     f.navigation.get_mut(&NavGroup::Primary).unwrap().push(Row {
+        subtitle: String::new(),
         id: "unavailable".into(),
         label: "Unexpected".into(),
         value: "".into(),
@@ -1463,6 +1474,7 @@ fn ux4_seven_menu_rows_fit_builtin_and_external_pack() {
                 Binding::Entries,
                 (0..7)
                     .map(|i| Row {
+                        subtitle: String::new(),
                         id: format!("action-{i}"),
                         label: if screen == ScreenId::ContextMenu {
                             [
@@ -1631,7 +1643,11 @@ fn theme_port_all_variants_all_screens_real_raster() {
             let hash = super::runtime::digest(rendered.pixels().data());
             println!("THEME_FRAME {id} {screen:?} {hash}");
             let expected: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!("settings-frame-hashes.json")).unwrap();
-            assert_eq!(hash, expected[&format!("{id}/{screen:?}")], "{id}/{screen:?}");
+            if let Ok(path) = std::env::var("ALLIUM_UPDATE_FRAME_HASHES") {
+                let mut updated: std::collections::BTreeMap<String,String> = std::fs::read_to_string(&path).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_default();
+                updated.insert(format!("{id}/{screen:?}"),hash.clone());
+                std::fs::write(path,serde_json::to_string_pretty(&updated).unwrap()+"\n").unwrap();
+            } else { assert_eq!(hash, expected[&format!("{id}/{screen:?}")], "{id}/{screen:?}"); }
             assert!(rendered.pixels().pixels().iter().any(|p|p.alpha()>0));
             for t in &rendered.targets {assert!(t.rect.0+t.rect.2<=640&&t.rect.1+t.rect.3<=480,"{id}/{screen:?} {t:?}");}
             if let Ok(out)=std::env::var("ALLIUM_THEME_PORT_FRAMES") {
@@ -1768,7 +1784,7 @@ fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
     let bank=FontBank::bind(&font_root()).unwrap();
     let mut logo=tiny_skia::Pixmap::new(96,24).unwrap();logo.fill(tiny_skia::Color::from_rgba8(250,10,80,255));let logo=Arc::new(logo);
     let mut themes=Vec::new();
-    for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load(&ink_pack_root().join(&id)).unwrap()));}}
+    for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load_with_settings(&ink_pack_root().join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap()));}}
     for id in ["orbit","compact"] {themes.push((id.into(),ThemeSnapshot::builtin(id).unwrap()));}
     for (id,snapshot) in themes {
         let theme=ThemeHandle::prepare(snapshot,&bank,901).unwrap();
@@ -1795,11 +1811,11 @@ fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
 fn media_big_picture_recents_renders_selected_game_art_on_right() {
     let bank=FontBank::bind(&font_root()).unwrap();
     for suffix in ["","-tall"] {
-        let theme=ThemeHandle::prepare(ThemeSnapshot::load(&ink_pack_root().join(format!("big-picture{suffix}"))).unwrap(),&bank,902).unwrap();
+        let theme=ThemeHandle::prepare(ThemeSnapshot::load_with_settings(&ink_pack_root().join("big-picture"), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap(),&bank,902).unwrap();
         let mut input=frame(ScreenId::Recents);input.focus=Focus::default();
         let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media-sd/Roms/TEST");
         let entry=crate::media::metadata(&fixture.join("Complete.sfc"));
-        input.rows.insert(Binding::Entries,vec![Row{id:"recent-fixture".into(),label:entry.name.clone(),value:String::new(),enabled:true}]);
+        input.rows.insert(Binding::Entries,vec![Row{subtitle:String::new(),id:"recent-fixture".into(),label:entry.name.clone(),value:String::new(),enabled:true}]);
         input.selected.insert(Binding::Entries,"recent-fixture".into());
         input.text.insert(Binding::SelectedTitle,entry.name.clone());
         let kind=if suffix.is_empty(){crate::media::Kind::Cover}else{crate::media::Kind::TallCover};
@@ -1813,3 +1829,6 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
         let logo=PreparedFrame::prepare(theme,&input).unwrap();assert_ne!(logo.pixels().pixel(500,144),no_title.pixels().pixel(500,144));
     }
 }
+
+#[path = "parity_tests.rs"]
+mod parity_d;

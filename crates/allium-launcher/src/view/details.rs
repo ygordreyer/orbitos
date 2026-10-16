@@ -17,6 +17,8 @@ pub(crate) struct Details {
     pub blurb: String,
     pub pages: Vec<String>,
     pub page: usize,
+    pub section_pages: Vec<Vec<common::theme::frame::DetailLine>>,
+    sections: Vec<(Option<String>, String)>,
     full_text: String,
 }
 impl Details {
@@ -156,6 +158,7 @@ impl Details {
             })
             .unwrap_or_else(|| "Synopsis unavailable.".into());
         let blurb = synopsis.chars().take(480).collect();
+        let synopsis_section = synopsis.clone();
         let summary_count = 2;
         let metadata: String = fields[..summary_count]
             .join(" · ")
@@ -228,7 +231,19 @@ impl Details {
                 .unwrap_or(&full_text)
                 .into()
         };
+        let mut sections = vec![(Some("SYNOPSIS".into()), synopsis_section)];
+        if let Some(entry) = fallback {
+            let host = entry.source.url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").trim_start_matches("www.");
+            let source_name = if host == "wikipedia.org" || host.ends_with(".wikipedia.org") { "Wikipedia" } else { host };
+            let mut provenance = format!("First release: {}\nSource: {}", entry.first_release_year, source_name);
+            if !has_local_synopsis { provenance.push_str(&format!("\n{}", entry.source.license.name)); }
+            sections.push((Some("PROVENANCE".into()), provenance));
+        } else if !shared.scraper.is_empty() {
+            sections.push((Some("PROVENANCE".into()), format!("Source: {}", shared.scraper)));
+        }
         Self {
+            section_pages: Vec::new(),
+            sections,
             metadata,
             metadata_runs: vec![
                 ("Platform".into(), platform.into()),
@@ -261,6 +276,19 @@ impl Details {
         else {
             return;
         };
+        if handle.pack().ink() && slot.paint.as_ref().is_some_and(|p|p.section_style.is_some()) {
+            let components = &handle.pack().screens[&ScreenId::GameDetail].components;
+            let separate = components.iter().any(|c|c.binding == Some(Binding::Pagination));
+            let mut sections = Vec::new();
+            if !components.iter().any(|c|c.binding == Some(Binding::SelectedFacts)) {
+                sections.extend(self.facts.iter().filter(|(label,_)|label != "First release").map(|(label,value)|(Some(label.to_uppercase()),value.clone())));
+            }
+            sections.extend(self.sections.clone());
+            self.section_pages = common::theme::render::ink_detail_pages(handle,slot,&sections,separate);
+            self.pages = self.section_pages.iter().map(|lines|lines.iter().map(|l|l.text.as_str()).collect::<Vec<_>>().join("\n")).collect();
+            self.page = self.page.min(self.pages.len().saturating_sub(1));
+            return;
+        }
         let role = slot.role.unwrap();
         let style = handle.component_text_style(slot, common::display::color::Color::new(0, 0, 0));
         let line = if handle.pack().ink() {
@@ -272,9 +300,10 @@ impl Details {
         } else {
             handle.pack().tokens.typography[&role].line_height
         };
+        let separate = handle.pack().ink() && handle.pack().screens[&ScreenId::GameDetail].components.iter().any(|c|c.binding == Some(Binding::Pagination));
         let limit = (slot.rect.3 / line)
             .min(slot.max_lines.unwrap())
-            .saturating_sub(1)
+            .saturating_sub(u32::from(!separate))
             .max(1) as usize;
         let body = if handle.pack().ink()
             && handle.pack().screens[&ScreenId::GameDetail]
@@ -1017,6 +1046,8 @@ mod tests {
             metadata_runs: vec![],
             facts: vec![],
             source: String::new(),
+            section_pages: Vec::new(),
+            sections: Vec::new(),
             ink_body: String::new(),
             blurb: String::new(),
             pages: pages(&"é".repeat(10000)),

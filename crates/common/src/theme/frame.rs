@@ -16,6 +16,7 @@ pub struct Focus {
 pub struct Row {
     pub id: String,
     pub label: String,
+    pub subtitle: String,
     pub value: String,
     pub enabled: bool,
 }
@@ -39,12 +40,25 @@ pub struct Art {
     pub selected_hero: Option<Arc<Pixmap>>,
     pub entries: BTreeMap<String, Arc<Pixmap>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pagination {
+    pub page: usize,
+    pub total: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailLine {
+    pub text: String,
+    pub heading: bool,
+    pub gap_before: u32,
+}
 #[derive(Clone, PartialEq)]
 pub struct FrameInputs {
     pub screen: ScreenId,
     pub text: BTreeMap<Binding, String>,
     pub rows: BTreeMap<Binding, Vec<Row>>,
     pub selected: BTreeMap<Binding, String>,
+    pub pagination: Option<Pagination>,
+    pub detail_lines: Vec<DetailLine>,
     pub metadata: Vec<(String, String)>,
     pub facts: Vec<(String, String)>,
     pub navigation: BTreeMap<NavGroup, Vec<Row>>,
@@ -93,6 +107,8 @@ impl FrameInputs {
             text: BTreeMap::new(),
             rows: BTreeMap::new(),
             selected: BTreeMap::new(),
+            pagination: None,
+            detail_lines: vec![],
             metadata: vec![],
             facts: vec![],
             navigation: BTreeMap::new(),
@@ -106,6 +122,22 @@ impl FrameInputs {
         }
     }
     pub fn validate(&self, theme: &super::fonts::ThemeHandle) -> Result<()> {
+        ensure!(
+            self.pagination
+                .is_none_or(|p| p.page > 0 && p.total >= p.page),
+            "Invalid pagination"
+        );
+        ensure!(
+            self.detail_lines.len() <= 32
+                && self
+                    .detail_lines
+                    .iter()
+                    .map(|l| l.text.chars().count() + 1)
+                    .sum::<usize>()
+                    <= 512
+                && self.detail_lines.iter().all(|l| l.gap_before <= 56),
+            "Invalid detail runs"
+        );
         for records in [&self.metadata, &self.facts] {
             ensure!(
                 records.len() <= 8
@@ -249,15 +281,20 @@ impl FrameInputs {
                 .pack()
                 .component(self.screen, &self.focus.component)
                 .ok_or_else(|| anyhow::anyhow!("Unknown focused component"))?;
+            let image_action = matches!(
+                c.kind,
+                super::pack::Kind::Image | super::pack::Kind::AssetImage
+            ) && c.paint.as_ref().is_some_and(|p| p.action.is_some());
             ensure!(
-                matches!(
-                    c.kind,
-                    super::pack::Kind::Entries
-                        | super::pack::Kind::SettingsRows
-                        | super::pack::Kind::DialogActions
-                        | super::pack::Kind::Navigation
-                        | super::pack::Kind::Keyboard
-                ),
+                image_action
+                    || matches!(
+                        c.kind,
+                        super::pack::Kind::Entries
+                            | super::pack::Kind::SettingsRows
+                            | super::pack::Kind::DialogActions
+                            | super::pack::Kind::Navigation
+                            | super::pack::Kind::Keyboard
+                    ),
                 "Focused component is not interactive"
             );
             let rows = if let Some(group) = c.group {
@@ -267,10 +304,11 @@ impl FrameInputs {
             };
             if let Some(id) = &self.focus.item {
                 ensure!(
-                    rows.is_some_and(|r| r
-                        .iter()
-                        .take(c.visible_count.unwrap_or(16) as usize)
-                        .any(|v| &v.id == id && v.enabled)),
+                    image_action && c.paint.as_ref().and_then(|p| p.action.as_ref()) == Some(id)
+                        || rows.is_some_and(|r| r
+                            .iter()
+                            .take(c.visible_count.unwrap_or(16) as usize)
+                            .any(|v| &v.id == id && v.enabled)),
                     "Focused item absent from visible model"
                 );
             }
@@ -287,6 +325,7 @@ fn validate_rows(rows: &[Row], limit: usize) -> Result<()> {
                 && row.id.len() <= 128
                 && ids.insert(&row.id)
                 && row.label.chars().count() <= 512
+                && row.subtitle.chars().count() <= 512
                 && row.value.chars().count() <= 512,
             "Invalid/duplicate row model"
         );

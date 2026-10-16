@@ -77,14 +77,17 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
                 binding,
                 input.text.get(&binding).cloned().unwrap_or_default(),
             );
+            if c.logo { out.art.selected_logo = input.art.selected_logo.clone(); }
             if binding == Binding::SelectedMetadata {
                 out.metadata = input.metadata.clone();
             }
+            if binding == Binding::SelectedBlurb { out.detail_lines = input.detail_lines.clone(); }
             if binding == Binding::SelectedFacts {
                 out.facts = input.facts.clone();
             }
             if binding == Binding::Pagination {
                 out.rows = input.rows.clone();
+                out.pagination = input.pagination;
             }
             if binding == Binding::OsdValue {
                 out.progress = input.progress;
@@ -166,6 +169,10 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
         Kind::Hints => out.hints = input.hints.clone(),
         Kind::Progress => out.progress = input.progress,
         _ => {}
+    }
+    if matches!(c.kind, Kind::Image | Kind::AssetImage) {
+        if c.binding == Some(Binding::SelectedLogo) {out.art.selected_logo = input.art.selected_logo.clone();}
+        if c.paint.as_ref().is_some_and(|p|p.action.is_some()) { out.focus = input.focus.clone(); }
     }
     out
 }

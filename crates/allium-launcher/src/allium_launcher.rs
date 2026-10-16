@@ -590,6 +590,7 @@ fn set_wallpaper(display: &mut impl Display, path: &Path) -> Result<()> {
 
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 mod orbit_proof {
+    include!("parity_capture_tests.rs");
     use super::*;
     use common::constants::{ALLIUM_BASE_DIR, ALLIUM_LAUNCHER_STATE};
     use serde_json::Value;
@@ -1716,6 +1717,8 @@ mod orbit_proof {
         catalog.validate().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (first_chunk_sent, first_chunk_received) = std::sync::mpsc::channel();
+        let (release_first_response, cancelled_first_response) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1755,7 +1758,8 @@ mod orbit_proof {
                 stream.write_all(header.as_bytes()).unwrap();
                 if attempt == 0 {
                     stream.write_all(&body[..65536]).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    first_chunk_sent.send(()).unwrap();
+                    cancelled_first_response.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
                     let _ = stream.write_all(&body[65536..]);
                 } else {
                     let _ = stream.write_all(&body[offset..]);
@@ -1963,6 +1967,7 @@ mod orbit_proof {
         let game_info_before = std::fs::read(common::constants::ALLIUM_GAME_INFO.as_path()).ok();
         let database_before = app.res.get::<Database>().select_games(&[&path]).unwrap();
         network::prefill("network-fixture").unwrap();
+        first_chunk_received.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(20);
         for key in [
             Key::X,
@@ -2005,6 +2010,7 @@ mod orbit_proof {
             "prefill cancellation needs a live worker"
         );
         network::event(KeyEvent::Pressed(Key::B)).unwrap();
+        release_first_response.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while network::active() {
             assert!(std::time::Instant::now() < deadline);

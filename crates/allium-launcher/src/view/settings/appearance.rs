@@ -39,6 +39,7 @@ fn rows(choices: &[ThemeChoice], current: Option<&ThemeHandle>) -> Vec<Row> {
             .any(|c| c.id.as_deref() == Some(&h.pack().id))
     });
     let mut rows = vec![Row {
+        subtitle: String::new(),
         id: "appearance-0".into(),
         label: "Theme".into(),
         value: current
@@ -61,6 +62,7 @@ fn rows(choices: &[ThemeChoice], current: Option<&ThemeHandle>) -> Vec<Row> {
                 .find(|o| current.settings().get(&setting.id) == Some(&o.id))
                 .unwrap();
             rows.push(Row {
+                subtitle: String::new(),
                 id: format!("appearance-{}", rows.len()),
                 label: setting.label.clone(),
                 value: option.label.clone(),
@@ -148,6 +150,7 @@ impl Appearance {
         let count = crate::theme_adapter::capacity(handle, screen, Binding::SettingsRows);
         self.list.set_visible_count_override(Some(count))?;
         let mut input = FrameInputs::new(screen);
+        input.pagination = Some(common::theme::frame::Pagination {page:self.list.selected()/count.max(1)+1,total:rows(&self.choices,Some(handle)).len().max(1).div_ceil(count.max(1))});
         input.text.insert(Binding::Title, "Theme".into());
         input.rows.insert(
             Binding::SettingsRows,

@@ -193,6 +193,7 @@ impl GuideSelector {
                 .skip(first)
                 .take(count)
                 .map(|(index, path)| ThemeRow {
+                    subtitle: String::new(),
                     id: format!("guide-{index}"),
                     label: path
                         .file_name()
@@ -204,6 +205,7 @@ impl GuideSelector {
                 })
                 .collect(),
         );
+        input.pagination = Some(common::theme::frame::Pagination {page: selected/count.max(1)+1,total: self.guides.len().max(1).div_ceil(count.max(1))});
         input.focus = Focus {
             component: theme_component(&theme, ScreenId::GuideSelector, Binding::Guides),
             item: Some(format!("guide-{selected}")),
@@ -214,6 +216,7 @@ impl GuideSelector {
         input.navigation.insert(
             NavGroup::Primary,
             vec![ThemeRow {
+                subtitle: String::new(),
                 id: "guide".into(),
                 label: locale.t("ingame-menu-guide"),
                 value: String::new(),

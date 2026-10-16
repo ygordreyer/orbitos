@@ -45,6 +45,7 @@ fn model(
     let count = entries.map_or(3, |c| c.visible_count.unwrap_or(3).min(5)) as usize;
     let rows: Vec<_> = (0..count)
         .map(|i| Row {
+            subtitle: String::new(),
             id: i.to_string(),
             label: format!("Game {i}: Racing the golden hour"),
             value: "PlayStation".into(),
@@ -59,6 +60,7 @@ fn model(
     input.rows.insert(
         Binding::Actions,
         vec![Row {
+            subtitle: String::new(),
             id: "launch".into(),
             label: "Launch".into(),
             value: String::new(),
@@ -82,6 +84,7 @@ fn model(
         ["recents", "library", "apps", "settings"]
             .into_iter()
             .map(|id| Row {
+                subtitle: String::new(),
                 id: id.into(),
                 label: id.into(),
                 value: String::new(),

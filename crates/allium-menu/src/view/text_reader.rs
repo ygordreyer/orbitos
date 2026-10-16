@@ -51,6 +51,7 @@ pub struct TextReader {
     cursor: usize,
     ink_page_history: VecDeque<(usize, usize)>,
     ink_page_theme: Option<(String, u64)>,
+    pagination_index: Option<(String, u64, usize, Vec<usize>)>,
     legacy_paragraph: Option<LegacyParagraph>,
     button_hints: ButtonHints<String>,
     keyboard: Option<Keyboard>,
@@ -127,6 +128,7 @@ impl TextReader {
             cursor,
             ink_page_history: VecDeque::new(),
             ink_page_theme: None,
+            pagination_index: None,
             legacy_paragraph: None,
             button_hints,
             keyboard: None,
@@ -314,6 +316,7 @@ impl TextReader {
     #[cfg(test)]
     fn replace_text(&mut self, text: String) {
         self.legacy_paragraph = None;
+        self.pagination_index = None;
         self.text = text;
     }
 
@@ -650,6 +653,20 @@ impl TextReader {
                     self.cursor as f32 / self.text.len().max(1) as f32 * 100.0
                 ),
             );
+            if let Some((layout,rect,max_lines)) = Self::ink_guide_layout(&theme) {
+                let valid = self.pagination_index.as_ref().is_some_and(|(digest,generation,len,_)|digest == theme.digest() && *generation == theme.generation() && *len == self.text.len());
+                if !valid {
+                    let mut starts = vec![0]; let mut at = 0;
+                    while at < self.text.len() {
+                        let used = layout.guide_page_len(&self.text[at..],rect.2,rect.3,max_lines);
+                        if used == 0 {break;} at += used;
+                        if at < self.text.len() { starts.push(at); }
+                    }
+                    self.pagination_index = Some((theme.digest().into(),theme.generation(),self.text.len(),starts));
+                }
+                let starts = &self.pagination_index.as_ref().unwrap().3;
+                input.pagination = Some(common::theme::frame::Pagination {page: starts.partition_point(|at| *at <= self.cursor).max(1), total: starts.len()});
+            }
             input.text.insert(Binding::GuideText, visible);
             input.hints = vec![
                 Hint {
@@ -678,6 +695,7 @@ impl TextReader {
         input.navigation.insert(
             NavGroup::Primary,
             vec![ThemeRow {
+                subtitle: String::new(),
                 id: "guide".into(),
                 label: locale.t("ingame-menu-guide"),
                 value: String::new(),
@@ -2279,7 +2297,7 @@ mod theme_adapter_tests {
     #[tokio::test]
     async fn themes5_mixed_guide_fallback_reverses_recorded_page_starts() {
         let paragraph = "Wide WWW narrow iii, éclair Straße 日本語 密碼 and  spaces. ".repeat(12);
-        let text = format!("\n{paragraph}\n\nAB\n{paragraph}\n\n").repeat(8);
+        let text = format!("\n{paragraph}\n\nAB\n{paragraph}\n\n").repeat(12);
         for id in THEMES5_PACKS {
             let (root, mut reader) = themes5_reader("mixed", id, &text);
             let mut starts = vec![0];
