@@ -302,6 +302,27 @@ ON CONFLICT(path) DO UPDATE SET name = ?, image = ?, core = ?, rating = ?, relea
         Ok(())
     }
 
+    /// Refresh imported metadata without changing core, favorites, history or screenshots.
+    pub fn update_game_metadata(&self, games: &[NewGame]) -> Result<()> {
+        let tx = self.conn.as_ref().unwrap().unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("
+INSERT INTO games (name, path, image, play_count, play_time, last_played, rating, release_date, developer, publisher, genres)
+VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)
+ON CONFLICT(path) DO UPDATE SET name = excluded.name, image = excluded.image,
+rating = excluded.rating, release_date = excluded.release_date, developer = excluded.developer,
+publisher = excluded.publisher, genres = excluded.genres")?;
+            for game in games {
+                stmt.execute(params![game.name, game.path.display().to_string(),
+                    game.image.as_ref().map(|p| p.display().to_string()), game.rating,
+                    game.release_date, game.developer, game.publisher,
+                    serde_json::to_string(&game.genres)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Selects played games sorted by most play time first.
     pub fn select_most_played(&self, limit: i64) -> Result<Vec<Game>> {
         let mut stmt = self

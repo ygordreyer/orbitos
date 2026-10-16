@@ -154,7 +154,7 @@ pub(crate) fn consume(
             }
         }
         match slot.as_ref().unwrap().updates.try_recv() {
-            Ok(Update::Games(games)) => database.update_games(&games)?,
+            Ok(Update::Games(games)) => database.update_game_metadata(&games)?,
             Ok(Update::Source(path, fingerprint)) => {
                 database.set_gamelist_fingerprint(&path, fingerprint)?
             }
@@ -253,15 +253,21 @@ mod tests {
             )
             .unwrap();
         }
+        let chosen_path = root.join("Roms/ONE/Game.sfc");
+        let chosen = NewGame { path: chosen_path.clone(), name: "Original".into(),
+            image: None, core: Some("chosen-core".into()), rating: None, release_date: None,
+            developer: None, publisher: None, genres: vec![], favorite: true };
+        db.update_games(&[chosen.clone()]).unwrap();
+        db.set_favorite(&chosen).unwrap();
+        db.increment_play_count(&chosen).unwrap();
+        db.add_play_time(&chosen_path, chrono::Duration::seconds(123)).unwrap();
+        db.update_screenshot_path(&chosen_path, Some(Path::new("user-shot.png"))).unwrap();
+        let original = db.select_games_in_directory(&root.join("Roms/ONE")).unwrap().remove(0);
         let marker = root.join(".allium/state/media-refresh");
         fs::write(&marker, b"").unwrap();
         assert!(!consume(&root, &db, &mapper, &locale).unwrap());
         assert!(!marker.exists());
-        assert!(
-            db.select_games_in_directory(&root.join("Roms/ONE"))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(db.get_core(&chosen_path).unwrap().as_deref(), Some("chosen-core"));
         let drain = || {
             for _ in 0..10000 {
                 if consume(&root, &db, &mapper, &locale).unwrap() {
@@ -280,6 +286,13 @@ mod tests {
             assert_eq!(games[0].name, "Updated game");
             assert_eq!(games[0].release_date.unwrap().to_string(), "1998-12-03");
         }
+        let refreshed = db.select_games_in_directory(&root.join("Roms/ONE")).unwrap().remove(0);
+        assert_eq!(refreshed.core, original.core);
+        assert_eq!(refreshed.favorite, original.favorite);
+        assert_eq!(refreshed.play_count, original.play_count);
+        assert_eq!(refreshed.play_time, original.play_time);
+        assert_eq!(refreshed.last_played, original.last_played);
+        assert_eq!(refreshed.screenshot_path, original.screenshot_path);
         assert!(!consume(&root, &db, &mapper, &locale).unwrap());
         fs::write(root.join("Roms/TWO/gamelist.xml"), "<broken").unwrap();
         fs::write(&marker, b"").unwrap();

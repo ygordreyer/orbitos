@@ -68,7 +68,7 @@ impl ApplicationHandler for SimulatorApp {
         if self.window.is_none() {
             trace!("Creating window in resumed()");
             let window_attrs = WinitWindow::default_attributes()
-                .with_title("Allium Simulator")
+                .with_title(format!("{} Simulator", crate::product::NAME))
                 .with_inner_size(PhysicalSize::new(
                     *SCREEN_WIDTH * *SCREEN_SCALE,
                     *SCREEN_HEIGHT * *SCREEN_SCALE,
