@@ -617,6 +617,7 @@ dependencies = [
  "memmap2",
  "nix 0.29.0",
  "png",
+ "quick-xml 0.41.0",
  "rusqlite",
  "rusqlite_migration",
  "rusttype",

@@ -30,6 +30,21 @@ pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
     let Some(actual) = theme.pack().screens.get(&screen) else {
         return false;
     };
+    // Logo capability does not alter component geometry. Retain the same layouts
+    // for older external packs whose title slots still use text only.
+    let same_layout = |a: &[Component], b: &[Component]| {
+        let normalize = |items: &[Component]| {
+            items
+                .iter()
+                .cloned()
+                .map(|mut c| {
+                    c.logo = false;
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        normalize(a) == normalize(b)
+    };
     let matches = if screen == ScreenId::Library {
         let mut preview = original.clone();
         preview.insert(
@@ -41,7 +56,7 @@ pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
             )
             .unwrap(),
         );
-        actual.components == *original || actual.components == preview
+        same_layout(&actual.components, original) || same_layout(&actual.components, &preview)
     } else {
         let mut icon = original.clone();
         for c in &mut icon {
@@ -49,12 +64,13 @@ pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
                 c.battery_style = Some(BatteryStyle::Icon);
             }
         }
-        actual.components == *original || actual.components == icon
+        same_layout(&actual.components, original) || same_layout(&actual.components, &icon)
     };
     matches && theme.pack().tokens.colors[&ColorRole::Background].ends_with("ff")
 }
 #[derive(Default)]
 struct ArtworkIdentity {
+    logo: Option<Weak<Pixmap>>,
     hero: Option<Weak<Pixmap>>,
     cover: Option<Weak<Pixmap>>,
     next_cover: Option<Weak<Pixmap>>,
@@ -66,6 +82,7 @@ pub(super) struct Inputs {
 }
 pub(super) fn restore_model(saved: &Inputs) -> FrameInputs {
     let mut model = saved.model.clone();
+    model.art.selected_logo = saved.art.logo.as_ref().and_then(Weak::upgrade);
     model.art.selected_hero = saved.art.hero.as_ref().and_then(Weak::upgrade);
     model.art.selected_cover = saved.art.cover.as_ref().and_then(Weak::upgrade);
     model.art.next_cover = saved.art.next_cover.as_ref().and_then(Weak::upgrade);
@@ -82,6 +99,7 @@ pub(super) fn capture(input: &FrameInputs) -> Inputs {
     let mut saved = input.clone();
     saved.art = Default::default();
     let mut art = ArtworkIdentity {
+        logo: input.art.selected_logo.as_ref().map(Arc::downgrade),
         hero: input.art.selected_hero.as_ref().map(Arc::downgrade),
         cover: input.art.selected_cover.as_ref().map(Arc::downgrade),
         next_cover: input.art.next_cover.as_ref().map(Arc::downgrade),
@@ -124,12 +142,16 @@ fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool {
     let a = &previous.model;
     match c.kind {
         Kind::Text => {
-            c.binding != Some(Binding::ThemeName)
-                && a.text.get(&c.binding.unwrap()) != b.text.get(&c.binding.unwrap())
+            (c.logo && !same_art(previous.art.logo.as_ref(), b.art.selected_logo.as_ref()))
+                || (c.binding != Some(Binding::ThemeName)
+                    && a.text.get(&c.binding.unwrap()) != b.text.get(&c.binding.unwrap()))
         }
         Kind::Status => a.status != b.status,
         Kind::Hints => a.hints != b.hints,
         Kind::Image => match c.binding {
+            Some(Binding::SelectedLogo) => {
+                !same_art(previous.art.logo.as_ref(), b.art.selected_logo.as_ref())
+            }
             Some(Binding::NextCover) => {
                 !same_art(previous.art.next_cover.as_ref(), b.art.next_cover.as_ref())
             }

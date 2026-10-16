@@ -1743,3 +1743,68 @@ fn theme_port_populated_recents_search_and_keyboard_focus_changes_both_targets()
         }
     }
 }
+
+#[test]
+fn review_builtin_game_heading_slots_are_logo_capable() {
+    for id in ["orbit","compact"] {
+        let pack=crate::theme::pack::Pack::builtin(id).unwrap();
+        for (screen, definition) in &pack.screens {
+            for c in &definition.components {
+                if c.binding==Some(Binding::SelectedTitle) || c.binding==Some(Binding::Title) && matches!(screen,ScreenId::GameDetail|ScreenId::ContextMenu|ScreenId::IngameMenu) {
+                    assert!(c.logo,"{id}/{screen:?}/{}",c.id);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
+    let bank=FontBank::bind(&font_root()).unwrap();
+    let mut logo=tiny_skia::Pixmap::new(96,24).unwrap();logo.fill(tiny_skia::Color::from_rgba8(250,10,80,255));let logo=Arc::new(logo);
+    let mut themes=Vec::new();
+    for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load(&ink_pack_root().join(&id)).unwrap()));}}
+    for id in ["orbit","compact"] {themes.push((id.into(),ThemeSnapshot::builtin(id).unwrap()));}
+    for (id,snapshot) in themes {
+        let theme=ThemeHandle::prepare(snapshot,&bank,901).unwrap();
+        for screen in ScreenId::ALL {
+            let slots:Vec<_>=theme.pack().screens[&screen].components.iter().filter(|c|c.logo||c.binding==Some(Binding::SelectedLogo)).collect();
+            if slots.is_empty(){continue;}
+            let mut input=frame(screen);input.focus=Focus::default();
+            let text=PreparedFrame::prepare(theme.clone(),&input).unwrap();
+            input.art.selected_logo=Some(logo.clone());let image=PreparedFrame::prepare(theme.clone(),&input).unwrap();
+            for slot in slots {
+                let r=slot.rect;
+                assert!((r.1..r.1+r.3).any(|y|(r.0..r.0+r.2).any(|x|text.pixels().pixel(x,y)!=image.pixels().pixel(x,y))),"{id}/{screen:?}/{} logo did not replace text",slot.id);
+                let title_binding=if slot.binding==Some(Binding::Title){Binding::Title}else{Binding::SelectedTitle};
+                let mut changed=input.clone();changed.text.insert(title_binding,"Another game heading".into());
+                let same=PreparedFrame::prepare(theme.clone(),&changed).unwrap();
+                assert!((r.1..r.1+r.3).all(|y|(r.0..r.0+r.2).all(|x|same.pixels().pixel(x,y)==image.pixels().pixel(x,y))),"{id}/{screen:?}/{} title leaked over logo",slot.id);
+            }
+            input.art.selected_logo=None;let fallback=PreparedFrame::prepare(theme.clone(),&input).unwrap();assert_eq!(text.pixels().data(),fallback.pixels().data());
+        }
+    }
+}
+
+#[test]
+fn media_big_picture_recents_renders_selected_game_art_on_right() {
+    let bank=FontBank::bind(&font_root()).unwrap();
+    for suffix in ["","-tall"] {
+        let theme=ThemeHandle::prepare(ThemeSnapshot::load(&ink_pack_root().join(format!("big-picture{suffix}"))).unwrap(),&bank,902).unwrap();
+        let mut input=frame(ScreenId::Recents);input.focus=Focus::default();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media-sd/Roms/TEST");
+        let entry=crate::media::metadata(&fixture.join("Complete.sfc"));
+        input.rows.insert(Binding::Entries,vec![Row{id:"recent-fixture".into(),label:entry.name.clone(),value:String::new(),enabled:true}]);
+        input.selected.insert(Binding::Entries,"recent-fixture".into());
+        input.text.insert(Binding::SelectedTitle,entry.name.clone());
+        let kind=if suffix.is_empty(){crate::media::Kind::Cover}else{crate::media::Kind::TallCover};
+        let cover=tiny_skia::Pixmap::load_png(crate::media::resolve(&fixture.join("Complete.sfc"),kind).unwrap()).unwrap();
+        let no_art=PreparedFrame::prepare(theme.clone(),&input).unwrap();input.art.selected_cover=Some(Arc::new(cover));
+        let rendered=PreparedFrame::prepare(theme.clone(),&input).unwrap();
+        assert_ne!(rendered.pixels().pixel(500,250),no_art.pixels().pixel(500,250));
+        input.text.insert(Binding::SelectedTitle,String::new());let no_title=PreparedFrame::prepare(theme.clone(),&input).unwrap();
+        assert!((120..168).any(|y|(432..608).any(|x|rendered.pixels().pixel(x,y)!=no_title.pixels().pixel(x,y))));
+        input.art.selected_logo=crate::media::load_logo(&fixture.join("Complete.sfc"));
+        let logo=PreparedFrame::prepare(theme,&input).unwrap();assert_ne!(logo.pixels().pixel(500,144),no_title.pixels().pixel(500,144));
+    }
+}

@@ -42,6 +42,13 @@ pub enum Recents {
 }
 
 impl Recents {
+    pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {
+        match self {
+            Self::List(list) => list.idle_media_step(handle),
+            Self::Carousel(_) => false,
+        }
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         match self {
             Self::List(list) => list.root_tab_navigation_ready(),

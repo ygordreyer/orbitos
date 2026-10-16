@@ -6,6 +6,7 @@ mod art_cache;
 mod consoles;
 mod discs;
 mod entry;
+mod media_refresh;
 mod network_cache;
 mod network_fs;
 mod network_library;

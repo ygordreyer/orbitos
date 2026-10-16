@@ -44,6 +44,7 @@ thread_local! {
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 pub(crate) fn invalidate_art() {
+    common::media::invalidate();
     ART_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
 fn art_generation() -> u64 {
@@ -56,9 +57,13 @@ struct CachedArt {
     image: Option<std::sync::Arc<Pixmap>>,
 }
 
+#[derive(Debug)]
 pub(crate) enum WarmArt {
+    Metadata(Entry),
     Cover(Entry),
     CoverFallback(Entry),
+    Logo(Entry),
+    OtherCover(Entry),
     Hero(Entry),
 }
 
@@ -66,8 +71,10 @@ pub(crate) enum WarmArt {
 pub struct Orbit {
     cache: VecDeque<CachedArt>,
     generation: u64,
+    media_generation: u64,
     legacy_ready: bool,
     ink_art: bool,
+    tall_art: bool,
     retired: Vec<std::sync::Weak<Pixmap>>,
     dirty: bool,
 }
@@ -77,8 +84,10 @@ impl Orbit {
         Self {
             cache: VecDeque::new(),
             generation: art_generation(),
+            media_generation: common::media::generation(),
             legacy_ready: false,
             ink_art: false,
+            tall_art: false,
             retired: Vec::new(),
             dirty: true,
         }
@@ -102,8 +111,37 @@ impl Orbit {
         }
     }
 
+    pub(crate) fn set_cover_shape(&mut self, tall: bool) {
+        if self.tall_art != tall {
+            self.release_art();
+            self.tall_art = tall;
+        }
+    }
+    fn cover_path(&self, entry: &Entry) -> PathBuf {
+        if self.tall_art {
+            if let Some(path) =
+                common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
+            {
+                return path;
+            }
+        }
+        art_path(entry, "stock")
+    }
+    fn cache_logo(&mut self, entry: &Entry) {
+        let Some(path) = common::media::cached_resolve(entry.path(), common::media::Kind::Logo)
+        else {
+            return;
+        };
+        if !self.cache.iter().any(|item| item.path == path) {
+            let image = load_prepared_art(&path, (0, 0), 480, 200, false).map(std::sync::Arc::new);
+            self.insert_cached(CachedArt { path, image });
+        }
+    }
     pub(crate) fn set_ink_art(&mut self, enabled: bool) {
-        if self.ink_art != enabled { self.release_art(); self.ink_art=enabled; }
+        if self.ink_art != enabled {
+            self.release_art();
+            self.ink_art = enabled;
+        }
     }
 
     pub(crate) fn prepare_window(
@@ -113,21 +151,22 @@ impl Orbit {
         first: usize,
         count: usize,
     ) {
+        let _ = (entries, selected, first, count);
         self.refresh_art();
-        for entry in entries
-            .iter()
-            .skip(first)
-            .take(count.min(CACHE_ENTRIES - 1))
-        {
-            self.cache_theme_cover(entry);
+    }
+    #[cfg(test)]
+    fn prepare_loaded_window(
+        &mut self,
+        entries: &[Entry],
+        selected: usize,
+        first: usize,
+        count: usize,
+    ) {
+        let mut work = Self::navigation_art_work(entries, selected, first, count);
+        while !work.is_empty() {
+            self.warm_art_step(&mut work);
         }
-        if let Some(entry) = entries.get(selected) {
-            self.cache_art(art_path(entry, "heroes"), (360, 210));
-            self.cache_theme_cover(entry);
-        }
-        if let Some(next) = peek_game(entries, first, count) {
-            self.cache_theme_cover(&entries[next]);
-        }
+        self.prepare_window(entries, selected, first, count);
     }
     pub(crate) fn navigation_art_work(
         entries: &[Entry],
@@ -145,6 +184,7 @@ impl Orbit {
         if let Some(entry) = entries.get(selected) {
             work.push_back(WarmArt::Hero(entry.clone()));
             work.push_back(WarmArt::Cover(entry.clone()));
+            work.push_back(WarmArt::Logo(entry.clone()));
         }
         if let Some(next) = peek_game(entries, first, count) {
             work.push_back(WarmArt::Cover(entries[next].clone()));
@@ -156,36 +196,87 @@ impl Orbit {
         let Some(task) = work.pop_front() else {
             return;
         };
-        let (entry, fallback) = match task {
-            WarmArt::Hero(entry) => {
-                self.cache_art(art_path(&entry, "heroes"), (360, 210));
-                return;
+        if let WarmArt::Metadata(entry) = task {
+            if let Entry::Game(game) = entry {
+                let _ = super::details::Details::new(&game, "");
             }
-            WarmArt::Cover(entry) => (entry, false),
-            WarmArt::CoverFallback(entry) => (entry, true),
-        };
-        let path = art_path(&entry, "stock");
-        if self.cache.iter().any(|item| item.path == path) {
             return;
         }
-        let image = if fallback {
-            load_prepared_art(
-                &art_path(&entry, "covers"),
-                (101, 101),
-                COVER_SIZE,
-                COVER_SIZE,
-                false,
-            )
-        } else {
-            load_prepared_art(&path, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false)
+        let entry = match &task {
+            WarmArt::Metadata(e)
+            | WarmArt::Cover(e)
+            | WarmArt::CoverFallback(e)
+            | WarmArt::Hero(e)
+            | WarmArt::Logo(e)
+            | WarmArt::OtherCover(e) => e,
         };
-        if image.is_none() && !fallback {
-            work.push_front(WarmArt::CoverFallback(entry));
-        } else {
-            self.insert_cached(CachedArt {
-                path,
-                image: image.map(std::sync::Arc::new),
-            });
+        for kind in [
+            common::media::Kind::Cover,
+            common::media::Kind::TallCover,
+            common::media::Kind::PreparedCover,
+            common::media::Kind::Background,
+            common::media::Kind::Logo,
+        ] {
+            common::media::resolve(entry.path(), kind);
+        }
+        let fallback = matches!(&task, WarmArt::CoverFallback(_));
+        match task {
+            WarmArt::Metadata(_) => unreachable!(),
+            WarmArt::Hero(entry) => self.cache_art(art_path(&entry, "heroes"), (360, 210)),
+            WarmArt::Logo(entry) => self.cache_logo(&entry),
+            WarmArt::OtherCover(entry) => {
+                let path = if self.tall_art {
+                    common::media::cached_resolve(entry.path(), common::media::Kind::Cover)
+                } else {
+                    common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
+                };
+                if let Some(path) = path {
+                    if !self.cache.iter().any(|item| item.path == path) {
+                        let image = if self.ink_art {
+                            load_ink_cover(&path)
+                        } else {
+                            load_prepared_art(
+                                &path,
+                                (0, 0),
+                                THEME_COVER_SIZE,
+                                THEME_COVER_SIZE,
+                                false,
+                            )
+                        };
+                        self.insert_cached(CachedArt {
+                            path,
+                            image: image.map(std::sync::Arc::new),
+                        });
+                    }
+                }
+            }
+            WarmArt::Cover(entry) | WarmArt::CoverFallback(entry) => {
+                let path = self.cover_path(&entry);
+                if self.cache.iter().any(|item| item.path == path) {
+                    return;
+                }
+                let image = if fallback {
+                    load_prepared_art(
+                        &art_path(&entry, "covers"),
+                        (101, 101),
+                        COVER_SIZE,
+                        COVER_SIZE,
+                        false,
+                    )
+                } else if self.ink_art {
+                    load_ink_cover(&path)
+                } else {
+                    load_prepared_art(&path, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false)
+                };
+                if image.is_none() && !fallback {
+                    work.push_front(WarmArt::CoverFallback(entry));
+                } else {
+                    self.insert_cached(CachedArt {
+                        path,
+                        image: image.map(std::sync::Arc::new),
+                    });
+                }
+            }
         }
     }
     pub(crate) fn theme_art(
@@ -197,6 +288,7 @@ impl Orbit {
     ) -> common::theme::frame::Art {
         let mut art = common::theme::frame::Art::default();
         if let Some(entry) = entries.get(selected) {
+            art.selected_logo = self.cached_image(&art_path(entry, "logos")).cloned();
             art.selected_hero = self.image(entry, "heroes").cloned();
             art.selected_cover = self.theme_cover_image(entry).cloned();
         }
@@ -212,35 +304,8 @@ impl Orbit {
         art
     }
 
-    fn cache_theme_cover(&mut self, entry: &Entry) {
-        let original = art_path(entry, "stock");
-        if let Some(index) = self.cache.iter().position(|item| item.path == original) {
-            let item = self.cache.remove(index).unwrap();
-            self.cache.push_front(item);
-            common::perf_trace::hit(common::perf_trace::ArtHit::Ram);
-            #[cfg(feature = "perf-bench")]
-            common::perf::hit(common::perf::Op::RamHit);
-            return;
-        }
-        let image = if self.ink_art { load_ink_cover(&original) } else { load_prepared_art(&original, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false) }
-            .or_else(|| {
-                load_prepared_art(
-                    &art_path(entry, "covers"),
-                    (101, 101),
-                    COVER_SIZE,
-                    COVER_SIZE,
-                    false,
-                )
-            })
-            .map(std::sync::Arc::new);
-        self.insert_cached(CachedArt {
-            path: original,
-            image,
-        });
-    }
-
     fn theme_cover_image(&self, entry: &Entry) -> Option<&std::sync::Arc<Pixmap>> {
-        self.cached_image(&art_path(entry, "stock"))
+        self.cached_image(&self.cover_path(entry))
     }
 
     fn cached_image(&self, path: &Path) -> Option<&std::sync::Arc<Pixmap>> {
@@ -264,6 +329,14 @@ impl Orbit {
             (COVER_SIZE, COVER_SIZE, false)
         } else {
             (390, 189, true)
+        };
+        let dimensions = if path.file_name().is_some_and(|n| {
+            n.to_string_lossy().ends_with(".hero.png")
+                || n.to_string_lossy().ends_with(".orbit.png")
+        }) {
+            dimensions
+        } else {
+            (0, 0)
         };
         self.insert_cached(CachedArt {
             image: load_prepared_art(&path, dimensions, width, height, crop)
@@ -332,6 +405,11 @@ impl Orbit {
     }
 
     fn refresh_art(&mut self) {
+        let media_generation = common::media::generation();
+        if self.media_generation != media_generation {
+            self.release_art();
+            self.media_generation = media_generation;
+        }
         let generation = art_generation();
         if self.generation != generation {
             self.release_art();
@@ -340,7 +418,9 @@ impl Orbit {
     }
 
     pub fn release_art(&mut self) {
-        while let Some(item) = self.cache.pop_back() { self.retire(item); }
+        while let Some(item) = self.cache.pop_back() {
+            self.retire(item);
+        }
         self.source_bytes();
         self.legacy_ready = false;
         self.dirty = true;
@@ -502,6 +582,16 @@ fn shelf_start(selected: usize, count: usize) -> usize {
 }
 
 fn art_path(entry: &Entry, kind: &str) -> PathBuf {
+    let media_kind = match kind {
+        "heroes" => common::media::Kind::Background,
+        "logos" => common::media::Kind::Logo,
+        "covers" => common::media::Kind::PreparedCover,
+        _ => common::media::Kind::Cover,
+    };
+    if let Some(path) = common::media::cached_resolve(entry.path(), media_kind) {
+        return path;
+    }
+
     if let Some(path) = crate::network_runtime::art_path(entry.path(), kind) {
         return path;
     }
@@ -514,6 +604,7 @@ fn art_path(entry: &Entry, kind: &str) -> PathBuf {
     filename.push(match kind {
         "heroes" => ".hero.png",
         "stock" => ".png",
+        "logos" => ".logo.png",
         _ => ".orbit.png",
     });
     entry
@@ -524,14 +615,38 @@ fn art_path(entry: &Entry, kind: &str) -> PathBuf {
         .join(filename)
 }
 
+fn decode_art_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
+    if bytes.starts_with(b"\x89PNG") {
+        return decode_png_bytes(bytes, dimensions);
+    }
+    let image = image::load_from_memory(bytes).ok()?;
+    if image.width() > 2048 || image.height() > 2048 {
+        return None;
+    }
+    let rgba = image.to_rgba8();
+    let mut pixels = Pixmap::new(rgba.width(), rgba.height())?;
+    for (src, dst) in rgba.pixels().zip(pixels.pixels_mut()) {
+        *dst = tiny_skia::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+    Some(pixels)
+}
+
 fn load_ink_cover(path: &Path) -> Option<Pixmap> {
-    let file=File::open(path).ok()?;
-    if file.metadata().ok()?.len()>MAX_PNG_BYTES{return None;}
-    let source=decode_png_bytes(&read_png_bytes(file)?,(0,0))?;
-    let scale=(176.0/source.width() as f32).min(264.0/source.height() as f32).min(1.0);
-    let width=(source.width() as f32*scale).round().max(1.0) as u32;
-    let height=(source.height() as f32*scale).round().max(1.0) as u32;
-    resize_art(source,width,height,false)
+    common::perf_trace::frontend_io_op();
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_PNG_BYTES {
+        return None;
+    }
+    common::perf_trace::frontend_io_op();
+    #[cfg(feature = "perf-bench")]
+    common::perf::hit(common::perf::Op::Decode);
+    let source = decode_art_bytes(&read_png_bytes(file)?, (0, 0))?;
+    let scale = (176.0 / source.width() as f32)
+        .min(264.0 / source.height() as f32)
+        .min(1.0);
+    let width = (source.width() as f32 * scale).round().max(1.0) as u32;
+    let height = (source.height() as f32 * scale).round().max(1.0) as u32;
+    resize_art(source, width, height, false)
 }
 
 fn load_prepared_art(
@@ -556,6 +671,23 @@ fn load_prepared_art(
     }
     common::perf_trace::frontend_io_op();
     let bytes = read_png_bytes(file)?;
+    let (width, height) = if crop {
+        (width, height)
+    } else {
+        let (sw, sh) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        if sw == 0 || sh == 0 || sw > 2048 || sh > 2048 {
+            return None;
+        }
+        let scale = (width as f32 / sw as f32).min(height as f32 / sh as f32);
+        (
+            (sw as f32 * scale).round().max(1.0) as u32,
+            (sh as f32 * scale).round().max(1.0) as u32,
+        )
+    };
     let key = metadata.as_ref().and_then(|metadata| {
         crate::art_cache::ArtKey::new(path, metadata, &bytes, dimensions, (width, height), crop)
     });
@@ -566,7 +698,7 @@ fn load_prepared_art(
         common::perf::hit(common::perf::Op::DiskHit);
         return Some(image);
     }
-    let image = resize_art(decode_png_bytes(&bytes, dimensions)?, width, height, crop)?;
+    let image = resize_art(decode_art_bytes(&bytes, dimensions)?, width, height, crop)?;
     if let Some(key) = key {
         key.store(cache_dir, &image);
     }
@@ -604,8 +736,8 @@ fn decode_png_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     if dimensions == (0, 0) {
-        if width < 64
-            || height < 64
+        if width < 1
+            || height < 1
             || width > 1024
             || height > 1024
             || width.checked_mul(height)? > 1024 * 1024
@@ -625,27 +757,33 @@ fn resize_art(image: Pixmap, width: u32, height: u32, crop: bool) -> Option<Pixm
     #[cfg(feature = "perf-bench")]
     common::perf::hit(common::perf::Op::ArtResize);
     let pixels = image::RgbaImage::from_raw(image.width(), image.height(), image.data().to_vec())?;
-    let resized_height = if crop {
-        (image.height() * width).div_ceil(image.width())
+    let scale = if crop {
+        (width as f32 / image.width() as f32).max(height as f32 / image.height() as f32)
     } else {
-        height
+        (width as f32 / image.width() as f32).min(height as f32 / image.height() as f32)
     };
+    let resized_width = (image.width() as f32 * scale).round().max(1.0) as u32;
+    let resized_height = (image.height() as f32 * scale).round().max(1.0) as u32;
     let resized = image::imageops::resize(
         &pixels,
-        width,
+        resized_width,
         resized_height,
         image::imageops::FilterType::Triangle,
     );
     let final_image = if crop {
-        image::imageops::crop_imm(&resized, 0, (resized_height - height) / 2, width, height)
-            .to_image()
+        image::imageops::crop_imm(
+            &resized,
+            (resized_width - width) / 2,
+            (resized_height - height) / 2,
+            width,
+            height,
+        )
+        .to_image()
     } else {
         resized
     };
-    Pixmap::from_vec(
-        final_image.into_raw(),
-        tiny_skia::IntSize::from_wh(width, height)?,
-    )
+    let size = tiny_skia::IntSize::from_wh(final_image.width(), final_image.height())?;
+    Pixmap::from_vec(final_image.into_raw(), size)
 }
 
 pub fn font(styles: &Stylesheet, size: u32, color: Color) -> FontTextStyle {
@@ -860,23 +998,55 @@ fn peek_game(entries: &[Entry], first: usize, count: usize) -> Option<usize> {
 mod next_cover_tests {
     use super::*;
     #[test]
+    #[cfg(feature = "perf-bench")]
+    fn review_frame_preparation_never_decodes_cold_selection() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/tests/fixtures/media-sd/Roms/TEST");
+        let entries = [Entry::Game(crate::entry::game::Game::new(
+            root.join("Complete.sfc"),
+        ))];
+        let mut orbit = Orbit::new();
+        common::perf::take();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let counts = common::perf::take();
+        assert_eq!(
+            counts.read_attempts + counts.decodes + counts.media_io,
+            0,
+            "frame performed IO/decode: {counts:?}"
+        );
+    }
+    #[test]
     #[serial_test::serial(orbit_fixture)]
     fn captured_case_art_prefers_clean_original_and_keeps_prepared_fallback() {
-        use common::theme::{ThemeRuntime, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, render::PreparedFrame};
         use crate::entry::game::Game;
+        use common::theme::{
+            ThemeRuntime,
+            frame::{FrameInputs, Row},
+            pack::{Binding, ScreenId},
+            render::PreparedFrame,
+        };
         let captured = PathBuf::from(std::env::var("ALLIUM_ACTUAL_CASE_ART_DIR").unwrap());
         let proof = PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_DIR").unwrap());
         std::fs::create_dir_all(&proof).unwrap();
-        let root = PathBuf::from("/private/tmp").join(format!("allium-actual-case-art-{}", std::process::id()));
+        let root = PathBuf::from("/private/tmp")
+            .join(format!("allium-actual-case-art-{}", std::process::id()));
         struct Cleanup(PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         std::fs::create_dir_all(root.join(".allium/state")).unwrap();
         std::fs::create_dir_all(root.join(".allium/fonts")).unwrap();
         std::fs::create_dir_all(root.join("Themes")).unwrap();
         std::fs::create_dir_all(root.join("Roms/PS/Imgs")).unwrap();
         let _cleanup = Cleanup(root.clone());
         for font in ["Nunito.ttf", "NotoSansCJK.otf"] {
-            std::fs::copy(common::constants::ALLIUM_FONTS_DIR.join(font), root.join(".allium/fonts").join(font)).unwrap();
+            std::fs::copy(
+                common::constants::ALLIUM_FONTS_DIR.join(font),
+                root.join(".allium/fonts").join(font),
+            )
+            .unwrap();
         }
         let game_path = root.join("Roms/PS/Mega Man Legends 2 PSP Improvements (v1.1).chd");
         let entry = Entry::Game(Game::new(game_path));
@@ -884,31 +1054,71 @@ mod next_cover_tests {
         let prepared = art_path(&entry, "covers");
         std::fs::copy(captured.join("megaman-original.png"), &original).unwrap();
         std::fs::copy(captured.join("megaman-orbit.png"), &prepared).unwrap();
-        let mut runtime = ThemeRuntime::bind(&root.join(".allium/state"), &root.join("Themes"), &root.join(".allium/fonts")).unwrap();
+        let mut runtime = ThemeRuntime::bind(
+            &root.join(".allium/state"),
+            &root.join("Themes"),
+            &root.join(".allium/fonts"),
+        )
+        .unwrap();
         let handle = runtime.choose("orbit").unwrap().snapshot.unwrap();
         let entries = [entry];
         let mut orbit = Orbit::new();
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let art = orbit.theme_art(&entries, 0, 0, 1);
         let clean = art.selected_cover.as_ref().unwrap().clone();
-        let expected = resize_art(load_final_png(&original, (0, 0)).unwrap(), THEME_COVER_SIZE, THEME_COVER_SIZE, false).unwrap();
+        let expected = resize_art(
+            load_final_png(&original, (0, 0)).unwrap(),
+            THEME_COVER_SIZE,
+            THEME_COVER_SIZE,
+            false,
+        )
+        .unwrap();
         assert_eq!((clean.width(), clean.height()), (140, 140));
-        assert_eq!(clean.data(), expected.data(), "themed case uses actual clean original");
+        assert_eq!(
+            clean.data(),
+            expected.data(),
+            "themed case uses actual clean original"
+        );
         let again = orbit.theme_art(&entries, 0, 0, 1);
-        assert!(std::sync::Arc::ptr_eq(&clean, again.selected_cover.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(
+            &clean,
+            again.selected_cover.as_ref().unwrap()
+        ));
         assert!(orbit.cache_entries() <= CACHE_ENTRIES);
         let mut input = FrameInputs::new(ScreenId::Library);
-        input.rows.insert(Binding::Entries, vec![Row { id: crate::theme_adapter::entry_id(entries[0].path()), label: entries[0].name().into(), value: String::new(), enabled: true }]);
+        input.rows.insert(
+            Binding::Entries,
+            vec![Row {
+                id: crate::theme_adapter::entry_id(entries[0].path()),
+                label: entries[0].name().into(),
+                value: String::new(),
+                enabled: true,
+            }],
+        );
         input.art = art;
-        PreparedFrame::prepare(handle.clone(), &input).unwrap().pixels().save_png(proof.join("actual-megaman-clean-rounded-case.png")).unwrap();
+        PreparedFrame::prepare(handle.clone(), &input)
+            .unwrap()
+            .pixels()
+            .save_png(proof.join("actual-megaman-clean-rounded-case.png"))
+            .unwrap();
 
         std::fs::remove_file(&original).unwrap();
         orbit.release_art();
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let fallback = orbit.theme_art(&entries, 0, 0, 1);
-        assert_eq!((fallback.selected_cover.as_ref().unwrap().width(), fallback.selected_cover.as_ref().unwrap().height()), (COVER_SIZE, COVER_SIZE));
+        assert_eq!(
+            (
+                fallback.selected_cover.as_ref().unwrap().width(),
+                fallback.selected_cover.as_ref().unwrap().height()
+            ),
+            (COVER_SIZE, COVER_SIZE)
+        );
         input.art = fallback;
-        PreparedFrame::prepare(handle, &input).unwrap().pixels().save_png(proof.join("actual-megaman-prepared-fallback-case.png")).unwrap();
+        PreparedFrame::prepare(handle, &input)
+            .unwrap()
+            .pixels()
+            .save_png(proof.join("actual-megaman-prepared-fallback-case.png"))
+            .unwrap();
 
         let window = (0..9)
             .map(|i| Entry::Game(Game::new(root.join(format!("Roms/PS/Window {i}.chd")))))
@@ -917,16 +1127,30 @@ mod next_cover_tests {
             std::fs::copy(&prepared, art_path(entry, "covers")).unwrap();
         }
         orbit.release_art();
-        orbit.prepare_window(&window, 7, 0, 8);
+        orbit.prepare_loaded_window(&window, 7, 0, 8);
         let full = orbit.theme_art(&window, 7, 0, 8);
-        assert_eq!(full.entries.len(), 8, "all eight visible prepared fallbacks survive");
+        assert_eq!(
+            full.entries.len(),
+            8,
+            "all eight visible prepared fallbacks survive"
+        );
         assert!(full.next_cover.is_some(), "ninth game's preview survives");
-        assert_eq!(orbit.cache_entries(), 10, "nine logical covers and one hero miss");
+        assert_eq!(
+            orbit.cache_entries(),
+            10,
+            "nine logical covers and one hero miss"
+        );
         for entry in window.iter().take(8) {
-            assert!(full.entries.contains_key(&crate::theme_adapter::entry_id(entry.path())));
+            assert!(
+                full.entries
+                    .contains_key(&crate::theme_adapter::entry_id(entry.path()))
+            );
         }
         let repeated = orbit.theme_art(&window, 7, 0, 8);
-        assert!(std::sync::Arc::ptr_eq(full.next_cover.as_ref().unwrap(), repeated.next_cover.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(
+            full.next_cover.as_ref().unwrap(),
+            repeated.next_cover.as_ref().unwrap()
+        ));
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]
@@ -963,7 +1187,7 @@ mod next_cover_tests {
         )
         .unwrap();
         let mut orbit = Orbit::new();
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let first = orbit.theme_art(&entries, 0, 0, 1);
         let original_cover = first.selected_cover.as_ref().unwrap().clone();
         let second = orbit.theme_art(&entries, 0, 0, 1);
@@ -983,7 +1207,7 @@ mod next_cover_tests {
         input.art = second;
         PreparedFrame::prepare(handle.clone(), &input).unwrap();
         assert_eq!(handle.debug_prepared_preview_identity(), Some(cached));
-        orbit.prepare_window(&entries, 1, 1, 1);
+        orbit.prepare_loaded_window(&entries, 1, 1, 1);
         let changed = orbit.theme_art(&entries, 1, 1, 1);
         assert!(!std::sync::Arc::ptr_eq(
             input.art.next_cover.as_ref().unwrap(),
@@ -997,7 +1221,7 @@ mod next_cover_tests {
         PreparedFrame::prepare(handle.clone(), &input).unwrap();
         assert!(handle.debug_prepared_preview_identity().is_none());
         orbit.release_art();
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let reloaded = orbit.theme_art(&entries, 0, 0, 1);
         assert!(!std::sync::Arc::ptr_eq(
             &original_cover,
@@ -1044,7 +1268,7 @@ mod refresh_tests {
         write_art(&prepared, 101, 101, 20);
         let mut orbit = Orbit::new();
         orbit.prepare(&entries, 0);
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let old = orbit.theme_art(&entries, 0, 0, 1);
         let old_legacy = orbit.image(&entries[0], "covers").unwrap().clone();
         assert!(old.selected_hero.is_none());
@@ -1053,7 +1277,7 @@ mod refresh_tests {
         write_art(&prepared, 101, 101, 100);
         write_art(&hero, 360, 210, 110);
         orbit.prepare(&entries, 0);
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         assert!(orbit.theme_art(&entries, 0, 0, 1).selected_hero.is_none());
         crate::view::details::invalidate_metadata();
         let mut platform = DefaultPlatform::new().unwrap();
@@ -1061,7 +1285,7 @@ mod refresh_tests {
         let mut styles = Stylesheet::new();
         styles.load_fonts().unwrap();
         orbit.draw(&entries, 0, &mut display, &styles);
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let new = orbit.theme_art(&entries, 0, 0, 1);
         assert_eq!(
             new.selected_cover.as_ref().unwrap().width(),
@@ -1105,7 +1329,7 @@ mod refresh_tests {
         write_art(&cover, 240, 240, 180);
         write_art(&hero, 360, 210, 190);
         invalidate_art();
-        orbit.prepare_window(&entries, 0, 0, 1);
+        orbit.prepare_loaded_window(&entries, 0, 0, 1);
         let replaced = orbit.theme_art(&entries, 0, 0, 1);
         assert_eq!(replaced.selected_cover.as_ref().unwrap().data()[0], 180);
         assert_eq!(replaced.selected_hero.as_ref().unwrap().data()[0], 190);
@@ -1166,7 +1390,10 @@ mod performance_round_tests {
                 Pixmap::new(140, 140).unwrap()
             });
             previous.push(image.clone());
-            orbit.insert_cached(CachedArt { path: PathBuf::from(format!("old{i}")), image: Some(image) });
+            orbit.insert_cached(CachedArt {
+                path: PathBuf::from(format!("old{i}")),
+                image: Some(image),
+            });
         }
         for i in 0..16 {
             let image = std::sync::Arc::new(if i == 15 {
@@ -1174,11 +1401,18 @@ mod performance_round_tests {
             } else {
                 Pixmap::new(140, 140).unwrap()
             });
-            orbit.insert_cached(CachedArt { path: PathBuf::from(format!("new{i}")), image: Some(image) });
+            orbit.insert_cached(CachedArt {
+                path: PathBuf::from(format!("new{i}")),
+                image: Some(image),
+            });
             assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
         }
         for i in 0..16 {
-            assert!(orbit.cached_image(&PathBuf::from(format!("new{i}"))).is_some());
+            assert!(
+                orbit
+                    .cached_image(&PathBuf::from(format!("new{i}")))
+                    .is_some()
+            );
         }
         assert_eq!(orbit.source_bytes(), 2 * (294840 + 15 * 78400));
         drop(previous);
@@ -1201,5 +1435,53 @@ mod performance_round_tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod media_contract_tests {
+    use super::*;
+    use crate::entry::game::Game;
+    #[test]
+    fn resolved_shape_selects_separate_tall_cover_and_fits_square_fallback() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/tests/fixtures/media-sd/Roms/TEST")
+            .canonicalize()
+            .unwrap();
+        let entries = vec![
+            Entry::Game(Game::new(root.join("Complete.sfc"))),
+            Entry::Game(Game::new(root.join("Legacy.sfc"))),
+        ];
+        let mut orbit = Orbit::new();
+        orbit.set_ink_art(true);
+        orbit.prepare_loaded_window(&entries, 0, 0, 2);
+        let square = orbit.theme_art(&entries, 0, 0, 2);
+        let image = square.selected_cover.unwrap();
+        assert_eq!(image.width(), image.height());
+        let logo = square.selected_logo.unwrap();
+        assert_eq!(logo.width() * 24, logo.height() * 96);
+        orbit.set_cover_shape(true);
+        orbit.prepare_loaded_window(&entries, 0, 0, 2);
+        let tall = orbit.theme_art(&entries, 0, 0, 2).selected_cover.unwrap();
+        assert_eq!(tall.width() * 3, tall.height() * 2);
+        let fallback = orbit.theme_art(&entries, 1, 0, 2).selected_cover.unwrap();
+        assert_eq!(fallback.width(), fallback.height());
+        assert_eq!(fallback.width(), 64);
+    }
+    #[test]
+    fn fitted_prepared_art_preserves_aspect_and_disk_cache_dimensions() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/tests/fixtures/media-sd/Roms/TEST/media/logos/Complete.png");
+        let image = load_prepared_art(&path, (0, 0), 480, 200, false).unwrap();
+        assert_eq!((image.width(), image.height()), (480, 120));
+        let again = load_prepared_art(&path, (0, 0), 480, 200, false).unwrap();
+        assert_eq!(image.data(), again.data());
+        let root = std::env::temp_dir().join(format!("allium-media-jpg-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let jpg = root.join("cover.jpg");
+        image::RgbImage::new(80, 120).save(&jpg).unwrap();
+        let jpeg = load_ink_cover(&jpg).unwrap();
+        assert_eq!((jpeg.width(), jpeg.height()), (80, 120));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

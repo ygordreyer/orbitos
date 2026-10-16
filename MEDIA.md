@@ -42,4 +42,6 @@ ES-DE fields: `path`, `name`, `sortname`, `desc`, `rating` (0 to 1), `releasedat
 
 - Writers replace one file at a time through a temporary name and rename, so the launcher never reads a half-written image or gamelist.
 - Writers never touch ROMs, saves, BIOS or `Imgs/` (legacy, read only).
-- The launcher rereads a system's media and gamelist when `gamelist.xml` changes (fingerprint in the database) or when `/mnt/SDCARD/.allium/state/media-refresh` exists (it deletes the marker after the rescan).
+- The launcher checks gamelist fingerprints when a directory loads. `/mnt/SDCARD/.allium/state/media-refresh` queues a background rescan and is consumed when claimed. Invalid systems are logged and skipped; another scan requires a new marker. Refresh applies at most 32 games per idle tick, after input.
+- Frame preparation reads cached media only. Idle work prefetches the selected game and its neighbours, including separate Square and Tall covers and logos. Artwork uses the existing 3 MiB cache budget.
+- Shared metadata records have a 4 MiB retained-byte budget with eviction. Game rows do not copy scraper records. Gamelists up to 32 MiB stream one record at a time (64 KiB maximum per record); larger or malformed input produces a logged error. Evicted records can be loaded again during idle work.
