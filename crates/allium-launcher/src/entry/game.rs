@@ -48,6 +48,15 @@ pub struct Game {
 }
 
 impl Game {
+    pub(crate) fn hydrate_name(&mut self) {
+        if let Some(name) =
+            common::media::cached_name(&self.path).filter(|name| !name.trim().is_empty())
+        {
+            self.name = name.clone();
+            self.full_name = name;
+        }
+    }
+
     pub fn new(path: PathBuf) -> Game {
         let full_name = path
             .file_stem()

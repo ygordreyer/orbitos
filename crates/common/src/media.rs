@@ -40,20 +40,177 @@ pub struct Metadata {
 pub const METADATA_BUDGET: usize = 4 * 1024 * 1024;
 pub const MAX_GAMELIST_BYTES: u64 = 32 * 1024 * 1024;
 const RECORD_LIMIT: usize = 64 * 1024;
+fn marker_budget(budget: usize) -> usize {
+    (budget / 16).min(64 * 1024)
+}
+fn resident_budget(budget: usize) -> usize {
+    budget.saturating_sub(marker_budget(budget))
+}
 type SharedMetadata = std::sync::Arc<Metadata>;
+#[derive(Clone)]
+struct Record {
+    parent: PathBuf,
+    data: SharedMetadata,
+}
+#[derive(Serialize, Deserialize)]
+struct SourceEntry {
+    name: String,
+    start: u64,
+    len: u64,
+}
 #[derive(Default)]
 struct Cache {
     sources: BTreeMap<PathBuf, Option<(u64, SystemTime)>>,
-    records: BTreeMap<PathBuf, SharedMetadata>,
+    records: BTreeMap<PathBuf, Record>,
     order: std::collections::VecDeque<(PathBuf, usize)>,
     bytes: usize,
     budget: Option<usize>,
-    missing: std::collections::BTreeSet<(PathBuf, PathBuf)>,
+    names: BTreeMap<PathBuf, BTreeMap<PathBuf, SourceEntry>>,
+    source_order: std::collections::VecDeque<(PathBuf, usize)>,
+    skipped_sources: BTreeMap<PathBuf, Fingerprint>,
+    skipped_bytes: usize,
+    defer_cold: bool,
+    local_containers: BTreeMap<PathBuf, Option<PathBuf>>,
     paths: BTreeMap<(PathBuf, Kind), Option<PathBuf>>,
     logos: BTreeMap<PathBuf, Option<std::sync::Arc<tiny_skia::Pixmap>>>,
 }
 const PATH_CACHE_LIMIT: usize = 512;
 impl Cache {
+    fn evict_record(&mut self) -> bool {
+        let Some((old, bytes)) = self.order.pop_front() else {
+            return false;
+        };
+        self.records.remove(&old);
+        self.bytes -= bytes;
+        true
+    }
+
+    fn forget_skipped_source(&mut self, path: &Path) {
+        if self.skipped_sources.remove(path).is_some() {
+            let bytes = source_bytes(path);
+            self.skipped_bytes -= bytes;
+            self.bytes -= bytes;
+        }
+    }
+
+    fn remember_skipped_source(&mut self, path: PathBuf, fingerprint: Fingerprint) {
+        self.forget_skipped_source(&path);
+        let bytes = source_bytes(&path);
+        let limit = marker_budget(self.budget.unwrap_or(METADATA_BUDGET));
+        if bytes > limit {
+            return;
+        }
+        while self.skipped_bytes + bytes > limit {
+            let discarded = self.skipped_sources.keys().next().unwrap().clone();
+            self.forget_skipped_source(&discarded);
+        }
+        self.skipped_bytes += bytes;
+        self.bytes += bytes;
+        self.skipped_sources.insert(path, fingerprint);
+    }
+
+    fn evict_source(&mut self) -> Option<bool> {
+        let (old, bytes) = self.source_order.pop_front()?;
+        let fingerprint = self.sources.remove(&old).unwrap();
+        let visible = self
+            .names
+            .remove(&old)
+            .is_some_and(|names| !names.is_empty());
+        self.bytes -= bytes;
+        self.remember_skipped_source(old, fingerprint);
+        Some(visible)
+    }
+
+    fn source_resolution_changes_names(&self, path: &Path, index: &NameIndex) -> bool {
+        if !index.valid || self.sources.get(path) == Some(&index.fingerprint) {
+            return false;
+        }
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        if path
+            .file_name()
+            .is_some_and(|name| name == "miyoogamelist.xml")
+            && self
+                .sources
+                .get(&parent.join("gamelist.xml"))
+                .or_else(|| self.skipped_sources.get(&parent.join("gamelist.xml")))
+                .is_some_and(Option::is_some)
+        {
+            return false;
+        }
+        // Resolving a missing child source can expose an already indexed ancestor's names.
+        self.names.iter().any(|(source, names)| {
+            source != path
+                && source
+                    .parent()
+                    .is_some_and(|ancestor| parent.starts_with(ancestor))
+                && names.keys().any(|game| game.starts_with(parent))
+        })
+    }
+
+    fn insert_source(&mut self, path: PathBuf, index: NameIndex) -> bool {
+        let resolution_changed = self.source_resolution_changes_names(&path, &index);
+        if let Some(at) = self.source_order.iter().position(|(p, _)| p == &path) {
+            let (_, bytes) = self.source_order.remove(at).unwrap();
+            self.bytes -= bytes;
+        }
+        self.sources.remove(&path);
+        self.forget_skipped_source(&path);
+        let old_names = self.names.remove(&path).unwrap_or_default();
+        let mut evicted_visible = false;
+        let budget = self.budget.unwrap_or(METADATA_BUDGET);
+        if !index.valid {
+            return !old_names.is_empty();
+        }
+        // Reserve the bounded marker allowance before admitting a resident prefix.
+        let resident_budget = resident_budget(budget);
+        if index.bytes > resident_budget {
+            self.remember_skipped_source(path, index.fingerprint);
+            return !old_names.is_empty();
+        }
+        while self.bytes - self.skipped_bytes + index.bytes > resident_budget {
+            if self.evict_record() {
+                continue;
+            }
+            let Some(removed_names) = self.evict_source() else {
+                self.remember_skipped_source(path, index.fingerprint);
+                return evicted_visible || !old_names.is_empty();
+            };
+            evicted_visible |= removed_names;
+        }
+        let same_names = old_names
+            .iter()
+            .map(|(path, entry)| (path, &entry.name))
+            .eq(index.names.iter().map(|(path, entry)| (path, &entry.name)));
+        let visible = evicted_visible || resolution_changed || !same_names;
+        self.bytes += index.bytes;
+        self.source_order.push_back((path.clone(), index.bytes));
+        self.sources.insert(path.clone(), index.fingerprint);
+        self.names.insert(path, index.names);
+        visible
+    }
+
+    fn discard_source(&mut self, path: &Path) {
+        self.forget_skipped_source(path);
+        if let Some(at) = self.source_order.iter().position(|(p, _)| p == path) {
+            let (_, bytes) = self.source_order.remove(at).unwrap();
+            self.bytes -= bytes;
+        }
+        self.sources.remove(path);
+        self.names.remove(path);
+        self.clear_records();
+        changed();
+        NAME_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    }
+
+    fn clear_records(&mut self) {
+        while self.evict_record() {}
+        self.local_containers.clear();
+        self.paths.clear();
+        self.logos.clear();
+    }
+
     fn insert_path(&mut self, key: (PathBuf, Kind), path: Option<PathBuf>) {
         if self.paths.len() >= PATH_CACHE_LIMIT {
             self.paths.clear();
@@ -61,12 +218,13 @@ impl Cache {
         self.paths.insert(key, path);
     }
 
-    fn insert(&mut self, path: PathBuf, data: Metadata) {
+    fn insert(&mut self, path: PathBuf, parent: PathBuf, data: Metadata) {
         if self.records.contains_key(&path) {
             return;
         }
         let bytes = 768
             + 2 * path.capacity()
+            + parent.capacity()
             + data.path.capacity()
             + [
                 &data.name,
@@ -86,18 +244,24 @@ impl Cache {
             .iter()
             .map(|s| s.capacity())
             .sum::<usize>();
-        let budget = self.budget.unwrap_or(METADATA_BUDGET);
+        let budget = resident_budget(self.budget.unwrap_or(METADATA_BUDGET));
         if bytes > budget {
             return;
         }
-        while self.bytes + bytes > budget {
-            let (old, bytes) = self.order.pop_front().unwrap();
-            self.records.remove(&old);
-            self.bytes -= bytes;
+        while self.bytes - self.skipped_bytes + bytes > budget {
+            if !self.evict_record() {
+                return;
+            }
         }
         self.bytes += bytes;
         self.order.push_back((path.clone(), bytes));
-        self.records.insert(path, std::sync::Arc::new(data));
+        self.records.insert(
+            path,
+            Record {
+                parent,
+                data: std::sync::Arc::new(data),
+            },
+        );
     }
 }
 fn io_op() {
@@ -117,6 +281,11 @@ fn stat(path: &Path) -> Option<fs::Metadata> {
 /// Streaming parser: at most one 64 KiB record and an 8 KiB reader buffer are live.
 /// Large or malformed input is an explicit error, never an empty replacement map.
 pub fn stream_gamelist(path: &Path, mut record: impl FnMut(Metadata)) -> anyhow::Result<()> {
+    stream_indexed(path, |data, _, _| record(data))
+}
+fn stream_indexed(path: &Path, mut record: impl FnMut(Metadata, u64, u64)) -> anyhow::Result<()> {
+    #[cfg(test)]
+    PARSES.with(|counts| *counts.borrow_mut().entry(path.into()).or_default() += 1);
     use quick_xml::events::Event;
     let size = stat(path)
         .ok_or_else(|| anyhow::anyhow!("Cannot stat {}", path.display()))?
@@ -134,12 +303,15 @@ pub fn stream_gamelist(path: &Path, mut record: impl FnMut(Metadata)) -> anyhow:
     let mut depth = 0usize;
     let mut root = false;
     let mut closed = false;
+    let mut start = 0;
     loop {
+        let position = reader.buffer_position();
         let event = reader.read_event_into(&mut buf)?;
         match &event {
             Event::Start(e) if depth == 0 && e.name().as_ref() == b"gameList" => root = true,
             Event::Start(e) if depth == 0 && e.name().as_ref() == b"game" => {
                 game.clear();
+                start = position;
                 depth = 1;
             }
             Event::Start(_) if depth > 0 => depth += 1,
@@ -160,7 +332,7 @@ pub fn stream_gamelist(path: &Path, mut record: impl FnMut(Metadata)) -> anyhow:
                 let data = quick_xml::de::from_str::<Metadata>(text).or_else(|_| {
                     quick_xml::de::from_str::<Metadata>(&text.replace('&', "&amp;"))
                 })?;
-                record(data);
+                record(data, start, reader.buffer_position() - start);
                 game.clear();
             }
         }
@@ -168,7 +340,25 @@ pub fn stream_gamelist(path: &Path, mut record: impl FnMut(Metadata)) -> anyhow:
     }
     Ok(())
 }
-thread_local! { static CACHE: RefCell<Cache> = RefCell::new(Cache::default()); }
+thread_local! {
+    static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
+    static CONTAINERS: RefCell<BTreeMap<PathBuf, PathBuf>> = const { RefCell::new(BTreeMap::new()) };
+    #[cfg(test)]
+    static PARSES: RefCell<BTreeMap<PathBuf, usize>> = const { RefCell::new(BTreeMap::new()) };
+}
+/// Descriptor relationships are explicit and survive metadata cache invalidation.
+pub fn set_game_containers(containers: impl IntoIterator<Item = (PathBuf, PathBuf)>) {
+    CONTAINERS.with(|c| {
+        *c.borrow_mut() = containers
+            .into_iter()
+            .map(|(game, container)| (normalize(&game), normalize(&container)))
+            .filter(|(game, container)| game != container && game.starts_with(container))
+            .collect();
+    });
+}
+pub fn game_container(path: &Path) -> Option<PathBuf> {
+    CONTAINERS.with(|c| c.borrow().get(&normalize(path)).cloned())
+}
 fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for c in path.components() {
@@ -189,8 +379,32 @@ fn changed() {
 pub fn generation() -> u64 {
     GENERATION.with(std::cell::Cell::get)
 }
+thread_local! { static KEEP_NAME_INDEXES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Row reloads invalidate artwork, but must not discard the indexes that triggered the reload.
+pub fn with_name_indexes<T>(reload: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            KEEP_NAME_INDEXES.with(|keep| keep.set(self.0));
+        }
+    }
+    let old = KEEP_NAME_INDEXES.with(|keep| keep.replace(true));
+    let _restore = Restore(old);
+    reload()
+}
 pub fn invalidate() {
-    CACHE.with(|c| *c.borrow_mut() = Cache::default());
+    if KEEP_NAME_INDEXES.with(std::cell::Cell::get) {
+        CACHE.with(|c| c.borrow_mut().clear_records());
+        changed();
+        return;
+    }
+    CACHE.with(|c| {
+        *c.borrow_mut() = Cache {
+            defer_cold: UI_NAMES.with(std::cell::Cell::get),
+            ..Cache::default()
+        }
+    });
+    INDEX_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
     changed();
 }
 pub fn fingerprint(metadata: &fs::Metadata) -> i64 {
@@ -200,43 +414,150 @@ pub fn fingerprint(metadata: &fs::Metadata) -> i64 {
     metadata.modified().ok().hash(&mut hash);
     hash.finish() as i64
 }
-fn source(parent: &Path, game: &Path, cache: &mut Cache) -> Option<SharedMetadata> {
-    for name in ["gamelist.xml", "miyoogamelist.xml"] {
-        let path = parent.join(name);
-        if !cache.sources.contains_key(&path) {
-            load_source(&path, cache);
+fn source(path: &Path, game: &Path, cache: &mut Cache) -> Option<Record> {
+    let parent = path.parent()?;
+    let key = normalize(game);
+    // The source index distinguishes absent identities from evicted full records.
+    if !cache.names.get(path)?.contains_key(&key) {
+        return None;
+    }
+    if let Some(record) = cache.records.get(&key) {
+        return Some(record.clone());
+    }
+    let entry = cache.names.get(path)?.get(&key)?;
+    let read = || -> anyhow::Result<Metadata> {
+        use std::io::{Read, Seek, SeekFrom};
+        io_op();
+        let mut file = fs::File::open(path)?;
+        anyhow::ensure!(
+            Some(file_fingerprint(&file)?) == cache.sources[path],
+            "Gamelist changed"
+        );
+        file.seek(SeekFrom::Start(entry.start))?;
+        let mut text = String::new();
+        (&mut file).take(entry.len).read_to_string(&mut text)?;
+        let data: Metadata = quick_xml::de::from_str(&text)
+            .or_else(|_| quick_xml::de::from_str(&text.replace('&', "&amp;")))?;
+        anyhow::ensure!(
+            normalize(&parent.join(&data.path)) == key,
+            "Gamelist identity changed"
+        );
+        anyhow::ensure!(
+            Some(file_fingerprint(&file)?) == cache.sources[path]
+                && source_fingerprint(path) == cache.sources[path],
+            "Gamelist changed"
+        );
+        Ok(data)
+    };
+    let data = match read() {
+        Ok(data) => data,
+        Err(error) => {
+            log::error!("Media record {}: {error:#}", path.display());
+            cache.discard_source(path);
+            return None;
         }
-        if cache.sources.get(&path).is_some_and(Option::is_some) {
-            let key = normalize(game);
-            if cache.missing.contains(&(path.clone(), key.clone())) {
-                return None;
+    };
+    cache.insert(key.clone(), parent.into(), data.clone());
+    Some(cache.records.get(&key).cloned().unwrap_or_else(|| Record {
+        parent: parent.into(),
+        data: std::sync::Arc::new(data),
+    }))
+}
+type Fingerprint = Option<(u64, SystemTime)>;
+struct NameIndex {
+    fingerprint: Fingerprint,
+    names: BTreeMap<PathBuf, SourceEntry>,
+    valid: bool,
+    bytes: usize,
+}
+fn source_fingerprint(path: &Path) -> Fingerprint {
+    stat(path).map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+}
+fn file_fingerprint(file: &fs::File) -> std::io::Result<(u64, SystemTime)> {
+    io_op();
+    let metadata = file.metadata()?;
+    Ok((
+        metadata.len(),
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+    ))
+}
+fn source_bytes(path: &Path) -> usize {
+    640 + 4 * path.as_os_str().len()
+}
+fn entry_bytes(path: &PathBuf, entry: &SourceEntry) -> usize {
+    192 + path.capacity() + entry.name.capacity()
+}
+fn read_name_index(path: &Path, budget: usize) -> NameIndex {
+    read_name_index_records(path, budget, |_, _| {})
+}
+fn read_name_index_records(
+    path: &Path,
+    budget: usize,
+    mut record: impl FnMut(PathBuf, Metadata),
+) -> NameIndex {
+    let budget = resident_budget(budget);
+    let fingerprint = source_fingerprint(path);
+    let mut index = NameIndex {
+        fingerprint,
+        names: BTreeMap::new(),
+        valid: true,
+        bytes: source_bytes(path),
+    };
+    let mut full = false;
+    if fingerprint.is_some() {
+        let parent = path.parent().unwrap();
+        if let Err(error) = stream_indexed(path, |data, start, len| {
+            if full {
+                return;
             }
-            if let Some(record) = cache.records.get(&key) {
-                return Some(record.clone());
+            let key = normalize(&parent.join(&data.path));
+            if index.names.contains_key(&key) {
+                return;
             }
-            // An evicted record is read only by explicit load/idle callers.
-            let mut found = None;
-            if let Err(error) = stream_gamelist(&path, |data| {
-                if normalize(&parent.join(&data.path)) == key {
-                    found = Some(data);
-                }
-            }) {
-                log::error!("Media source {}: {error:#}", path.display());
-            }
-            let Some(data) = found else {
-                if cache.missing.len() >= 512 {
-                    cache.missing.clear();
-                }
-                cache.missing.insert((path.clone(), key));
-                return None;
+            let entry = SourceEntry {
+                name: data.name.clone(),
+                start,
+                len,
             };
-            cache.insert(key.clone(), data);
-            return cache.records.get(&key).cloned();
+            let bytes = entry_bytes(&key, &entry);
+            // Keep a bounded prefix resident. Overflow identities remain unhydrated.
+            if index.bytes + bytes > budget {
+                full = true;
+                return;
+            }
+            index.bytes += bytes;
+            record(key.clone(), data);
+            index.names.insert(key, entry);
+        }) {
+            log::error!("Media source {}: {error:#}", path.display());
         }
     }
-    None
+    if fingerprint != source_fingerprint(path) {
+        index.names.clear();
+        index.bytes = source_bytes(path);
+        index.valid = false;
+    }
+    index
 }
+
 fn load_source(path: &Path, cache: &mut Cache) {
+    if let Some(previous) = cache.skipped_sources.get(path) {
+        if *previous == source_fingerprint(path) {
+            return;
+        }
+        cache.forget_skipped_source(path);
+    }
+    if cache.defer_cold {
+        if KEEP_NAME_INDEXES.with(std::cell::Cell::get) && cache.sources.contains_key(path) {
+            return;
+        }
+        schedule_name_index(
+            path,
+            cache.budget.unwrap_or(METADATA_BUDGET),
+            cache.sources.get(path).copied(),
+        );
+        return;
+    }
     let fingerprint = stat(path).map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
     let old = cache.sources.get(path);
     if old == Some(&fingerprint) {
@@ -244,30 +565,140 @@ fn load_source(path: &Path, cache: &mut Cache) {
     }
     if old.is_some() {
         changed();
-        cache.missing.clear();
-        cache.paths.clear();
-        cache.logos.clear();
-        cache.records.clear();
-        cache.order.clear();
-        cache.bytes = 0;
+        cache.clear_records();
     }
-    if fingerprint.is_some() {
-        let parent = path.parent().unwrap();
-        if let Err(error) = stream_gamelist(path, |data| {
-            cache.insert(normalize(&parent.join(&data.path)), data)
-        }) {
-            log::error!("Media source {}: {error:#}", path.display());
+    let index = read_name_index_records(
+        path,
+        cache.budget.unwrap_or(METADATA_BUDGET),
+        |key, data| {
+            cache.insert(key, path.parent().unwrap().into(), data);
+        },
+    );
+    if !index.valid {
+        cache.clear_records();
+    }
+    cache.insert_source(path.into(), index);
+}
+
+// A single worker and a bounded queue keep both outstanding XML and completion payloads bounded.
+const INDEX_WORKER_BUDGET: usize = 1024 * 1024;
+type IndexJob = (PathBuf, usize, u64, Option<Fingerprint>);
+type IndexDone = (PathBuf, Option<NameIndex>, u64);
+struct IndexWorker {
+    send: std::sync::mpsc::SyncSender<IndexJob>,
+    recv: std::sync::mpsc::Receiver<IndexDone>,
+    pending: std::collections::BTreeSet<PathBuf>,
+    waiting: std::collections::VecDeque<IndexJob>,
+}
+impl IndexWorker {
+    fn dispatch(&mut self) {
+        if let Some(job) = self.waiting.pop_front() {
+            if let Err(std::sync::mpsc::TrySendError::Full(job)) = self.send.try_send(job) {
+                self.waiting.push_front(job);
+            }
         }
     }
-    if cache.sources.len() >= 64 {
-        cache.sources.clear();
+
+    fn new() -> Self {
+        let (send, jobs) = std::sync::mpsc::sync_channel::<IndexJob>(1);
+        let (done, recv) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("media-names".into())
+            .spawn(move || {
+                while let Ok((path, budget, epoch, previous)) = jobs.recv() {
+                    let current = stat(&path)
+                        .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+                    let index = (previous != Some(current))
+                        .then(|| read_name_index(&path, budget.min(INDEX_WORKER_BUDGET)));
+                    if done.send((path, index, epoch)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("media index worker");
+        Self {
+            send,
+            recv,
+            pending: Default::default(),
+            waiting: Default::default(),
+        }
     }
-    cache.sources.insert(path.into(), fingerprint);
+}
+thread_local! {
+    static INDEX_WORKER: RefCell<Option<IndexWorker>> = const { RefCell::new(None) };
+    static UI_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INDEX_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NAME_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+fn schedule_name_index(path: &Path, budget: usize, previous: Option<Fingerprint>) {
+    INDEX_WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let worker = slot.get_or_insert_with(IndexWorker::new);
+        if worker.pending.len() >= PATH_CACHE_LIMIT || worker.pending.contains(path) {
+            return;
+        }
+        let epoch = INDEX_EPOCH.with(std::cell::Cell::get);
+        worker
+            .waiting
+            .push_back((path.into(), budget, epoch, previous));
+        worker.pending.insert(path.into());
+        worker.dispatch();
+    });
+}
+/// Adopt completed indexes without waiting for the worker or opening files.
+/// Call from the owning view's update hook, including when no redraw is pending.
+pub fn poll_name_indexes() {
+    INDEX_WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(worker) = slot.as_mut() else { return };
+        while let Ok((path, index, epoch)) = worker.recv.try_recv() {
+            worker.pending.remove(&path);
+            let current_epoch = INDEX_EPOCH.with(std::cell::Cell::get);
+            if epoch != current_epoch {
+                let budget = CACHE.with(|c| c.borrow().budget.unwrap_or(METADATA_BUDGET));
+                worker
+                    .waiting
+                    .push_back((path.clone(), budget, current_epoch, None));
+                worker.pending.insert(path);
+                continue;
+            }
+            let Some(index) = index else { continue };
+            let visible = CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if index.fingerprint.is_some() || !index.valid {
+                    cache.clear_records();
+                }
+                cache.insert_source(path, index)
+            });
+            if visible {
+                NAME_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+            }
+            changed();
+        }
+        worker.dispatch();
+    });
+}
+pub fn name_generation() -> u64 {
+    NAME_GENERATION.with(std::cell::Cell::get)
+}
+/// UI hydration is cache-only. All subsequent cold media lookups on this thread defer XML too.
+pub fn defer_cold_sources() {
+    UI_NAMES.with(|ui| ui.set(true));
+    CACHE.with(|c| c.borrow_mut().defer_cold = true);
+}
+pub fn cached_name(path: &Path) -> Option<String> {
+    defer_cold_sources();
+    let record = cached_metadata(path);
+    if !record.name.is_empty() {
+        return Some(record.name.clone());
+    }
+    name(path)
 }
 /// Fingerprints are checked at directory load or explicit refresh, never at frame preparation.
 pub fn check_directory(parent: &Path) {
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
+        cache.local_containers.clear();
         for ancestor in parent.ancestors().take(8) {
             for name in ["gamelist.xml", "miyoogamelist.xml"] {
                 load_source(&ancestor.join(name), &mut cache);
@@ -278,24 +709,145 @@ pub fn check_directory(parent: &Path) {
         }
     });
 }
-fn metadata_with_parent(path: &Path, cache: &mut Cache) -> (PathBuf, SharedMetadata) {
-    let mut system = path.parent().unwrap_or(Path::new(".")).to_owned();
+fn launch_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["cue", "m3u", "chd", "pbp", "iso"]
+            .iter()
+            .any(|ext| e.eq_ignore_ascii_case(ext))
+    })
+}
+fn local_container(path: &Path, cache: &mut Cache) -> Option<PathBuf> {
+    let key = normalize(path);
+    if let Some(found) = cache.local_containers.get(&key) {
+        return found.clone();
+    }
+    let found = (|| {
+        let parent = path.parent()?;
+        if !launch_file(path) || !is_file(path) {
+            return None;
+        }
+        if path.file_stem() == parent.file_name() {
+            return Some(parent.into());
+        }
+        io_op();
+        let mut launches = 0;
+        for entry in fs::read_dir(parent).ok()? {
+            let entry = entry.ok()?;
+            if launch_file(&entry.path()) && entry.file_type().ok()?.is_file() {
+                launches += 1;
+                if launches > 1 {
+                    return None;
+                }
+            }
+        }
+        (launches == 1).then(|| parent.into())
+    })();
+    if cache.local_containers.len() >= PATH_CACHE_LIMIT {
+        cache.local_containers.clear();
+    }
+    cache.local_containers.insert(key, found.clone());
+    found
+}
+fn identity_source(path: &Path, cache: &mut Cache) -> Option<(PathBuf, PathBuf)> {
+    let mut parents = Vec::new();
     for parent in path.ancestors().skip(1).take(8) {
-        if parent
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "Roms")
-        {
-            system = parent.into();
-        }
-        if let Some(game) = source(parent, path, cache) {
-            return (parent.into(), game);
-        }
+        parents.push(parent);
         if parent.file_name().is_some_and(|n| n == "Roms") {
             break;
         }
     }
-    (system, SharedMetadata::default())
+    let unresolved = std::cell::Cell::new(false);
+    let find = |identity: &Path, cache: &mut Cache| {
+        let key = normalize(identity);
+        for parent in &parents {
+            for name in ["gamelist.xml", "miyoogamelist.xml"] {
+                let source = parent.join(name);
+                if !cache.sources.contains_key(&source) {
+                    load_source(&source, cache);
+                    if !cache.sources.contains_key(&source)
+                        && !cache.skipped_sources.contains_key(&source)
+                    {
+                        unresolved.set(true);
+                        continue;
+                    }
+                }
+                if cache
+                    .sources
+                    .get(&source)
+                    .or_else(|| cache.skipped_sources.get(&source))
+                    .is_some_and(Option::is_some)
+                {
+                    if cache
+                        .names
+                        .get(&source)
+                        .and_then(|names| names.get(&key))
+                        .is_some_and(|entry| entry.len > 0)
+                    {
+                        return (!unresolved.get()).then_some((source, key));
+                    }
+                    break;
+                }
+            }
+        }
+        None
+    };
+    // Exact identities win across all sources before an immediate game container is tried.
+    find(path, cache).or_else(|| {
+        if unresolved.get() {
+            return None;
+        }
+        let container = game_container(path).or_else(|| local_container(path, cache))?;
+        find(&container, cache)
+    })
+}
+/// Hydration uses the source name index, never reparsing evicted full metadata.
+pub fn name(path: &Path) -> Option<String> {
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let (source, identity) = identity_source(path, &mut cache)?;
+        cache
+            .names
+            .get(&source)?
+            .get(&identity)
+            .map(|entry| entry.name.clone())
+    })
+}
+fn metadata_with_parent(path: &Path, cache: &mut Cache) -> (PathBuf, SharedMetadata, PathBuf) {
+    if cache.defer_cold {
+        if let Some(record) = cache.records.get(&normalize(path)) {
+            let identity = if record.data.path.as_os_str().is_empty() {
+                path.into()
+            } else {
+                normalize(&record.parent.join(&record.data.path))
+            };
+            return (record.parent.clone(), record.data.clone(), identity);
+        }
+    }
+    if let Some((source_path, identity)) = identity_source(path, cache) {
+        if let Some(record) = source(&source_path, &identity, cache) {
+            if identity != normalize(path) {
+                cache.insert(
+                    normalize(path),
+                    record.parent.clone(),
+                    (*record.data).clone(),
+                );
+            }
+            return (record.parent, record.data, identity);
+        }
+    }
+    let system = path
+        .ancestors()
+        .skip(1)
+        .take(8)
+        .find(|parent| {
+            parent
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "Roms")
+        })
+        .or_else(|| path.parent())
+        .unwrap_or(Path::new("."));
+    (system.into(), SharedMetadata::default(), path.into())
 }
 pub fn metadata(path: &Path) -> SharedMetadata {
     CACHE.with(|c| metadata_with_parent(path, &mut c.borrow_mut()).1)
@@ -306,7 +858,7 @@ pub fn cached_metadata(path: &Path) -> SharedMetadata {
         c.borrow()
             .records
             .get(&normalize(path))
-            .cloned()
+            .map(|record| record.data.clone())
             .unwrap_or_default()
     })
 }
@@ -327,7 +879,7 @@ pub fn resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
         if let Some(found) = cache.paths.get(&key) {
             return found.clone();
         }
-        let (parent, data) = metadata_with_parent(path, &mut cache);
+        let (parent, data, identity) = metadata_with_parent(path, &mut cache);
         let tags: &[&str] = match kind {
             Kind::Cover | Kind::PreparedCover => &[&data.image, &data.thumbnail],
             Kind::Logo => &[&data.marquee],
@@ -340,6 +892,7 @@ pub fn resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
             .map(|tag| parent.join(tag))
             .find(|candidate| is_file(candidate.as_path()));
         let stem = path.file_stem().unwrap_or_default();
+        let inherited_stem = identity.file_stem().unwrap_or_default();
         let kinds: &[&str] = match kind {
             Kind::Cover | Kind::PreparedCover => &["covers", "box2dfront"],
             Kind::TallCover => &["covers-tall"],
@@ -347,13 +900,21 @@ pub fn resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
             Kind::Background => &["backgrounds", "fanart"],
             Kind::Screenshot => &["screenshots"],
         };
-        for folder in kinds {
-            for ext in ["png", "jpg"] {
-                let mut filename = stem.to_os_string();
-                filename.push(format!(".{ext}"));
-                let candidate = parent.join("media").join(folder).join(filename);
-                if found.is_none() && is_file(candidate.as_path()) {
-                    found = Some(candidate);
+        for art_stem in [
+            Some(stem),
+            (inherited_stem != stem).then_some(inherited_stem),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for folder in kinds {
+                for ext in ["png", "jpg"] {
+                    let mut filename = art_stem.to_os_string();
+                    filename.push(format!(".{ext}"));
+                    let candidate = parent.join("media").join(folder).join(filename);
+                    if found.is_none() && is_file(candidate.as_path()) {
+                        found = Some(candidate);
+                    }
                 }
             }
         }
@@ -482,6 +1043,7 @@ mod tests {
             let game = PathBuf::from(format!("/fixture/G{n}.sfc"));
             adopt_game(PreparedGame {
                 path: game.clone(),
+                parent: "/fixture".into(),
                 metadata: std::sync::Arc::new(Metadata::default()),
                 paths: kinds
                     .into_iter()
@@ -501,6 +1063,7 @@ mod tests {
         let game = PathBuf::from("/fixture/last.sfc");
         adopt_game(PreparedGame {
             path: game.clone(),
+            parent: "/fixture".into(),
             metadata: std::sync::Arc::new(Metadata::default()),
             paths: vec![
                 (Kind::Cover, Some(game.with_extension("png"))),
@@ -564,6 +1127,667 @@ mod tests {
                 root.join(format!("overrides/{file}.png"))
             );
         }
+    }
+    #[test]
+    fn hydration_indexes_each_source_once_despite_misses_and_eviction() {
+        invalidate();
+        PARSES.with(|c| c.borrow_mut().clear());
+        set_metadata_budget(512 * 1024);
+        let root =
+            std::env::temp_dir().join(format!("allium-hydrate-index-{}", std::process::id()));
+        let mut rows = Vec::new();
+        for system in ["PS", "SFC", "NES"] {
+            let dir = root.join("Roms").join(system);
+            fs::create_dir_all(&dir).unwrap();
+            let mut xml = String::from("<gameList>");
+            for n in 0..34 {
+                xml.push_str(&format!(
+                    "<game><path>./G{n}.chd</path><name>Title {n}</name><desc>{}</desc></game>",
+                    "D".repeat(8192)
+                ));
+            }
+            if system == "PS" {
+                for n in 0..50 {
+                    xml.push_str(&format!("<game><path>./Network{n}</path><name>Network title {n}</name><desc>{}</desc></game>", "N".repeat(8192)));
+                }
+            }
+            xml.push_str("</gameList>");
+            fs::write(dir.join("gamelist.xml"), xml).unwrap();
+        }
+        for n in 0..100 {
+            let system = ["PS", "SFC", "NES"][n % 3];
+            rows.push((
+                root.join("Roms")
+                    .join(system)
+                    .join(format!("G{}.chd", n / 3)),
+                format!("Title {}", n / 3),
+            ));
+        }
+        let containers = (0..50)
+            .map(|n| {
+                let container = root.join(format!("Roms/PS/Network{n}"));
+                let launch = container.join("Discs/Launch.cue");
+                rows.push((launch.clone(), format!("Network title {n}")));
+                (launch, container)
+            })
+            .collect::<Vec<_>>();
+        set_game_containers(containers);
+        for _ in 0..2 {
+            for (path, title) in &rows {
+                assert_eq!(name(path).as_deref(), Some(title.as_str()));
+                assert_eq!(metadata(path).name, *title);
+            }
+            for system in ["PS", "SFC", "NES"] {
+                check_directory(&root.join("Roms").join(system));
+            }
+            for n in 0..600 {
+                assert!(name(&root.join(format!("Roms/PS/Absent{n}.chd"))).is_none());
+                assert!(
+                    metadata(&root.join(format!("Roms/PS/Absent{n}.chd")))
+                        .name
+                        .is_empty()
+                );
+            }
+        }
+        PARSES.with(|c| {
+            let counts = c.borrow();
+            assert_eq!(counts.len(), 3);
+            for system in ["PS", "SFC", "NES"] {
+                assert_eq!(
+                    counts.get(&root.join("Roms").join(system).join("gamelist.xml")),
+                    Some(&1)
+                );
+            }
+        });
+        assert!(CACHE.with(|c| c.borrow().bytes) <= 512 * 1024);
+        assert!(!CACHE.with(|c| c.borrow().records.is_empty()));
+        assert!(cached_metadata(&rows[0].0).name.is_empty());
+        assert_eq!(name(&rows[0].0).as_deref(), Some(rows[0].1.as_str()));
+        let ps = root.join("Roms/PS");
+        fs::write(
+            ps.join("gamelist.xml"),
+            "<gameList><game><path>./G0.chd</path><name>Changed title</name></game></gameList>",
+        )
+        .unwrap();
+        check_directory(&ps);
+        assert_eq!(name(&ps.join("G0.chd")).as_deref(), Some("Changed title"));
+        assert!(name(&ps.join("Network0/Discs/Launch.cue")).is_none());
+        assert_eq!(
+            name(&root.join("Roms/NES/G0.chd")).as_deref(),
+            Some("Title 0")
+        );
+        PARSES.with(|c| {
+            assert_eq!(c.borrow().get(&ps.join("gamelist.xml")), Some(&2));
+            assert_eq!(
+                c.borrow().get(&root.join("Roms/NES/gamelist.xml")),
+                Some(&1)
+            );
+        });
+        fs::remove_dir_all(root).unwrap();
+        set_game_containers(std::iter::empty());
+        invalidate();
+    }
+    #[test]
+    fn name_indexes_and_absent_sources_share_the_retention_budget() {
+        let root = std::env::temp_dir().join(format!("allium-index-budget-{}", std::process::id()));
+        for budget in [METADATA_BUDGET, INDEX_WORKER_BUDGET] {
+            invalidate();
+            set_metadata_budget(budget);
+            for n in 0..90 {
+                let dir = root.join(format!("Roms/S{n}"));
+                fs::create_dir_all(&dir).unwrap();
+                let mut xml = String::from("<gameList>");
+                for game in 0..180 {
+                    xml.push_str(&format!(
+                        "<game><path>./G{game}.chd</path><name>{n} Title {game}</name></game>"
+                    ));
+                }
+                xml.push_str("</gameList>");
+                fs::write(dir.join("gamelist.xml"), xml).unwrap();
+                check_directory(&dir);
+                CACHE.with(|c| {
+                    let c = c.borrow();
+                    assert!(c.bytes <= budget);
+                    let charged = c.source_order.iter().map(|(_, bytes)| bytes).sum::<usize>()
+                        + c.order.iter().map(|(_, bytes)| bytes).sum::<usize>();
+                    assert_eq!(c.bytes, charged + c.skipped_bytes);
+                    assert_eq!(c.names.len(), c.sources.len());
+                    assert_eq!(c.source_order.len(), c.sources.len());
+                    assert!(c.names.contains_key(&dir.join("gamelist.xml")));
+                });
+            }
+            CACHE.with(|c| {
+                let c = c.borrow();
+                assert!(!c.sources.contains_key(&root.join("Roms/S0/gamelist.xml")));
+                assert!(!c.names.contains_key(&root.join("Roms/S0/gamelist.xml")));
+                assert!(c.sources.values().any(Option::is_none));
+            });
+        }
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+    }
+
+    #[test]
+    fn oversized_source_keeps_a_bounded_resident_prefix_without_scratch_files() {
+        use std::os::unix::fs::MetadataExt;
+        let root =
+            std::env::temp_dir().join(format!("allium-index-bounded-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("gamelist.xml");
+        let mut xml = String::from("<gameList>");
+        for n in 0..6000 {
+            xml.push_str(&format!(
+                "<game><path>G{n}.chd</path><name>Title {n} {}</name></game>",
+                "N".repeat(900)
+            ));
+        }
+        xml.push_str("</gameList>");
+        fs::write(&source, xml).unwrap();
+        let scratch_files = || -> std::collections::BTreeSet<_> {
+            fs::read_dir("/dev/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::File::open(entry.path()).ok()?.metadata().ok())
+                .filter(|m| m.is_file() && m.nlink() == 0)
+                .map(|m| (m.dev(), m.ino()))
+                .collect()
+        };
+        for budget in [METADATA_BUDGET, INDEX_WORKER_BUDGET] {
+            let before = scratch_files();
+            let index = read_name_index(&source, budget);
+            assert!(
+                scratch_files().is_subset(&before),
+                "index retained an unlinked scratch file"
+            );
+            assert!(index.bytes <= budget);
+            assert!(!index.names.is_empty());
+            assert!(index.names.len() < 6000);
+            assert!(index.names.contains_key(&root.join("G0.chd")));
+            assert!(!index.names.contains_key(&root.join("G5999.chd")));
+            assert_eq!(
+                index.bytes,
+                source_bytes(&source)
+                    + index
+                        .names
+                        .iter()
+                        .map(|(p, e)| entry_bytes(p, e))
+                        .sum::<usize>()
+            );
+            let mut cache = Cache {
+                budget: Some(budget),
+                ..Cache::default()
+            };
+            cache.insert_source(source.clone(), index);
+            assert!(cache.names[&source].contains_key(&root.join("G0.chd")));
+            assert!(self::source(&source, &root.join("G5999.chd"), &mut cache).is_none());
+            assert!(cache.bytes <= budget);
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reordered_source_rejects_stale_offsets_before_deferred_validation() {
+        let root = std::env::temp_dir().join(format!("allium-stale-offset-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let xml = root.join("gamelist.xml");
+        let a = "<game><path>A.chd</path><name>Alpha</name></game>";
+        let b = "<game><path>B.chd</path><name>Bravo</name></game>";
+        fs::write(&xml, format!("<gameList>{a}{b}</gameList>")).unwrap();
+        let mut cache = Cache {
+            defer_cold: true,
+            ..Cache::default()
+        };
+        cache.insert_source(xml.clone(), read_name_index(&xml, METADATA_BUDGET));
+        fs::write(&xml, format!("<gameList>{b}{a} </gameList>")).unwrap();
+        load_source(&xml, &mut cache);
+        assert!(source(&xml, &root.join("A.chd"), &mut cache).is_none());
+        assert!(!cache.sources.contains_key(&xml));
+        assert!(cache.records.is_empty());
+        cache.insert_source(xml.clone(), read_name_index(&xml, METADATA_BUDGET));
+        assert_eq!(
+            source(&xml, &root.join("A.chd"), &mut cache)
+                .unwrap()
+                .data
+                .name,
+            "Alpha"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decoded_record_identity_is_checked_even_with_a_matching_fingerprint() {
+        let root =
+            std::env::temp_dir().join(format!("allium-offset-identity-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let xml = root.join("gamelist.xml");
+        let a = "<game><path>A.chd</path><name>Alpha</name></game>";
+        let b = "<game><path>B.chd</path><name>Bravo</name></game>";
+        fs::write(&xml, format!("<gameList>{a}{b}</gameList>")).unwrap();
+        let mut index = read_name_index(&xml, METADATA_BUDGET);
+        fs::write(&xml, format!("<gameList>{b}{a}</gameList>")).unwrap();
+        index.fingerprint =
+            stat(&xml).map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+        let mut cache = Cache::default();
+        cache.insert_source(xml.clone(), index);
+        assert!(source(&xml, &root.join("A.chd"), &mut cache).is_none());
+        assert!(cache.records.is_empty());
+        assert!(!cache.sources.contains_key(&xml));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_changed_during_construction_discards_the_index() {
+        let root = std::env::temp_dir().join(format!("allium-index-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let xml = root.join("gamelist.xml");
+        fs::write(
+            &xml,
+            "<gameList><game><path>A.chd</path><name>Alpha</name></game></gameList>",
+        )
+        .unwrap();
+        let index = read_name_index_records(&xml, METADATA_BUDGET, |_, _| {
+            fs::write(&xml, "<gameList><game><path>B.chd</path><name>Replacement Bravo</name></game></gameList>").unwrap();
+        });
+        assert!(index.names.is_empty());
+        let mut cache = Cache::default();
+        cache.insert_source(xml.clone(), index);
+        assert!(!cache.sources.contains_key(&xml));
+        cache.insert_source(xml.clone(), read_name_index(&xml, METADATA_BUDGET));
+        assert_eq!(
+            source(&xml, &root.join("B.chd"), &mut cache)
+                .unwrap()
+                .data
+                .name,
+            "Replacement Bravo"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_evicted_source_hydration_jobs_and_generation_settle() {
+        invalidate();
+        defer_cold_sources();
+        let root =
+            std::env::temp_dir().join(format!("allium-evicted-names-{}", std::process::id()));
+        let mut games = Vec::new();
+        for n in 0..6 {
+            let dir = root.join(format!("Roms/S{n}"));
+            fs::create_dir_all(&dir).unwrap();
+            let mut xml = String::from("<gameList>");
+            for game in 0..1200 {
+                xml.push_str(&format!(
+                    "<game><path>G{game}.chd</path><name>{}</name></game>",
+                    "N".repeat(900)
+                ));
+            }
+            xml.push_str("</gameList>");
+            fs::write(dir.join("gamelist.xml"), xml).unwrap();
+            games.push(dir.join("G0.chd"));
+        }
+        let (send, jobs) = std::sync::mpsc::sync_channel::<IndexJob>(1);
+        let (done, recv) = std::sync::mpsc::sync_channel(1);
+        let old_worker = INDEX_WORKER.with(|slot| {
+            slot.replace(Some(IndexWorker {
+                send,
+                recv,
+                pending: Default::default(),
+                waiting: Default::default(),
+            }))
+        });
+        let mut counts = BTreeMap::<PathBuf, usize>::new();
+        let mut settled = 0;
+        for round in 0..40 {
+            for game in &games {
+                let _ = cached_name(game);
+            }
+            if let Ok((path, budget, epoch, previous)) = jobs.try_recv() {
+                *counts.entry(path.clone()).or_default() += 1;
+                let index = (previous != Some(source_fingerprint(&path)))
+                    .then(|| read_name_index(&path, budget.min(INDEX_WORKER_BUDGET)));
+                if let Some(index) = &index {
+                    if index.fingerprint.is_some() {
+                        assert!(index.bytes > METADATA_BUDGET / 5);
+                    }
+                }
+                done.send((path, index, epoch)).unwrap();
+            }
+            poll_name_indexes();
+            if round == 25 {
+                settled = name_generation();
+            }
+        }
+        let final_generation = name_generation();
+        INDEX_WORKER.with(|slot| {
+            slot.replace(old_worker);
+        });
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+        for game in &games {
+            let source = game.parent().unwrap().join("gamelist.xml");
+            assert_eq!(
+                counts.get(&source),
+                Some(&1),
+                "reindexed {}",
+                source.display()
+            );
+        }
+        assert!(counts.values().all(|count| *count == 1), "jobs: {counts:?}");
+        assert_eq!(final_generation, settled, "idle generation did not settle");
+    }
+
+    #[test]
+    fn metadata_budget_markers_retry_on_fingerprint_change_and_invalidation() {
+        invalidate();
+        let root = std::env::temp_dir().join(format!("allium-name-marker-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("gamelist.xml");
+        fs::write(&path, "<gameList/>").unwrap();
+        let mut cache = Cache {
+            budget: Some(64 * 1024),
+            ..Cache::default()
+        };
+        assert!(!cache.insert_source(
+            path.clone(),
+            NameIndex {
+                fingerprint: source_fingerprint(&path),
+                names: BTreeMap::new(),
+                valid: true,
+                bytes: 64 * 1024,
+            }
+        ));
+        assert!(cache.skipped_sources.contains_key(&path));
+        PARSES.with(|p| p.borrow_mut().clear());
+        load_source(&path, &mut cache);
+        PARSES.with(|p| assert!(p.borrow().is_empty()));
+        fs::write(
+            &path,
+            "<gameList><game><path>G.chd</path><name>Changed</name></game></gameList>",
+        )
+        .unwrap();
+        load_source(&path, &mut cache);
+        assert!(!cache.skipped_sources.contains_key(&path));
+        assert_eq!(cache.names[&path][&root.join("G.chd")].name, "Changed");
+        assert_eq!(PARSES.with(|p| p.borrow()[&path]), 1);
+        cache.evict_source().unwrap();
+        assert!(cache.skipped_sources.contains_key(&path));
+        CACHE.with(|c| {
+            c.replace(cache);
+        });
+        invalidate();
+        CACHE.with(|c| assert!(c.borrow().skipped_sources.is_empty()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_noop_index_completions_do_not_bump_name_generation() {
+        invalidate();
+        let path = PathBuf::from("/metadata-noop/gamelist.xml");
+        let game = PathBuf::from("/metadata-noop/G.chd");
+        let index = |start| NameIndex {
+            fingerprint: Some((100, SystemTime::UNIX_EPOCH)),
+            names: [(
+                game.clone(),
+                SourceEntry {
+                    name: "Title".into(),
+                    start,
+                    len: 30,
+                },
+            )]
+            .into(),
+            valid: true,
+            bytes: 2000,
+        };
+        CACHE.with(|c| {
+            c.borrow_mut().insert_source(path.clone(), index(10));
+        });
+        let (send, _jobs) = std::sync::mpsc::sync_channel::<IndexJob>(1);
+        let (done, recv) = std::sync::mpsc::sync_channel(1);
+        let old_worker = INDEX_WORKER.with(|slot| {
+            slot.replace(Some(IndexWorker {
+                send,
+                recv,
+                pending: Default::default(),
+                waiting: Default::default(),
+            }))
+        });
+        let before = name_generation();
+        let epoch = INDEX_EPOCH.with(std::cell::Cell::get);
+        for completion in [
+            None,
+            Some(index(20)),
+            Some(NameIndex {
+                fingerprint: None,
+                names: BTreeMap::new(),
+                valid: true,
+                bytes: 1000,
+            }),
+        ] {
+            let source = if completion.as_ref().is_some_and(|i| i.fingerprint.is_none()) {
+                PathBuf::from("/metadata-noop/miyoogamelist.xml")
+            } else {
+                path.clone()
+            };
+            done.send((source, completion, epoch)).unwrap();
+            poll_name_indexes();
+        }
+        INDEX_WORKER.with(|slot| {
+            slot.replace(old_worker);
+        });
+        assert_eq!(name_generation(), before);
+        invalidate();
+    }
+
+    #[test]
+    fn cold_ui_names_defer_xml_and_refresh_from_worker_indexes() {
+        invalidate();
+        PARSES.with(|p| p.borrow_mut().clear());
+        let root = std::env::temp_dir().join(format!("allium-async-name-{}", std::process::id()));
+        let dir = root.join("Roms/PS");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gamelist.xml"), "<gameList><game><path>./Game</path><name>Worker title</name></game><game><path>./Game/Discs/Exact.cue</path><name>Exact title</name></game></gameList>").unwrap();
+        let launch = dir.join("Game/Discs/Launch.cue");
+        let exact = dir.join("Game/Discs/Exact.cue");
+        set_game_containers([
+            (launch.clone(), dir.join("Game")),
+            (exact.clone(), dir.join("Game")),
+        ]);
+        let generation = name_generation();
+        assert_eq!(cached_name(&launch), None);
+        // Art lookup on this UI thread must defer cold XML as well.
+        assert!(metadata(&launch).name.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            poll_name_indexes();
+            if cached_name(&launch).as_deref() == Some("Worker title") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_ne!(generation, name_generation());
+        assert_eq!(cached_name(&exact).as_deref(), Some("Exact title"));
+        PARSES.with(|p| assert!(p.borrow().is_empty(), "UI thread parsed XML"));
+        assert!(CACHE.with(|c| c.borrow().bytes) <= METADATA_BUDGET);
+        fs::remove_dir_all(root).unwrap();
+        set_game_containers(std::iter::empty());
+        invalidate();
+    }
+
+    #[test]
+    fn inherited_folder_art_uses_container_stem_and_exact_file_wins() {
+        invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-container-art-{}", std::process::id()));
+        let system = root.join("Roms/PS");
+        fs::create_dir_all(system.join("Game/Discs")).unwrap();
+        fs::write(system.join("gamelist.xml"), "<gameList><game><path>./Game</path><name>Container</name></game><game><path>./Game/Discs/Exact.cue</path><name>Exact</name></game></gameList>").unwrap();
+        let launch = system.join("Game/Discs/Launch.cue");
+        let exact = system.join("Game/Discs/Exact.cue");
+        set_game_containers([
+            (launch.clone(), system.join("Game")),
+            (exact.clone(), system.join("Game")),
+        ]);
+        for (kind, folder) in [
+            (Kind::Cover, "covers"),
+            (Kind::Background, "backgrounds"),
+            (Kind::Logo, "logos"),
+        ] {
+            let dir = system.join("media").join(folder);
+            fs::create_dir_all(&dir).unwrap();
+            for stem in ["Game", "Exact"] {
+                fs::write(dir.join(format!("{stem}.png")), b"fixture").unwrap();
+            }
+            assert_eq!(resolve(&launch, kind), Some(dir.join("Game.png")));
+            assert_eq!(resolve(&exact, kind), Some(dir.join("Exact.png")));
+            fs::write(dir.join("Launch.png"), b"exact file art").unwrap();
+            clear_prepared_paths();
+            assert_eq!(resolve(&launch, kind), Some(dir.join("Launch.png")));
+        }
+        fs::remove_dir_all(root).unwrap();
+        set_game_containers(std::iter::empty());
+        invalidate();
+    }
+
+    #[test]
+    fn directory_inheritance_requires_a_verified_immediate_container() {
+        invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-container-scope-{}", std::process::id()));
+        for dir in ["Collection", "Grandchild/Sub", "Named", "Single"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "Collection/GameA.cue",
+            "Collection/GameB.cue",
+            "Grandchild/Sub/Launch.cue",
+            "Named/Named.cue",
+            "Named/Disc2.chd",
+            "Single/Disc.iso",
+        ] {
+            fs::write(root.join(file), b"fixture").unwrap();
+        }
+        fs::write(
+            root.join("gamelist.xml"),
+            "<gameList>
+            <game><path>./Collection</path><name>Collection title</name></game>
+            <game><path>./Grandchild</path><name>Grandparent title</name></game>
+            <game><path>./Named</path><name>Named title</name></game>
+            <game><path>./Single</path><name>Single title</name></game>
+            <game><path>./Network</path><name>Explicit network title</name></game>
+            </gameList>",
+        )
+        .unwrap();
+        for file in [
+            "Collection/GameA.cue",
+            "Collection/GameB.cue",
+            "Grandchild/Sub/Launch.cue",
+            "Network/Discs/Launch.cue",
+        ] {
+            assert!(name(&root.join(file)).is_none(), "{file}");
+            assert!(metadata(&root.join(file)).name.is_empty(), "{file}");
+        }
+        for (file, title) in [
+            ("Named/Named.cue", "Named title"),
+            ("Single/Disc.iso", "Single title"),
+        ] {
+            assert_eq!(name(&root.join(file)).as_deref(), Some(title));
+            assert_eq!(metadata(&root.join(file)).name, title);
+        }
+        let launch = root.join("Network/Discs/Launch.cue");
+        set_game_containers([(launch.clone(), root.join("Network"))]);
+        assert_eq!(name(&launch).as_deref(), Some("Explicit network title"));
+        assert_eq!(metadata(&launch).name, "Explicit network title");
+        assert_eq!(cached_metadata(&launch).name, "Explicit network title");
+        fs::remove_dir_all(root).unwrap();
+        set_game_containers(std::iter::empty());
+        invalidate();
+    }
+    #[test]
+    fn directory_rom_metadata_keeps_exact_priority_source_and_cached_identity() {
+        invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-directory-metadata-{}", std::process::id()));
+        fs::create_dir_all(root.join("Dir/Sub")).unwrap();
+        fs::create_dir_all(root.join("Spaces 100% literal")).unwrap();
+        fs::create_dir_all(root.join("Sibling")).unwrap();
+        fs::create_dir_all(root.join("art")).unwrap();
+        for file in [
+            "Dir/Dir.cue",
+            "Dir/Dir.bin",
+            "Dir/Sub/Exact.cue",
+            "Spaces 100% literal/Disc.cue",
+            "Sibling/Other.cue",
+            "Single.nes",
+            "Prefix.nes",
+            "Spaces 100%.nes",
+        ] {
+            fs::write(root.join(file), b"fixture").unwrap();
+        }
+        for file in ["cover.png", "logo.png"] {
+            fs::write(root.join("art").join(file), b"distinct media").unwrap();
+        }
+        fs::write(root.join("gamelist.xml"), "<gameList>
+            <game><path>./Dir/</path><name>Directory title</name><releasedate>19981203T000000</releasedate><desc>Directory synopsis</desc><image>./art/cover.png</image><marquee>./art/logo.png</marquee></game>
+            <game><path>./Spaces 100% literal</path><name>Literal directory</name></game>
+            <game><path>./Dir/Sub/Exact.cue</path><name>Exact nested title</name><marquee>./art/logo.png</marquee></game>
+            <game><path>Single.nes</path><name>Single title</name></game>
+            <game><path>./Prefix.nes</path><name>Prefix title</name></game>
+            <game><path>./Spaces 100%.nes</path><name>Literal file</name></game>
+            </gameList>").unwrap();
+        fs::write(
+            root.join("Dir/gamelist.xml"),
+            "<gameList><game><path>./Sub</path><name>Closer directory</name></game></gameList>",
+        )
+        .unwrap();
+        for path in [
+            root.join("Dir"),
+            root.join("./Dir/"),
+            root.join("Dir/Dir.cue"),
+        ] {
+            let data = metadata(&path);
+            assert_eq!(data.name, "Directory title");
+            assert_eq!(data.releasedate, "19981203T000000");
+            assert_eq!(data.desc, "Directory synopsis");
+            assert_eq!(cached_metadata(&path).name, "Directory title");
+            assert_eq!(
+                resolve(&path, Kind::Logo),
+                Some(root.join("./art/logo.png"))
+            );
+            assert_eq!(
+                resolve(&path, Kind::Cover),
+                Some(root.join("./art/cover.png"))
+            );
+        }
+        for (file, title) in [
+            ("Single.nes", "Single title"),
+            ("./Prefix.nes", "Prefix title"),
+            ("Spaces 100%.nes", "Literal file"),
+            ("Spaces 100% literal/Disc.cue", "Literal directory"),
+            ("Dir/Sub/Exact.cue", "Exact nested title"),
+        ] {
+            assert_eq!(metadata(&root.join(file)).name, title);
+        }
+        assert_eq!(
+            resolve(&root.join("Dir/Sub/Exact.cue"), Kind::Logo),
+            Some(root.join("./art/logo.png"))
+        );
+        for file in ["Sibling/Other.cue", "Unknown.nes"] {
+            assert!(metadata(&root.join(file)).name.is_empty());
+            assert!(resolve(&root.join(file), Kind::Logo).is_none());
+        }
+        let cue = root.join("Dir/Dir.cue");
+        let prepared = prepare_game(&cue);
+        invalidate();
+        adopt_game(prepared);
+        assert_eq!(cached_metadata(&cue).name, "Directory title");
+        clear_prepared_paths();
+        assert_eq!(resolve(&cue, Kind::Logo), Some(root.join("./art/logo.png")));
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
     }
     #[test]
     fn media_lookup_order_png_jpg_aliases_and_cached_misses() {
@@ -728,11 +1952,12 @@ mod tests {
 /// A worker's resolved paths and shared record, adopted without touching storage.
 pub struct PreparedGame {
     path: PathBuf,
+    parent: PathBuf,
     metadata: SharedMetadata,
     paths: Vec<(Kind, Option<PathBuf>)>,
 }
 pub fn prepare_game(path: &Path) -> PreparedGame {
-    let metadata = metadata(path);
+    let (parent, metadata, _) = CACHE.with(|c| metadata_with_parent(path, &mut c.borrow_mut()));
     let paths = [
         Kind::Cover,
         Kind::TallCover,
@@ -745,6 +1970,7 @@ pub fn prepare_game(path: &Path) -> PreparedGame {
     .collect();
     PreparedGame {
         path: path.into(),
+        parent,
         metadata,
         paths,
     }
@@ -754,7 +1980,7 @@ pub fn adopt_game(game: PreparedGame) {
         let mut cache = cache.borrow_mut();
         let key = normalize(&game.path);
         if !cache.records.contains_key(&key) {
-            cache.insert(key, (*game.metadata).clone());
+            cache.insert(key, game.parent, (*game.metadata).clone());
         }
         for (kind, path) in game.paths {
             cache.insert_path((game.path.clone(), kind), path);
@@ -763,21 +1989,43 @@ pub fn adopt_game(game: PreparedGame) {
 }
 /// Worker-local policy. Call after invalidation as well, which resets the cache.
 pub fn set_metadata_budget(bytes: usize) {
-    CACHE.with(|cache| cache.borrow_mut().budget = Some(bytes.min(METADATA_BUDGET)));
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let budget = bytes.min(METADATA_BUDGET);
+        cache.budget = Some(budget);
+        while cache.skipped_bytes > marker_budget(budget) {
+            let path = cache.skipped_sources.keys().next().unwrap().clone();
+            cache.forget_skipped_source(&path);
+        }
+        while cache.bytes - cache.skipped_bytes > resident_budget(budget) {
+            if cache.evict_record() {
+                continue;
+            }
+            if cache.evict_source().is_none() {
+                let Some(path) = cache.skipped_sources.keys().next().cloned() else {
+                    break;
+                };
+                cache.forget_skipped_source(&path);
+            }
+        }
+    });
 }
 pub fn clear_prepared_paths() {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.paths.clear();
-        cache.missing.clear();
+        cache.local_containers.clear();
     });
 }
 
-pub fn adopt_paths(game: &Path, paths: impl IntoIterator<Item = (Kind, PathBuf)>) {
+pub fn adopt_fallback_paths(game: &Path, paths: impl IntoIterator<Item = (Kind, PathBuf)>) {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         for (kind, path) in paths {
-            cache.insert_path((game.into(), kind), Some(path));
+            let key = (game.into(), kind);
+            if cache.paths.get(&key).is_none_or(Option::is_none) {
+                cache.insert_path(key, Some(path));
+            }
         }
     });
 }

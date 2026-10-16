@@ -34,6 +34,7 @@ pub struct RecentsCarousel {
     game_name: Label<String>,
     button_hints: ButtonHints<String>,
     dirty: bool,
+    name_generation: u64,
 }
 
 impl RecentsCarousel {
@@ -101,6 +102,7 @@ impl RecentsCarousel {
             game_name,
             button_hints,
             dirty: true,
+            name_generation: common::media::name_generation(),
         };
 
         carousel.game_name.scroll(true);
@@ -119,6 +121,7 @@ impl RecentsCarousel {
     }
 
     fn load_games(res: &Resources) -> Result<Vec<Game>> {
+        common::media::defer_cold_sources();
         let database = res.get::<Database>();
         let db_games = database.select_last_played(RECENT_GAMES_LIMIT)?;
 
@@ -135,7 +138,7 @@ impl RecentsCarousel {
             let image =
                 crate::entry::lazy_image::LazyImage::from_path(&game.path, game.image.clone());
 
-            games.push(Game {
+            let mut game = Game {
                 name: game.name.clone(),
                 full_name: game.name,
                 path: game.path,
@@ -149,7 +152,9 @@ impl RecentsCarousel {
                 genres: game.genres,
                 favorite: game.favorite,
                 screenshot_path: game.screenshot_path,
-            });
+            };
+            game.hydrate_name();
+            games.push(game);
         }
 
         Ok(games)
@@ -218,6 +223,26 @@ impl RecentsCarousel {
 
 #[async_trait(?Send)]
 impl View for RecentsCarousel {
+    fn update(&mut self, dt: std::time::Duration) {
+        common::media::poll_name_indexes();
+        let generation = common::media::name_generation();
+        if self.name_generation != generation {
+            for game in &mut self.games {
+                game.hydrate_name();
+                if matches!(game.image, crate::entry::lazy_image::LazyImage::NotFound) {
+                    game.image = crate::entry::lazy_image::LazyImage::Unknown(game.path.clone());
+                }
+            }
+            if let Err(error) = self.update_current_game() {
+                log::error!("Refresh recent carousel names: {error:#}");
+            }
+            self.name_generation = generation;
+        }
+        self.screenshot.update(dt);
+        self.game_name.update(dt);
+        self.button_hints.update(dt);
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,

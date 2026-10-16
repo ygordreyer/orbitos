@@ -45,11 +45,21 @@ pub struct Framebuffer {
 
 thread_local! {
     static OBSERVED: RefCell<(VarScreeninfo, FixScreeninfo)> = RefCell::default();
+    static NEW_BACKING: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
 impl Framebuffer {
     pub fn new(_: &str) -> Result<Self> {
-        bail!("host presenter tests must not open a framebuffer device")
+        let frame = NEW_BACKING.with(|backing| backing.borrow_mut().take());
+        let Some(frame) = frame else {
+            bail!("host presenter tests must not open a framebuffer device");
+        };
+        Ok(Self {
+            device: File::open("/dev/null")?,
+            frame,
+            var_screen_info: OBSERVED.with(|state| state.borrow().0.clone()),
+            fix_screen_info: OBSERVED.with(|state| state.borrow().1.clone()),
+        })
     }
     pub fn get_var_screeninfo(_: &File) -> Result<VarScreeninfo> {
         Ok(OBSERVED.with(|state| state.borrow().0.clone()))
@@ -127,6 +137,10 @@ fn dl15b_framebuffer_display_sequential_partial_presents_match_full_render() {
 }
 
 fn assert_visible(display: &super::FramebufferDisplay, page: usize, stage: &str) {
+    assert!(
+        NEW_BACKING.with(|backing| backing.borrow().is_none()),
+        "new backing was never mapped; writes still target the old backing"
+    );
     let w = display.pixmap.width() as usize;
     let h = display.pixmap.height() as usize;
     let bytes = w * h * 4;
@@ -157,6 +171,7 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
         ..FixScreeninfo::default()
     };
     OBSERVED.with(|state| *state.borrow_mut() = (var.clone(), fix.clone()));
+    NEW_BACKING.with(|backing| *backing.borrow_mut() = None);
     FramebufferDisplay {
         page_history: None,
         pixmap: Pixmap::new(w, h).unwrap(),
@@ -220,6 +235,32 @@ impl PresenterProbe {
     pub fn new(width: u32, height: u32) -> Self {
         Self(test_display(width, height))
     }
+    pub fn set_page(&mut self, page: u32) {
+        OBSERVED.with(|state| state.borrow_mut().0.yoffset = page * self.0.pixmap.height());
+    }
+    pub fn replace_backing(&mut self) {
+        OBSERVED.with(|state| state.borrow_mut().1.smem_start += 4096);
+        NEW_BACKING.with(|backing| {
+            *backing.borrow_mut() = Some(vec![0xa5; self.0.iface.frame.len()]);
+        });
+    }
+    pub fn needs_present(&mut self) -> Result<bool> {
+        use crate::display::Display;
+        self.0.needs_present()
+    }
+    pub fn assert_visible(&self) {
+        let page = OBSERVED.with(|state| state.borrow().0.yoffset / self.0.pixmap.height());
+        assert_visible(&self.0, page as usize, "launcher display repair");
+    }
+    pub fn flush(
+        &mut self,
+        pixels: tiny_skia::PixmapRef<'_>,
+        areas: &[crate::geom::Rect],
+    ) -> Result<()> {
+        use crate::display::Display;
+        self.0.pixmap.data_mut().copy_from_slice(pixels.data());
+        self.0.flush_rects(areas)
+    }
     pub fn present(
         &mut self,
         pixels: tiny_skia::PixmapRef<'_>,
@@ -255,7 +296,9 @@ fn dl16_full_flush_observes_new_page_and_invalidates_other_pages() {
     display.flush_rects(&[area]).unwrap();
     assert_visible(&display, 0, "old page after intervening full refresh");
     OBSERVED.with(|state| state.borrow_mut().1.smem_start += 4096);
-    display.iface.frame[..32 * 24 * 4].fill(0xa5);
+    NEW_BACKING.with(|backing| {
+        *backing.borrow_mut() = Some(vec![0xa5; display.iface.frame.len()]);
+    });
     display.flush_rects(&[]).unwrap();
     assert_visible(
         &display,
@@ -277,4 +320,44 @@ fn dl16_fragmented_page_history_bounds_damage_memory() {
     assert_eq!(history.damage(0), vec![Rect::new(0, 0, 640, 480)]);
     display.flush_rects(&areas).unwrap();
     assert_visible(&display, 0, "fragmented history full fallback");
+}
+
+#[test]
+fn framebuffer_backing_identity_and_mapping_size_remap_before_repair() {
+    use super::*;
+    for identity_change in [true, false] {
+        let mut display = test_display(32, 24);
+        display.clear(Color::new(17, 33, 99)).unwrap();
+        display.flush().unwrap();
+        assert!(!display.needs_present().unwrap());
+        let old_mapping = display.iface.frame.as_ptr();
+        let new_len = OBSERVED.with(|state| {
+            let mut state = state.borrow_mut();
+            if identity_change {
+                state.1.smem_start += 4096;
+            } else {
+                state.0.yres_virtual += 24;
+                state.1.smem_len = state.1.line_length * state.0.yres_virtual;
+            }
+            (state.1.line_length * state.0.yres_virtual) as usize + 64
+        });
+        NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; new_len]));
+        assert!(display.needs_present().unwrap());
+        display.flush_rects(&[]).unwrap();
+        assert_visible(&display, 0, "replacement backing full repaint");
+        assert_ne!(
+            display.iface.frame.as_ptr(),
+            old_mapping,
+            "old mapping was reused"
+        );
+        assert_eq!(display.iface.frame.len(), new_len);
+        assert!(!display.needs_present().unwrap());
+        OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24);
+        assert!(
+            display.needs_present().unwrap(),
+            "old page validity survived remapping"
+        );
+        display.flush_rects(&[]).unwrap();
+        assert_visible(&display, 1, "other replacement page requires full repaint");
+    }
 }

@@ -519,7 +519,10 @@ async fn dl17_frontend_proxy() -> Result<()> {
                 if finished {
                     break;
                 }
-                ensure!(warm_started.elapsed() < Duration::from_secs(10), "warm work did not finish");
+                ensure!(
+                    warm_started.elapsed() < Duration::from_secs(10),
+                    "warm work did not finish"
+                );
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
@@ -619,5 +622,545 @@ async fn dl17_frontend_proxy() -> Result<()> {
         }
         println!("FRONTEND_PROXY {}", row);
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "explicit disposable completion and presentation fixture"]
+async fn completion_presentation_proofs() -> Result<()> {
+    use crate::view::orbit::{WarmArt, proof_art_completion};
+    use common::theme::pack::{Binding, ScreenId};
+    let _cleanup = fixture()?;
+    let logos = ALLIUM_GAMES_DIR.join("media/logos");
+    fs::create_dir_all(&logos)?;
+    for i in 0..20 {
+        art(&logos.join(format!("Game {i:02}.png")), 192, 48, 70 + i)?;
+    }
+    for theme in [
+        "orbit",
+        "orbit-hero",
+        "big-picture",
+        "compact-plus",
+        "completion-modal",
+        "completion-metadata",
+    ] {
+        let modal = theme == "completion-modal";
+        let changed_metadata = theme == "completion-metadata";
+        let source_theme = if modal || changed_metadata {
+            "orbit-hero"
+        } else {
+            theme
+        };
+        if theme != "orbit" {
+            copy_tree(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../themes")
+                    .join(source_theme),
+                &ALLIUM_SD_ROOT.join("Themes").join(theme),
+            )?;
+        }
+        if modal || changed_metadata {
+            let path = ALLIUM_SD_ROOT.join("Themes").join(theme).join("theme.json");
+            let mut pack: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            pack["id"] = theme.into();
+            if modal {
+                let compact: serde_json::Value = serde_json::from_slice(&fs::read(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../themes/compact-plus/theme.json"),
+                )?)?;
+                let artless_list = compact["screens"]["library"]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["kind"] == "entries")
+                    .unwrap()
+                    .clone();
+                for c in pack["screens"]["library"]["components"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    if c["kind"] == "entries" {
+                        *c = artless_list.clone();
+                    }
+                }
+            }
+            fs::write(path, serde_json::to_vec(&pack)?)?;
+        }
+        crate::view::details::invalidate_metadata();
+        let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
+        crate::theme_adapter::choose(&app.res, Some(theme))?;
+        app.view.proof_select_tab(1);
+        let games = if changed_metadata {
+            // The sidecar contract requires a console directory below ALLIUM_GAMES_DIR.
+            let games = ALLIUM_GAMES_DIR.join("PS");
+            fs::create_dir_all(&games)?;
+            for directory in ["Imgs", "media"] {
+                copy_tree(&ALLIUM_GAMES_DIR.join(directory), &games.join(directory))?;
+            }
+            fs::copy(
+                ALLIUM_GAMES_DIR.join("gamelist.xml"),
+                games.join("gamelist.xml"),
+            )?;
+            for i in 0..20 {
+                let path = games.join(format!("Game {i:02}.chd"));
+                fs::write(&path, [])?;
+                let mut record: common::database::NewGame = Game::new(path).into();
+                record.image = Some(games.join(format!("Imgs/Game {i:02}.png")));
+                app.res.get::<Database>().update_games(&[record])?;
+            }
+            app.view.proof_games_directory(games.clone());
+            games
+        } else {
+            ALLIUM_GAMES_DIR.to_path_buf()
+        };
+        let mut overlay = false;
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        if modal {
+            event(&mut app, KeyEvent::Pressed(Key::Start), &tx).await?;
+            ensure!(
+                app.view.proof_game_theme_inputs().last().unwrap().screen == ScreenId::GameDetail,
+                "details did not open"
+            );
+        }
+        app.display.record_presentations();
+        app.present_frame(false, &mut overlay).await?;
+        app.display.take_presented_frames();
+        let model = app.view.proof_game_theme_inputs().remove(0);
+        let selected = model.focus.item.as_ref().unwrap().clone();
+        if modal {
+            let handle = crate::theme_adapter::snapshot(&app.res).unwrap();
+            ensure!(
+                !handle.pack().screens[&ScreenId::Library]
+                    .components
+                    .iter()
+                    .any(|c| c.binding == Some(Binding::SelectedCover)
+                        || c.art_size.unwrap_or(0) > 0),
+                "modal fixture Library depends on cover"
+            );
+        }
+        if changed_metadata {
+            fs::write(
+                ALLIUM_BASE_DIR.join("metadata/game-details.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1, "platform": "PS", "entries": [{
+                        "id": "completion-game", "title": "Completion game", "aliases": [model.text[&Binding::SelectedTitle]],
+                        "year": 1999, "first_release_year": 1999, "release_region": "USA",
+                        "developer": "Completion studio", "publisher": "Completion publisher", "genres": ["Racing"],
+                        "description": "A changed description received from the metadata worker.",
+                        "source": {"title": "Fixture", "url": "https://example.org/fixture", "license": {"name": "Fixture", "url": "https://example.org/license"}}
+                    }]
+                }))?,
+            )?;
+        }
+        let visible: Vec<_> = model.rows[&common::theme::pack::Binding::Entries]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        let peek =
+            crate::theme_adapter::entry_id(&games.join(format!("Game {:02}.chd", visible.len())));
+        proof_art_completion();
+        let started = Instant::now();
+        let mut metadata_noops = 0;
+        let mut offscreen_noops = 0;
+        let mut redraws = 0;
+        let mut logo_redraws = 0;
+        let mut modal_cover_redraws = 0;
+        let mut metadata_redraws = 0;
+        loop {
+            ensure!(
+                !app.view.should_draw(),
+                "previous completion did not settle"
+            );
+            let pixels = app.display.pixmap().data().to_vec();
+            let pending = app.view.idle_media_step();
+            let task = proof_art_completion();
+            if let Some(task) = &task {
+                let offscreen = match task {
+                    WarmArt::Hero(e) | WarmArt::Logo(e) => {
+                        crate::theme_adapter::entry_id(e.path()) != selected
+                    }
+                    WarmArt::Cover(e) | WarmArt::CoverFallback(e) => {
+                        let id = crate::theme_adapter::entry_id(e.path());
+                        !visible.contains(&id) && id != peek
+                    }
+                    _ => false,
+                };
+                if matches!(task, WarmArt::Metadata(_)) && !app.view.should_draw() {
+                    metadata_noops += 1;
+                }
+                if offscreen {
+                    offscreen_noops += 1;
+                    ensure!(
+                        !app.view.should_draw(),
+                        "offscreen art invalidated {theme}: {task:?}"
+                    );
+                }
+            }
+            let dirty = app.view.should_draw();
+            app.present_frame(false, &mut overlay).await?;
+            let frames = app.display.take_presented_frames();
+            let fresh = app.view.proof_fresh_game_pixels();
+            if fresh != pixels {
+                ensure!(
+                    dirty,
+                    "visible completion was not invalidated for {theme}: {task:?}"
+                );
+                if matches!(&task, Some(WarmArt::Logo(e)) if crate::theme_adapter::entry_id(e.path()) == selected)
+                {
+                    logo_redraws += 1;
+                }
+                if modal
+                    && matches!(&task, Some(WarmArt::Cover(e) | WarmArt::CoverFallback(e)) if crate::theme_adapter::entry_id(e.path()) == selected)
+                {
+                    modal_cover_redraws += 1;
+                }
+                if changed_metadata
+                    && app.view.proof_game_theme_inputs()[0].text[&Binding::SelectedMetadata]
+                        .contains("1999")
+                {
+                    metadata_redraws += 1;
+                }
+                ensure!(
+                    frames.len() == 1,
+                    "visible completion did not present exactly once: {task:?}"
+                );
+                ensure!(
+                    app.display.pixmap().data() != pixels,
+                    "completion presented unchanged pixels"
+                );
+                redraws += 1;
+            } else {
+                ensure!(frames.is_empty(), "no-op completion presented {theme}");
+                ensure!(
+                    app.display.pixmap().data() == pixels,
+                    "no-op completion changed pixels"
+                );
+            }
+            ensure!(
+                app.display.pixmap().data() == fresh,
+                "completion differs from fresh {theme}: {task:?}, dirty={dirty}"
+            );
+            app.present_frame(false, &mut overlay).await?;
+            ensure!(
+                app.display.take_presented_frames().is_empty(),
+                "completion presented twice"
+            );
+            if !pending {
+                break;
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(10),
+                "media work did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        ensure!(
+            metadata_noops > 0 && offscreen_noops > 0 && redraws > 0,
+            "missing completion cases for {theme}"
+        );
+        ensure!(
+            logo_redraws > 0,
+            "logo arrival was not exercised for {theme}"
+        );
+        ensure!(
+            !modal || modal_cover_redraws > 0,
+            "modal cover arrival was not exercised"
+        );
+        ensure!(
+            !changed_metadata || metadata_redraws > 0,
+            "changed metadata was not exercised"
+        );
+        ensure!(!app.view.idle_media_step(), "settled media restarted work");
+        if modal {
+            event(&mut app, KeyEvent::Pressed(Key::B), &tx).await?;
+            app.present_frame(false, &mut overlay).await?;
+            app.display.take_presented_frames();
+        }
+
+        let trace = ALLIUM_SD_ROOT.join(format!("{theme}-completion.jsonl"));
+        common::perf_trace::start_probe(trace.to_str().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        for key in [Key::Right, Key::Left, Key::Down, Key::Up, Key::R, Key::L] {
+            let pixels = app.display.pixmap().data().to_vec();
+            perf::take();
+            {
+                let _input = common::perf_trace::phase(common::perf_trace::Phase::Input);
+                event(&mut app, KeyEvent::Released(key), &tx).await?;
+            }
+            app.present_frame(false, &mut overlay).await?;
+            ensure!(perf::take().frames == 0, "release prepared a model");
+            ensure!(
+                common::perf_trace::probe_counts()["stages"]["phases"]["layout"]["begin_monotonic_us"]
+                    == 0,
+                "release entered layout"
+            );
+            ensure!(
+                app.display.take_presented_frames().is_empty(),
+                "release presented"
+            );
+            ensure!(
+                app.display.pixmap().data() == pixels,
+                "release changed pixels"
+            );
+        }
+        app.view.proof_theme_redraw();
+        app.present_frame(false, &mut overlay).await?;
+        ensure!(
+            app.display.take_presented_frames().is_empty(),
+            "empty damage flushed"
+        );
+        ensure!(
+            fs::read_to_string(&trace)?.is_empty(),
+            "no-op presentation logged a drawn frame"
+        );
+        app.display.presenter();
+        app.present_frame(false, &mut overlay).await?;
+        ensure!(
+            app.display.take_presented_frames().len() == 1,
+            "first backing was not initialized"
+        );
+        app.display.presenter().assert_visible();
+        for backing_change in [false, true] {
+            if backing_change {
+                app.display.presenter().replace_backing();
+            } else {
+                app.display.presenter().set_page(1);
+            }
+            let pixels = app.display.pixmap().data().to_vec();
+            app.view.proof_theme_redraw();
+            app.present_frame(false, &mut overlay).await?;
+            ensure!(
+                app.display.pixmap().data() == pixels,
+                "repair recomposed different pixels"
+            );
+            ensure!(
+                app.display.take_presented_frames().len() == 1,
+                "empty damage skipped display repair, backing_change={backing_change}"
+            );
+            app.display.presenter().assert_visible();
+            app.present_frame(false, &mut overlay).await?;
+            ensure!(
+                app.display.take_presented_frames().is_empty(),
+                "repaired display presented again"
+            );
+        }
+        let pixels = app.display.pixmap().data().to_vec();
+        app.display.save()?;
+        app.handle_command(Command::Redraw).await?;
+        app.present_frame(false, &mut overlay).await?;
+        ensure!(
+            app.display.take_presented_frames().len() == 1,
+            "wake redraw did not present"
+        );
+        ensure!(
+            app.display.pixmap().data() == pixels,
+            "wake redraw changed composition"
+        );
+        app.display.presenter().assert_visible();
+        app.display.pop();
+        println!(
+            "COMPLETION_PROOF theme={theme} visible_redraws={redraws} logo_redraws={logo_redraws} modal_cover_redraws={modal_cover_redraws} metadata_redraws={metadata_redraws} metadata_noops={metadata_noops} offscreen_noops={offscreen_noops} release_models=0 empty_damage_presents=0 display_repairs=3 wake_presents=1"
+        );
+        app.view.stop_workers();
+    }
+    Ok(())
+}
+
+thread_local! {
+    static LOOP_INPUT: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>>> = const { std::cell::RefCell::new(None) };
+    static LOOP_STATE: std::cell::RefCell<Option<std::rc::Rc<LoopState>>> = const { std::cell::RefCell::new(None) };
+}
+#[derive(Default)]
+struct LoopState {
+    held: std::cell::Cell<bool>,
+    polls: std::cell::Cell<usize>,
+    input: tokio::sync::Notify,
+    settled: tokio::sync::Notify,
+}
+pub(super) fn has_loop_input() -> bool {
+    LOOP_INPUT.with(|input| input.borrow().is_some())
+}
+pub(super) async fn poll_loop_input() -> KeyEvent {
+    std::future::poll_fn(|cx| {
+        LOOP_INPUT.with(|input| input.borrow_mut().as_mut().unwrap().poll_recv(cx))
+    })
+    .await
+    .unwrap()
+}
+pub(super) fn loop_input(keys: &EnumMap<Key, bool>) {
+    LOOP_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.held.set(keys[Key::Right]);
+            state.input.notify_one();
+        }
+    });
+}
+pub(super) fn loop_media_poll(pending: bool) {
+    LOOP_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.polls.set(state.polls.get() + 1);
+            if !pending {
+                state.settled.notify_one();
+            }
+        }
+    });
+}
+struct LoopReset;
+impl Drop for LoopReset {
+    fn drop(&mut self) {
+        LOOP_INPUT.with(|input| *input.borrow_mut() = None);
+        LOOP_STATE.with(|state| *state.borrow_mut() = None);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "explicit disposable event loop fixture"]
+async fn release_and_settled_media_event_loop() -> Result<()> {
+    let _cleanup = fixture()?;
+    let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await?;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    LOOP_INPUT.with(|input| *input.borrow_mut() = Some(receiver));
+    let state = std::rc::Rc::new(LoopState::default());
+    LOOP_STATE.with(|slot| *slot.borrow_mut() = Some(state.clone()));
+    let _reset = LoopReset;
+    sender.send(KeyEvent::Pressed(Key::Right))?;
+    let checks = async {
+        state.input.notified().await;
+        ensure!(state.held.get(), "event loop did not record held key");
+        let polls = state.polls.get();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        ensure!(
+            state.polls.get() == polls,
+            "media polled while a key was held"
+        );
+        perf::take();
+        sender.send(KeyEvent::Released(Key::Right))?;
+        state.input.notified().await;
+        ensure!(!state.held.get(), "release failed to clear held state");
+        ensure!(
+            perf::take().frames == 0,
+            "release prepared a frame in event loop"
+        );
+        state.settled.notified().await;
+        let polls = state.polls.get();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ensure!(state.polls.get() == polls, "settled media kept polling");
+        println!(
+            "EVENT_LOOP_PROOF release_models=0 held_state_cleared=true settled_extra_polls=0 total_media_polls={polls}"
+        );
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::select! {
+            result = app.run_event_loop() => anyhow::bail!("event loop stopped: {result:?}"),
+            result = checks => result,
+        }
+    })
+    .await??;
+    app.view.stop_workers();
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn perf_name_index_consumed_by_view_rearms_settled_media() -> Result<()> {
+    use crate::view::orbit::proof_art_completion;
+    use common::theme::pack::Binding;
+
+    let root = ALLIUM_SD_ROOT.join("lane-a-name-index-regression");
+    fs::create_dir_all(root.join("Imgs"))?;
+    let _cleanup = Cleanup(root.clone());
+    for i in 0..3 {
+        fs::write(root.join(format!("Raw {i}.chd")), [])?;
+        art(&root.join(format!("Imgs/Raw {i}.png")), 240, 240, i)?;
+    }
+    common::media::invalidate();
+    let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
+    crate::theme_adapter::choose(&app.res, Some("orbit"))?;
+    app.view.proof_games_directory(root.clone());
+    app.display.record_presentations();
+    app.display.save()?;
+    let mut overlay = false;
+    let mut media_pending = true;
+    let mut generation = common::media::name_generation();
+    let start = Instant::now();
+    // Drain initial indexes and artwork before reproducing the completion race.
+    while start.elapsed() < Duration::from_millis(300) || media_pending {
+        app.update_view(Duration::ZERO, &mut generation, &mut media_pending);
+        media_pending = app.view.idle_media_step();
+        app.present_frame(false, &mut overlay).await?;
+        app.display.take_presented_frames();
+        ensure!(
+            start.elapsed() < Duration::from_secs(10),
+            "initial media did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    ensure!(!app.view.should_draw(), "initial scene did not settle");
+    proof_art_completion();
+    let pixels = app.display.pixmap().data().to_vec();
+    let _ = crate::network_runtime::poll();
+    generation = common::media::name_generation();
+    // Queue only after network polling. The owning view must consume this result.
+    fs::write(
+        root.join("gamelist.xml"),
+        "<gameList><game><path>Raw 0.chd</path><name>Indexed title zero</name></game><game><path>Raw 1.chd</path><name>Indexed title one</name></game><game><path>Raw 2.chd</path><name>Indexed title two</name></game></gameList>",
+    )?;
+    common::media::check_directory(&root);
+    let before = generation;
+    let start = Instant::now();
+    while common::media::name_generation() == before {
+        app.update_view(Duration::ZERO, &mut generation, &mut media_pending);
+        ensure!(
+            start.elapsed() < Duration::from_secs(10),
+            "view did not consume the index"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    ensure!(
+        media_pending,
+        "view-consumed name index did not rearm settled media"
+    );
+    ensure!(
+        app.view.should_draw(),
+        "name index did not invalidate the themed scene"
+    );
+    ensure!(
+        !crate::network_runtime::poll(),
+        "later network poll rediscovered the consumed generation"
+    );
+    app.present_frame(false, &mut overlay).await?;
+    ensure!(
+        app.display.take_presented_frames().len() == 1,
+        "name-index refresh did not present a frame"
+    );
+    ensure!(
+        app.display.pixmap().data() != pixels,
+        "name-index frame kept stale pixels"
+    );
+    ensure!(
+        app.view.proof_game_theme_inputs()[0].text[&Binding::SelectedTitle]
+            .starts_with("Indexed title"),
+        "view kept the old list"
+    );
+    let start = Instant::now();
+    let mut media_work = 0;
+    while media_pending {
+        media_pending = app.view.idle_media_step();
+        if proof_art_completion().is_some() {
+            media_work += 1;
+        }
+        app.present_frame(false, &mut overlay).await?;
+        app.display.take_presented_frames();
+        ensure!(
+            start.elapsed() < Duration::from_secs(10),
+            "rearmed media did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    ensure!(media_work > 0, "replacement list never loaded artwork");
+    app.view.stop_workers();
     Ok(())
 }

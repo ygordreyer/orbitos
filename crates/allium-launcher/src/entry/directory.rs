@@ -209,7 +209,7 @@ impl Directory {
 
         let gamelist = self.path.join("gamelist.xml");
         if should_parse_gamelist(&gamelist)? {
-            crate::view::details::invalidate_metadata();
+            common::media::with_name_indexes(crate::view::details::invalidate_metadata);
             debug!("Parsing gamelist.xml at {:?}", gamelist);
             #[cfg(feature = "miyoo")]
             {
@@ -264,7 +264,7 @@ impl Directory {
         } else if !gamelist.exists() {
             let gamelist = self.path.join("miyoogamelist.xml");
             if should_parse_gamelist(&gamelist)? {
-                crate::view::details::invalidate_metadata();
+                common::media::with_name_indexes(crate::view::details::invalidate_metadata);
                 debug!("Parsing miyoogamelist.xml at {:?}", gamelist);
                 #[cfg(feature = "miyoo")]
                 {
@@ -376,10 +376,11 @@ impl Directory {
         );
 
         for entry in entries.iter_mut() {
-            if let Entry::Game(game) = entry
-                && let Some(core) = database.get_core(&game.path)?
-            {
-                game.core = Some(core);
+            if let Entry::Game(game) = entry {
+                game.hydrate_name();
+                if let Some(core) = database.get_core(&game.path)? {
+                    game.core = Some(core);
+                }
             }
         }
 

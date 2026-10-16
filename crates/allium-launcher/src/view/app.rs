@@ -307,6 +307,50 @@ where
         self.views.1.theme_models(&handle).unwrap()
     }
 
+    #[cfg(all(test, feature = "perf-bench"))]
+    pub(crate) fn proof_fresh_game_pixels(&mut self) -> Vec<u8> {
+        let handle = crate::theme_adapter::snapshot(&self.res).unwrap();
+        let mut models = self.proof_game_theme_inputs();
+        let status = if self
+            .res
+            .get::<Stylesheet>()
+            .status_bar
+            .hide_status_in_launcher
+        {
+            common::theme::frame::Status::default()
+        } else {
+            self.status_bar.theme_inputs()
+        };
+        prepare_theme_inputs(&mut models, &self.res, self.selected, &status);
+        if handle.pack().ink()
+            && models.len() > 1
+            && models.last().is_some_and(|m| {
+                handle.pack().screens[&m.screen]
+                    .components
+                    .iter()
+                    .any(|c| c.kind == common::theme::pack::Kind::Hints)
+            })
+        {
+            let underlay = models.len() - 1;
+            for model in &mut models[..underlay] {
+                model.hints.clear();
+                model.suppress_hints = true;
+            }
+        }
+        let mut display = <DefaultPlatform as Platform>::Display::default();
+        for model in models {
+            common::theme::render::PreparedFrame::prepare(handle.clone(), &model)
+                .unwrap()
+                .paint(&mut display);
+        }
+        display.pixmap().data().to_vec()
+    }
+
+    #[cfg(all(test, feature = "perf-bench"))]
+    pub(crate) fn proof_theme_redraw(&mut self) {
+        self.theme_dirty = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn prepared_status_boxes(&self) -> usize {
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
@@ -821,7 +865,7 @@ where
                 self.theme_was_layered = scene.frames.len() != 1;
                 self.theme_dirty = false;
                 self.dirty = false;
-                return Ok(true);
+                return Ok(self.present_damage.as_ref().is_none_or(|damage| !damage.is_empty()));
             }
         }
         let display_styles = styles.display_style();

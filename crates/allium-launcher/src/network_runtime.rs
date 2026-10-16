@@ -162,6 +162,7 @@ fn with<T>(default: T, f: impl FnOnce(&mut Runtime) -> T) -> T {
 pub fn initialize(root: PathBuf) -> Result<()> {
     COMPLETION_PENDING.with(|pending| pending.set(false));
     RUNTIME.with(|cell| *cell.borrow_mut() = None);
+    common::media::set_game_containers(std::iter::empty());
     // Only a confirmed missing profile can select legacy launch behavior.
     STARTUP.with(|cell| {
         *cell.borrow_mut() = Startup::Blocked {
@@ -237,6 +238,14 @@ fn initialize_profile(root: PathBuf) -> Result<()> {
             .into(),
         );
     }
+    common::media::set_game_containers(catalog.games.iter().filter_map(|game| {
+        let identity = config.root.join(&game.game_path);
+        let container = config.root.join(&game.cache_path);
+        (game.install_kind == "directory"
+            && identity != container
+            && identity.starts_with(&container))
+        .then_some((identity, container))
+    }));
     RUNTIME.with(|cell| {
         *cell.borrow_mut() = Some(Runtime {
             epoch: 0,
@@ -304,13 +313,22 @@ impl Runtime {
         let mut game = Game::new(self.config.root.join(&descriptor.game_path));
         game.name = descriptor.display_title.clone();
         game.full_name = descriptor.display_title.clone();
-        let stock = self.catalog_art(descriptor, "stock");
-        if stock.exists() {
+        game.hydrate_name();
+        if let Some(stock) = common::media::cached_resolve(&game.path, common::media::Kind::Cover)
+            .or_else(|| self.catalog_art(descriptor, "stock").filter(|p| p.exists()))
+        {
             game.image = crate::entry::lazy_image::LazyImage::Found(stock);
         }
         game
     }
-    fn catalog_art(&self, game: &NetworkGame, kind: &str) -> PathBuf {
+    fn catalog_art(&self, game: &NetworkGame, kind: &str) -> Option<PathBuf> {
+        let suffix = match kind {
+            "stock" => ".png",
+            "heroes" => ".hero.png",
+            "covers" => ".orbit.png",
+            "logos" => return None,
+            _ => return None,
+        };
         let cache = Path::new(&game.cache_path);
         let basename = if game.install_kind == "directory"
             && !cache
@@ -323,12 +341,8 @@ impl Runtime {
         }
         .unwrap_or_default();
         let mut name = basename.to_os_string();
-        name.push(match kind {
-            "heroes" => ".hero.png",
-            "covers" => ".orbit.png",
-            _ => ".png",
-        });
-        self.config.root.join("Roms/PS/Imgs").join(name)
+        name.push(suffix);
+        Some(self.config.root.join("Roms/PS/Imgs").join(name))
     }
     fn start(&mut self, task: Task) -> Result<()> {
         ensure!(self.job.is_none(), "Network operation already active");
@@ -806,7 +820,8 @@ pub fn badge(path: &Path) -> Option<String> {
 }
 pub fn art_path(path: &Path, kind: &str) -> Option<PathBuf> {
     with(None, |r| {
-        r.descriptor(path).map(|game| r.catalog_art(&game, kind))
+        r.descriptor(path)
+            .and_then(|game| r.catalog_art(&game, kind))
     })
 }
 pub fn virtual_directory(path: &Path) -> bool {
@@ -884,15 +899,18 @@ pub fn frame_presented() {
     });
 }
 pub fn poll() -> bool {
+    let before = common::media::name_generation();
+    common::media::poll_name_indexes();
+    let names_dirty = before != common::media::name_generation();
     let blocked_dirty = startup_dirty();
-    with(false, |r| {
+    with(names_dirty, |r| {
         r.poll();
         let dirty = r.dirty;
         r.dirty = false;
         if dirty {
             common::perf_trace::network_event("dirty_returned", "poll", Some(r.job.is_some()));
         }
-        dirty
+        dirty || (names_dirty && r.modal.is_none())
     }) || blocked_dirty
 }
 pub fn event(event: KeyEvent) -> Result<bool> {
@@ -941,6 +959,7 @@ pub fn merge_directory(directory: &Path, entries: &mut Vec<Entry>) {
             {
                 game.name = descriptor.display_title.clone();
                 game.full_name = descriptor.display_title.clone();
+                game.hydrate_name();
             }
             let container = if descriptor.install_kind == "directory" {
                 Path::new(&descriptor.cache_path).parent()
@@ -958,17 +977,21 @@ pub fn merge_directory(directory: &Path, entries: &mut Vec<Entry>) {
     });
 }
 pub fn search(query: &str, entries: &mut Vec<Entry>) {
+    for entry in entries.iter_mut() {
+        if let Entry::Game(game) = entry {
+            game.hydrate_name();
+        }
+    }
+    let query = query.to_lowercase();
     with((), |r| {
-        for game in &r.catalog.games {
-            if game
-                .display_title
-                .to_lowercase()
-                .contains(&query.to_lowercase())
-                && !entries
-                    .iter()
-                    .any(|e| e.path() == r.config.root.join(&game.game_path))
+        for descriptor in &r.catalog.games {
+            let identity = r.config.root.join(&descriptor.game_path);
+            let name = common::media::cached_name(&identity).unwrap_or_default();
+            if (descriptor.display_title.to_lowercase().contains(&query)
+                || name.to_lowercase().contains(&query))
+                && !entries.iter().any(|e| e.path() == identity)
             {
-                entries.push(Entry::Game(r.virtual_game(game)));
+                entries.push(Entry::Game(r.virtual_game(descriptor)));
             }
         }
     });

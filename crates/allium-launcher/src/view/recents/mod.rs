@@ -105,6 +105,13 @@ impl Recents {
 
 #[async_trait(?Send)]
 impl View for Recents {
+    fn update(&mut self, dt: std::time::Duration) {
+        match self {
+            Self::Carousel(carousel) => carousel.update(dt),
+            Self::List(list) => list.update(dt),
+        }
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,

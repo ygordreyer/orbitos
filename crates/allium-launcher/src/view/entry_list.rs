@@ -241,6 +241,11 @@ where
                 .is_some_and(|child| child.disc_picker_active())
     }
 
+    pub fn interaction_active(&self) -> bool {
+        // Core selection is owned by the menu; its saved state outlives cancellation.
+        self.menu.is_some() || self.child.as_ref().is_some_and(|c| c.interaction_active())
+    }
+
     pub(crate) fn details_active(&self) -> bool {
         self.details.is_some() || self.child.as_ref().is_some_and(|c| c.details_active())
     }
@@ -324,24 +329,106 @@ where
                 selected,
             ] {
                 let e = self.entries[i].clone();
-                self.idle_media_work.extend([
-                    WarmArt::Metadata(e.clone()),
-                    WarmArt::Cover(e.clone()),
-                ]);
+                self.idle_media_work
+                    .extend([WarmArt::Metadata(e.clone()), WarmArt::Cover(e.clone())]);
                 // Keep full selected/next art resident; previous covers still prefetch.
                 if i == selected || i == (selected + 1) % self.entries.len() {
-                    self.idle_media_work.extend([WarmArt::Hero(e.clone()), WarmArt::Logo(e.clone())]);
+                    self.idle_media_work
+                        .extend([WarmArt::Hero(e.clone()), WarmArt::Logo(e.clone())]);
                 }
-                if i == selected { self.idle_media_work.push_back(WarmArt::OtherCover(e)); }
+                if i == selected {
+                    self.idle_media_work.push_back(WarmArt::OtherCover(e));
+                }
             }
         }
+        let mut composed_screens = vec![screen];
+        if self.details.is_some() {
+            composed_screens.push(common::theme::pack::ScreenId::GameDetail);
+        }
+        if self.menu.is_some() {
+            composed_screens.push(common::theme::pack::ScreenId::ContextMenu);
+        }
+        if self.disc_picker.is_some() {
+            composed_screens.push(common::theme::pack::ScreenId::DiscPicker);
+        }
+        let components: Vec<_> = composed_screens
+            .iter()
+            .flat_map(|screen| &handle.pack().screens[screen].components)
+            .collect();
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
         orbit.set_ink_art(ink);
         orbit.set_cover_shape(tall);
-        let changed = orbit.warm_art_step(&mut self.idle_media_work);
+        let visible_art = |mut art: common::theme::frame::Art| {
+            use common::theme::pack::{Arrangement, Binding, Kind};
+            let image = |binding| {
+                components
+                    .iter()
+                    .any(|c| c.kind == Kind::Image && c.binding == Some(binding))
+            };
+            if !image(Binding::SelectedHero) {
+                art.selected_hero = None;
+            }
+            if !image(Binding::SelectedCover) {
+                art.selected_cover = None;
+            }
+            if !image(Binding::SelectedLogo) && !components.iter().any(|c| c.logo) {
+                art.selected_logo = None;
+            }
+            if !image(Binding::NextCover)
+                && !components.iter().any(|c| {
+                    c.layout == Some(Arrangement::Shelf)
+                        && (!ink || c.paint.as_ref().is_some_and(|p| p.peek.is_some()))
+                })
+            {
+                art.next_cover = None;
+            }
+            if !components.iter().any(|c| {
+                c.kind == Kind::Entries
+                    && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
+            }) {
+                art.entries.clear();
+            }
+            art
+        };
+        let before = visible_art(orbit.theme_art(&self.entries, selected, first, count));
+        let completed = orbit.warm_art_step(&mut self.idle_media_work);
         let pending = !self.idle_media_work.is_empty() || orbit.art_pending();
+        if !completed {
+            return pending;
+        }
+        let after = visible_art(orbit.theme_art(&self.entries, selected, first, count));
+        let art_changed = before != after;
+        let mut metadata_changed = false;
+        if let Some(Entry::Game(game)) = self.entries.get(selected) {
+            use common::theme::pack::Binding;
+            let metadata = components
+                .iter()
+                .any(|c| c.binding == Some(Binding::SelectedMetadata));
+            let blurb = components
+                .iter()
+                .any(|c| c.binding == Some(Binding::SelectedBlurb));
+            if metadata || blurb {
+                let before = self.semantic_info.take();
+                let platform = self
+                    .res
+                    .get::<ConsoleMapper>()
+                    .get_console(&game.path)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let after = SelectedInfo::get(&mut self.semantic_info, game, &platform);
+                metadata_changed = before.as_ref().is_none_or(|before| {
+                    (metadata
+                        && (before.metadata != after.metadata
+                            || (ink && before.metadata_runs != after.metadata_runs)))
+                        || (blurb && before.blurb != after.blurb)
+                });
+            } else {
+                self.semantic_info = None;
+            }
+        }
+        let changed = art_changed || metadata_changed;
         if changed {
-            self.semantic_info = None;
+            super::orbit::visible_completion();
             self.set_should_draw();
         }
         pending || changed

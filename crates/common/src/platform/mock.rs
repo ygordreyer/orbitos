@@ -89,6 +89,8 @@ impl Default for MockPlatform {
 
 pub struct MockDisplay {
     #[cfg(feature = "perf-bench")]
+    presenter: Option<crate::platform::PresenterProbe>,
+    #[cfg(feature = "perf-bench")]
     probe_damage: Vec<Rect>,
     pixmap: Pixmap,
     recording: Option<Recording>,
@@ -100,6 +102,12 @@ struct Recording {
 }
 
 impl MockDisplay {
+    #[cfg(feature = "perf-bench")]
+    pub fn presenter(&mut self) -> &mut crate::platform::PresenterProbe {
+        self.presenter.get_or_insert_with(|| {
+            crate::platform::PresenterProbe::new(SCREEN_WIDTH, SCREEN_HEIGHT)
+        })
+    }
     #[cfg(feature = "perf-bench")]
     pub fn take_probe_damage(&mut self) -> Vec<Rect> {
         std::mem::take(&mut self.probe_damage)
@@ -126,6 +134,8 @@ impl MockDisplay {
         Self {
             pixmap: Pixmap::new(SCREEN_WIDTH, SCREEN_HEIGHT).expect("Failed to create mock pixmap"),
             recording: None,
+            #[cfg(feature = "perf-bench")]
+            presenter: None,
             #[cfg(feature = "perf-bench")]
             probe_damage: vec![],
         }
@@ -166,7 +176,22 @@ impl Display for MockDisplay {
         Ok(())
     }
 
+    fn needs_present(&mut self) -> Result<bool> {
+        #[cfg(feature = "perf-bench")]
+        if let Some(presenter) = &mut self.presenter {
+            return presenter.needs_present();
+        }
+        Ok(false)
+    }
+
     fn flush(&mut self) -> Result<()> {
+        #[cfg(feature = "perf-bench")]
+        if let Some(presenter) = &mut self.presenter {
+            presenter.flush(
+                self.pixmap.as_ref(),
+                &[Rect::new(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)],
+            )?;
+        }
         #[cfg(feature = "perf-bench")]
         {
             self.probe_damage = vec![self.bounding_box()];
@@ -182,6 +207,10 @@ impl Display for MockDisplay {
     }
 
     fn flush_rects(&mut self, areas: &[Rect]) -> Result<()> {
+        #[cfg(feature = "perf-bench")]
+        if let Some(presenter) = &mut self.presenter {
+            presenter.flush(self.pixmap.as_ref(), areas)?;
+        }
         #[cfg(feature = "perf-bench")]
         {
             self.probe_damage = areas.to_vec();

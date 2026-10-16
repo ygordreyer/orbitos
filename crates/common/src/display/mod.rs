@@ -108,6 +108,11 @@ pub trait Display: Sized {
         Ok(())
     }
 
+    /// Whether the visible backing needs repair even when composition has no damage.
+    fn needs_present(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Flush any pending changes to the display
     fn flush(&mut self) -> Result<()> {
         crate::perf_trace::count(

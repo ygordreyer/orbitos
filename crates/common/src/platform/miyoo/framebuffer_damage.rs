@@ -65,6 +65,9 @@ impl PageHistory {
     pub fn is_valid(&self, page: usize) -> bool {
         self.pages[page].valid
     }
+    pub fn needs_repair(&self, page: usize) -> bool {
+        !self.pages[page].valid || self.pages[page].rows.iter().any(|word| *word != 0)
+    }
     pub fn add(&mut self, areas: &[Rect]) {
         for area in areas {
             let x0 = area.x.max(0).min(self.width as i32) as u32;

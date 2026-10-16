@@ -74,6 +74,7 @@ impl Sort for SearchResultsSort {
         _console_mapper: &ConsoleMapper,
         _locale: &Locale,
     ) -> Result<Vec<Entry>> {
+        common::media::defer_cold_sources();
         let query = self.query();
 
         let mut games = database.search(query, RECENT_GAMES_LIMIT)?;
@@ -104,7 +105,7 @@ impl Sort for SearchResultsSort {
                 let full_name = game.name.clone();
                 let image = LazyImage::from_path(&game.path, game.image);
 
-                Entry::Game(Game {
+                let mut game = Game {
                     name: game.name,
                     full_name,
                     path: game.path,
@@ -118,10 +119,15 @@ impl Sort for SearchResultsSort {
                     genres: game.genres,
                     favorite: game.favorite,
                     screenshot_path: game.screenshot_path,
-                })
+                };
+                game.hydrate_name();
+                Entry::Game(game)
             })
             .collect::<Vec<_>>();
         crate::network_runtime::search(query, &mut entries);
+        if matches!(self, Self::Alphabetical(_)) {
+            entries.sort_by_key(|entry| entry.name().to_lowercase());
+        }
         Ok(entries)
     }
 
@@ -141,6 +147,7 @@ pub struct SearchResultsView {
     result_count: Label<String>,
     button_hints: ButtonHints<String>,
     search_view: SearchView,
+    name_generation: u64,
 }
 
 impl SearchResultsView {
@@ -164,11 +171,9 @@ impl SearchResultsView {
         let Rect { x, y, w, h } = rect;
         let styles = res.get::<Stylesheet>();
 
-        let entry_count = {
-            let database = res.get::<Database>();
-            let games = database.search(&query, RECENT_GAMES_LIMIT)?;
-            games.len()
-        };
+        let entry_count = SearchResultsSort::Relevance(query.clone())
+            .entries(&res.get(), &res.get(), &res.get())?
+            .len();
 
         let sort = SearchResultsSort::Relevance(query.clone());
 
@@ -199,11 +204,13 @@ impl SearchResultsView {
         result_count.font_size(styles.ui.tab_font_size);
 
         let list_y = y + styles.ui.margin_y + styles.tab_font_size() as i32 * 2;
-        let list = EntryList::new(
-            Rect::new(x, y + list_y, w, h - list_y as u32),
-            res.clone(),
-            sort.clone(),
-        )?;
+        let list = common::media::with_name_indexes(|| {
+            EntryList::new(
+                Rect::new(x, y + list_y, w, h - list_y as u32),
+                res.clone(),
+                sort.clone(),
+            )
+        })?;
 
         let button_hints = {
             let locale = res.get::<Locale>();
@@ -248,6 +255,7 @@ impl SearchResultsView {
             result_count,
             button_hints,
             search_view: SearchView::new(res),
+            name_generation: common::media::name_generation(),
         })
     }
 
@@ -255,15 +263,13 @@ impl SearchResultsView {
         self.query = new_query.clone();
         self.header.set_text(format!("🔍 {}", new_query));
 
-        let entry_count = {
-            let database = self.res.get::<Database>();
-            let games = database.search(&new_query, RECENT_GAMES_LIMIT)?;
-            games.len()
-        };
+        let entry_count = SearchResultsSort::Relevance(new_query.clone())
+            .entries(&self.res.get(), &self.res.get(), &self.res.get())?
+            .len();
 
         let sort = SearchResultsSort::Relevance(new_query);
         self.current_sort = sort.clone();
-        self.list.sort(sort)?;
+        common::media::with_name_indexes(|| self.list.sort(sort))?;
         self.update_sort_button_hint();
 
         let result_text = {
@@ -290,6 +296,45 @@ impl SearchResultsView {
 
 #[async_trait(?Send)]
 impl View for SearchResultsView {
+    fn update(&mut self, dt: std::time::Duration) {
+        common::media::poll_name_indexes();
+        let generation = common::media::name_generation();
+        if self.name_generation != generation
+            && !self.list.interaction_active()
+            && !self.list.details_active()
+            && !self.list.disc_picker_active()
+        {
+            let state = self.list.save();
+            match common::media::with_name_indexes(|| self.list.sort(self.current_sort.clone())) {
+                Ok(()) => {
+                    let entries = self
+                        .current_sort
+                        .entries(&self.res.get(), &self.res.get(), &self.res.get())
+                        .unwrap_or_default();
+                    let selected = state
+                        .selected_path
+                        .as_ref()
+                        .and_then(|path| entries.iter().position(|entry| entry.path() == path))
+                        .unwrap_or(state.selected);
+                    self.list.select(selected);
+                    let count = entries.len();
+                    let mut values = HashMap::new();
+                    values.insert("count".into(), LocaleFluentValue::from(count));
+                    self.result_count
+                        .set_text(self.res.get::<Locale>().ta("search-games-found", &values));
+                    self.name_generation = generation;
+                    self.set_should_draw();
+                }
+                Err(error) => log::error!("Refresh search names: {error:#}"),
+            }
+        }
+        self.list.update(dt);
+        self.header.update(dt);
+        self.result_count.update(dt);
+        self.button_hints.update(dt);
+        self.search_view.update(dt);
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,
@@ -440,5 +485,238 @@ impl View for SearchResultsView {
 
     fn set_position(&mut self, _point: Point) {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_refresh_waits_for_context_menu_to_close() {
+        common::media::invalidate();
+        common::media::defer_cold_sources();
+        let root = std::env::temp_dir().join(format!(
+            "allium-search_results-menu-refresh-{}",
+            std::process::id()
+        ));
+        let dir = root.join("Roms/PS");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [dir.join("Match A.chd"), dir.join("Match B.chd")];
+        let database = Database::in_memory().unwrap();
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+            let mut game = crate::entry::game::Game::new(path.clone());
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            database.update_games(&[game.into()]).unwrap();
+        }
+        std::fs::write(root.join("Roms/gamelist.xml"),
+            "<gameList><game><path>PS/Match A.chd</path><name>Zulu</name></game><game><path>PS/Match B.chd</path><name>Alpha</name></game></gameList>").unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        let mut mapper = ConsoleMapper::new();
+        mapper.load_config().unwrap();
+        assert!(!mapper.get_console(&paths[0]).unwrap().cores.is_empty());
+        map.insert(mapper);
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let mut view =
+            SearchResultsView::new(Rect::new(0, 0, 640, 480), res, "Match".into()).unwrap();
+        view.current_sort = SearchResultsSort::Alphabetical("Match".into());
+        common::media::with_name_indexes(|| view.list.sort(view.current_sort.clone())).unwrap();
+        let before = view.list.save();
+        let generation = view.name_generation;
+        let (send, mut recv) = tokio::sync::mpsc::channel(16);
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Select),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        assert!(view.list.interaction_active());
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Down),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Right),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            common::media::poll_name_indexes();
+            let _ = common::media::cached_name(&paths[0]);
+            if common::media::cached_name(&paths[0]).as_deref() == Some("Zulu") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index never completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        view.update(std::time::Duration::from_millis(16));
+        assert!(
+            view.list.interaction_active(),
+            "background refresh closed context menu"
+        );
+        assert_eq!(view.name_generation, generation);
+        assert_eq!(view.list.save().selected, before.selected);
+        assert_eq!(view.list.save().selected_path, before.selected_path);
+        view.handle_key_event(KeyEvent::Pressed(Key::Select), send, &mut VecDeque::new())
+            .await
+            .unwrap();
+        assert!(!view.list.interaction_active());
+        assert!(matches!(recv.try_recv(), Ok(Command::Redraw)));
+        assert!(
+            recv.try_recv().is_err(),
+            "menu cancellation launched a game"
+        );
+        view.update(std::time::Duration::from_millis(16));
+        assert_eq!(view.name_generation, common::media::name_generation());
+        assert_eq!(view.list.save().selected_path.as_ref(), Some(&paths[0]));
+        assert_eq!(
+            view.list.save().selected,
+            1,
+            "names did not refresh after menu closed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
+    #[test]
+    fn search_view_update_hydrates_existing_database_hits_and_preserves_fields() {
+        common::media::invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-search-refresh-{}", std::process::id()));
+        let dir = root.join("Roms/TEST");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Raw.chd");
+        std::fs::write(&path, b"fixture").unwrap();
+        std::fs::write(
+            dir.join("gamelist.xml"),
+            "<gameList><game><path>./Raw.chd</path><name>Hydrated search</name></game></gameList>",
+        )
+        .unwrap();
+        let mut game = Game::new(path);
+        game.favorite = true;
+        game.rating = Some(7);
+        game.developer = Some("Database studio".into());
+        let database = Database::in_memory().unwrap();
+        let row: common::database::NewGame = game.clone().into();
+        database.update_games(&[row.clone()]).unwrap();
+        database.set_favorite(&row).unwrap();
+        common::media::invalidate();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let mut view =
+            SearchResultsView::new(Rect::new(0, 0, 640, 480), res.clone(), "Raw".into()).unwrap();
+        let generation = view.name_generation;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            view.update(std::time::Duration::from_millis(16));
+            if view.name_generation != generation {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search view did not refresh"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let entries = view
+            .current_sort
+            .entries(&res.get(), &res.get(), &res.get())
+            .unwrap();
+        let Entry::Game(hydrated) = &entries[0] else {
+            panic!("game")
+        };
+        game.name = "Hydrated search".into();
+        game.full_name = game.name.clone();
+        assert_eq!(hydrated, &game);
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+    #[test]
+    fn search_refresh_preserves_game_path_after_name_reorder_and_falls_back_if_removed() {
+        common::media::invalidate();
+        common::media::defer_cold_sources();
+        let root =
+            std::env::temp_dir().join(format!("allium-search-reorder-{}", std::process::id()));
+        let dir = root.join("Roms/PS");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [
+            dir.join("Match A.chd"),
+            dir.join("Match B.chd"),
+            dir.join("Match C.chd"),
+        ];
+        let database = Database::in_memory().unwrap();
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+            let mut game = Game::new(path.clone());
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            database.update_games(&[game.into()]).unwrap();
+        }
+        std::fs::write(dir.join("gamelist.xml"),
+            "<gameList><game><path>Match A.chd</path><name>Zulu</name></game><game><path>Match B.chd</path><name>Alpha</name></game><game><path>Match C.chd</path><name>Middle</name></game></gameList>").unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let mut view =
+            SearchResultsView::new(Rect::new(0, 0, 640, 480), res.clone(), "Match".into()).unwrap();
+        view.current_sort = SearchResultsSort::Alphabetical("Match".into());
+        common::media::with_name_indexes(|| view.list.sort(view.current_sort.clone())).unwrap();
+        view.list.select(0);
+        assert_eq!(view.list.save().selected_path.as_ref(), Some(&paths[0]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            view.update(std::time::Duration::from_millis(16));
+            if common::media::cached_name(&paths[0]).as_deref() == Some("Zulu") {
+                view.update(std::time::Duration::from_millis(16));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search names never hydrated"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let state = view.list.save();
+        assert_eq!(state.selected_path.as_ref(), Some(&paths[0]));
+        assert_eq!(state.selected, 2);
+        view.list.select(1);
+        assert_eq!(view.list.save().selected_path.as_ref(), Some(&paths[2]));
+        res.get::<Database>().delete_game(&paths[2]).unwrap();
+        view.name_generation = common::media::name_generation().wrapping_sub(1);
+        view.update(std::time::Duration::from_millis(16));
+        let state = view.list.save();
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_path.as_ref(), Some(&paths[0]));
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
 }

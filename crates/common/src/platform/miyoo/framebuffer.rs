@@ -188,13 +188,36 @@ impl FramebufferDisplay {
     }
 
     fn refresh_present_layout(&mut self) -> Result<()> {
-        self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)?;
-        self.iface.fix_screen_info = Framebuffer::get_fix_screeninfo(&self.iface.device)?;
+        let var = Framebuffer::get_var_screeninfo(&self.iface.device)?;
+        let fix = Framebuffer::get_fix_screeninfo(&self.iface.device)?;
         anyhow::ensure!(
-            self.iface.var_screen_info.xres == self.pixmap.width()
-                && self.iface.var_screen_info.yres == self.pixmap.height(),
+            var.xres == self.pixmap.width() && var.yres == self.pixmap.height(),
             "Framebuffer dimensions changed"
         );
+        // Screen-info refreshes cannot retarget the existing mmap to a new backing.
+        let mapped_length = |fix: &FixScreeninfo, var: &VarScreeninfo| {
+            u64::from(fix.line_length) * u64::from(var.yres_virtual)
+        };
+        if fix.smem_start != self.iface.fix_screen_info.smem_start
+            || fix.smem_len != self.iface.fix_screen_info.smem_len
+            || mapped_length(&fix, &var)
+                != mapped_length(&self.iface.fix_screen_info, &self.iface.var_screen_info)
+        {
+            self.page_history = None;
+            let iface = Framebuffer::new("/dev/fb0").map_err(|error| {
+                anyhow!("Failed to remap framebuffer; reinitialize display: {error}")
+            })?;
+            anyhow::ensure!(
+                iface.var_screen_info.xres == self.pixmap.width()
+                    && iface.var_screen_info.yres == self.pixmap.height(),
+                "Framebuffer dimensions changed during remap"
+            );
+            validate_layout(&iface, iface.var_screen_info.yoffset as usize)?;
+            self.iface = iface;
+        } else {
+            self.iface.var_screen_info = var;
+            self.iface.fix_screen_info = fix;
+        }
         validate_layout(&self.iface, self.iface.var_screen_info.yoffset as usize)
     }
 
@@ -390,6 +413,16 @@ impl Display for FramebufferDisplay {
             *pixel = f(color).into();
         }
         Ok(())
+    }
+
+    fn needs_present(&mut self) -> Result<bool> {
+        self.refresh_present_layout()?;
+        Ok(self.page_history.as_ref().is_none_or(|history| {
+            !history.matches(&self.iface)
+                || history
+                    .page(self.iface.var_screen_info.yoffset)
+                    .is_none_or(|page| history.needs_repair(page))
+        }))
     }
 
     fn flush(&mut self) -> Result<()> {

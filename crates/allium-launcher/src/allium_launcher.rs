@@ -55,7 +55,12 @@ impl AlliumLauncher<DefaultPlatform> {
 
         let mut res = TypeMap::new();
         let database = Database::new()?;
-        if let Err(error)=crate::media_refresh::consume(&ALLIUM_SD_ROOT, &database, &console_mapper, &Locale::new(&LocaleSettings::load()?.lang)) {
+        if let Err(error) = crate::media_refresh::consume(
+            &ALLIUM_SD_ROOT,
+            &database,
+            &console_mapper,
+            &Locale::new(&LocaleSettings::load()?.lang),
+        ) {
             warn!("Media refresh will be retried: {error:#}");
         }
         crate::network_runtime::refresh_history(&database)?;
@@ -111,6 +116,8 @@ impl AlliumLauncher<DefaultPlatform> {
         let mut overlay_was_drawn = true;
         let mut warm_steps = 0;
         let mut warm_work = None;
+        let mut media_pending = true;
+        let mut name_generation = common::media::name_generation();
         let mut media_poll = Instant::now();
         loop {
             crate::network_runtime::trace_loop("loop_iteration", "before_poll");
@@ -121,9 +128,10 @@ impl AlliumLauncher<DefaultPlatform> {
             }
             if network_dirty {
                 self.view.set_should_draw();
+                media_pending = true;
             }
             let dt = last_frame.elapsed();
-            self.view.update(dt);
+            self.update_view(dt, &mut name_generation, &mut media_pending);
             last_frame = Instant::now();
 
             self.present_frame(network_dirty, &mut overlay_was_drawn)
@@ -171,6 +179,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 }
             }
             if handled_action {
+                media_pending = true;
                 warm_work = None;
                 warm_steps = 0;
                 continue;
@@ -197,6 +206,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 cmd = rx.recv() => {
                     crate::network_runtime::trace_wake("command");
                     if let Some(cmd) = cmd {
+                        media_pending = true;
                         warm_work = None;
                         warm_steps = 0;
                         let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
@@ -208,6 +218,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
                     warm_steps = 0;
                     warm_work = None;
+                    media_pending = true;
                     let mut bubble = VecDeque::new();
                     match event {
                         KeyEvent::Pressed(key) => {
@@ -218,6 +229,8 @@ impl AlliumLauncher<DefaultPlatform> {
                         }
                         KeyEvent::Autorepeat(_) => {}
                     }
+                    #[cfg(all(test, feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
+                    perf_bench::loop_input(&keys);
 
                     // Ignore menu key presses
                     if !keys[Key::Menu] && !matches!(event, KeyEvent::Released(Key::Menu)) {
@@ -226,15 +239,26 @@ impl AlliumLauncher<DefaultPlatform> {
                         navigation_warm_tests::handled_input();
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(if warm_work.is_some() {1} else {10})), if keys.values().all(|pressed| !pressed) && rx.is_empty() => {
-                    if self.view.idle_media_step() {continue;}
+                _ = tokio::time::sleep(if warm_work.is_some() {
+                    std::time::Duration::from_millis(1)
+                } else if media_pending || (warm_allowed && warm_steps < 2) || crate::media_refresh::pending() {
+                    std::time::Duration::from_millis(10)
+                } else {
+                    std::time::Duration::from_secs(1).saturating_sub(media_poll.elapsed())
+                }), if keys.values().all(|pressed| !pressed) && rx.is_empty() => {
+                    if media_pending {
+                        media_pending = self.view.idle_media_step();
+                        #[cfg(all(test, feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
+                        perf_bench::loop_media_poll(media_pending);
+                        if media_pending {continue;}
+                    }
                     if warm_steps<2 && warm_allowed {
-                        if self.view.prewarm_navigation_step(&mut warm_work,if warm_steps==0 {1} else {-1})? {warm_steps+=1;self.view.set_should_draw();}
+                        if self.view.prewarm_navigation_step(&mut warm_work,if warm_steps==0 {1} else {-1})? {warm_steps+=1;}
                     }
                     if media_poll.elapsed()>=std::time::Duration::from_secs(1) {
                         let marker = if crate::media_refresh::pending() { Ok(Some(true)) } else { crate::media_refresh::marker_ready(&ALLIUM_SD_ROOT) };
                         match marker {
-                            Ok(None) => continue,
+                            Ok(None) => { media_poll=Instant::now(); continue; },
                             Ok(Some(false)) => { media_poll=Instant::now(); continue; },
                             Err(error) => { warn!("Media marker: {error:#}"); media_poll=Instant::now(); continue; },
                             Ok(Some(true)) => {},
@@ -244,6 +268,7 @@ impl AlliumLauncher<DefaultPlatform> {
                                 self.view.save()?;
                                 self.view=App::load_or_new(self.display.bounding_box(),self.res.clone(),self.platform.battery()?)?;
                                 warm_work=None;warm_steps=0;overlay_was_drawn=true;
+                                media_pending=true;
                                 media_poll=Instant::now();
                             },
                             Ok(false)=>{if !crate::media_refresh::pending() {media_poll=Instant::now();}},
@@ -267,6 +292,21 @@ impl AlliumLauncher<DefaultPlatform> {
         }
     }
 
+    fn update_view(
+        &mut self,
+        dt: std::time::Duration,
+        name_generation: &mut u64,
+        media_pending: &mut bool,
+    ) {
+        self.view.update(dt);
+        let observed = common::media::name_generation();
+        if observed != *name_generation {
+            *name_generation = observed;
+            *media_pending = true;
+            self.view.set_should_draw();
+        }
+    }
+
     fn navigation_warm_allowed(&self) -> bool {
         self.toast.is_none()
             && !crate::network_runtime::blocks_navigation_warm()
@@ -274,6 +314,14 @@ impl AlliumLauncher<DefaultPlatform> {
     }
 
     async fn poll_input(&mut self) -> KeyEvent {
+        #[cfg(all(
+            test,
+            feature = "perf-bench",
+            not(any(feature = "miyoo", feature = "simulator"))
+        ))]
+        if perf_bench::has_loop_input() {
+            return perf_bench::poll_loop_input().await;
+        }
         #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
         if navigation_warm_tests::has_input() {
             return navigation_warm_tests::poll_input().await;
@@ -329,7 +377,19 @@ impl AlliumLauncher<DefaultPlatform> {
                 .unwrap_or(&[self.display.bounding_box()]),
         );
         drop(compose_phase);
-        if drawn || network_dirty {
+        let composition_changed = (drawn || network_dirty)
+            && (network_dirty
+                || *overlay_was_drawn
+                || present_damage
+                    .as_ref()
+                    .is_none_or(|damage| !damage.is_empty()));
+        let display_repair = !composition_changed && self.display.needs_present()?;
+        if composition_changed || display_repair {
+            let present_damage = if display_repair {
+                Some(present_damage.unwrap_or_default())
+            } else {
+                present_damage
+            };
             crate::network_runtime::trace_loop("frame_drawn", "compose");
             {
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::Present);
@@ -942,7 +1002,11 @@ mod orbit_proof {
             let target = ALLIUM_THEMES_DIR.join(id);
             if !target.exists() {
                 fs::create_dir_all(target.join("assets")).unwrap();
-                fs::copy(repo.join("themes").join(id).join("theme.json"), target.join("theme.json")).unwrap();
+                fs::copy(
+                    repo.join("themes").join(id).join("theme.json"),
+                    target.join("theme.json"),
+                )
+                .unwrap();
                 for asset in fs::read_dir(repo.join("themes").join(id).join("assets")).unwrap() {
                     let asset = asset.unwrap();
                     fs::copy(asset.path(), target.join("assets").join(asset.file_name())).unwrap();
@@ -1074,11 +1138,17 @@ mod orbit_proof {
             .unwrap();
         press(&mut app, Key::Right, &tx).await;
         render_theme(&mut app);
-        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().pack().id, "orbit-hero");
+        assert_eq!(
+            crate::theme_adapter::snapshot(&app.res).unwrap().pack().id,
+            "orbit-hero"
+        );
         press(&mut app, Key::Down, &tx).await;
         press(&mut app, Key::Right, &tx).await;
         render_theme(&mut app);
-        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().settings()["cover_shape"], "tall");
+        assert_eq!(
+            crate::theme_adapter::snapshot(&app.res).unwrap().settings()["cover_shape"],
+            "tall"
+        );
         app.display
             .pixmap()
             .to_owned()
@@ -1108,11 +1178,17 @@ mod orbit_proof {
         app.view.proof_select_tab(3);
         press(&mut app, Key::A, &tx).await;
         press(&mut app, Key::Left, &tx).await;
-        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().pack().id, "compact-plus");
+        assert_eq!(
+            crate::theme_adapter::snapshot(&app.res).unwrap().pack().id,
+            "compact-plus"
+        );
         press(&mut app, Key::Down, &tx).await;
         press(&mut app, Key::Down, &tx).await;
         press(&mut app, Key::Left, &tx).await;
-        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().settings()["color_scheme"], "black");
+        assert_eq!(
+            crate::theme_adapter::snapshot(&app.res).unwrap().settings()["color_scheme"],
+            "black"
+        );
         press(&mut app, Key::B, &tx).await;
         crate::theme_adapter::choose(&app.res, None).unwrap();
         app.view.set_should_draw();
@@ -1124,16 +1200,15 @@ mod orbit_proof {
         );
         assert_eq!(fs::read(database_path).unwrap(), db_before);
         assert_eq!(state(&app)["games"], identity);
-        assert!(
-            rx.try_recv().is_err(),
-            "Theme options emit no command"
-        );
+        assert!(rx.try_recv().is_err(), "Theme options emit no command");
         eprintln!("THEME_OPTION_COMMANDS=[]");
         assert_eq!(
             app.res.get::<Stylesheet>().display_style().ui.text_color,
             app.res.get::<Stylesheet>().ui.text_color
         );
-        for path in installed { fs::remove_dir_all(path).unwrap(); }
+        for path in installed {
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1751,8 +1826,12 @@ mod orbit_proof {
                     .lines()
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
-                        if !name.eq_ignore_ascii_case("range") { return None; }
-                        value.trim().strip_prefix("bytes=")
+                        if !name.eq_ignore_ascii_case("range") {
+                            return None;
+                        }
+                        value
+                            .trim()
+                            .strip_prefix("bytes=")
                             .and_then(|v| v.strip_suffix('-'))
                             .and_then(|v| v.parse::<usize>().ok())
                     })
@@ -1776,7 +1855,9 @@ mod orbit_proof {
                 if attempt == 0 {
                     stream.write_all(&body[..65536]).unwrap();
                     chunk_sent.send(()).unwrap();
-                    cancel_ready.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+                    cancel_ready
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
                     let _ = stream.write_all(&body[65536..]);
                 } else {
                     let _ = stream.write_all(&body[offset..]);
@@ -1986,7 +2067,10 @@ mod orbit_proof {
         network::prefill("network-fixture").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while chunk_ready.try_recv().is_err() {
-            assert!(std::time::Instant::now() < deadline, "first download chunk was not sent");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first download chunk was not sent"
+            );
             network::poll();
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }

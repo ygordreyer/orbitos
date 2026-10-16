@@ -28,6 +28,7 @@ pub struct RecentsList {
     rect: Rect,
     list: EntryList<RecentsSort>,
     button_hints: ButtonHints<String>,
+    name_generation: u64,
 }
 
 impl RecentsList {
@@ -75,6 +76,7 @@ impl RecentsList {
             rect,
             list,
             button_hints,
+            name_generation: common::media::name_generation(),
         })
     }
 
@@ -84,9 +86,11 @@ impl RecentsList {
         state: Option<RecentsListState>,
     ) -> Result<Self> {
         let list = if let Some(state) = state {
-            EntryList::load(rect, res.clone(), state)?
+            common::media::with_name_indexes(|| EntryList::load(rect, res.clone(), state))?
         } else {
-            EntryList::new(rect, res.clone(), RecentsSort::LastPlayed)?
+            common::media::with_name_indexes(|| {
+                EntryList::new(rect, res.clone(), RecentsSort::LastPlayed)
+            })?
         };
 
         Self::new(rect, res, list)
@@ -99,6 +103,25 @@ impl RecentsList {
 
 #[async_trait(?Send)]
 impl View for RecentsList {
+    fn update(&mut self, dt: std::time::Duration) {
+        common::media::poll_name_indexes();
+        let generation = common::media::name_generation();
+        if self.name_generation != generation
+            && !self.list.details_active()
+            && !self.list.disc_picker_active()
+        {
+            let state = self.list.save();
+            match common::media::with_name_indexes(|| self.list.sort(state.sort)) {
+                Ok(()) => {
+                    self.list.select(state.selected);
+                    self.name_generation = generation;
+                }
+                Err(error) => log::error!("Refresh recent names: {error:#}"),
+            }
+        }
+        self.list.update(dt);
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,
@@ -196,6 +219,7 @@ impl Sort for RecentsSort {
         _console_mapper: &ConsoleMapper,
         _locale: &Locale,
     ) -> Result<Vec<Entry>> {
+        common::media::defer_cold_sources();
         let games = match self {
             RecentsSort::LastPlayed => database.select_last_played(RECENT_GAMES_LIMIT),
             RecentsSort::MostPlayed => database.select_most_played(RECENT_GAMES_LIMIT),
@@ -226,7 +250,7 @@ impl Sort for RecentsSort {
 
                 let image = LazyImage::from_path(&game.path, game.image);
 
-                Entry::Game(Game {
+                let mut game = Game {
                     name: game.name,
                     full_name,
                     path: game.path,
@@ -240,12 +264,85 @@ impl Sort for RecentsSort {
                     genres: game.genres,
                     favorite: game.favorite,
                     screenshot_path: game.screenshot_path,
-                })
+                };
+                game.hydrate_name();
+                Entry::Game(game)
             })
             .collect())
     }
 
     fn preserve_selection(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn recent_view_update_adopts_cold_names_without_waiting_for_input() {
+        common::media::invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-recents-refresh-{}", std::process::id()));
+        let dir = root.join("Roms/TEST");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Raw.chd");
+        std::fs::write(&path, b"fixture").unwrap();
+        std::fs::write(
+            dir.join("gamelist.xml"),
+            "<gameList><game><path>./Raw.chd</path><name>Hydrated recent</name></game></gameList>",
+        )
+        .unwrap();
+        let database = Database::in_memory().unwrap();
+        assert!(
+            RecentsSort::LastPlayed
+                .entries(&database, &ConsoleMapper::new(), &Locale::new("en-US"))
+                .unwrap()
+                .is_empty()
+        );
+        common::media::check_directory(&dir);
+        assert!(common::media::cached_metadata(&path).name.is_empty());
+        let row: common::database::NewGame = Game::new(path).into();
+        database.update_games(&[row.clone()]).unwrap();
+        database.increment_play_count(&row).unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let rect = Rect::new(0, 54, 640, 376);
+        let list = EntryList::new(rect, res.clone(), RecentsSort::LastPlayed).unwrap();
+        let view = RecentsList::new(rect, res.clone(), list).unwrap();
+        let mut recents = crate::view::recents::Recents::List(Box::new(view));
+        let generation = common::media::name_generation();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            recents.update(std::time::Duration::from_millis(16));
+            let crate::view::recents::Recents::List(view) = &recents else {
+                unreachable!()
+            };
+            let entries = RecentsSort::LastPlayed
+                .entries(&res.get(), &res.get(), &res.get())
+                .unwrap();
+            if view.name_generation != generation && entries[0].name() == "Hydrated recent" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recent view did not refresh"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let entries = RecentsSort::LastPlayed
+            .entries(&res.get(), &res.get(), &res.get())
+            .unwrap();
+        assert_eq!(entries[0].name(), "Hydrated recent");
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
 }

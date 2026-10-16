@@ -62,6 +62,9 @@ thread_local! {
     static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 pub(crate) fn completion_generation() -> u64 { ART_COMPLETIONS.with(std::cell::Cell::get) }
+pub(crate) fn visible_completion() {
+    ART_COMPLETIONS.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
 pub(crate) fn invalidate_art() {
     common::media::invalidate();
     ART_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
@@ -1586,6 +1589,7 @@ struct ArtJob {
     tall: bool,
     task: WarmArt,
     network_paths: Vec<(common::media::Kind, PathBuf)>,
+    container: Option<PathBuf>,
     #[cfg(feature = "perf-bench")]
     trace: Option<String>,
 }
@@ -1643,10 +1647,13 @@ fn worker() -> ArtWorker {
                     | WarmArt::Hero(e) => e,
                 };
                 let path = entry.path().to_owned();
+                common::media::set_game_containers(
+                    job.container.map(|container| (path.clone(), container)),
+                );
                 let metadata = matches!(job.task, WarmArt::Metadata(_));
                 if !job.network_paths.is_empty() {
                     let _ = common::media::prepare_game(&path);
-                    common::media::adopt_paths(&path, job.network_paths);
+                    common::media::adopt_fallback_paths(&path, job.network_paths);
                 }
                 let mut orbit = Orbit::new();
                 orbit.ink_art = job.ink;
@@ -1704,10 +1711,12 @@ impl Orbit {
         ART_WORKER.with(|state| {
             let mut state = state.borrow_mut();
             let worker = state.get_or_insert_with(worker);
-            let mut changed = false;
+            let mut completed = false;
             if let Ok(result) = worker.recv.try_recv() {
                 worker.busy = None;
                 if result.owner == self.worker_id && result.epoch == self.worker_epoch {
+                    #[cfg(all(test, feature = "perf-bench"))]
+                    TEST_ART_COMPLETION.with(|slot| *slot.borrow_mut() = self.pending_task.clone());
                     self.pending_task = None;
                     common::media::adopt_game(result.media);
                     if let Some(cache) = result.sidecars {
@@ -1723,8 +1732,7 @@ impl Orbit {
                         }
                         self.worker_samples.push((result.counts, result.stages));
                     }
-                    ART_COMPLETIONS.with(|generation| generation.set(generation.get().wrapping_add(1)));
-                    changed = true;
+                    completed = true;
                 }
             }
             if worker.busy != Some(self.worker_id) {
@@ -1733,7 +1741,7 @@ impl Orbit {
                 }
             }
             if worker.busy.is_some() {
-                return changed;
+                return completed;
             }
             while let Some(task) = work.pop_front() {
                 let path = match &task {
@@ -1782,6 +1790,7 @@ impl Orbit {
                     crate::network_runtime::art_path(entry.path(), name).map(|p| (kind, p))
                 })
                 .collect();
+                let container = common::media::game_container(entry.path());
                 self.pending_task = Some(task.clone());
                 let job = ArtJob {
                     owner: self.worker_id,
@@ -1793,6 +1802,7 @@ impl Orbit {
                     tall: self.tall_art,
                     task,
                     network_paths,
+                    container,
                     #[cfg(feature = "perf-bench")]
                     trace: common::perf_trace::probe_path(),
                 };
@@ -1801,7 +1811,7 @@ impl Orbit {
                 }
                 break;
             }
-            changed
+            completed
         })
     }
 }
@@ -1815,9 +1825,301 @@ impl Orbit {
 
 #[cfg(test)]
 thread_local! { static TEST_ART_GATE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(all(test, feature = "perf-bench"))]
+thread_local! { static TEST_ART_COMPLETION: std::cell::RefCell<Option<WarmArt>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(all(test, feature = "perf-bench"))]
+pub(crate) fn proof_art_completion() -> Option<WarmArt> {
+    TEST_ART_COMPLETION.with(|slot| slot.borrow_mut().take())
+}
 #[cfg(test)]
 pub(crate) fn proof_art_gate(gate: Option<std::sync::Arc<std::sync::Barrier>>) {
     TEST_ART_GATE.with(|slot| *slot.borrow_mut() = gate);
+}
+
+#[cfg(test)]
+mod network_media_tests {
+    use super::*;
+    use crate::{
+        consoles::ConsoleMapper,
+        entry::{Sort, directory::Directory, game::Game},
+        network_library::{Catalog, NetworkGame, Payload},
+        view::{details::Details, recents::RecentsSort},
+    };
+    use common::{database::Database, locale::Locale, media::Kind};
+
+    #[test]
+    fn network_directory_metadata_names_and_worker_art_preserve_gamelist() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("allium-network-media-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::remove_file(self.0.join(".allium/state/network-library/config.json"));
+                crate::network_runtime::initialize(self.0.clone()).unwrap();
+                std::fs::remove_dir_all(&self.0).unwrap();
+                common::media::invalidate();
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let system = root.join("Roms/PS");
+        let state = root.join(".allium/state/network-library");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(system.join("art")).unwrap();
+        std::fs::create_dir_all(system.join("Imgs")).unwrap();
+        for (file, width, height, color) in [
+            (
+                "art/cover.png",
+                140,
+                140,
+                tiny_skia::Color::from_rgba8(255, 0, 0, 255),
+            ),
+            (
+                "art/logo.png",
+                400,
+                175,
+                tiny_skia::Color::from_rgba8(0, 255, 0, 255),
+            ),
+            (
+                "art/hero.png",
+                360,
+                210,
+                tiny_skia::Color::from_rgba8(255, 255, 0, 255),
+            ),
+            (
+                "Imgs/Dir.png",
+                140,
+                140,
+                tiny_skia::Color::from_rgba8(0, 0, 255, 255),
+            ),
+            (
+                "Imgs/Dir.orbit.png",
+                101,
+                101,
+                tiny_skia::Color::from_rgba8(0, 0, 255, 255),
+            ),
+            (
+                "Imgs/Dir.hero.png",
+                360,
+                210,
+                tiny_skia::Color::from_rgba8(0, 0, 255, 255),
+            ),
+        ] {
+            let mut image = Pixmap::new(width, height).unwrap();
+            image.fill(color);
+            image.save_png(system.join(file)).unwrap();
+        }
+        let revision = "b".repeat(64);
+        let descriptor = NetworkGame {
+            id: "directory".into(),
+            display_title: "Catalog title".into(),
+            platform: "PS".into(),
+            bundle_revision: revision.clone(),
+            game_path: "Roms/PS/Dir/Dir.cue".into(),
+            cache_path: "Roms/PS/Dir".into(),
+            launch_path: "Roms/PS/Dir/Dir.cue".into(),
+            install_kind: "directory".into(),
+            files: [("cue", "Dir.cue", "cue"), ("bin", "Dir.bin", "rom")]
+                .into_iter()
+                .map(|(id, file, role)| Payload {
+                    id: id.into(),
+                    relative_path: file.into(),
+                    bytes: 1,
+                    sha256: "c".repeat(64),
+                    role: role.into(),
+                    http_route: format!("/v1/files/directory/{revision}/{id}"),
+                })
+                .collect(),
+            discs: vec![],
+        };
+        let catalog = Catalog {
+            version: 1,
+            library_id: "fixture".into(),
+            revision: "a".repeat(64),
+            games: vec![descriptor.clone()],
+        };
+        catalog.validate().unwrap();
+        std::fs::write(
+            state.join("catalog.json"),
+            serde_json::to_vec(&catalog).unwrap(),
+        )
+        .unwrap();
+        let locale = Locale::new("en-US");
+        let mapper = ConsoleMapper::new();
+        for marquee in [true, false] {
+            common::media::invalidate();
+            std::fs::create_dir_all(system.join("Dir")).unwrap();
+            std::fs::write(system.join("Dir/Dir.cue"), b"FILE \"Dir.bin\" BINARY\n").unwrap();
+            std::fs::write(system.join("Dir/Dir.bin"), b"fixture").unwrap();
+            std::fs::write(system.join("gamelist.xml"), format!("<gameList><game><path>./Dir/</path><name>Gamelist directory name</name><releasedate>19981203T000000</releasedate><desc>Directory synopsis</desc><image>./art/cover.png</image><fanart>./art/hero.png</fanart>{}</game></gameList>", if marquee { "<marquee>./art/logo.png</marquee>" } else { "" })).unwrap();
+            let db = Database::in_memory().unwrap();
+            let raw = Game::new(root.join(&descriptor.game_path));
+            let row: common::database::NewGame = raw.clone().into();
+            db.update_games(&[row.clone()]).unwrap();
+            db.increment_play_count(&row).unwrap();
+            common::media::check_directory(&system.join("Dir"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let recents = loop {
+                let recents = RecentsSort::LastPlayed
+                    .entries(&db, &mapper, &locale)
+                    .unwrap();
+                if recents[0].name() == "Gamelist directory name" {
+                    break recents;
+                }
+                common::media::poll_name_indexes();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cold recent index did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert_eq!(recents[0].name(), "Gamelist directory name");
+            assert_eq!(db.select_game(&raw.path).unwrap().unwrap().name, row.name);
+            let local = Directory::new(system.clone())
+                .entries(&db, &mapper, &locale)
+                .unwrap();
+            assert!(
+                local.iter().any(
+                    |e| e.path() == system.join("Dir") && e.name() == "Gamelist directory name"
+                )
+            );
+            std::fs::remove_dir_all(system.join("Dir")).unwrap();
+            std::fs::write(
+                state.join("config.json"),
+                r#"{"version":1,"library_id":"fixture","address":"127.0.0.1:9"}"#,
+            )
+            .unwrap();
+            crate::network_runtime::initialize(root.clone()).unwrap();
+            assert!(crate::network_runtime::registered(&raw.path));
+            common::media::invalidate();
+            let mut search = Vec::new();
+            crate::network_runtime::search("gAmElIsT dIrEcToRy", &mut search);
+            assert!(search.is_empty());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while search.is_empty() {
+                crate::network_runtime::poll();
+                crate::network_runtime::search("gAmElIsT dIrEcToRy", &mut search);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cold search index did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(search.len(), 1);
+            assert_eq!(search[0].path(), raw.path);
+            assert_eq!(search[0].name(), "Gamelist directory name");
+            assert_eq!(db.select_game(&raw.path).unwrap().unwrap().name, row.name);
+            let mut stored = raw.clone();
+            stored.favorite = true;
+            stored.rating = Some(8);
+            stored.developer = Some("Database studio".into());
+            let mut existing = vec![Entry::Game(stored.clone())];
+            crate::network_runtime::search(&raw.name, &mut existing);
+            assert_eq!(existing.len(), 1);
+            let Entry::Game(hydrated) = &existing[0] else {
+                panic!("game")
+            };
+            let mut expected = stored;
+            expected.name = "Gamelist directory name".into();
+            expected.full_name = expected.name.clone();
+            assert_eq!(hydrated, &expected);
+            crate::network_runtime::search("Catalog title", &mut search);
+            assert_eq!(search.len(), 1);
+            for (kind, suffix) in [
+                ("stock", ".png"),
+                ("covers", ".orbit.png"),
+                ("heroes", ".hero.png"),
+            ] {
+                assert_eq!(
+                    crate::network_runtime::art_path(&raw.path, kind),
+                    Some(system.join(format!("Imgs/Dir{suffix}")))
+                );
+            }
+            for kind in ["logos", "screenshots", "covers-tall", "unknown"] {
+                assert!(crate::network_runtime::art_path(&raw.path, kind).is_none());
+            }
+            let library = Directory::new(system.clone())
+                .entries(&db, &mapper, &locale)
+                .unwrap();
+            let entry = library
+                .iter()
+                .find(|e| e.path() == raw.path)
+                .unwrap()
+                .clone();
+            assert_eq!(entry.name(), "Gamelist directory name");
+            assert!(!library.iter().any(|e| e.path() == system.join("Dir")));
+            let recents = RecentsSort::LastPlayed
+                .entries(&db, &mapper, &locale)
+                .unwrap();
+            assert_eq!(recents[0].name(), "Gamelist directory name");
+            common::media::invalidate();
+            let mut orbit = Orbit::new();
+            orbit.set_ink_art(true);
+            let mut work = VecDeque::from([
+                WarmArt::Metadata(entry.clone()),
+                WarmArt::Cover(entry.clone()),
+                WarmArt::Logo(entry.clone()),
+                WarmArt::Hero(entry.clone()),
+            ]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !work.is_empty() || orbit.art_pending() {
+                orbit.warm_art_step(&mut work);
+                assert!(std::time::Instant::now() < deadline, "art worker timed out");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let art = orbit.theme_art(std::slice::from_ref(&entry), 0, 0, 1);
+            if marquee {
+                let logo = art.selected_logo.unwrap();
+                assert_eq!((logo.width(), logo.height()), (400, 175));
+                assert_eq!(logo.pixel(0, 0).unwrap().green(), 255);
+            } else {
+                assert!(art.selected_logo.is_none());
+            }
+            assert_eq!(art.selected_cover.unwrap().pixel(0, 0).unwrap().red(), 255);
+            assert_eq!(art.selected_hero.unwrap().pixel(0, 0).unwrap().red(), 255);
+            assert_eq!(
+                common::media::cached_resolve(&raw.path, Kind::PreparedCover),
+                Some(system.join("./art/cover.png"))
+            );
+            assert_eq!(
+                common::media::cached_metadata(&raw.path).name,
+                "Gamelist directory name"
+            );
+            for details in [
+                Details::cached(&raw, "PlayStation"),
+                Details::new(&raw, "PlayStation"),
+            ] {
+                assert!(details.metadata.contains("1998"));
+                assert_eq!(details.blurb, "Directory synopsis");
+            }
+            if !marquee {
+                std::fs::remove_file(system.join("art/cover.png")).unwrap();
+                std::fs::remove_file(system.join("art/hero.png")).unwrap();
+                common::media::invalidate();
+                let mut work = VecDeque::from([
+                    WarmArt::Cover(entry.clone()),
+                    WarmArt::Hero(entry.clone()),
+                    WarmArt::Logo(entry.clone()),
+                ]);
+                while !work.is_empty() || orbit.art_pending() {
+                    orbit.warm_art_step(&mut work);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "art fallback timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let art = orbit.theme_art(&[entry], 0, 0, 1);
+                assert_eq!(art.selected_cover.unwrap().pixel(0, 0).unwrap().blue(), 255);
+                assert_eq!(art.selected_hero.unwrap().pixel(0, 0).unwrap().blue(), 255);
+                assert!(art.selected_logo.is_none());
+            }
+            std::fs::remove_file(state.join("config.json")).unwrap();
+            crate::network_runtime::initialize(root.clone()).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

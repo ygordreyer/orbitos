@@ -30,6 +30,7 @@ pub struct Games {
     res: Resources,
     list: EntryList<GamesSort>,
     button_hints: ButtonHints<String>,
+    name_generation: u64,
 }
 
 impl Games {
@@ -95,6 +96,7 @@ impl Games {
             res: res.clone(),
             list,
             button_hints,
+            name_generation: common::media::name_generation(),
         })
     }
 
@@ -138,6 +140,33 @@ impl Games {
 
 #[async_trait(?Send)]
 impl View for Games {
+    fn update(&mut self, dt: std::time::Duration) {
+        common::media::poll_name_indexes();
+        let generation = common::media::name_generation();
+        if self.name_generation != generation
+            && !self.list.interaction_active()
+            && !self.list.details_active()
+            && !self.list.disc_picker_active()
+        {
+            let state = self.list.save();
+            match common::media::with_name_indexes(|| {
+                EntryList::load(self.rect, self.res.clone(), state)
+            }) {
+                Ok(mut list) => {
+                    if crate::theme_adapter::legacy_orbit(&self.res) {
+                        list.enable_orbit();
+                    }
+                    self.list = list;
+                    self.name_generation = generation;
+                    self.set_should_draw();
+                }
+                Err(error) => log::error!("Refresh Games names: {error:#}"),
+            }
+        }
+        self.list.update(dt);
+        self.button_hints.update(dt);
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,
@@ -410,5 +439,191 @@ impl Sort for GamesSort {
 
     fn preserve_selection(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::entry::game::Game;
+
+    #[tokio::test]
+    async fn metadata_refresh_waits_for_context_menu_to_close() {
+        common::media::invalidate();
+        common::media::defer_cold_sources();
+        let root =
+            std::env::temp_dir().join(format!("allium-games-menu-refresh-{}", std::process::id()));
+        let dir = root.join("Roms/PS");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [dir.join("Match A.chd"), dir.join("Match B.chd")];
+        let database = Database::in_memory().unwrap();
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+            let mut game = crate::entry::game::Game::new(path.clone());
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            database.update_games(&[game.into()]).unwrap();
+        }
+        std::fs::write(root.join("Roms/gamelist.xml"),
+            "<gameList><game><path>PS/Match A.chd</path><name>Zulu</name></game><game><path>PS/Match B.chd</path><name>Alpha</name></game></gameList>").unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        let mut mapper = ConsoleMapper::new();
+        mapper.load_config().unwrap();
+        assert!(!mapper.get_console(&paths[0]).unwrap().cores.is_empty());
+        map.insert(mapper);
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let list = common::media::with_name_indexes(|| {
+            EntryList::new(
+                Rect::new(0, 54, 640, 376),
+                res.clone(),
+                GamesSort::Alphabetical(Directory::new(dir)),
+            )
+        })
+        .unwrap();
+        let mut view = Games::new(Rect::new(0, 54, 640, 376), res, list).unwrap();
+        let before = view.list.save();
+        let generation = view.name_generation;
+        let (send, mut recv) = tokio::sync::mpsc::channel(16);
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Select),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        assert!(view.list.interaction_active());
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Down),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        view.handle_key_event(
+            KeyEvent::Pressed(Key::Right),
+            send.clone(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            common::media::poll_name_indexes();
+            let _ = common::media::cached_name(&paths[0]);
+            if common::media::cached_name(&paths[0]).as_deref() == Some("Zulu") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index never completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        view.update(std::time::Duration::from_millis(16));
+        assert!(
+            view.list.interaction_active(),
+            "background refresh closed context menu"
+        );
+        assert_eq!(view.name_generation, generation);
+        assert_eq!(view.list.save().selected, before.selected);
+        assert_eq!(view.list.save().selected_path, before.selected_path);
+        view.handle_key_event(KeyEvent::Pressed(Key::Select), send, &mut VecDeque::new())
+            .await
+            .unwrap();
+        assert!(!view.list.interaction_active());
+        assert!(matches!(recv.try_recv(), Ok(Command::Redraw)));
+        assert!(
+            recv.try_recv().is_err(),
+            "menu cancellation launched a game"
+        );
+        view.update(std::time::Duration::from_millis(16));
+        assert_eq!(view.name_generation, common::media::name_generation());
+        assert_eq!(view.list.save().selected_path.as_ref(), Some(&paths[0]));
+        assert_eq!(
+            view.list.save().selected,
+            1,
+            "names did not refresh after menu closed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
+    #[test]
+    fn games_update_retries_cold_sources_and_preserves_nested_selection_by_path() {
+        common::media::invalidate();
+        common::media::defer_cold_sources();
+        let root =
+            std::env::temp_dir().join(format!("allium-games-refresh-{}", std::process::id()));
+        let system = root.join("Roms/PS");
+        let nested = system.join("Pack");
+        std::fs::create_dir_all(&nested).unwrap();
+        let paths = [nested.join("RawA.chd"), nested.join("RawB.chd")];
+        let database = Database::in_memory().unwrap();
+        for path in &paths {
+            std::fs::write(path, b"fixture").unwrap();
+            let mut game = Game::new(path.clone());
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            database.update_games(&[game.into()]).unwrap();
+        }
+        std::fs::write(root.join("Roms/gamelist.xml"),
+            "<gameList><game><path>PS/Pack/RawA.chd</path><name>Zulu</name></game><game><path>PS/Pack/RawB.chd</path><name>Alpha</name></game></gameList>").unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let state = GamesState {
+            sort: GamesSort::Alphabetical(Directory::new(system)),
+            selected: 0,
+            selected_path: Some(nested.clone()),
+            child: Some(Box::new(GamesState {
+                sort: GamesSort::Alphabetical(Directory::new(nested.clone())),
+                selected: 0,
+                selected_path: Some(paths[0].clone()),
+                child: None,
+            })),
+        };
+        let list = common::media::with_name_indexes(|| {
+            EntryList::load(Rect::new(0, 54, 640, 376), res.clone(), state)
+        })
+        .unwrap();
+        let mut view = Games::new(Rect::new(0, 54, 640, 376), res, list).unwrap();
+        assert_eq!(view.save().child.unwrap().selected, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            view.update(std::time::Duration::from_millis(16));
+            let state = view.save();
+            assert_eq!(state.selected_path.as_ref(), Some(&nested));
+            let child = state.child.unwrap();
+            assert_eq!(child.sort.directory().path, nested);
+            assert_eq!(child.selected_path.as_ref(), Some(&paths[0]));
+            if child.selected == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Games entries never rehydrated and reordered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            common::media::cached_name(&paths[0]).as_deref(),
+            Some("Zulu")
+        );
+        assert_eq!(
+            common::media::cached_name(&paths[1]).as_deref(),
+            Some("Alpha")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
 }

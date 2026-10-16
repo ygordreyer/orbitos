@@ -80,30 +80,27 @@ pub fn initialize() {
 }
 fn install(path: &str) -> std::io::Result<()> {
     let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let bytes = file.metadata()?.len();
-    if bytes < LOG_LIMIT {
-        TRACE.with(|trace| {
-            *trace.borrow_mut() = Some(Trace {
-                file,
-                path: path.into(),
-                counts: [0; 14],
-                stages: [0; 8],
-                stage_begin: [0; 8],
-                stage_end: [0; 8],
-                cpu: [0; 8],
-                hits: [0; 3],
-                started: None,
-                render_us: 0,
-                attempt: 0,
-                wake_us: 0,
-                input_us: 0,
-                damage_rects: 0,
-                damage_pixels: 0,
-                render_reason: "none",
-                present_reason: "none",
-            })
-        });
-    }
+    TRACE.with(|trace| {
+        *trace.borrow_mut() = Some(Trace {
+            file,
+            path: path.into(),
+            counts: [0; 14],
+            stages: [0; 8],
+            stage_begin: [0; 8],
+            stage_end: [0; 8],
+            cpu: [0; 8],
+            hits: [0; 3],
+            started: None,
+            render_us: 0,
+            attempt: 0,
+            wake_us: 0,
+            input_us: 0,
+            damage_rects: 0,
+            damage_pixels: 0,
+            render_reason: "none",
+            present_reason: "none",
+        })
+    });
     Ok(())
 }
 fn thread_cpu_ns() -> u64 {
@@ -261,7 +258,7 @@ pub fn drawn_frame() {
 }
 
 fn append_bounded(file: &mut File, line: &[u8]) -> std::io::Result<()> {
-    append_line(file, line, false)
+    append_line(file, line, true)
 }
 fn append_line(file: &mut File, line: &[u8], rolling: bool) -> std::io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -413,10 +410,11 @@ mod tests {
             drawn_frame();
         }
         assert!(std::fs::metadata(&path).unwrap().len() <= LOG_LIMIT);
-        assert!(TRACE.with(|trace| trace.borrow().is_none()));
+        assert!(TRACE.with(|trace| trace.borrow().is_some()));
         for line in std::fs::read_to_string(&path).unwrap().lines() {
             serde_json::from_str::<serde_json::Value>(line).unwrap();
         }
+        TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
     #[test]
@@ -430,12 +428,51 @@ mod tests {
         }
         let data = std::fs::read_to_string(&path).unwrap();
         assert!(data.len() as u64 <= LOG_LIMIT);
-        assert!(TRACE.with(|trace| trace.borrow().is_none()));
+        assert!(TRACE.with(|trace| trace.borrow().is_some()));
         for line in data.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(value["menu_phase"], "first_frame_prepare");
             assert!(value["wall_us"].is_number() && value["cpu_us"].is_number());
         }
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn full_existing_frame_log_installs_and_rolls_repeatedly() {
+        let path =
+            std::env::temp_dir().join(format!("allium-trace-full-{}.log", std::process::id()));
+        let file = File::create(&path).unwrap();
+        file.set_len(LOG_LIMIT + 1).unwrap();
+        drop(file);
+        install(path.to_str().unwrap()).unwrap();
+        let mut previous = LOG_LIMIT + 1;
+        let mut rollovers = 0;
+        for _ in 0..2000 {
+            begin_render();
+            drawn_frame();
+            let length = std::fs::metadata(&path).unwrap().len();
+            assert!(length <= LOG_LIMIT);
+            if length < previous {
+                rollovers += 1;
+            }
+            previous = length;
+        }
+        assert!(rollovers >= 3);
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(data.ends_with('\n'));
+        let lines: Vec<serde_json::Value> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.last().unwrap()["render_attempt"], 2000);
+        assert!(
+            lines
+                .windows(2)
+                .all(|pair| pair[1]["render_attempt"].as_u64().unwrap()
+                    == pair[0]["render_attempt"].as_u64().unwrap() + 1)
+        );
+        assert!(TRACE.with(|t| t.borrow().is_some()));
+        TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
     #[test]
@@ -487,8 +524,12 @@ mod tests {
             .set_len(LOG_LIMIT)
             .unwrap();
         drawn_frame();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), LOG_LIMIT);
-        assert!(TRACE.with(|t| t.borrow().is_none()));
+        assert!(std::fs::metadata(&path).unwrap().len() < LOG_LIMIT);
+        assert!(TRACE.with(|t| t.borrow().is_some()));
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(data.ends_with('\n'));
+        serde_json::from_str::<serde_json::Value>(data.trim()).unwrap();
+        TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
 }
