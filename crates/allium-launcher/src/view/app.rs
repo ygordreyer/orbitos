@@ -453,6 +453,7 @@ where
     }
 
     pub(crate) fn idle_media_step(&mut self) -> bool {
+        let completion = super::orbit::completion_generation();
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             return false;
         };
@@ -466,7 +467,7 @@ where
                 _ => false,
             }
         };
-        if worked {
+        if completion != super::orbit::completion_generation() {
             self.theme_dirty = true;
         }
         worked

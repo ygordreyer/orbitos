@@ -466,6 +466,7 @@ fn load_synopses(parent: &Path, source: &Path) -> CachedValue {
 }
 const METADATA_BYTES: usize = 256 * 1024;
 const METADATA_SOURCES: usize = 16;
+#[derive(Clone)]
 enum CachedValue {
     Synopses(std::collections::BTreeMap<PathBuf, String>),
     Catalog(MetadataCatalog),
@@ -499,13 +500,14 @@ fn source_identity(path: &Path) -> Option<SourceIdentity> {
         metadata.mode(),
     ))
 }
+#[derive(Clone)]
 struct CachedSource {
     path: PathBuf,
     identity: Option<SourceIdentity>,
     value: CachedValue,
     bytes: usize,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MetadataCache {
     sources: std::collections::VecDeque<CachedSource>,
     bytes: usize,
@@ -558,7 +560,7 @@ pub(crate) fn invalidate_metadata() {
     crate::view::orbit::invalidate_art();
 }
 const SIDECAR_LIMIT: usize = 128 * 1024;
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct MetadataCatalog {
     schema_version: u32,
     platform: String,
@@ -1172,4 +1174,12 @@ mod media_contract_tests {
         assert!(missing.metadata.contains("Year unavailable"));
         assert!(missing.full_text.contains("Synopsis unavailable"));
     }
+}
+
+pub(crate) struct WarmCache(MetadataCache);
+pub(crate) fn warm_cache() -> WarmCache {
+    METADATA_CACHE.with(|cache| WarmCache(cache.borrow().clone()))
+}
+pub(crate) fn adopt_warm_cache(cache: WarmCache) {
+    METADATA_CACHE.with(|slot| *slot.borrow_mut() = cache.0);
 }

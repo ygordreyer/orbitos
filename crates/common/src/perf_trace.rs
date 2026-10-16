@@ -43,7 +43,11 @@ pub enum Count {
 }
 struct Trace {
     counts: [u64; 14],
+    stages: [u64; 8],
+    stage_begin: [u64; 8],
+    stage_end: [u64; 8],
     file: File,
+    path: String,
     cpu: [u64; 8],
     hits: [u64; 3],
     started: Option<Instant>,
@@ -81,7 +85,11 @@ fn install(path: &str) -> std::io::Result<()> {
         TRACE.with(|trace| {
             *trace.borrow_mut() = Some(Trace {
                 file,
+                path: path.into(),
                 counts: [0; 14],
+                stages: [0; 8],
+                stage_begin: [0; 8],
+                stage_end: [0; 8],
                 cpu: [0; 8],
                 hits: [0; 3],
                 started: None,
@@ -126,6 +134,9 @@ pub fn phase(phase: Phase) -> PhaseGuard {
         let trace = trace.as_mut()?;
         if matches!(phase, Phase::Input) {
             trace.input_us = monotonic_us();
+            trace.stages = [0; 8];
+            trace.stage_begin = [0; 8];
+            trace.stage_end = [0; 8];
         }
         Some(Timing {
             start: thread_cpu_ns(),
@@ -215,6 +226,8 @@ pub fn drawn_frame() {
             return;
         };
         let line = serde_json::json!({
+            "thread": std::thread::current().name(),
+            "stages": stage_values(trace),
             "frontend_io_ops": FRONTEND_IO_OPS.with(std::cell::Cell::get),
             "text_hits":trace.counts[0], "text_misses":trace.counts[1], "text_evictions":trace.counts[2],
             "blit_map_builds":trace.counts[3], "copied_pixels":trace.counts[4], "flushed_pixels":trace.counts[5],
@@ -653,7 +666,7 @@ pub fn start_probe(path: &str) {
 pub fn probe_counts() -> serde_json::Value {
     TRACE.with(|t| {
         let t = t.borrow(); let t = t.as_ref().unwrap();
-        serde_json::json!({"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
+        serde_json::json!({"stages":stage_values(t),"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
             "converted_pixels":t.counts[7],"flushed_pixels":t.counts[5],
             "compared_pixels":t.counts[8],"scanned_pixels":t.counts[9],"changed_pixels":t.counts[10],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
@@ -672,4 +685,127 @@ pub fn frontend_io_op() {
 #[cfg(any(test, feature = "perf-bench"))]
 pub fn frontend_io_ops() -> u64 {
     FRONTEND_IO_OPS.with(std::cell::Cell::get)
+}
+
+/// Inclusive wall times and process-wide monotonic endpoints for one input/frame.
+#[derive(Clone, Copy)]
+pub enum Stage {
+    Selection,
+    SelectedInfo,
+    ArtworkLookup,
+    Decode,
+    Layout,
+    Raster,
+    Present,
+    DiskCache,
+}
+pub struct StageGuard {
+    stage: Stage,
+    start: Option<u64>,
+}
+pub fn stage(stage: Stage) -> StageGuard {
+    let start = TRACE.with(|state| {
+        let mut state = state.borrow_mut();
+        let trace = state.as_mut()?;
+        let now = monotonic_us();
+        if trace.stage_begin[stage as usize] == 0 {
+            trace.stage_begin[stage as usize] = now;
+        }
+        Some(now)
+    });
+    StageGuard { stage, start }
+}
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            let end = monotonic_us();
+            TRACE.with(|state| {
+                if let Some(trace) = state.borrow_mut().as_mut() {
+                    trace.stages[self.stage as usize] += end.saturating_sub(start);
+                    trace.stage_end[self.stage as usize] = end;
+                }
+            });
+        }
+    }
+}
+fn stage_values(trace: &Trace) -> serde_json::Value {
+    let mut stages = serde_json::Map::new();
+    for (i, name) in [
+        "selection",
+        "selected_info",
+        "artwork_lookup",
+        "decode",
+        "layout",
+        "raster",
+        "present",
+        "disk_cache",
+    ]
+    .iter()
+    .enumerate()
+    {
+        stages.insert((*name).into(), serde_json::json!({"wall_us":trace.stages[i],"begin_monotonic_us":trace.stage_begin[i],"end_monotonic_us":trace.stage_end[i]}));
+    }
+    serde_json::json!({"input_received_monotonic_us":trace.input_us,"phases":stages})
+}
+
+#[cfg(any(test, feature = "perf-bench"))]
+pub fn probe_counts_if_enabled() -> serde_json::Value {
+    if TRACE.with(|t| t.borrow().is_some()) {
+        probe_counts()
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+#[cfg(any(test, feature = "perf-bench"))]
+pub fn probe_path() -> Option<String> {
+    TRACE.with(|state| state.borrow().as_ref().map(|trace| trace.path.clone()))
+}
+
+#[cfg(test)]
+mod latency_stage_tests {
+    use super::*;
+    #[test]
+    fn right_trace_preserves_input_stages_across_begin_render() {
+        let path =
+            std::env::temp_dir().join(format!("allium-right-stages-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        {
+            let _input = phase(Phase::Input);
+            let _selection = stage(Stage::Selection);
+        }
+        begin_render();
+        for which in [
+            Stage::SelectedInfo,
+            Stage::ArtworkLookup,
+            Stage::Layout,
+            Stage::Raster,
+            Stage::Present,
+        ] {
+            let _stage = stage(which);
+        }
+        drawn_frame();
+        let row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        let input = row["stages"]["input_received_monotonic_us"]
+            .as_u64()
+            .unwrap();
+        let phases = &row["stages"]["phases"];
+        assert!(input > 0);
+        for name in [
+            "selection",
+            "selected_info",
+            "artwork_lookup",
+            "layout",
+            "raster",
+            "present",
+        ] {
+            let start = phases[name]["begin_monotonic_us"].as_u64().unwrap();
+            let end = phases[name]["end_monotonic_us"].as_u64().unwrap();
+            assert!(start >= input && end >= start, "{name}: {row}");
+        }
+        assert_eq!(phases["decode"]["wall_us"], 0);
+        TRACE.with(|trace| *trace.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
 }

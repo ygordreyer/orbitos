@@ -7,6 +7,9 @@ use std::{
 };
 use tiny_skia::Pixmap;
 
+// Shared source pixels, not the number of component references to those pixels.
+pub const ART_INPUT_BYTES: usize = 7 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Focus {
     pub component: String,
@@ -225,6 +228,7 @@ impl FrameInputs {
             ensure!(key.chars().count() <= 12, "Keyboard label too long");
         }
         let mut art_bytes = 0usize;
+        let mut art_sources = BTreeSet::new();
         for image in self
             .art
             .selected_cover
@@ -238,10 +242,12 @@ impl FrameInputs {
                 image.width() <= 640 && image.height() <= 480,
                 "Game art dimensions exceed limit"
             );
-            art_bytes += image.data().len();
+            if art_sources.insert(Arc::as_ptr(image)) {
+                art_bytes += image.data().len();
+            }
         }
         ensure!(
-            self.art.entries.len() <= 16 && art_bytes <= 4 * 1024 * 1024,
+            self.art.entries.len() <= 16 && art_bytes <= ART_INPUT_BYTES,
             "Game art input budget exceeded"
         );
         if !self.focus.component.is_empty() {

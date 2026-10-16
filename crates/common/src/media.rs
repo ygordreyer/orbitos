@@ -47,6 +47,7 @@ struct Cache {
     records: BTreeMap<PathBuf, SharedMetadata>,
     order: std::collections::VecDeque<(PathBuf, usize)>,
     bytes: usize,
+    budget: Option<usize>,
     missing: std::collections::BTreeSet<(PathBuf, PathBuf)>,
     paths: BTreeMap<(PathBuf, Kind), Option<PathBuf>>,
     logos: BTreeMap<PathBuf, Option<std::sync::Arc<tiny_skia::Pixmap>>>,
@@ -77,10 +78,11 @@ impl Cache {
             .iter()
             .map(|s| s.capacity())
             .sum::<usize>();
-        if bytes > METADATA_BUDGET {
+        let budget = self.budget.unwrap_or(METADATA_BUDGET);
+        if bytes > budget {
             return;
         }
-        while self.bytes + bytes > METADATA_BUDGET {
+        while self.bytes + bytes > budget {
             let (old, bytes) = self.order.pop_front().unwrap();
             self.records.remove(&old);
             self.bytes -= bytes;
@@ -668,4 +670,61 @@ mod tests {
         assert_eq!(logo.width() * 24, logo.height() * 96);
         assert!(load_logo(&fixture().join("Missing.sfc")).is_none());
     }
+}
+
+/// A worker's resolved paths and shared record, adopted without touching storage.
+pub struct PreparedGame {
+    path: PathBuf,
+    metadata: SharedMetadata,
+    paths: Vec<(Kind, Option<PathBuf>)>,
+}
+pub fn prepare_game(path: &Path) -> PreparedGame {
+    let metadata = metadata(path);
+    let paths = [
+        Kind::Cover,
+        Kind::TallCover,
+        Kind::Logo,
+        Kind::Background,
+        Kind::PreparedCover,
+    ]
+    .into_iter()
+    .map(|kind| (kind, resolve(path, kind)))
+    .collect();
+    PreparedGame {
+        path: path.into(),
+        metadata,
+        paths,
+    }
+}
+pub fn adopt_game(game: PreparedGame) {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = normalize(&game.path);
+        if !cache.records.contains_key(&key) {
+            cache.insert(key, (*game.metadata).clone());
+        }
+        for (kind, path) in game.paths {
+            cache.paths.insert((game.path.clone(), kind), path);
+        }
+    });
+}
+/// Worker-local policy. Call after invalidation as well, which resets the cache.
+pub fn set_metadata_budget(bytes: usize) {
+    CACHE.with(|cache| cache.borrow_mut().budget = Some(bytes.min(METADATA_BUDGET)));
+}
+pub fn clear_prepared_paths() {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.paths.clear();
+        cache.missing.clear();
+    });
+}
+
+pub fn adopt_paths(game: &Path, paths: impl IntoIterator<Item = (Kind, PathBuf)>) {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for (kind, path) in paths {
+            cache.paths.insert((game.into(), kind), Some(path));
+        }
+    });
 }

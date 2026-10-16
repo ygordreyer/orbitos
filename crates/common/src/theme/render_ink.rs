@@ -362,8 +362,10 @@ impl PreparedFrame {
             Some(pixels)
         });
         let pixels = if let Some(p) = cached {
+            crate::perf_trace::count(crate::perf_trace::Count::TextHit, 1);
             p
         } else {
+            crate::perf_trace::count(crate::perf_trace::Count::TextMiss, 1);
             let lines = if guide {
                 ty.guide_lines(&value, rect.2, ty.guide_line_count(rect.3, count))
             } else {

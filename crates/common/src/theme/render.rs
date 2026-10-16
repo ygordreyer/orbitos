@@ -249,6 +249,7 @@ impl PreparedFrame {
         input: &FrameInputs,
         previous: Option<Self>,
     ) -> Result<Self> {
+        let _stage = crate::perf_trace::stage(crate::perf_trace::Stage::Raster);
         input.validate(&theme)?;
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
         #[cfg(feature = "perf-bench")]

@@ -155,7 +155,8 @@ async fn dl17b_each_warm_step_preserves_prepared_pixels_and_input_targets() {
     let scene = app.view.proof_navigation_scene();
     for direction in [1, -1] {
         let mut work = None;
-        for step in 0..100 {
+        let started = std::time::Instant::now();
+        for step in 0.. {
             let finished = app
                 .view
                 .prewarm_navigation_step(&mut work, direction)
@@ -167,8 +168,30 @@ async fn dl17b_each_warm_step_preserves_prepared_pixels_and_input_targets() {
             if finished {
                 break;
             }
-            assert!(step < 99, "warm plan did not finish");
-            tokio::task::yield_now().await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "warm plan did not finish");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn pending_artwork_does_not_redraw_until_worker_completion() {
+    let (_reset,mut app)=launcher_fixture();
+    let mut overlay=false;
+    app.present_frame(false,&mut overlay).await.unwrap();
+    assert!(!app.view.should_draw());
+    let gate=std::sync::Arc::new(std::sync::Barrier::new(2));
+    crate::view::orbit::proof_art_gate(Some(gate.clone()));
+    assert!(app.view.idle_media_step());
+    crate::view::orbit::proof_art_gate(None);
+    let waiting_draw=app.view.should_draw();
+    gate.wait();
+    assert!(!waiting_draw,"a pending decode invalidated the prepared frame");
+    let started=std::time::Instant::now();
+    while app.view.idle_media_step() {
+        assert!(started.elapsed()<std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(app.view.should_draw(),"completed artwork must invalidate the scene");
 }

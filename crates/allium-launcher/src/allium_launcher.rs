@@ -232,6 +232,13 @@ impl AlliumLauncher<DefaultPlatform> {
                         if self.view.prewarm_navigation_step(&mut warm_work,if warm_steps==0 {1} else {-1})? {warm_steps+=1;self.view.set_should_draw();}
                     }
                     if media_poll.elapsed()>=std::time::Duration::from_secs(1) {
+                        let marker = if crate::media_refresh::pending() { Ok(Some(true)) } else { crate::media_refresh::marker_ready(&ALLIUM_SD_ROOT) };
+                        match marker {
+                            Ok(None) => continue,
+                            Ok(Some(false)) => { media_poll=Instant::now(); continue; },
+                            Err(error) => { warn!("Media marker: {error:#}"); media_poll=Instant::now(); continue; },
+                            Ok(Some(true)) => {},
+                        }
                         match crate::media_refresh::consume(&ALLIUM_SD_ROOT,&self.res.get::<Database>(),&self.res.get::<ConsoleMapper>(),&self.res.get::<Locale>()) {
                             Ok(true)=>{
                                 self.view.save()?;
@@ -325,6 +332,7 @@ impl AlliumLauncher<DefaultPlatform> {
         if drawn || network_dirty {
             crate::network_runtime::trace_loop("frame_drawn", "compose");
             {
+                let _stage = common::perf_trace::stage(common::perf_trace::Stage::Present);
                 let _phase = common::perf_trace::phase(common::perf_trace::Phase::Flush);
                 if let Some(damage) =
                     present_damage.filter(|_| !*overlay_was_drawn && !network_dirty)

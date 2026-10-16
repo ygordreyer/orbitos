@@ -58,6 +58,7 @@ impl SelectedInfo {
         game: &crate::entry::game::Game,
         platform: &str,
     ) -> &'a Self {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::SelectedInfo);
         let generation = crate::view::details::metadata_generation();
         if slot.as_ref().is_none_or(|info| {
             info.path != game.path
@@ -310,24 +311,24 @@ where
                 self.idle_media_work.extend([
                     WarmArt::Metadata(e.clone()),
                     WarmArt::Cover(e.clone()),
-                    WarmArt::Hero(e.clone()),
-                    WarmArt::Logo(e.clone()),
-                    WarmArt::OtherCover(e),
                 ]);
+                // Keep full selected/next art resident; previous covers still prefetch.
+                if i == selected || i == (selected + 1) % self.entries.len() {
+                    self.idle_media_work.extend([WarmArt::Hero(e.clone()), WarmArt::Logo(e.clone())]);
+                }
+                if i == selected { self.idle_media_work.push_back(WarmArt::OtherCover(e)); }
             }
-        }
-        if self.idle_media_work.is_empty() {
-            return false;
         }
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
         orbit.set_ink_art(ink);
         orbit.set_cover_shape(tall);
-        orbit.warm_art_step(&mut self.idle_media_work);
-        if self.idle_media_work.is_empty() {
+        let changed = orbit.warm_art_step(&mut self.idle_media_work);
+        let pending = !self.idle_media_work.is_empty() || orbit.art_pending();
+        if changed {
             self.semantic_info = None;
             self.set_should_draw();
         }
-        true
+        pending || changed
     }
 
     pub(crate) fn navigation_warm_ready(&self) -> bool {
@@ -346,8 +347,8 @@ where
             return child.navigation_warm_art_step(work);
         }
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
-        if !work.artwork.is_empty() {
-            orbit.warm_art_step(&mut work.artwork);
+        orbit.warm_art_step(&mut work.artwork);
+        if !work.artwork.is_empty() || orbit.art_pending() {
             return false;
         }
         work.input.art = orbit.theme_art(&self.entries, work.selected, work.first, work.count);
@@ -405,7 +406,6 @@ where
                 .get_console(entry.path())
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
-            let _ = crate::view::details::Details::new(game, &platform);
             let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
             input
                 .text
@@ -445,6 +445,7 @@ where
         screen: common::theme::pack::ScreenId,
         handle: &common::theme::ThemeHandle,
     ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Layout);
         use common::theme::{
             frame::{Focus, FrameInputs, Hint, Row},
             pack::{Binding, ScreenId},
@@ -845,6 +846,7 @@ where
     }
 
     pub fn select(&mut self, index: usize) {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Selection);
         self.list.select(index);
         if !matches!(self.entries.get(self.list.selected()), Some(Entry::Game(_))) {
             self.semantic_info = None;
@@ -1744,12 +1746,13 @@ mod perf_fix_tests {
             "compact-plus",
             "compact-plus-tall",
         ] {
-            let snapshot = ThemeSnapshot::load(
+            let snapshot = ThemeSnapshot::load_with_settings(
                 &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../themes")
-                    .join(id)
+                    .join(id.strip_suffix("-tall").unwrap_or(id))
                     .canonicalize()
                     .unwrap(),
+                &std::collections::BTreeMap::from([("cover_shape".into(), if id.ends_with("-tall") { "tall" } else { "square" }.into())]),
             )
             .unwrap();
             let handle = ThemeHandle::prepare(snapshot, &bank, 991).unwrap();
@@ -1768,7 +1771,7 @@ mod perf_fix_tests {
                     .navigation_warm_model(&handle, direction, FrameInputs::new(ScreenId::Library))
                     .unwrap()
                     .expect("metadata themes must support prefetch");
-                while !list.navigation_warm_art_step(&mut plan) {}
+                while !list.navigation_warm_art_step(&mut plan) { tokio::time::sleep(std::time::Duration::from_millis(1)).await; }
             }
             common::perf::take();
             let before = common::perf_trace::frontend_io_ops();
@@ -1818,6 +1821,8 @@ mod perf_fix_tests {
         list.select(0);
         assert!(list.semantic_info.is_none());
     }
+    include!("entry_latency_bench.rs");
+
 }
 
 #[cfg(test)]
@@ -1960,4 +1965,5 @@ pub(crate) mod ux4_tests {
             assert_eq!(restored.list.selected(), 1);
         }
     }
+
 }

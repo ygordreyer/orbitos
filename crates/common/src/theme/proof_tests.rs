@@ -1768,7 +1768,7 @@ fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
     let bank=FontBank::bind(&font_root()).unwrap();
     let mut logo=tiny_skia::Pixmap::new(96,24).unwrap();logo.fill(tiny_skia::Color::from_rgba8(250,10,80,255));let logo=Arc::new(logo);
     let mut themes=Vec::new();
-    for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load(&ink_pack_root().join(&id)).unwrap()));}}
+    for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load_with_settings(&ink_pack_root().join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap()));}}
     for id in ["orbit","compact"] {themes.push((id.into(),ThemeSnapshot::builtin(id).unwrap()));}
     for (id,snapshot) in themes {
         let theme=ThemeHandle::prepare(snapshot,&bank,901).unwrap();
@@ -1795,7 +1795,7 @@ fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
 fn media_big_picture_recents_renders_selected_game_art_on_right() {
     let bank=FontBank::bind(&font_root()).unwrap();
     for suffix in ["","-tall"] {
-        let theme=ThemeHandle::prepare(ThemeSnapshot::load(&ink_pack_root().join(format!("big-picture{suffix}"))).unwrap(),&bank,902).unwrap();
+        let theme=ThemeHandle::prepare(ThemeSnapshot::load_with_settings(&ink_pack_root().join("big-picture"), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap(),&bank,902).unwrap();
         let mut input=frame(ScreenId::Recents);input.focus=Focus::default();
         let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media-sd/Roms/TEST");
         let entry=crate::media::metadata(&fixture.join("Complete.sfc"));

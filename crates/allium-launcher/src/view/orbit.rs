@@ -33,7 +33,22 @@ const THEME_COVER_SIZE: u32 = 140;
 const CARD_STRIDE: i32 = 176;
 const SHELF_CARDS: usize = 3;
 const CACHE_ENTRIES: usize = 16;
-const CACHE_PIXEL_BYTES: usize = 3 * 1024 * 1024;
+const CACHE_PIXEL_BYTES: usize = common::theme::frame::ART_INPUT_BYTES;
+const BASE_CACHE_BYTES: usize = 3 * 1024 * 1024;
+const WORKER_METADATA_BYTES: usize = 1024 * 1024;
+const WORKER_STACK_BYTES: usize = 256 * 1024;
+thread_local! {
+    static EXTRA_SOURCE_BYTES: std::cell::RefCell<Vec<std::rc::Weak<std::cell::Cell<usize>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn source_account() -> std::rc::Rc<std::cell::Cell<usize>> {
+    let account = std::rc::Rc::new(std::cell::Cell::new(0));
+    EXTRA_SOURCE_BYTES.with(|accounts| {
+        let mut accounts = accounts.borrow_mut();
+        accounts.retain(|a| a.strong_count() > 0);
+        accounts.push(std::rc::Rc::downgrade(&account));
+    });
+    account
+}
 const MAX_PNG_BYTES: u64 = 512 * 1024;
 
 pub fn enabled() -> bool {
@@ -42,7 +57,9 @@ pub fn enabled() -> bool {
 
 thread_local! {
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+pub(crate) fn completion_generation() -> u64 { ART_COMPLETIONS.with(std::cell::Cell::get) }
 pub(crate) fn invalidate_art() {
     common::media::invalidate();
     ART_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
@@ -57,7 +74,7 @@ struct CachedArt {
     image: Option<std::sync::Arc<Pixmap>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum WarmArt {
     Metadata(Entry),
     Cover(Entry),
@@ -70,6 +87,7 @@ pub(crate) enum WarmArt {
 #[derive(Debug)]
 pub struct Orbit {
     cache: VecDeque<CachedArt>,
+    source_account: std::rc::Rc<std::cell::Cell<usize>>,
     generation: u64,
     media_generation: u64,
     legacy_ready: bool,
@@ -77,12 +95,18 @@ pub struct Orbit {
     tall_art: bool,
     retired: Vec<std::sync::Weak<Pixmap>>,
     dirty: bool,
+    worker_id: u64,
+    worker_epoch: u64,
+    pending_task: Option<WarmArt>,
+    #[cfg(feature = "perf-bench")]
+    worker_samples: Vec<(common::perf::Counts, serde_json::Value)>,
 }
 
 impl Orbit {
     pub fn new() -> Self {
         Self {
             cache: VecDeque::new(),
+            source_account: source_account(),
             generation: art_generation(),
             media_generation: common::media::generation(),
             legacy_ready: false,
@@ -90,6 +114,11 @@ impl Orbit {
             tall_art: false,
             retired: Vec::new(),
             dirty: true,
+            worker_id: { static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed) },
+            worker_epoch: 0,
+            pending_task: None,
+            #[cfg(feature = "perf-bench")]
+            worker_samples: Vec::new(),
         }
     }
 
@@ -133,7 +162,7 @@ impl Orbit {
             return;
         };
         if !self.cache.iter().any(|item| item.path == path) {
-            let image = load_prepared_art(&path, (0, 0), 480, 200, false).map(std::sync::Arc::new);
+            let image = if self.ink_art { load_device_art(&path, 480, 200) } else { load_prepared_art(&path, (0, 0), 480, 200, false) }.map(std::sync::Arc::new);
             self.insert_cached(CachedArt { path, image });
         }
     }
@@ -164,7 +193,7 @@ impl Orbit {
     ) {
         let mut work = Self::navigation_art_work(entries, selected, first, count);
         while !work.is_empty() {
-            self.warm_art_step(&mut work);
+            self.warm_art_step_sync(&mut work);
         }
         self.prepare_window(entries, selected, first, count);
     }
@@ -191,7 +220,7 @@ impl Orbit {
         }
         work
     }
-    pub(crate) fn warm_art_step(&mut self, work: &mut VecDeque<WarmArt>) {
+    fn warm_art_step_sync(&mut self, work: &mut VecDeque<WarmArt>) {
         self.refresh_art();
         let Some(task) = work.pop_front() else {
             return;
@@ -286,6 +315,7 @@ impl Orbit {
         first: usize,
         count: usize,
     ) -> common::theme::frame::Art {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::ArtworkLookup);
         let mut art = common::theme::frame::Art::default();
         if let Some(entry) = entries.get(selected) {
             art.selected_logo = self.cached_image(&art_path(entry, "logos")).cloned();
@@ -325,6 +355,10 @@ impl Orbit {
             common::perf::hit(common::perf::Op::RamHit);
             return;
         }
+        if self.ink_art && dimensions == (360, 210) {
+            self.insert_cached(CachedArt { image:load_device_art(&path,640,480).map(std::sync::Arc::new), path });
+            return;
+        }
         let (width, height, crop) = if dimensions == (101, 101) {
             (COVER_SIZE, COVER_SIZE, false)
         } else {
@@ -347,7 +381,7 @@ impl Orbit {
 
     fn source_bytes(&mut self) -> usize {
         self.retired.retain(|image| image.strong_count() != 0);
-        self.cache
+        let bytes = self.cache
             .iter()
             .filter_map(|item| item.image.as_ref())
             .map(|image| image.data().len())
@@ -357,7 +391,9 @@ impl Orbit {
                 .iter()
                 .filter_map(std::sync::Weak::upgrade)
                 .map(|image| image.data().len())
-                .sum::<usize>()
+                .sum::<usize>();
+        self.source_account.set(bytes.saturating_sub(BASE_CACHE_BYTES));
+        bytes
     }
 
     fn retire(&mut self, item: CachedArt) {
@@ -371,13 +407,19 @@ impl Orbit {
 
     fn insert_cached(&mut self, item: CachedArt) {
         let bytes = item.image.as_ref().map_or(0, |image| image.data().len());
-        while self.cache.len() >= CACHE_ENTRIES || self.source_bytes() + bytes > CACHE_PIXEL_BYTES {
+        while self.cache.len() >= CACHE_ENTRIES || self.source_bytes() + bytes > self.source_budget() {
             let Some(old) = self.cache.pop_back() else {
                 return;
             };
             self.retire(old);
         }
         self.cache.push_front(item);
+        self.source_bytes();
+    }
+
+    fn source_budget(&self) -> usize {
+        let other_extra = EXTRA_SOURCE_BYTES.with(|accounts| accounts.borrow().iter().filter_map(std::rc::Weak::upgrade).filter(|a| !std::rc::Rc::ptr_eq(a,&self.source_account)).map(|a|a.get()).sum::<usize>());
+        BASE_CACHE_BYTES + (CACHE_PIXEL_BYTES - BASE_CACHE_BYTES).saturating_sub(other_extra)
     }
 
     fn image(&self, entry: &Entry, kind: &str) -> Option<&std::sync::Arc<Pixmap>> {
@@ -418,6 +460,8 @@ impl Orbit {
     }
 
     pub fn release_art(&mut self) {
+        self.worker_epoch = self.worker_epoch.wrapping_add(1);
+        self.pending_task = None;
         while let Some(item) = self.cache.pop_back() {
             self.retire(item);
         }
@@ -616,9 +660,13 @@ fn art_path(entry: &Entry, kind: &str) -> PathBuf {
 }
 
 fn decode_art_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
+    let _stage = common::perf_trace::stage(common::perf_trace::Stage::Decode);
     if bytes.starts_with(b"\x89PNG") {
         return decode_png_bytes(bytes, dimensions);
     }
+    #[cfg(feature = "perf-bench")]
+    common::perf::hit(common::perf::Op::Decode);
+    common::perf_trace::hit(common::perf_trace::ArtHit::Decode);
     let image = image::load_from_memory(bytes).ok()?;
     if image.width() > 2048 || image.height() > 2048 {
         return None;
@@ -631,22 +679,22 @@ fn decode_art_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
     Some(pixels)
 }
 
-fn load_ink_cover(path: &Path) -> Option<Pixmap> {
+fn load_device_art(path: &Path, width: u32, height: u32) -> Option<Pixmap> {
+    let _phase = common::perf_trace::phase(common::perf_trace::Phase::ArtLoad);
     common::perf_trace::frontend_io_op();
     let file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_PNG_BYTES {
-        return None;
-    }
     common::perf_trace::frontend_io_op();
-    #[cfg(feature = "perf-bench")]
-    common::perf::hit(common::perf::Op::Decode);
-    let source = decode_art_bytes(&read_png_bytes(file)?, (0, 0))?;
-    let scale = (176.0 / source.width() as f32)
-        .min(264.0 / source.height() as f32)
-        .min(1.0);
-    let width = (source.width() as f32 * scale).round().max(1.0) as u32;
-    let height = (source.height() as f32 * scale).round().max(1.0) as u32;
-    resize_art(source, width, height, false)
+    if file.metadata().ok()?.len() > MAX_PNG_BYTES { return None; }
+    common::perf_trace::frontend_io_op();
+    let bytes = read_png_bytes(file)?;
+    let (w,h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format().ok()?.into_dimensions().ok()?;
+    if w == 0 || h == 0 || w > width || h > height { return None; }
+    decode_art_bytes(&bytes, (0,0))
+}
+fn load_ink_cover(path: &Path) -> Option<Pixmap> {
+    // MEDIA.md sources already fit the device. Geometry is fitted once by the renderer.
+    load_device_art(path, 480, 480)
 }
 
 fn load_prepared_art(
@@ -688,11 +736,18 @@ fn load_prepared_art(
             (sh as f32 * scale).round().max(1.0) as u32,
         )
     };
-    let key = metadata.as_ref().and_then(|metadata| {
+    let key = {
+        let _disk_stage = common::perf_trace::stage(common::perf_trace::Stage::DiskCache);
+        metadata.as_ref().and_then(|metadata| {
         crate::art_cache::ArtKey::new(path, metadata, &bytes, dimensions, (width, height), crop)
-    });
+        })
+    };
     let cache_dir = common::constants::ALLIUM_ORBIT_ART_CACHE_DIR.as_path();
-    if let Some(image) = key.as_ref().and_then(|key| key.load(cache_dir)) {
+    let disk_image = {
+        let _disk_stage = common::perf_trace::stage(common::perf_trace::Stage::DiskCache);
+        key.as_ref().and_then(|key| key.load(cache_dir))
+    };
+    if let Some(image) = disk_image {
         common::perf_trace::hit(common::perf_trace::ArtHit::Disk);
         #[cfg(feature = "perf-bench")]
         common::perf::hit(common::perf::Op::DiskHit);
@@ -700,6 +755,7 @@ fn load_prepared_art(
     }
     let image = resize_art(decode_art_bytes(&bytes, dimensions)?, width, height, crop)?;
     if let Some(key) = key {
+        let _disk_stage = common::perf_trace::stage(common::perf_trace::Stage::DiskCache);
         key.store(cache_dir, &image);
     }
     Some(image)
@@ -1483,5 +1539,306 @@ mod media_contract_tests {
         let jpeg = load_ink_cover(&jpg).unwrap();
         assert_eq!((jpeg.width(), jpeg.height()), (80, 120));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[derive(Debug)]
+struct ArtJob {
+    owner: u64,
+    epoch: u64,
+    generation: u64,
+    #[cfg(test)]
+    gate: Option<std::sync::Arc<std::sync::Barrier>>,
+    ink: bool,
+    tall: bool,
+    task: WarmArt,
+    network_paths: Vec<(common::media::Kind, PathBuf)>,
+    #[cfg(feature = "perf-bench")]
+    trace: Option<String>,
+}
+struct ArtResult {
+    owner: u64,
+    epoch: u64,
+    media: common::media::PreparedGame,
+    sidecars: Option<super::details::WarmCache>,
+    art: VecDeque<CachedArt>,
+    #[cfg(feature = "perf-bench")]
+    counts: common::perf::Counts,
+    #[cfg(feature = "perf-bench")]
+    stages: serde_json::Value,
+}
+struct ArtWorker {
+    send: std::sync::mpsc::SyncSender<ArtJob>,
+    recv: std::sync::mpsc::Receiver<ArtResult>,
+    busy: Option<u64>,
+}
+thread_local! {
+    // One worker and one result slot for the whole launcher, including inactive tabs.
+    static ART_WORKER: std::cell::RefCell<Option<ArtWorker>> = const { std::cell::RefCell::new(None) };
+}
+fn worker() -> ArtWorker {
+    let (send, jobs) = std::sync::mpsc::sync_channel::<ArtJob>(1);
+    let (done, recv) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("allium-art".into())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+            common::perf_trace::initialize();
+            common::media::set_metadata_budget(WORKER_METADATA_BYTES);
+            let mut generation = None;
+            while let Ok(job) = jobs.recv() {
+                #[cfg(test)]
+                if let Some(gate) = &job.gate {
+                    gate.wait();
+                }
+                if generation != Some(job.generation) {
+                    common::media::invalidate();
+                    super::details::invalidate_metadata();
+                    common::media::set_metadata_budget(WORKER_METADATA_BYTES);
+                    generation = Some(job.generation);
+                }
+                let entry = match &job.task {
+                    WarmArt::Metadata(e)
+                    | WarmArt::Cover(e)
+                    | WarmArt::CoverFallback(e)
+                    | WarmArt::OtherCover(e)
+                    | WarmArt::Logo(e)
+                    | WarmArt::Hero(e) => e,
+                };
+                let path = entry.path().to_owned();
+                let metadata = matches!(job.task, WarmArt::Metadata(_));
+                if !job.network_paths.is_empty() {
+                    let _ = common::media::prepare_game(&path);
+                    common::media::adopt_paths(&path, job.network_paths);
+                }
+                let mut orbit = Orbit::new();
+                orbit.ink_art = job.ink;
+                orbit.tall_art = job.tall;
+                let mut work = VecDeque::from([job.task]);
+                #[cfg(feature = "perf-bench")]
+                if let Some(path) = &job.trace {
+                    common::perf_trace::start_probe(path);
+                }
+                #[cfg(feature = "perf-bench")]
+                common::perf::take();
+                common::perf_trace::begin_render();
+                while !work.is_empty() {
+                    orbit.warm_art_step_sync(&mut work);
+                }
+                let media = common::media::prepare_game(&path);
+                let result = ArtResult {
+                    owner: job.owner,
+                    epoch: job.epoch,
+                    media,
+                    sidecars: metadata.then(super::details::warm_cache),
+                    art: orbit.cache,
+                    #[cfg(feature = "perf-bench")]
+                    counts: common::perf::take(),
+                    #[cfg(feature = "perf-bench")]
+                    stages: common::perf_trace::probe_counts_if_enabled(),
+                };
+                common::media::clear_prepared_paths();
+                common::perf_trace::drawn_frame();
+                if done.send(result).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("art worker unavailable");
+    ArtWorker {
+        send,
+        recv,
+        busy: None,
+    }
+}
+
+impl Orbit {
+    pub(crate) fn art_pending(&self) -> bool {
+        self.pending_task.is_some()
+            || ART_WORKER.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|w| w.busy == Some(self.worker_id))
+            })
+    }
+    pub(crate) fn warm_art_step(&mut self, work: &mut VecDeque<WarmArt>) -> bool {
+        self.refresh_art();
+        ART_WORKER.with(|state| {
+            let mut state = state.borrow_mut();
+            let worker = state.get_or_insert_with(worker);
+            let mut changed = false;
+            if let Ok(result) = worker.recv.try_recv() {
+                worker.busy = None;
+                if result.owner == self.worker_id && result.epoch == self.worker_epoch {
+                    self.pending_task = None;
+                    common::media::adopt_game(result.media);
+                    if let Some(cache) = result.sidecars {
+                        super::details::adopt_warm_cache(cache);
+                    }
+                    for item in result.art {
+                        self.insert_cached(item);
+                    }
+                    #[cfg(feature = "perf-bench")]
+                    {
+                        if self.worker_samples.len() == 64 {
+                            self.worker_samples.remove(0);
+                        }
+                        self.worker_samples.push((result.counts, result.stages));
+                    }
+                    ART_COMPLETIONS.with(|generation| generation.set(generation.get().wrapping_add(1)));
+                    changed = true;
+                }
+            }
+            if worker.busy != Some(self.worker_id) {
+                if let Some(task) = self.pending_task.take() {
+                    work.push_front(task);
+                }
+            }
+            if worker.busy.is_some() {
+                return changed;
+            }
+            while let Some(task) = work.pop_front() {
+                let path = match &task {
+                    WarmArt::Metadata(_) => None,
+                    WarmArt::Cover(e) | WarmArt::CoverFallback(e) => Some(self.cover_path(e)),
+                    WarmArt::Hero(e) => Some(art_path(e, "heroes")),
+                    WarmArt::Logo(e) => {
+                        common::media::cached_resolve(e.path(), common::media::Kind::Logo)
+                    }
+                    WarmArt::OtherCover(e) => common::media::cached_resolve(
+                        e.path(),
+                        if self.tall_art {
+                            common::media::Kind::Cover
+                        } else {
+                            common::media::Kind::TallCover
+                        },
+                    ),
+                };
+                // A missing path has to be resolved by the worker at least once.
+                if let Some(index) = path
+                    .as_ref()
+                    .and_then(|path| self.cache.iter().position(|item| &item.path == path))
+                {
+                    let item = self.cache.remove(index).unwrap();
+                    self.cache.push_front(item);
+                    continue;
+                }
+                #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+                crate::allium_launcher::navigation_warm_tests::art_load();
+                let entry = match &task {
+                    WarmArt::Metadata(e)
+                    | WarmArt::Cover(e)
+                    | WarmArt::CoverFallback(e)
+                    | WarmArt::OtherCover(e)
+                    | WarmArt::Logo(e)
+                    | WarmArt::Hero(e) => e,
+                };
+                let network_paths = [
+                    ("stock", common::media::Kind::Cover),
+                    ("covers", common::media::Kind::PreparedCover),
+                    ("heroes", common::media::Kind::Background),
+                    ("logos", common::media::Kind::Logo),
+                ]
+                .into_iter()
+                .filter_map(|(name, kind)| {
+                    crate::network_runtime::art_path(entry.path(), name).map(|p| (kind, p))
+                })
+                .collect();
+                self.pending_task = Some(task.clone());
+                let job = ArtJob {
+                    owner: self.worker_id,
+                    epoch: self.worker_epoch,
+                    generation: common::media::generation(),
+                    #[cfg(test)]
+                    gate: TEST_ART_GATE.with(|slot| slot.borrow().clone()),
+                    ink: self.ink_art,
+                    tall: self.tall_art,
+                    task,
+                    network_paths,
+                    #[cfg(feature = "perf-bench")]
+                    trace: common::perf_trace::probe_path(),
+                };
+                if worker.send.try_send(job).is_ok() {
+                    worker.busy = Some(self.worker_id);
+                }
+                break;
+            }
+            changed
+        })
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+impl Orbit {
+    pub(crate) fn take_worker_samples(&mut self) -> Vec<(common::perf::Counts, serde_json::Value)> {
+        std::mem::take(&mut self.worker_samples)
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TEST_ART_GATE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn proof_art_gate(gate: Option<std::sync::Arc<std::sync::Barrier>>) {
+    TEST_ART_GATE.with(|slot| *slot.borrow_mut() = gate);
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    #[test]
+    #[cfg(feature = "perf-bench")]
+    fn pack_sized_media_decode_once_without_resize_or_disk_cache() {
+        let root = std::env::temp_dir().join(format!("allium-packed-art-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (kind, w, h) in [
+            ("cover", 480, 480),
+            ("tall", 320, 480),
+            ("logo", 480, 200),
+            ("hero", 640, 480),
+        ] {
+            let path = root.join(format!("{kind}.png"));
+            Pixmap::new(w, h).unwrap().save_png(&path).unwrap();
+            common::perf::take();
+            let image = load_device_art(&path, w, h).unwrap();
+            let counts = common::perf::take();
+            assert_eq!((image.width(), image.height()), (w, h));
+            assert_eq!(
+                (counts.decodes, counts.art_resizes, counts.disk_hits),
+                (1, 0, 0)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn source_cache_extra_allowance_is_shared_between_lists() {
+        let added_budget = (CACHE_PIXEL_BYTES - BASE_CACHE_BYTES)
+            + WORKER_METADATA_BYTES
+            + 2 * 256 * 1024
+            + 640 * 480 * 4
+            + 512 * 1024
+            + 64 * 1024
+            + WORKER_STACK_BYTES
+            + 64 * 1024;
+        assert!(added_budget <= 8 * 1024 * 1024);
+        let mut first = Orbit::new();
+        let mut second = Orbit::new();
+        for i in 0..12 {
+            first.insert_cached(CachedArt {
+                path: format!("first-{i}").into(),
+                image: Some(std::sync::Arc::new(Pixmap::new(480, 480).unwrap())),
+            });
+            second.insert_cached(CachedArt {
+                path: format!("second-{i}").into(),
+                image: Some(std::sync::Arc::new(Pixmap::new(480, 480).unwrap())),
+            });
+            let added = first.source_bytes().saturating_sub(BASE_CACHE_BYTES)
+                + second.source_bytes().saturating_sub(BASE_CACHE_BYTES);
+            assert!(added <= 4 * 1024 * 1024);
+        }
     }
 }

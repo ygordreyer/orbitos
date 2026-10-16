@@ -294,3 +294,70 @@ mod tests {
         common::media::invalidate();
     }
 }
+
+struct MarkerProbe {
+    root: PathBuf,
+    result: Receiver<std::io::Result<bool>>,
+}
+thread_local! {
+    static MARKER_PROBE: std::cell::RefCell<Option<MarkerProbe>> = const { std::cell::RefCell::new(None) };
+}
+/// The routine idle poll must not wait on an SD-card stat when no refresh is requested.
+pub(crate) fn marker_ready(root: &Path) -> Result<Option<bool>> {
+    MARKER_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|probe| probe.root != root) {
+            *slot = None;
+        }
+        if slot.is_none() {
+            let marker = root.join(".allium/state/media-refresh");
+            let (send, result) = mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("allium-media-marker".into())
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let _ = send.send(marker.try_exists());
+                })?;
+            *slot = Some(MarkerProbe {
+                root: root.into(),
+                result,
+            });
+            return Ok(None);
+        }
+        match slot.as_ref().unwrap().result.try_recv() {
+            Ok(found) => {
+                *slot = None;
+                Ok(Some(found?))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                *slot = None;
+                anyhow::bail!("Media marker worker disconnected")
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod marker_probe_tests {
+    use super::*;
+    #[test]
+    fn asynchronous_marker_probe_keeps_claim_and_refresh_on_the_existing_path() {
+        let root = std::env::temp_dir().join(format!("allium-marker-probe-{}", std::process::id()));
+        fs::create_dir_all(root.join(".allium/state")).unwrap();
+        let marker = root.join(".allium/state/media-refresh");
+        fs::write(&marker, []).unwrap();
+        assert_eq!(marker_ready(&root).unwrap(), None);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(found) = marker_ready(&root).unwrap() {
+                assert!(found);
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(marker.exists(), "probe must not claim the marker");
+        fs::remove_dir_all(root).unwrap();
+    }
+}

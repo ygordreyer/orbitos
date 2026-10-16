@@ -501,6 +501,7 @@ async fn dl17_frontend_proxy() -> Result<()> {
         for direction in [1, -1] {
             let mut work = None;
             let mut step = 0;
+            let warm_started = Instant::now();
             loop {
                 let start = Instant::now();
                 let io = common::perf_trace::frontend_io_ops();
@@ -518,8 +519,8 @@ async fn dl17_frontend_proxy() -> Result<()> {
                 if finished {
                     break;
                 }
-                ensure!(step < 100, "warm work did not finish");
-                tokio::task::yield_now().await;
+                ensure!(warm_started.elapsed() < Duration::from_secs(10), "warm work did not finish");
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
         ensure!(

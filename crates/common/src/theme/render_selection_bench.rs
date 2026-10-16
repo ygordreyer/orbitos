@@ -10,7 +10,10 @@ fn theme(id: &str) -> ThemeHandle {
         .unwrap();
     let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
     ThemeHandle::prepare(
-        ThemeSnapshot::load(&root.join("themes").join(id)).unwrap(),
+        ThemeSnapshot::load_with_settings(
+            &root.join("themes").join(id.strip_suffix("-tall").unwrap_or(id)),
+            &std::collections::BTreeMap::from([("cover_shape".into(), if id.ends_with("-tall") { "tall" } else { "square" }.into())]),
+        ).unwrap(),
         &bank,
         1,
     )
@@ -349,4 +352,34 @@ fn ink_opaque_art_does_not_make_a_transparent_base_opaque() {
     let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
     assert!(!frame.is_opaque());
     assert!(frame.pixels.data() == PreparedFrame::prepare(theme, &input).unwrap().pixels.data());
+}
+
+#[test]
+fn ink_late_cover_completion_only_damages_the_cover_component() {
+    let theme=theme("big-picture");
+    let arts=art();
+    let mut input=model(&theme,ScreenId::Recents,0,&arts);
+    input.art.selected_cover=None;
+    let before=PreparedFrame::prepare(theme.clone(),&input).unwrap();
+    input.art.selected_cover=Some(arts[0].clone());
+    let after=PreparedFrame::prepare_reusing(theme.clone(),&input,Some(before)).unwrap();
+    let cover=theme.pack().screens[&ScreenId::Recents].components.iter().find(|c| c.binding==Some(Binding::SelectedCover)).unwrap().rect;
+    assert_eq!(after.damage,vec![cover]);
+    assert_eq!(after.pixels.data(),PreparedFrame::prepare(theme,&input).unwrap().pixels.data());
+}
+
+#[test]
+fn frame_art_budget_counts_shared_sources_once_and_rejects_unique_overflow() {
+    let theme=theme("big-picture");
+    let arts=art();
+    let mut input=model(&theme,ScreenId::Library,0,&arts);
+    let image=Arc::new(Pixmap::new(640,480).unwrap());
+    input.art.selected_cover=Some(image.clone());
+    input.art.selected_hero=Some(image.clone());
+    input.art.selected_logo=Some(image.clone());
+    input.art.next_cover=Some(image.clone());
+    input.art.entries=(0..16).map(|i|(i.to_string(),image.clone())).collect();
+    input.validate(&theme).unwrap();
+    input.art.entries=(0..7).map(|i|(i.to_string(),Arc::new(Pixmap::new(640,480).unwrap()))).collect();
+    assert!(input.validate(&theme).unwrap_err().to_string().contains("Game art input budget exceeded"));
 }
