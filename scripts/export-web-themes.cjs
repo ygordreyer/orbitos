@@ -18,7 +18,7 @@ function exportVariant(original,shape,selected={}){
    spec.components=L.resolve(original,screen,shape).map(c=>{
     const out={},paint={};
     for(const [key,value] of Object.entries(c)){
-     if(key.startsWith('_')||key==='shapes'||typeKeys.includes(key)&&key!=='color'||key==='focus_weight'||key==='items'||key==='shadow')continue;
+     if(key.startsWith('_')||key==='shapes'||typeKeys.includes(key)&&key!=='color'||key==='focus_weight'||key==='items')continue;
      if(old.has(key))out[key]=value;else paint[key]=value;
     }
     if(c.role){

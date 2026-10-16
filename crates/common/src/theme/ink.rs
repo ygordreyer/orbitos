@@ -262,7 +262,7 @@ impl Paint {
             }
             if let Some(s) = surface.shadow {
                 ensure!(
-                    s.x.abs() <= 24 && s.y.abs() <= 24 && s.blur <= 12 && alpha(s.alpha),
+                    s.x.unsigned_abs() <= 24 && s.y.unsigned_abs() <= 24 && s.blur <= 12 && alpha(s.alpha),
                     "Invalid shadow"
                 );
             }

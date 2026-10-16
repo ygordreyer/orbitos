@@ -477,13 +477,13 @@ impl PreparedFrame {
                 if index == 0 && c.kind == Kind::Background {
                     0
                 } else {
-                    (c.rect.2 * c.rect.3 * 4) as usize
+                    { let r = effects::paint_bounds(c); (r.2 * r.3 * 4) as usize }
                 }
             })
             .sum::<usize>();
         let scratch_bytes = operations
             .iter()
-            .map(|(c, _)| (c.rect.2 * c.rect.3 * 4) as usize)
+            .map(|(c, _)| { let r = effects::paint_bounds(c); (r.2 * r.3 * 4) as usize })
             .max()
             .unwrap_or(0);
         if underlay_bytes + scratch_bytes > ACTIVE_LIMIT {
@@ -544,7 +544,7 @@ impl PreparedFrame {
             "ink_initial"
         });
         for (index, (c, input)) in operations.iter().enumerate() {
-            let r = c.rect;
+            let r = effects::paint_bounds(c);
             let deps = dependencies(c, input);
             let changed =
                 !incremental || !retained::matches(&cache.entries[index].dependencies, &deps);
