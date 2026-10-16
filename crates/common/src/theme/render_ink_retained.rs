@@ -77,6 +77,9 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
                 binding,
                 input.text.get(&binding).cloned().unwrap_or_default(),
             );
+            if binding == Binding::KeyboardValue && input.focus.component == c.id {
+                out.focus = input.focus.clone();
+            }
             if binding == Binding::SelectedMetadata {
                 out.metadata = input.metadata.clone();
             }
@@ -163,7 +166,10 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
             out.keyboard_cursor = input.keyboard_cursor;
         }
         Kind::Status => out.status = input.status.clone(),
-        Kind::Hints => out.hints = input.hints.clone(),
+        Kind::Hints => {
+            out.hints = input.hints.clone();
+            out.suppress_hints = input.suppress_hints;
+        }
         Kind::Progress => out.progress = input.progress,
         _ => {}
     }
@@ -477,13 +483,19 @@ impl PreparedFrame {
                 if index == 0 && c.kind == Kind::Background {
                     0
                 } else {
-                    { let r = effects::paint_bounds(c); (r.2 * r.3 * 4) as usize }
+                    {
+                        let r = effects::paint_bounds(c);
+                        (r.2 * r.3 * 4) as usize
+                    }
                 }
             })
             .sum::<usize>();
         let scratch_bytes = operations
             .iter()
-            .map(|(c, _)| { let r = effects::paint_bounds(c); (r.2 * r.3 * 4) as usize })
+            .map(|(c, _)| {
+                let r = effects::paint_bounds(c);
+                (r.2 * r.3 * 4) as usize
+            })
             .max()
             .unwrap_or(0);
         if underlay_bytes + scratch_bytes > ACTIVE_LIMIT {

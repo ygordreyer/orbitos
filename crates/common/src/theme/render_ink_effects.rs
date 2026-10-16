@@ -23,6 +23,9 @@ pub(super) fn effect_padding(c: &Component) -> u32 {
 
 pub(super) fn paint_bounds(c: &Component) -> Rect {
     let mut pad = effect_padding(c);
+    if c.kind == Kind::Text && c.binding == Some(Binding::KeyboardValue) {
+        pad = pad.max(3);
+    }
     if c.layout == Some(Arrangement::Shelf) {
         let scale = c.paint.as_ref().unwrap().focus_scale.unwrap_or(1.0);
         pad += ((c.rect.2.max(c.rect.3) as f32 * (scale - 1.0)) / 2.0).ceil() as u32 + 2;

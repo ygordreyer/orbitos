@@ -53,6 +53,7 @@ pub struct FrameInputs {
     pub navigation: BTreeMap<NavGroup, Vec<Row>>,
     pub focus: Focus,
     pub hints: Vec<Hint>,
+    pub suppress_hints: bool,
     pub status: Status,
     pub progress: Option<f32>,
     pub keyboard: Vec<String>,
@@ -101,6 +102,7 @@ impl FrameInputs {
             navigation: BTreeMap::new(),
             focus: Focus::default(),
             hints: vec![],
+            suppress_hints: false,
             status: Status::default(),
             progress: None,
             keyboard: vec![],
@@ -180,19 +182,7 @@ impl FrameInputs {
         ensure!(self.hints.len() <= 8, "Too many hints");
         for hint in &self.hints {
             ensure!(
-                matches!(
-                    hint.button.as_str(),
-                    "A" | "B"
-                        | "X"
-                        | "Y"
-                        | "L"
-                        | "R"
-                        | "L/R"
-                        | "START"
-                        | "SELECT"
-                        | "MENU"
-                        | "Dpad"
-                ),
+                semantic_button(&hint.button),
                 "Unknown semantic button"
             );
             ensure!(hint.label.chars().count() <= 64, "Hint exceeds limit");
@@ -223,6 +213,9 @@ impl FrameInputs {
                     && self.keyboard_cursor.1 < 5,
                 "Fixed keyboard model required"
             );
+        }
+        if matches!(self.screen, ScreenId::Keyboard | ScreenId::Search) && theme.pack().screens[&self.screen].components.iter().any(|c| c.paint.as_ref().is_some_and(|p| p.keyboard_layout.as_deref() == Some("qwerty"))) {
+            ensure!(self.keyboard_cursor.0 < [10, 9, 7, 3, 1][self.keyboard_cursor.1], "Keyboard cursor points to inactive cell");
         }
         for key in &self.keyboard {
             ensure!(key.chars().count() <= 12, "Keyboard label too long");
@@ -263,7 +256,7 @@ impl FrameInputs {
                         | super::pack::Kind::DialogActions
                         | super::pack::Kind::Navigation
                         | super::pack::Kind::Keyboard
-                ),
+                ) || (theme.pack().ink() && c.binding == Some(Binding::KeyboardValue)),
                 "Focused component is not interactive"
             );
             let rows = if let Some(group) = c.group {
@@ -298,4 +291,8 @@ fn validate_rows(rows: &[Row], limit: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn semantic_button(button: &str) -> bool {
+    matches!(button, "A" | "B" | "X" | "Y" | "L" | "R" | "L/R" | "START" | "SELECT" | "MENU" | "Start" | "Select" | "Menu" | "Dpad" | "Up/Down" | "Left/Right" | "↑↓" | "←→" | "↑ ↓" | "← →")
 }

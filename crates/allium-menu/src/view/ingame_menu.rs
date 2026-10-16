@@ -1077,6 +1077,7 @@ mod theme_adapter_tests {
     #[tokio::test]
     #[ignore = "release host benchmark; real state file and six rows"]
     async fn perf6_representative_host_open() {
+        let _state_guard = crate::allium_menu::MENU_STATE_TEST_LOCK.lock().await;
         let (theme, root) = orbit_handle();
         let res = perf6_resources(theme, true);
         let rect = Rect::new(0, 0, 640, 480);
@@ -1203,6 +1204,7 @@ mod theme_adapter_tests {
 
     #[tokio::test]
     async fn perf5_quit_keeps_screenshot_quit_exit_order() {
+        let _state_guard = crate::allium_menu::MENU_STATE_TEST_LOCK.lock().await;
         let mut map = TypeMap::new();
         map.insert(Stylesheet::load().unwrap());
         map.insert(Locale::new("en-US"));

@@ -1587,6 +1587,8 @@ fn theme_port_four_packs_options_parse_validate_and_discover() {
 #[test]
 fn theme_port_all_variants_all_screens_real_raster() {
     let root=ink_pack_root();let bank=FontBank::bind(&font_root()).unwrap();
+    let update = std::env::var_os("ALLIUM_UPDATE_FRAME_HASHES").is_some();
+    let mut hashes = std::collections::BTreeMap::new();
     for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {
         let id=format!("{base}{suffix}");let ready=ThemeHandle::prepare(ThemeSnapshot::load_with_settings(&root.join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap(),&bank,500).unwrap();
         for screen in ScreenId::ALL {
@@ -1631,18 +1633,22 @@ fn theme_port_all_variants_all_screens_real_raster() {
             let hash = super::runtime::digest(rendered.pixels().data());
             println!("THEME_FRAME {id} {screen:?} {hash}");
             let expected: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!("settings-frame-hashes.json")).unwrap();
-            assert_eq!(hash, expected[&format!("{id}/{screen:?}")], "{id}/{screen:?}");
+            if !update { assert_eq!(hash, expected[&format!("{id}/{screen:?}")], "{id}/{screen:?}"); }
+            hashes.insert(format!("{id}/{screen:?}"), hash);
             assert!(rendered.pixels().pixels().iter().any(|p|p.alpha()>0));
             for t in &rendered.targets {assert!(t.rect.0+t.rect.2<=640&&t.rect.1+t.rect.3<=480,"{id}/{screen:?} {t:?}");}
             if let Ok(out)=std::env::var("ALLIUM_THEME_PORT_FRAMES") {
                 let dir=Path::new(&out).join(&id);std::fs::create_dir_all(&dir).unwrap();
                 let name=serde_json::to_value(screen).unwrap().as_str().unwrap().to_owned();
-                let mut pixels=if screen.is_dialog()||screen.is_osd(){let mut underlay=frame(ScreenId::Library);underlay.hints.clear();PreparedFrame::prepare(ready.clone(),&underlay).unwrap().pixels().clone()}else{rendered.pixels().clone()};
+                let mut pixels=if screen.is_dialog()||screen.is_osd(){let mut underlay=frame(ScreenId::Library);underlay.hints.clear();underlay.suppress_hints=true;PreparedFrame::prepare(ready.clone(),&underlay).unwrap().pixels().clone()}else{rendered.pixels().clone()};
                 if screen.is_dialog()||screen.is_osd(){pixels.draw_pixmap(0,0,rendered.pixels().as_ref(),&tiny_skia::PixmapPaint::default(),tiny_skia::Transform::identity(),None);}
                 pixels.save_png(dir.join(format!("{name}.png"))).unwrap();
             }
         }
     }}
+    if update {
+        std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/theme/settings-frame-hashes.json"), serde_json::to_string_pretty(&hashes).unwrap() + "\n").unwrap();
+    }
 }
 
 #[test]
@@ -1816,3 +1822,5 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
 
 #[path = "parity_a_tests.rs"]
 mod parity_a;
+#[path = "parity_c_tests.rs"]
+mod parity_c_tests;

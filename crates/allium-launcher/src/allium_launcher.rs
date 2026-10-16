@@ -921,6 +921,13 @@ mod orbit_proof {
             fs::remove_dir(path).unwrap();
         }
         fs::remove_dir_all(external).unwrap();
+        fs::remove_file(ctr).unwrap();
+        for suffix in ["orbit", "hero"] {
+            fs::remove_file(
+                ALLIUM_GAMES_DIR.join(format!("PS/Imgs/Crash Team Racing (USA).{suffix}.png")),
+            )
+            .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1724,6 +1731,8 @@ mod orbit_proof {
         catalog.validate().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (chunk_sent, chunk_ready) = std::sync::mpsc::channel();
+        let (cancel_sent, cancel_ready) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1740,7 +1749,9 @@ mod orbit_proof {
                 let offset = request
                     .lines()
                     .find_map(|line| {
-                        line.strip_prefix("Range: bytes=")
+                        let (name, value) = line.split_once(':')?;
+                        if !name.eq_ignore_ascii_case("range") { return None; }
+                        value.trim().strip_prefix("bytes=")
                             .and_then(|v| v.strip_suffix('-'))
                             .and_then(|v| v.parse::<usize>().ok())
                     })
@@ -1763,7 +1774,8 @@ mod orbit_proof {
                 stream.write_all(header.as_bytes()).unwrap();
                 if attempt == 0 {
                     stream.write_all(&body[..65536]).unwrap();
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    chunk_sent.send(()).unwrap();
+                    cancel_ready.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
                     let _ = stream.write_all(&body[65536..]);
                 } else {
                     let _ = stream.write_all(&body[offset..]);
@@ -1971,6 +1983,12 @@ mod orbit_proof {
         let game_info_before = std::fs::read(common::constants::ALLIUM_GAME_INFO.as_path()).ok();
         let database_before = app.res.get::<Database>().select_games(&[&path]).unwrap();
         network::prefill("network-fixture").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chunk_ready.try_recv().is_err() {
+            assert!(std::time::Instant::now() < deadline, "first download chunk was not sent");
+            network::poll();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(20);
         for key in [
             Key::X,
@@ -2013,6 +2031,7 @@ mod orbit_proof {
             "prefill cancellation needs a live worker"
         );
         network::event(KeyEvent::Pressed(Key::B)).unwrap();
+        cancel_sent.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while network::active() {
             assert!(std::time::Instant::now() < deadline);

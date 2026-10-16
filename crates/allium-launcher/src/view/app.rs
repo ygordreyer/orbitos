@@ -43,6 +43,7 @@ fn prepare_theme_inputs(
     if top.screen.is_dialog() {
         for input in underlays {
             input.hints.clear();
+            input.suppress_hints = true;
         }
     }
 }
@@ -601,6 +602,7 @@ where
                 let underlay = models.len() - 1;
                 for model in &mut models[..underlay] {
                     model.hints.clear();
+                    model.suppress_hints = true;
                 }
             }
             let mut previous = self

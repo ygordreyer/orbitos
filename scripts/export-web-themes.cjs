@@ -29,6 +29,8 @@ function exportVariant(original,shape,selected={}){
     // The controller supplies localization, actions and navigation identities.
     if(c.kind==='overlay'){out.color='background';out.radius=c.radius||0;}
     if(c.kind==='navigation'&&c.items)paint.icons=c.items.map(item=>item.icon);
+    if(c.kind==='hints'&&c.items)paint.hint_items=c.items;
+    if(c.kind==='keyboard')paint.keyboard_layout='qwerty';
     out.paint=paint;return out;
    });
   }

@@ -296,7 +296,27 @@ mod tests {
     use std::env;
 
     use super::*;
-    use serial_test::serial;
+
+    // A child process keeps configuration overrides away from other tests' lazy globals.
+    fn isolated_config_test(name: &str) -> bool {
+        if env::var("ALLIUM_CONSOLE_TEST_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let status = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("ALLIUM_CONSOLE_TEST_CHILD", name)
+            .env(
+                "ALLIUM_BASE_DIR",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../static/.allium")
+                    .canonicalize()
+                    .unwrap(),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated console configuration test failed");
+        true
+    }
 
     #[test]
     fn test_console_mapper() {
@@ -339,11 +359,9 @@ mod tests {
     }
 
     #[test]
-    #[serial(env_ALLIUM_BASE_DIR)]
     fn test_config() {
-        // SAFETY: tests that depend on this env var are run serially
-        unsafe {
-            env::set_var("ALLIUM_BASE_DIR", "../../static/.allium");
+        if isolated_config_test("consoles::tests::test_config") {
+            return;
         }
 
         let mut mapper = ConsoleMapper::new();
@@ -430,11 +448,9 @@ mod tests {
     }
 
     #[test]
-    #[serial(env_ALLIUM_BASE_DIR)]
     fn test_core_names() {
-        // SAFETY: tests that depend on this env var are run serially
-        unsafe {
-            env::set_var("ALLIUM_BASE_DIR", "../../static/.allium");
+        if isolated_config_test("consoles::tests::test_core_names") {
+            return;
         }
 
         let mut mapper = ConsoleMapper::new();

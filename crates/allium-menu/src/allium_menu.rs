@@ -21,6 +21,11 @@ use type_map::TypeMap;
 use crate::retroarch_info::RetroArchInfo;
 use crate::view::ingame_menu::IngameMenu;
 
+// Constructors consume the same state file that prewarm and quit tests inspect.
+#[cfg(test)]
+pub(crate) static MENU_STATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+
 pub struct AlliumMenu<P>
 where
     P: Platform,
@@ -514,6 +519,7 @@ mod orbit_global_proof {
 
     #[tokio::test]
     async fn perf6_release_metadata_replaces_seed_before_any_menu_draw() {
+        let _state_guard = MENU_STATE_TEST_LOCK.lock().await;
         let root =
             std::env::temp_dir().join(format!("perf6-fresh-metadata-{}", std::process::id()));
         std::fs::create_dir_all(root.join("state")).unwrap();
@@ -582,6 +588,7 @@ mod orbit_global_proof {
 
     #[tokio::test]
     async fn perf6_prewarm_keeps_display_and_state_read_only() {
+        let _state_guard = MENU_STATE_TEST_LOCK.lock().await;
         let mut app = AlliumMenu::new(DefaultPlatform::new().unwrap(), Stylesheet::load().unwrap())
             .await
             .unwrap();
@@ -616,6 +623,7 @@ mod orbit_global_proof {
 
     #[tokio::test]
     async fn perf5_pending_exit_restores_without_menu_draw_or_flush() {
+        let _state_guard = MENU_STATE_TEST_LOCK.lock().await;
         let mut menu =
             AlliumMenu::new(DefaultPlatform::new().unwrap(), Stylesheet::load().unwrap())
                 .await
@@ -631,6 +639,7 @@ mod orbit_global_proof {
 
     #[tokio::test]
     async fn perf5_menu_press_skips_theme_refresh_and_keeps_release_barrier() {
+        let _state_guard = MENU_STATE_TEST_LOCK.lock().await;
         let mut menu =
             AlliumMenu::new(DefaultPlatform::new().unwrap(), Stylesheet::load().unwrap())
                 .await
@@ -716,6 +725,7 @@ mod orbit_global_proof {
 
     #[tokio::test]
     async fn native_orbit_global_menu_preserves_raw_theme() {
+        let _state_guard = MENU_STATE_TEST_LOCK.lock().await;
         assert!(common::constants::ALLIUM_SD_ROOT.ends_with("native-orbit-fixture"));
         assert!(!common::constants::ALLIUM_SD_ROOT.starts_with("/Volumes"));
         let styles = Stylesheet::load().unwrap();
