@@ -2,21 +2,21 @@
   {
     "id": "orbit-hero",
     "name": "Orbit Hero",
-    "manifest_bytes": 67307
+    "manifest_bytes": 79586
   },
   {
     "id": "orbit-row",
     "name": "Orbit Row",
-    "manifest_bytes": 64427
+    "manifest_bytes": 75164
   },
   {
     "id": "big-picture",
     "name": "Big Picture",
-    "manifest_bytes": 60219
+    "manifest_bytes": 77201
   },
   {
     "id": "compact-plus",
     "name": "Compact+",
-    "manifest_bytes": 82658
+    "manifest_bytes": 88128
   }
 ]

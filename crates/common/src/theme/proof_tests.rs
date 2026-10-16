@@ -1813,3 +1813,6 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
         let logo=PreparedFrame::prepare(theme,&input).unwrap();assert_ne!(logo.pixels().pixel(500,144),no_title.pixels().pixel(500,144));
     }
 }
+
+#[path = "parity_a_tests.rs"]
+mod parity_a;
