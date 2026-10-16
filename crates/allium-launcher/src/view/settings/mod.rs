@@ -201,7 +201,7 @@ impl Settings {
             "settings-about",
         ]);
         let mut input = FrameInputs::new(screen);
-        input.text.insert(Binding::Title, locale.t("tab-settings"));
+        input.text.insert(Binding::Title, common::product::NAME.into());
         input.rows.insert(
             Binding::SettingsRows,
             keys.iter()

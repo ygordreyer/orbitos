@@ -194,7 +194,7 @@ impl Catalog {
                         && Path::new(&game.launch_path)
                             == Path::new(&game.cache_path)
                                 .join(Path::new(&game.cache_path).file_name().unwrap())),
-                "Incompatible Allium identity/launch path"
+                "Incompatible library identity/launch path"
             );
             ensure!(
                 paths.contains(&rom_path(&game.launch_path)?),

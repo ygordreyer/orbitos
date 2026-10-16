@@ -135,7 +135,7 @@ settings-power-volume-on-startup-muted = Muted
 settings-files = Files
 
 settings-system-update-menu = System Update
-settings-system-allium-version = Allium Version
+settings-system-allium-version = Product Version
 settings-system-latest-version = Latest Version
 settings-system-model-name = Model Name
 settings-system-firmware-version = Firmware Version
@@ -203,3 +203,14 @@ keyboard-button-shift = Shift
 
 powering-off = Powering off...
 charging = Charging...
+
+# Product identity values come from common::product.
+settings-about-product = Product
+settings-about-version = Version
+settings-about-build = Build
+settings-about-channel = Channel
+settings-about-upstream = Based on
+settings-about-license = Upstream license
+settings-about-authors = Upstream authors
+settings-about-source = Upstream source
+settings-about-warranty = Upstream license note

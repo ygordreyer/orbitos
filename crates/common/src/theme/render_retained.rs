@@ -116,6 +116,7 @@ pub(super) fn matches(saved: &Inputs, input: &FrameInputs) -> bool {
     let mut model = input.clone();
     model.art = Default::default();
     saved.model == model
+        && same_art(saved.art.logo.as_ref(), input.art.selected_logo.as_ref())
         && same_art(saved.art.hero.as_ref(), input.art.selected_hero.as_ref())
         && same_art(saved.art.cover.as_ref(), input.art.selected_cover.as_ref())
         && same_art(saved.art.next_cover.as_ref(), input.art.next_cover.as_ref())

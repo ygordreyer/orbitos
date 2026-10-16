@@ -67,6 +67,9 @@ struct Entry {
 }
 fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
     let mut out = FrameInputs::new(input.screen);
+    if c.logo || c.binding == Some(Binding::SelectedLogo) {
+        out.art.selected_logo = input.art.selected_logo.clone();
+    }
     match c.kind {
         Kind::Text => {
             let binding = match c.binding.unwrap() {
@@ -201,6 +204,37 @@ mod review_tests {
     use super::*;
     use crate::theme::fonts::FontBank;
     use std::path::Path;
+
+    #[test]
+    fn logo_only_selection_change_repaints_retained_titles() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let snapshots = [ThemeSnapshot::builtin("orbit").unwrap(),
+            ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap()];
+        for snapshot in snapshots {
+            let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+            let mut input = FrameInputs::new(ScreenId::Library);
+            input.text.insert(Binding::SelectedTitle, "Same title".into());
+            let logo = |color| {
+                let mut p = Pixmap::new(80, 20).unwrap();
+                p.fill(color);
+                Arc::new(p)
+            };
+            input.art.selected_logo = Some(logo(tiny_skia::Color::from_rgba8(255, 0, 0, 255)));
+            let before = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            let saved = retained::capture(&input);
+            assert!(retained::matches(&saved, &input));
+            input.art.selected_logo = Some(logo(tiny_skia::Color::from_rgba8(0, 0, 255, 255)));
+            assert!(!retained::matches(&saved, &input));
+            let fresh = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            assert_ne!(before.pixels.data(), fresh.pixels.data());
+            let after = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
+            assert_eq!(after.pixels.data(), fresh.pixels.data());
+            input.art.selected_logo = None;
+            let removed = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(after)).unwrap();
+            assert_eq!(removed.pixels.data(), PreparedFrame::prepare(theme, &input).unwrap().pixels.data());
+        }
+    }
 
     fn synthetic_theme(oversized: bool) -> ThemeHandle {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

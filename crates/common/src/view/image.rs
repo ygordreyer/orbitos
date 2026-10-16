@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use async_trait::async_trait;
 use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as FirImage};
-use image::{RgbaImage, imageops};
+use image::{ImageDecoder, RgbaImage, imageops};
 use log::{error, trace};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
@@ -123,7 +123,20 @@ impl Image {
     ) -> Option<RgbaImage> {
         #[cfg(feature = "perf-bench")]
         crate::perf::hit(crate::perf::Op::Read);
-        let image = ::image::open(path)
+        let mut reader = ::image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+        let mut limits = ::image::Limits::default();
+        limits.max_image_width = Some(2048);
+        limits.max_image_height = Some(2048);
+        limits.max_alloc = Some(32 * 1024 * 1024);
+        reader.limits(limits);
+        let decoder = reader.into_decoder().ok()?;
+        let (width, height) = decoder.dimensions();
+        if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 2048 * 2048 {
+            return None;
+        }
+        #[cfg(test)]
+        SOURCE_DECODES.with(|n| n.set(n.get() + 1));
+        let image = ::image::DynamicImage::from_decoder(decoder)
             .map_err(|e| error!("Failed to load image at {}: {}", path.display(), e))
             .ok()?;
         #[cfg(feature = "perf-bench")]
@@ -232,5 +245,35 @@ impl View for Image {
         self.rect.x = point.x;
         self.rect.y = point.y;
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod media_safety_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cover_rejects_tiny_huge_jpeg_before_decode() {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[0, 0, 0], 1, 1, image::ExtendedColorType::Rgb8).unwrap();
+        let sof = bytes.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        bytes[sof + 5..sof + 7].copy_from_slice(&8192u16.to_be_bytes());
+        bytes[sof + 7..sof + 9].copy_from_slice(&8192u16.to_be_bytes());
+        assert!(bytes.len() < 1024);
+        let path = std::env::temp_dir().join(format!("allium-legacy-huge-header-{}.jpg", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        SOURCE_DECODES.with(|n| n.set(0));
+        for mode in [ImageMode::Raw, ImageMode::Cover, ImageMode::Contain] {
+            let view = Image::new(Rect::new(0, 0, 140, 140), path.clone(), mode);
+            assert!(view.image(&path, view.rect, mode, 0).is_none());
+        }
+        SOURCE_DECODES.with(|n| assert_eq!(n.get(), 0));
+        std::fs::remove_file(path).unwrap();
     }
 }
