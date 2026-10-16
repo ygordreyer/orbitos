@@ -314,13 +314,14 @@ fn prepare_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WRITER's try-lock also covers unrelated directories. Share the launcher
+    // proof gate so concurrent tests cannot silently skip writes or cleanup.
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn exact_pixels_validation_identity_and_eviction() {
-        let dir = std::env::temp_dir().join(format!(
-            "allium-art-cache-test-{}",
-            TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let fixture = Fixture::new();
+        let dir = &fixture.0;
         let source = dir.join("source.png");
         fs::write(&source, b"source").unwrap();
         let key = ArtKey::new(
@@ -380,18 +381,25 @@ mod tests {
         assert!(source.exists());
         assert!(key.load(&source).is_none());
         key.store(&source, &pixels);
-        fs::remove_dir_all(dir).unwrap();
     }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "allium-art-perf3-{}-{}",
-                std::process::id(),
-                TEMP_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let dir = std::env::temp_dir().join(format!(
+                    "allium-art-cache-test-{}-{}",
+                    std::process::id(),
+                    FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&dir) {
+                    Ok(()) => return Self(dir),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        panic!("cannot create art cache fixture {}: {error}", dir.display())
+                    }
+                }
+            }
         }
         fn key(&self, bytes: &[u8]) -> ArtKey {
             let source = self.0.join("source.png");
@@ -413,6 +421,7 @@ mod tests {
         }
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn reserve_admission_rounds_allocation_and_fails_closed() {
         let incoming = 4097;
         let exact = RESERVE_BYTES + WRITE_MARGIN + 8192;
@@ -427,6 +436,7 @@ mod tests {
         assert!(fs::read_dir(&dir.0).unwrap().next().is_none());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn failed_reserve_or_statvfs_skips_publication_before_temp_creation() {
         let dir = Fixture::new();
         let key = dir.key(b"source");
@@ -442,6 +452,7 @@ mod tests {
         );
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_denied_space_leaves_missing_directory_absent() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -454,6 +465,7 @@ mod tests {
         assert!(!fixture.0.join("missing").exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_failed_statvfs_leaves_missing_directory_absent() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -464,6 +476,7 @@ mod tests {
         assert!(!fixture.0.join("missing").exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_budgets_every_missing_directory_and_lock_block() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -487,6 +500,7 @@ mod tests {
         assert!(key.load(&dir).is_some());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_existing_directory_budgets_only_missing_lock() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -502,6 +516,7 @@ mod tests {
         assert_eq!(key.load(&fixture.0).unwrap().data(), image.data());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_existing_lock_failed_statvfs_creates_nothing() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -518,6 +533,7 @@ mod tests {
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn initialization_cleanup_without_lock_creates_nothing() {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
@@ -529,6 +545,7 @@ mod tests {
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn young_temps_block_admission_without_deletion() {
         let dir = Fixture::new();
         let young = dir.0.join(".young.tmp");
@@ -537,6 +554,7 @@ mod tests {
         assert!(young.exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn failed_publication_keeps_young_temp_until_stale_reclamation() {
         let dir = Fixture::new();
         let key = dir.key(b"source");
@@ -572,6 +590,7 @@ mod tests {
         assert!(!temps[0].exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn corrupt_pixel_payload_is_deleted_as_a_miss() {
         let dir = Fixture::new();
         let key = dir.key(b"source");
@@ -585,6 +604,7 @@ mod tests {
         assert!(!path.exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn same_metadata_and_length_content_changes_invalidate_key() {
         let dir = Fixture::new();
         let key = dir.key(b"source");
@@ -594,6 +614,7 @@ mod tests {
         assert_ne!(key.hash, changed.hash);
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn stale_temps_are_reclaimed_young_temps_count_and_oldest_entries_evict_before_allocation() {
         let dir = Fixture::new();
         let stale = dir.0.join(".stale.tmp");
@@ -622,6 +643,7 @@ mod tests {
         assert!(young.exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn publication_evicts_before_payload_admission_with_existing_lock() {
         let dir = Fixture::new();
         let source = dir.0.join("source.png");
@@ -655,6 +677,7 @@ mod tests {
         assert_eq!(key.load(&dir.0).unwrap().data(), image.data());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn reserve_pressure_evicts_then_rechecks_actual_free_space() {
         let dir = Fixture::new();
         let entry = dir.0.join(format!("{}.rgba", "0".repeat(64)));
@@ -678,6 +701,7 @@ mod tests {
         assert!(!entry.exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn advisory_lock_contender() {
         let Some(dir) = std::env::var_os("ALLIUM_CACHE_LOCK_TEST") else {
             return;
@@ -696,10 +720,13 @@ mod tests {
         key.store(&dir, &Pixmap::new(3, 2).unwrap());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn writers_skip_process_and_cross_process_lock_contention() {
         let dir = Fixture::new();
         let key = dir.key(b"source");
         let guard = CacheWriter::acquire(&dir.0).unwrap();
+        let other = Fixture::new();
+        assert!(CacheWriter::acquire(&other.0).is_none());
         key.store(&dir.0, &Pixmap::new(3, 2).unwrap());
         assert!(!key.path(&dir.0).exists());
         let run = || {
@@ -719,6 +746,7 @@ mod tests {
         assert!(key.path(&dir.0).exists());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     #[ignore = "explicit source hashing versus PNG decode measurement"]
     fn source_hash_cost_measurement() {
         let root = PathBuf::from(std::env::var_os("ALLIUM_SOURCE_HASH_ART").unwrap());
@@ -764,6 +792,7 @@ mod tests {
         );
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn dl8_art_rechecks_before_each_payload_write() {
         for denied_check in [3, 4] {
             let dir = Fixture::new();
