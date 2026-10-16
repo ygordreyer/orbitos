@@ -62,7 +62,7 @@ fn game_context(
         let cover = common::media::resolve(&game.path, kind)
             .or_else(|| common::media::resolve(&game.path, common::media::Kind::Cover))
             .or_else(|| game.image.clone())
-            .and_then(|path| image::open(path).ok())
+            .and_then(|path| cover_image(&path))
             .and_then(|image| {
                 let rgba = image.thumbnail(320, 320).to_rgba8();
                 let mut pixels = tiny_skia::Pixmap::new(rgba.width(), rgba.height())?;
@@ -121,4 +121,75 @@ fn game_context(
 
 thread_local! {
     static COVER: std::cell::RefCell<Option<(std::path::PathBuf, Option<std::path::PathBuf>, bool, u64, Option<std::sync::Arc<tiny_skia::Pixmap>>)>> = const { std::cell::RefCell::new(None) };
+}
+
+const MAX_COVER_DIMENSION: u32 = 2048;
+const MAX_COVER_PIXELS: u64 = 2048 * 2048;
+
+fn cover_image(path: &std::path::Path) -> Option<image::DynamicImage> {
+    let (width, height) = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width == 0
+        || height == 0
+        || width > MAX_COVER_DIMENSION
+        || height > MAX_COVER_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_COVER_PIXELS
+    {
+        return None;
+    }
+    let mut reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_COVER_DIMENSION);
+    limits.max_image_height = Some(MAX_COVER_DIMENSION);
+    reader.limits(limits);
+    #[cfg(test)]
+    COVER_DECODE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+    reader.decode().ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static COVER_DECODE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn menu_cover_rejects_oversized_header_before_decode() {
+        let path =
+            std::env::temp_dir().join(format!("allium-menu-cover-{}.png", std::process::id()));
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        COVER_DECODE_ATTEMPTS.with(|attempts| attempts.set(0));
+        assert!(cover_image(&path).is_some());
+        COVER_DECODE_ATTEMPTS.with(|attempts| assert_eq!(attempts.get(), 1));
+        for (width, height) in [(8192u32, 8192u32), (2049, 1), (1, 2049)] {
+            let mut bytes = original.clone();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            let mut crc = !0u32;
+            for byte in &bytes[12..29] {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(image::image_dimensions(&path).unwrap(), (width, height));
+            COVER_DECODE_ATTEMPTS.with(|attempts| attempts.set(0));
+            assert!(cover_image(&path).is_none());
+            COVER_DECODE_ATTEMPTS.with(|attempts| assert_eq!(attempts.get(), 0));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

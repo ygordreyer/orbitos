@@ -57,8 +57,13 @@ impl DateTime {
 #[async_trait(?Send)]
 impl View for DateTime {
     fn theme_value(&self) -> String {
-        self.edit_state.as_ref().map_or(self.value, |state| state.value)
-            .format("%Y-%m-%d %H:%M:%S").to_string()
+        let Some(state) = &self.edit_state else {
+            return self.value.format("%Y-%m-%d %H:%M:%S").to_string();
+        };
+        let mut fields = ["%Y", "-", "%m", "-", "%d", " ", "%H", ":", "%M", ":", "%S"]
+            .map(|format| state.value.format(format).to_string());
+        fields[state.selected] = format!("[{}]", fields[state.selected]);
+        fields.concat()
     }
 
     fn draw(
@@ -317,5 +322,70 @@ impl View for DateTime {
     fn blur(&mut self) {
         self.text_color = StylesheetColor::Foreground;
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn themed_datetime_marks_each_selected_field_and_clears_on_exit() {
+        let value = chrono::NaiveDate::from_ymd_opt(2026, 10, 16)
+            .unwrap()
+            .and_hms_opt(14, 5, 0)
+            .unwrap();
+        let mut editor = DateTime::new(Point::zero(), value, Alignment::Right);
+        assert_eq!(editor.theme_value(), "2026-10-16 14:05:00");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut bubble = VecDeque::new();
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble)
+            .await
+            .unwrap();
+        assert_eq!(editor.theme_value(), "2026-10-16 [14]:05:00");
+        for _ in 0..3 {
+            editor
+                .handle_key_event(KeyEvent::Pressed(Key::Left), tx.clone(), &mut bubble)
+                .await
+                .unwrap();
+        }
+        for expected in [
+            "[2026]-10-16 14:05:00",
+            "2026-[10]-16 14:05:00",
+            "2026-10-[16] 14:05:00",
+            "2026-10-16 [14]:05:00",
+            "2026-10-16 14:[05]:00",
+            "2026-10-16 14:05:[00]",
+        ] {
+            assert_eq!(editor.theme_value(), expected);
+            editor
+                .handle_key_event(KeyEvent::Pressed(Key::Right), tx.clone(), &mut bubble)
+                .await
+                .unwrap();
+        }
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::Up), tx.clone(), &mut bubble)
+            .await
+            .unwrap();
+        assert_eq!(editor.theme_value(), "2026-10-16 14:05:[01]");
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut bubble)
+            .await
+            .unwrap();
+        assert_eq!(editor.theme_value(), "2026-10-16 14:05:00");
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble)
+            .await
+            .unwrap();
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::Up), tx.clone(), &mut bubble)
+            .await
+            .unwrap();
+        editor
+            .handle_key_event(KeyEvent::Pressed(Key::A), tx, &mut bubble)
+            .await
+            .unwrap();
+        assert_eq!(editor.theme_value(), "2026-10-16 15:05:00");
     }
 }

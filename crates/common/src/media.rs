@@ -52,7 +52,15 @@ struct Cache {
     paths: BTreeMap<(PathBuf, Kind), Option<PathBuf>>,
     logos: BTreeMap<PathBuf, Option<std::sync::Arc<tiny_skia::Pixmap>>>,
 }
+const PATH_CACHE_LIMIT: usize = 512;
 impl Cache {
+    fn insert_path(&mut self, key: (PathBuf, Kind), path: Option<PathBuf>) {
+        if self.paths.len() >= PATH_CACHE_LIMIT {
+            self.paths.clear();
+        }
+        self.paths.insert(key, path);
+    }
+
     fn insert(&mut self, path: PathBuf, data: Metadata) {
         if self.records.contains_key(&path) {
             return;
@@ -396,10 +404,7 @@ pub fn resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
         {
             found = Some(path.into());
         }
-        if cache.paths.len() >= 512 {
-            cache.paths.clear();
-        }
-        cache.paths.insert(key, found.clone());
+        cache.insert_path(key, found.clone());
         found
     })
 }
@@ -463,6 +468,54 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn adopted_game_paths_obey_resolve_cache_limit() {
+        invalidate();
+        let kinds = [
+            Kind::Cover,
+            Kind::TallCover,
+            Kind::Logo,
+            Kind::Background,
+            Kind::PreparedCover,
+        ];
+        for n in 0..600 {
+            let game = PathBuf::from(format!("/fixture/G{n}.sfc"));
+            adopt_game(PreparedGame {
+                path: game.clone(),
+                metadata: std::sync::Arc::new(Metadata::default()),
+                paths: kinds
+                    .into_iter()
+                    .map(|kind| (kind, Some(game.with_extension("png"))))
+                    .collect(),
+            });
+            CACHE.with(|cache| {
+                let cache = cache.borrow();
+                assert!(cache.paths.len() <= PATH_CACHE_LIMIT);
+                assert_eq!(
+                    cache.paths.get(&(game.clone(), Kind::PreparedCover)),
+                    Some(&Some(game.with_extension("png")))
+                );
+            });
+        }
+        // A worker cache rollover still admits successful paths and cached misses.
+        let game = PathBuf::from("/fixture/last.sfc");
+        adopt_game(PreparedGame {
+            path: game.clone(),
+            metadata: std::sync::Arc::new(Metadata::default()),
+            paths: vec![
+                (Kind::Cover, Some(game.with_extension("png"))),
+                (Kind::Logo, None),
+            ],
+        });
+        assert_eq!(
+            resolve(&game, Kind::Cover),
+            Some(game.with_extension("png"))
+        );
+        assert_eq!(resolve(&game, Kind::Logo), None);
+        CACHE.with(|cache| assert_eq!(cache.borrow().paths.get(&(game, Kind::Logo)), Some(&None)));
+        invalidate();
+    }
+
     #[test]
     fn media_fixture_present_absent_metadata_unknown_and_missing_fields() {
         invalidate();
@@ -704,7 +757,7 @@ pub fn adopt_game(game: PreparedGame) {
             cache.insert(key, (*game.metadata).clone());
         }
         for (kind, path) in game.paths {
-            cache.paths.insert((game.path.clone(), kind), path);
+            cache.insert_path((game.path.clone(), kind), path);
         }
     });
 }
@@ -724,7 +777,7 @@ pub fn adopt_paths(game: &Path, paths: impl IntoIterator<Item = (Kind, PathBuf)>
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         for (kind, path) in paths {
-            cache.paths.insert((game.into(), kind), Some(path));
+            cache.insert_path((game.into(), kind), Some(path));
         }
     });
 }

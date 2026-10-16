@@ -24,6 +24,30 @@ use log::{error, trace};
 use tokio::sync::mpsc::Sender;
 
 const INK_PAGE_HISTORY_LIMIT: usize = 64;
+const PAGINATION_PAGE_BUDGET: usize = 4;
+
+struct PaginationIndex {
+    digest: String,
+    generation: u64,
+    text_len: usize,
+    starts: Vec<usize>,
+    resume: usize,
+    complete: bool,
+}
+
+impl PaginationIndex {
+    fn pagination(&self, cursor: usize) -> Option<common::theme::frame::Pagination> {
+        // A restored/search cursor may be beyond the indexed prefix. Never label it
+        // with the last known page number while incremental indexing catches up.
+        if !self.complete && cursor > self.resume {
+            return None;
+        }
+        Some(common::theme::frame::Pagination {
+            page: self.starts.partition_point(|at| *at <= cursor).max(1),
+            total: self.starts.len(),
+        })
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -51,7 +75,7 @@ pub struct TextReader {
     cursor: usize,
     ink_page_history: VecDeque<(usize, usize)>,
     ink_page_theme: Option<(String, u64)>,
-    pagination_index: Option<(String, u64, usize, Vec<usize>)>,
+    pagination_index: Option<PaginationIndex>,
     legacy_paragraph: Option<LegacyParagraph>,
     button_hints: ButtonHints<String>,
     keyboard: Option<Keyboard>,
@@ -653,19 +677,40 @@ impl TextReader {
                     self.cursor as f32 / self.text.len().max(1) as f32 * 100.0
                 ),
             );
-            if let Some((layout,rect,max_lines)) = Self::ink_guide_layout(&theme) {
-                let valid = self.pagination_index.as_ref().is_some_and(|(digest,generation,len,_)|digest == theme.digest() && *generation == theme.generation() && *len == self.text.len());
+            if let Some((layout, rect, max_lines)) = Self::ink_guide_layout(&theme) {
+                let valid = self.pagination_index.as_ref().is_some_and(|index| {
+                    index.digest == theme.digest()
+                        && index.generation == theme.generation()
+                        && index.text_len == self.text.len()
+                });
                 if !valid {
-                    let mut starts = vec![0]; let mut at = 0;
-                    while at < self.text.len() {
-                        let used = layout.guide_page_len(&self.text[at..],rect.2,rect.3,max_lines);
-                        if used == 0 {break;} at += used;
-                        if at < self.text.len() { starts.push(at); }
-                    }
-                    self.pagination_index = Some((theme.digest().into(),theme.generation(),self.text.len(),starts));
+                    self.pagination_index = Some(PaginationIndex {
+                        digest: theme.digest().into(),
+                        generation: theme.generation(),
+                        text_len: self.text.len(),
+                        starts: vec![0],
+                        resume: 0,
+                        complete: self.text.is_empty(),
+                    });
                 }
-                let starts = &self.pagination_index.as_ref().unwrap().3;
-                input.pagination = Some(common::theme::frame::Pagination {page: starts.partition_point(|at| *at <= self.cursor).max(1), total: starts.len()});
+                let index = self.pagination_index.as_mut().unwrap();
+                for _ in 0..PAGINATION_PAGE_BUDGET {
+                    if index.complete {
+                        break;
+                    }
+                    let used = layout.guide_page_len(
+                        &self.text[index.resume..], rect.2, rect.3, max_lines,
+                    );
+                    if used == 0 {
+                        break;
+                    }
+                    index.resume += used;
+                    index.complete = index.resume == self.text.len();
+                    if !index.complete {
+                        index.starts.push(index.resume);
+                    }
+                }
+                input.pagination = index.pagination(self.cursor);
             }
             input.text.insert(Binding::GuideText, visible);
             input.hints = vec![
@@ -1598,6 +1643,71 @@ mod theme_adapter_tests {
         "orbit",
         "compact",
     ];
+
+    #[test]
+    fn guide_pagination_indexes_bounded_pages_per_refresh_and_resumes() {
+        let text = "é 日本語 line\n".repeat(240);
+        let (root, mut reader) = themes5_reader("pagination-budget", "orbit-hero", &text);
+        let theme = reader.res.get::<Option<ThemeHandle>>().clone().unwrap();
+        let (layout, rect, max_lines) = TextReader::ink_guide_layout(&theme).unwrap();
+        let mut expected = vec![0];
+        let mut at = 0;
+        while at < text.len() {
+            at += layout.guide_page_len(&text[at..], rect.2, rect.3, max_lines);
+            if at < text.len() {
+                expected.push(at);
+            }
+        }
+        assert!(expected.len() > PAGINATION_PAGE_BUDGET * 2);
+        reader.refresh_theme(Status::default()).unwrap();
+        let index = reader.pagination_index.as_ref().unwrap();
+        assert!(!index.complete);
+        assert_eq!(index.starts, expected[..=PAGINATION_PAGE_BUDGET]);
+        let pagination = index.pagination(0).unwrap();
+        assert_eq!(
+            (pagination.page, pagination.total),
+            (1, PAGINATION_PAGE_BUDGET + 1)
+        );
+        // Deep restored/search cursors must not cause an unbounded synchronous catch-up.
+        reader.cursor = expected[expected.len() - 2] + "é".len();
+        assert!(index.pagination(reader.cursor).is_none());
+        let mut previous = index.starts.len();
+        for _ in 0..expected.len() {
+            reader.refresh_theme(Status::default()).unwrap();
+            let index = reader.pagination_index.as_ref().unwrap();
+            assert!(index.starts.len() - previous <= PAGINATION_PAGE_BUDGET);
+            assert_eq!(index.starts, expected[..index.starts.len()]);
+            previous = index.starts.len();
+            if index.complete {
+                break;
+            }
+        }
+        let index = reader.pagination_index.as_ref().unwrap();
+        assert!(index.complete);
+        assert_eq!(index.starts, expected);
+        assert_eq!(
+            index.pagination(reader.cursor).unwrap().page,
+            expected.len() - 1
+        );
+        for (page, cursor) in expected.iter().enumerate() {
+            assert_eq!(index.pagination(*cursor).unwrap().page, page + 1);
+        }
+        assert_eq!(index.pagination(text.len()).unwrap().page, expected.len());
+        // Each cache identity component must invalidate a completed index.
+        for identity in 0..3 {
+            let index = reader.pagination_index.as_mut().unwrap();
+            match identity {
+                0 => index.digest.push('x'),
+                1 => index.generation += 1,
+                _ => index.text_len += 1,
+            }
+            reader.refresh_theme(Status::default()).unwrap();
+            let index = reader.pagination_index.as_ref().unwrap();
+            assert_eq!(index.starts.len(), PAGINATION_PAGE_BUDGET + 1);
+            assert!(!index.complete);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn themes6_render(reader: &mut TextReader) {
         reader.refresh_theme(Status::default()).unwrap();
