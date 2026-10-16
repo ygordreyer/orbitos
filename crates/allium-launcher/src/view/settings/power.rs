@@ -276,6 +276,12 @@ async fn toast_needs_restart_for_effect(res: &Resources, commands: &Sender<Comma
 }
 
 impl SettingsChild for Power {
+    fn clear_theme(&mut self) -> Result<()> { self.list.set_visible_count_override(None) }
+    fn theme_models(&mut self, handle: &common::theme::ThemeHandle)
+        -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        Ok(Some(super::page_models(&mut self.list, handle, "settings-power")?))
+    }
+
     fn save(&self) -> ChildState {
         ChildState {
             selected: self.list.selected(),

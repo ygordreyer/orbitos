@@ -553,6 +553,13 @@ impl View for SystemUpdate {
 }
 
 impl SettingsChild for SystemUpdate {
+    fn clear_theme(&mut self) -> Result<()> { self.list.set_visible_count_override(None) }
+    fn theme_models(&mut self, handle: &common::theme::ThemeHandle)
+        -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        self.check_background_tasks();
+        Ok(Some(super::page_models(&mut self.list, handle, "settings-system-update-menu")?))
+    }
+
     fn save(&self) -> ChildState {
         ChildState {
             selected: self.list.selected(),

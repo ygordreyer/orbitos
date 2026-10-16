@@ -56,6 +56,11 @@ impl DateTime {
 
 #[async_trait(?Send)]
 impl View for DateTime {
+    fn theme_value(&self) -> String {
+        self.edit_state.as_ref().map_or(self.value, |state| state.value)
+            .format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,

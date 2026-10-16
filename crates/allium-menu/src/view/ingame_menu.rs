@@ -346,7 +346,7 @@ where
         let game = self.res.get::<GameInfo>();
         let mut input = FrameInputs::new(ScreenId::IngameMenu);
         input.text.insert(Binding::Title, game.name.clone());
-        input.art.selected_logo = common::media::load_logo(&game.path);
+        super::game_context(&mut input, &self.res, &theme);
         let rows = self
             .entries
             .iter()
@@ -971,7 +971,7 @@ mod theme_adapter_tests {
     use type_map::TypeMap;
 
     #[derive(Clone)]
-    struct TestBattery;
+    pub(super) struct TestBattery;
 
     impl Battery for TestBattery {
         fn update(&mut self) -> Result<()> {
@@ -1049,7 +1049,7 @@ mod theme_adapter_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn perf6_resources(theme: ThemeHandle, clock: bool) -> Resources {
+    pub(super) fn perf6_resources(theme: ThemeHandle, clock: bool) -> Resources {
         let mut map = TypeMap::new();
         let mut styles = Stylesheet::load().unwrap();
         styles.status_bar.show_clock = clock;
@@ -1066,7 +1066,7 @@ mod theme_adapter_tests {
         Resources::new(map)
     }
 
-    fn perf6_info() -> Option<RetroArchInfo> {
+    pub(super) fn perf6_info() -> Option<RetroArchInfo> {
         Some(RetroArchInfo {
             max_disk_slots: 1,
             disk_slot: 0,
@@ -1511,5 +1511,112 @@ mod theme_adapter_tests {
         );
         assert!(matches!(rx.recv().await, Some(Command::Exit)));
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parity_b_tests {
+    use super::theme_adapter_tests::{TestBattery, perf6_info, perf6_resources};
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/parity-b-support.rs"
+    ));
+    #[tokio::test]
+    async fn parity_b_menu_and_guides() {
+        let temp =
+            std::env::temp_dir().join(format!("allium-parity-b-menu-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let guide = temp.join("Guide Watch.txt");
+        fs::write(
+            &guide,
+            "First bookmark.\nYour saved notes for this game appear here.\n",
+        )
+        .unwrap();
+        let image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-fixtures/real-art/r4-cover.png");
+        let tall_path = temp.join("PS/media/covers-tall/r4.png");
+        fs::create_dir_all(tall_path.parent().unwrap()).unwrap();
+        fs::write(temp.join("PS/gamelist.xml"), "<gameList><game><path>./r4.chd</path><name>R4 - Ridge Racer Type 4</name><releasedate>19981203T000000</releasedate></game></gameList>").unwrap();
+        image::open(&image)
+            .unwrap()
+            .resize_exact(120, 180, image::imageops::FilterType::Lanczos3)
+            .save(&tall_path)
+            .unwrap();
+        for (variant, theme) in parity_variants() {
+            let res = perf6_resources(theme.clone(), false);
+            res.insert(common::database::Database::in_memory().unwrap());
+            res.insert(GameInfo {
+                name: "R4 - Ridge Racer Type 4".into(),
+                path: temp.join("PS/r4.chd"),
+                image: Some(image.clone()),
+                has_menu: true,
+                ..Default::default()
+            });
+            res.get::<common::database::Database>()
+                .update_guide_cursor(&guide, 16)
+                .unwrap();
+            let mut input = FrameInputs::new(ScreenId::GuideSelector);
+            super::super::game_context(&mut input, &res, &theme);
+            super::super::guide_shell(&mut input, &res.get::<Locale>());
+            assert_eq!(
+                input.navigation[&common::theme::pack::NavGroup::Primary].len(),
+                4
+            );
+            assert_eq!(input.selected[&Binding::Navigation], "tab-2");
+            assert_eq!(
+                input.metadata,
+                vec![
+                    ("Platform".into(), "PS".into()),
+                    ("Released".into(), "1998".into())
+                ]
+            );
+            assert_eq!(
+                input.text[&Binding::SelectedTitle],
+                "R4 - Ridge Racer Type 4"
+            );
+            let cover = input.art.selected_cover.as_ref().unwrap();
+            assert_eq!(
+                cover.height() > cover.width(),
+                theme.pack().alignment.as_ref().unwrap().cover_shape == "tall"
+            );
+            let mut again = FrameInputs::new(ScreenId::IngameMenu);
+            super::super::game_context(&mut again, &res, &theme);
+            assert!(std::sync::Arc::ptr_eq(
+                input.art.selected_cover.as_ref().unwrap(),
+                again.art.selected_cover.as_ref().unwrap()
+            ));
+            let mut menu = IngameMenu::new(
+                Rect::new(0, 0, 640, 480),
+                IngameMenuState::default(),
+                res,
+                TestBattery,
+                perf6_info(),
+            );
+            menu.refresh_theme().unwrap();
+            parity_save_overlay(&variant, "ingame_menu", menu.theme_frame.as_ref().unwrap());
+            menu.guide_selector = Some(GuideSelector::new(
+                Rect::new(0, 0, 640, 480),
+                menu.res.clone(),
+                vec![guide.clone(), guide.clone()],
+                0,
+                false,
+            ));
+            menu.refresh_theme().unwrap();
+            menu.guide_selector.as_mut().unwrap().refresh_theme(common::theme::frame::Status {
+                clock: Some("12:34".into()), battery: Some(82), network: Some("online".into()), ..Default::default()
+            }).unwrap();
+            parity_save(
+                &variant,
+                "guide_selector",
+                menu.guide_selector
+                    .as_ref()
+                    .unwrap()
+                    .prepared_theme_frame()
+                    .unwrap()
+                    .pixels(),
+            );
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 }

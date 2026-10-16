@@ -751,12 +751,15 @@ impl PreparedFrame {
                     .map_or(0, Vec::len) as u32;
                 let end = if matches!(c.kind, Kind::Entries | Kind::SettingsRows) {
                     if count == 0 {
-                        continue;
+                        let Some(empty) = c.paint.as_ref().filter(|p| !p.collapse_empty).and_then(|p| p.empty.as_ref()) else { continue; };
+                        let ty = self.ink_subtype(c, &Run { role: empty.role, color: empty.color, ..Run::default() });
+                        c.rect.1 + empty.offset_y + ty.line
+                    } else {
+                        c.rect.1
+                            + (count * c.item_extent.unwrap_or(0)
+                                + count.saturating_sub(1) * c.gap.unwrap_or(0))
+                            .min(c.rect.3)
                     }
-                    c.rect.1
-                        + (count * c.item_extent.unwrap_or(0)
-                            + count.saturating_sub(1) * c.gap.unwrap_or(0))
-                        .min(c.rect.3)
                 } else if c.kind == Kind::Text
                     && input
                         .text
@@ -1020,6 +1023,11 @@ impl PreparedFrame {
                     .unwrap_or(&[]);
                 if rows.is_empty() && p.collapse_empty {
                     return Ok(());
+                }
+                if rows.is_empty() && let Some(empty) = &p.empty {
+                    let ty = self.ink_subtype(c, &Run { role: empty.role, color: empty.color, ..Run::default() });
+                    self.ink_text(&c.id, Rect(c.rect.0, c.rect.1 + empty.offset_y, c.rect.2, ty.line),
+                        &ty, "No items", 1, empty.align.unwrap_or(Align::Left), Overflow::Ellipsis, false)?;
                 }
                 for (i, row) in rows
                     .iter()

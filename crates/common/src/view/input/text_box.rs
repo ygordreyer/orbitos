@@ -59,6 +59,11 @@ impl TextBox {
 
 #[async_trait(?Send)]
 impl View for TextBox {
+    fn theme_value(&self) -> String { self.label.theme_value() }
+    fn theme_keyboard(&self) -> Option<super::keyboard::KeyboardThemeInputs> {
+        self.keyboard.as_ref().map(Keyboard::theme_inputs)
+    }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,
