@@ -212,7 +212,7 @@ impl InkTextLayout {
 }
 struct CachedShelf {
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
-    source: Option<std::sync::Weak<Pixmap>>,
+    source: Option<crate::theme::image_cache::SourceIdentity>,
     key: String,
     pixels: Arc<Pixmap>,
 }
@@ -223,6 +223,46 @@ struct CachedText {
     pixels: Arc<Pixmap>,
 }
 thread_local! {static SURFACES: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};static TEXT: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};}
+#[cfg(test)]
+thread_local! { static UNCACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(super) fn uncached<T>(paint: impl FnOnce() -> T) -> T {
+    let old = UNCACHED.replace(true);
+    let result = paint();
+    UNCACHED.set(old);
+    result
+}
+thread_local! {
+    static REPLAY_CLIP: RefCell<Option<Vec<Rect>>> = const { RefCell::new(None) };
+}
+fn with_replay_clip<T>(clip: Option<Vec<Rect>>, paint: impl FnOnce() -> T) -> T {
+    let previous = REPLAY_CLIP.replace(clip);
+    let result = paint();
+    REPLAY_CLIP.replace(previous);
+    result
+}
+pub(super) fn bitmap(
+    dest: &mut Pixmap,
+    x: i32,
+    y: i32,
+    source: tiny_skia::PixmapRef<'_>,
+    auxiliary: bool,
+) {
+    let clip = REPLAY_CLIP.with(|clip| clip.borrow().clone());
+    if !super::ink_blit::reference()
+        && dest.width() == 640
+        && dest.height() == 480
+        && let Some(clip) = clip
+    {
+        for r in clip {
+            super::ink_blit::draw_clipped(&mut dest.as_mut(), x, y, source, (r.0, r.1, r.2, r.3));
+        }
+    } else if auxiliary {
+        super::ink_blit::bitmap(dest, x, y, source);
+    } else {
+        super::ink_blit::draw(&mut dest.as_mut(), x, y, source);
+    }
+}
 fn opacity_table(opacity: f32) -> Arc<[u8]> {
     thread_local! { static TABLES: RefCell<VecDeque<(u32, Arc<[u8]>)>> = const { RefCell::new(VecDeque::new()) }; }
     TABLES.with(|tables| {
@@ -421,11 +461,12 @@ impl PreparedFrame {
             }
             pix
         };
-        super::ink_blit::bitmap(
+        bitmap(
             &mut self.pixels,
             rect.0 as i32,
             rect.1 as i32,
             pixels.as_ref().as_ref(),
+            true,
         );
         self.text_boxes.push((id.into(), rect));
         Ok(())
@@ -502,11 +543,12 @@ impl PreparedFrame {
             });
             pixels
         };
-        super::ink_blit::bitmap(
+        bitmap(
             &mut self.pixels,
             rect.0 as i32,
             rect.1 as i32,
             pixels.as_ref().as_ref(),
+            true,
         );
     }
     fn ink_surface_raw(
@@ -659,7 +701,7 @@ impl PreparedFrame {
         self.ink_empty_stack(&mut components);
         self.ink_fit_dialog(&mut components, input);
         #[cfg(test)]
-        if std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
+        if UNCACHED.get() || std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
             return self.render_ink_uncached(input, &components);
         }
         self.render_ink_retained(input, &components)
@@ -755,8 +797,22 @@ impl PreparedFrame {
                     .map_or(0, Vec::len) as u32;
                 let end = if matches!(c.kind, Kind::Entries | Kind::SettingsRows) {
                     if count == 0 {
-                        let Some(empty) = c.paint.as_ref().filter(|p| !p.collapse_empty).and_then(|p| p.empty.as_ref()) else { continue; };
-                        let ty = self.ink_subtype(c, &Run { role: empty.role, color: empty.color, ..Run::default() });
+                        let Some(empty) = c
+                            .paint
+                            .as_ref()
+                            .filter(|p| !p.collapse_empty)
+                            .and_then(|p| p.empty.as_ref())
+                        else {
+                            continue;
+                        };
+                        let ty = self.ink_subtype(
+                            c,
+                            &Run {
+                                role: empty.role,
+                                color: empty.color,
+                                ..Run::default()
+                            },
+                        );
                         c.rect.1 + empty.offset_y + ty.line
                     } else {
                         c.rect.1
@@ -845,11 +901,15 @@ impl PreparedFrame {
                         let pagination = input.pagination.or_else(|| {
                             let text = input.text.get(&Binding::Pagination)?;
                             let (page, total) = text.split_once('/')?;
-                            Some(crate::theme::frame::Pagination { page: page.trim().parse().ok()?, total: total.trim().parse().ok()? })
+                            Some(crate::theme::frame::Pagination {
+                                page: page.trim().parse().ok()?,
+                                total: total.trim().parse().ok()?,
+                            })
                         });
-                        pagination.filter(|page| !p.hide_single || page.total > 1).map(|page| {
-                            format!("{} / {}", page.page, page.total)
-                        }).unwrap_or_default()
+                        pagination
+                            .filter(|page| !p.hide_single || page.total > 1)
+                            .map(|page| format!("{} / {}", page.page, page.total))
+                            .unwrap_or_default()
                     }
                     b => input.text.get(&b).cloned().unwrap_or_default(),
                 };
@@ -885,7 +945,10 @@ impl PreparedFrame {
             }
             Kind::Image => {
                 if c.binding == Some(Binding::SelectedLogo) {
-                    if self.logo(c, input)? { self.ink_image_action(c, input); return Ok(()); }
+                    if self.logo(c, input)? {
+                        self.ink_image_action(c, input);
+                        return Ok(());
+                    }
                     let title = input
                         .text
                         .get(&Binding::SelectedTitle)
@@ -1007,11 +1070,12 @@ impl PreparedFrame {
                         .get(&input.screen)
                         .and_then(|a| a.get(&c.id))
                     {
-                        super::ink_blit::bitmap(
+                        bitmap(
                             &mut self.pixels,
                             c.rect.0 as i32,
                             c.rect.1 as i32,
                             image.as_ref(),
+                            true,
                         );
                     }
                 }
@@ -1026,10 +1090,27 @@ impl PreparedFrame {
                 if rows.is_empty() && p.collapse_empty {
                     return Ok(());
                 }
-                if rows.is_empty() && let Some(empty) = &p.empty {
-                    let ty = self.ink_subtype(c, &Run { role: empty.role, color: empty.color, ..Run::default() });
-                    self.ink_text(&c.id, Rect(c.rect.0, c.rect.1 + empty.offset_y, c.rect.2, ty.line),
-                        &ty, "No items", 1, empty.align.unwrap_or(Align::Left), Overflow::Ellipsis, false)?;
+                if rows.is_empty()
+                    && let Some(empty) = &p.empty
+                {
+                    let ty = self.ink_subtype(
+                        c,
+                        &Run {
+                            role: empty.role,
+                            color: empty.color,
+                            ..Run::default()
+                        },
+                    );
+                    self.ink_text(
+                        &c.id,
+                        Rect(c.rect.0, c.rect.1 + empty.offset_y, c.rect.2, ty.line),
+                        &ty,
+                        "No items",
+                        1,
+                        empty.align.unwrap_or(Align::Left),
+                        Overflow::Ellipsis,
+                        false,
+                    )?;
                 }
                 for (i, row) in rows
                     .iter()
@@ -1048,34 +1129,7 @@ impl PreparedFrame {
                         self.ink_row(c, row, r, input, false)?;
                     }
                 }
-                if c.layout == Some(Arrangement::Shelf) && p.peek.is_some() && !rows.is_empty() {
-                    let source = input
-                        .art
-                        .next_cover
-                        .as_ref()
-                        .or_else(|| input.art.entries.get(&rows.last().unwrap().id));
-                    if let Some(source) = source {
-                        let row = Row {
-                            subtitle: String::new(),
-                            id: "ink-preview".into(),
-                            label: String::new(),
-                            value: String::new(),
-                            enabled: false,
-                        };
-                        let mut model = input.clone();
-                        let last = rows.last().and_then(|r| input.art.entries.get(&r.id));
-                        let end = last.is_some_and(|last| Arc::ptr_eq(last, source));
-                        model.art.entries.insert(row.id.clone(), source.clone());
-                        self.ink_shelf(
-                            c,
-                            &row,
-                            rows.len(),
-                            &model,
-                            p.peek.as_ref().unwrap().opacity.unwrap_or(0.62)
-                                * if end { 0.35 } else { 1.0 },
-                        )?;
-                    }
-                }
+                self.ink_shelf_peek(c, rows, input)?;
             }
             Kind::DialogActions => {
                 let rows = input
@@ -1172,11 +1226,15 @@ impl PreparedFrame {
         } else if active {
             p.active_fill
         } else {
-            c.frame_color.or(if c.kind == Kind::Navigation || action && p.action_style.is_none() && p.primary_style.is_none() {
-                Some(ColorRole::Surface)
-            } else {
-                None
-            })
+            c.frame_color.or(
+                if c.kind == Kind::Navigation
+                    || action && p.action_style.is_none() && p.primary_style.is_none()
+                {
+                    Some(ColorRole::Surface)
+                } else {
+                    None
+                },
+            )
         };
         let mut surface = if action {
             if row.id == "play" || row.id == "launch" {
@@ -1278,35 +1336,135 @@ impl PreparedFrame {
             p.text_align.unwrap_or(Align::Left)
         };
         let rect = Rect(r.0 + inset, r.1, r.2.saturating_sub(2 * inset).max(1), r.3);
-        let sub = p.subtitle.as_ref().filter(|_| !row.subtitle.is_empty()).map(|run| self.ink_subtype(c, run));
+        let sub = p
+            .subtitle
+            .as_ref()
+            .filter(|_| !row.subtitle.is_empty())
+            .map(|run| self.ink_subtype(c, run));
         let mut lines = vec![(&row.label, ty.clone())];
         if let Some(mut st) = sub {
-            if focused { st.color = p.subtitle.as_ref().and_then(|r| r.focus_color).or(p.focus_text).unwrap_or(if c.focus_style == Some(FocusStyle::Fill) { ColorRole::FocusText } else { st.color }); }
+            if focused {
+                st.color = p
+                    .subtitle
+                    .as_ref()
+                    .and_then(|r| r.focus_color)
+                    .or(p.focus_text)
+                    .unwrap_or(if c.focus_style == Some(FocusStyle::Fill) {
+                        ColorRole::FocusText
+                    } else {
+                        st.color
+                    });
+            }
             lines.push((&row.subtitle, st));
         }
         let mut relative = Vec::new();
         let mut y = 0.0;
-        for (text, style) in &lines { relative.push(y + style.ink_bounds(text).0); y += style.line as f32; }
-        let top = lines.iter().enumerate().map(|(i,(text,t))| relative[i] - if symbol(text) { t.ink_bounds(text).0 } else { t.cap() }).fold(f32::INFINITY, f32::min);
-        let bottom = lines.iter().enumerate().map(|(i,(text,t))| relative[i] + if symbol(text) { t.ink_bounds(text).1 } else { 0.0 }).fold(f32::NEG_INFINITY, f32::max);
-        let shift = r.1 as f32 + (r.3 as f32 - (bottom-top))/2.0 - top;
-        let baselines: Vec<_> = relative.iter().map(|b| (b+shift).round()).collect();
-        let mut vt = self.ink_type(&action_component, false); vt.color = ty.color; vt.size *= 0.82;
-        let value_width = if row.value.is_empty() { 0.0 } else { vt.metrics(&vt.value(&row.value)).0.ceil().min(r.2 as f32 * 0.38) };
-        let copy_width = (rect.2 as f32 - if value_width > 0.0 { value_width + 7.0 } else { 0.0 }).max(1.0);
+        for (text, style) in &lines {
+            relative.push(y + style.ink_bounds(text).0);
+            y += style.line as f32;
+        }
+        let top = lines
+            .iter()
+            .enumerate()
+            .map(|(i, (text, t))| {
+                relative[i]
+                    - if symbol(text) {
+                        t.ink_bounds(text).0
+                    } else {
+                        t.cap()
+                    }
+            })
+            .fold(f32::INFINITY, f32::min);
+        let bottom = lines
+            .iter()
+            .enumerate()
+            .map(|(i, (text, t))| {
+                relative[i]
+                    + if symbol(text) {
+                        t.ink_bounds(text).1
+                    } else {
+                        0.0
+                    }
+            })
+            .fold(f32::NEG_INFINITY, f32::max);
+        let shift = r.1 as f32 + (r.3 as f32 - (bottom - top)) / 2.0 - top;
+        let baselines: Vec<_> = relative.iter().map(|b| (b + shift).round()).collect();
+        let mut vt = self.ink_type(&action_component, false);
+        vt.color = ty.color;
+        vt.size *= 0.82;
+        let value_width = if row.value.is_empty() {
+            0.0
+        } else {
+            vt.metrics(&vt.value(&row.value))
+                .0
+                .ceil()
+                .min(r.2 as f32 * 0.38)
+        };
+        let copy_width = (rect.2 as f32
+            - if value_width > 0.0 {
+                value_width + 7.0
+            } else {
+                0.0
+            })
+        .max(1.0);
         let title_ink = ty.metrics(&ty.value(&row.label));
-        let title_width = copy_width.min(title_ink.2-title_ink.1);
+        let title_width = copy_width.min(title_ink.2 - title_ink.1);
         let vi = vt.metrics(&vt.value(&row.value));
-        let value_extent = value_width.min(vi.2-vi.1);
+        let value_extent = value_width.min(vi.2 - vi.1);
         let centered = align == Align::Center && value_width > 0.0;
-        let start = r.0 as f32 + (r.2 as f32-title_width-value_extent-7.0)/2.0;
-        for (i,(text,style)) in lines.iter().enumerate() {
-            let (x,width) = if centered && i==0 { (start,title_width) } else { (rect.0 as f32,if align == Align::Center { rect.2 as f32 } else { copy_width }) };
-            self.ink_baseline(&c.id, Rect(x.round().max(0.0) as u32,r.1,width.max(1.0).floor() as u32,r.3),style,text,align,baselines[i])?;
+        let start = r.0 as f32 + (r.2 as f32 - title_width - value_extent - 7.0) / 2.0;
+        for (i, (text, style)) in lines.iter().enumerate() {
+            let (x, width) = if centered && i == 0 {
+                (start, title_width)
+            } else {
+                (
+                    rect.0 as f32,
+                    if align == Align::Center {
+                        rect.2 as f32
+                    } else {
+                        copy_width
+                    },
+                )
+            };
+            self.ink_baseline(
+                &c.id,
+                Rect(
+                    x.round().max(0.0) as u32,
+                    r.1,
+                    width.max(1.0).floor() as u32,
+                    r.3,
+                ),
+                style,
+                text,
+                align,
+                baselines[i],
+            )?;
         }
         if value_width > 0.0 {
-            let x = if centered { start+title_width+7.0 } else { (rect.0+rect.2) as f32-value_width };
-            self.ink_baseline(&c.id,Rect(x.round().max(0.0) as u32,r.1,if centered {value_extent} else {value_width}.max(1.0).floor() as u32,r.3),&vt,&row.value,if centered {Align::Center} else {Align::Right},baselines[0])?;
+            let x = if centered {
+                start + title_width + 7.0
+            } else {
+                (rect.0 + rect.2) as f32 - value_width
+            };
+            self.ink_baseline(
+                &c.id,
+                Rect(
+                    x.round().max(0.0) as u32,
+                    r.1,
+                    if centered { value_extent } else { value_width }
+                        .max(1.0)
+                        .floor() as u32,
+                    r.3,
+                ),
+                &vt,
+                &row.value,
+                if centered {
+                    Align::Center
+                } else {
+                    Align::Right
+                },
+                baselines[0],
+            )?;
         }
         if row.enabled {
             self.targets.push(Target {
@@ -1332,6 +1490,7 @@ impl PreparedFrame {
         let p = c.paint.as_ref().unwrap();
         let weak = self.theme.weak();
         let source = input.art.entries.get(&row.id);
+        let identity = source.map(crate::theme::image_cache::source_identity);
         let key = format!(
             "{:?}:{}:{}:{}:{}:{}",
             self.screen, c.id, c.rect.2, c.rect.3, focused, preview
@@ -1343,11 +1502,7 @@ impl PreparedFrame {
                     entry.theme.ptr_eq(&weak)
                         && entry.theme.strong_count() > 0
                         && entry.key == key
-                        && match (&entry.source, source) {
-                            (Some(a), Some(b)) => a.upgrade().is_some_and(|a| Arc::ptr_eq(&a, b)),
-                            (None, None) => true,
-                            _ => false,
-                        }
+                        && entry.source == identity
                 })?;
                 let entry = cache.remove(index).unwrap();
                 let pixels = entry.pixels.clone();
@@ -1365,6 +1520,7 @@ impl PreparedFrame {
             tile_height + 2 * margin,
         )?;
         let old = std::mem::replace(&mut self.pixels, tile);
+        let replay_clip = REPLAY_CLIP.take();
         let case = Rect(margin, margin, c.item_extent.unwrap(), ah + 2 * pad);
         if focused && c.focus_style == Some(FocusStyle::Glow) {
             self.ink_glow(case, c);
@@ -1395,6 +1551,7 @@ impl PreparedFrame {
         }
         self.ink_focus(c, case, focused);
         tile = std::mem::replace(&mut self.pixels, old);
+        REPLAY_CLIP.replace(replay_clip);
         let dw = (tile.width() as f32 * scale).round() as u32;
         let dh = (tile.height() as f32 * scale).round() as u32;
         if scale != 1.0 {
@@ -1417,13 +1574,98 @@ impl PreparedFrame {
                 }
                 cache.push_front(CachedShelf {
                     theme: weak,
-                    source: source.map(Arc::downgrade),
+                    source: identity,
                     key,
                     pixels: pixels.clone(),
                 });
             });
         }
         Ok(pixels)
+    }
+    fn ink_shelf_peek(&mut self, c: &Component, rows: &[Row], input: &FrameInputs) -> Result<()> {
+        let p = c.paint.as_ref().unwrap();
+        if c.layout == Some(Arrangement::Shelf) && p.peek.is_some() && !rows.is_empty() {
+            let source = input
+                .art
+                .next_cover
+                .as_ref()
+                .or_else(|| input.art.entries.get(&rows.last().unwrap().id));
+            if let Some(source) = source {
+                let row = Row {
+                    subtitle: String::new(),
+                    id: "ink-preview".into(),
+                    label: String::new(),
+                    value: String::new(),
+                    enabled: false,
+                };
+                let mut model = input.clone();
+                let last = rows.last().and_then(|r| input.art.entries.get(&r.id));
+            let end = last.is_some_and(|last| Arc::ptr_eq(last, source));
+                model.art.entries.insert(row.id.clone(), source.clone());
+                self.ink_shelf(
+                    c,
+                    &row,
+                    rows.len(),
+                    &model,
+                    p.peek.as_ref().unwrap().opacity.unwrap_or(0.62) * if end { 0.35 } else { 1.0 },
+                )?;
+            }
+        }
+        Ok(())
+    }
+    fn ink_shelf_bounds(&self, c: &Component, row: &Row, index: usize) -> Rect {
+        let p = c.paint.as_ref().unwrap();
+        let pad = c.padding.unwrap();
+        let (aw, ah) = p
+            .art
+            .as_ref()
+            .map(|a| (a.width, a.height))
+            .unwrap_or((c.art_size.unwrap(), c.art_size.unwrap()));
+        let margin = effects::effect_padding(c);
+        let scale = p.focus_scale.unwrap_or(1.0).max(1.0);
+        let width = ((c.item_extent.unwrap() + 2 * margin) as f32 * scale).round() as i32;
+        let height = ((ah + 2 * pad + 2 * margin) as f32 * scale).round() as i32;
+        let x = c.rect.0 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap());
+        let right = (c.rect.0 + c.rect.2).min(640);
+        if x >= right {
+            return Rect(right, c.rect.1, 0, 0);
+        }
+        let left = x as i32 - (width - c.item_extent.unwrap() as i32) / 2;
+        let top = c.rect.1 as i32 - (height - (ah + 2 * pad) as i32) / 2;
+        let mut bounds = Rect(
+            left.max(0) as u32,
+            top.max(0) as u32,
+            (left + width).min(640) as u32 - left.max(0) as u32,
+            (top + height).min(480) as u32 - top.max(0) as u32,
+        );
+        if p.caption_mode.as_deref() != Some("none") {
+            for focused in [false, true] {
+                let ty = self.ink_type(c, focused);
+                let full = p.caption_mode.as_deref() == Some("focused") && focused;
+                let width = if full {
+                    (ty.metrics(&ty.value(&row.label)).0.ceil() as u32 + 2)
+                        .max(aw)
+                        .min(c.rect.2)
+                } else {
+                    (aw as f32 * if focused { scale } else { 1.0 }).round() as u32
+                };
+                let width = width.min(right.saturating_sub(c.rect.0));
+                let cx = (x + pad + aw / 2)
+                    .saturating_sub(width / 2)
+                    .max(c.rect.0)
+                    .min(right.saturating_sub(width).max(c.rect.0));
+                bounds = retained::union(
+                    bounds,
+                    Rect(
+                        cx,
+                        c.rect.1 + pad + ah,
+                        width,
+                        c.rect.3.saturating_sub(pad + ah),
+                    ),
+                );
+            }
+        }
+        bounds
     }
     fn ink_shelf(
         &mut self,
@@ -1467,13 +1709,7 @@ impl PreparedFrame {
         let atx = x as i32 - (dw as i32 - c.item_extent.unwrap() as i32) / 2;
         let aty = c.rect.1 as i32 - (dh as i32 - (ah + 2 * pad) as i32) / 2;
         if opacity == 1.0 && !super::ink_blit::reference() {
-            super::ink_blit::draw_clipped(
-                &mut self.pixels.as_mut(),
-                atx,
-                aty,
-                tile.as_ref().as_ref(),
-                (0, 0, 640, 480),
-            );
+            bitmap(&mut self.pixels, atx, aty, tile.as_ref().as_ref(), true);
         } else {
             let mut mask = tiny_skia::Mask::new(640, 480).unwrap();
             let path = tiny_skia::PathBuilder::from_rect(
@@ -1554,40 +1790,73 @@ impl PreparedFrame {
         let mut b = tiny_skia::PathBuilder::new();
         let bounds = match icon {
             "apps" => {
-                for (x,y) in [(4.0,4.0),(14.0,4.0),(4.0,14.0),(14.0,14.0)] { b.push_rect(tiny_skia::Rect::from_xywh(x,y,6.0,6.0).unwrap()); }
-                (3.0,3.0,18.0,18.0)
+                for (x, y) in [(4.0, 4.0), (14.0, 4.0), (4.0, 14.0), (14.0, 14.0)] {
+                    b.push_rect(tiny_skia::Rect::from_xywh(x, y, 6.0, 6.0).unwrap());
+                }
+                (3.0, 3.0, 18.0, 18.0)
             }
             "library" => {
-                for x in [4.0,10.0] {b.push_rect(tiny_skia::Rect::from_xywh(x,5.0,5.0,15.0).unwrap());}
-                b.move_to(16.0,5.0);b.line_to(20.0,4.0);b.line_to(23.0,19.0);b.line_to(19.0,20.0);b.close();
-                (3.0,3.0,21.0,18.0)
+                for x in [4.0, 10.0] {
+                    b.push_rect(tiny_skia::Rect::from_xywh(x, 5.0, 5.0, 15.0).unwrap());
+                }
+                b.move_to(16.0, 5.0);
+                b.line_to(20.0, 4.0);
+                b.line_to(23.0, 19.0);
+                b.line_to(19.0, 20.0);
+                b.close();
+                (3.0, 3.0, 21.0, 18.0)
             }
             "recents" => {
-                b.move_to(12.0,4.0);
-                b.cubic_to(16.418278,4.0,20.0,7.581722,20.0,12.0);
-                b.cubic_to(20.0,16.418278,16.418278,20.0,12.0,20.0);
-                b.cubic_to(7.581722,20.0,4.0,16.418278,4.0,12.0);
-                b.move_to(4.0,4.0);b.line_to(4.0,10.0);b.line_to(10.0,10.0);
-                b.move_to(12.0,7.0);b.line_to(12.0,12.0);b.line_to(16.0,14.0);
-                (3.0,3.0,18.0,18.0)
+                b.move_to(12.0, 4.0);
+                b.cubic_to(16.418278, 4.0, 20.0, 7.581722, 20.0, 12.0);
+                b.cubic_to(20.0, 16.418278, 16.418278, 20.0, 12.0, 20.0);
+                b.cubic_to(7.581722, 20.0, 4.0, 16.418278, 4.0, 12.0);
+                b.move_to(4.0, 4.0);
+                b.line_to(4.0, 10.0);
+                b.line_to(10.0, 10.0);
+                b.move_to(12.0, 7.0);
+                b.line_to(12.0, 12.0);
+                b.line_to(16.0, 14.0);
+                (3.0, 3.0, 18.0, 18.0)
             }
             "settings" => {
-                b.move_to(12.0,3.0);
-                for (x,y) in [(15.0,6.0),(19.0,5.0),(20.0,9.0),(23.0,12.0),(20.0,15.0),(19.0,19.0),(15.0,18.0),(12.0,21.0),(9.0,18.0),(5.0,19.0),(4.0,15.0),(1.0,12.0),(4.0,9.0),(5.0,5.0),(9.0,6.0)] {b.line_to(x,y);}b.close();
-                b.push_circle(12.0,12.0,4.0);
-                (0.0,2.0,24.0,20.0)
+                b.move_to(12.0, 3.0);
+                for (x, y) in [
+                    (15.0, 6.0),
+                    (19.0, 5.0),
+                    (20.0, 9.0),
+                    (23.0, 12.0),
+                    (20.0, 15.0),
+                    (19.0, 19.0),
+                    (15.0, 18.0),
+                    (12.0, 21.0),
+                    (9.0, 18.0),
+                    (5.0, 19.0),
+                    (4.0, 15.0),
+                    (1.0, 12.0),
+                    (4.0, 9.0),
+                    (5.0, 5.0),
+                    (9.0, 6.0),
+                ] {
+                    b.line_to(x, y);
+                }
+                b.close();
+                b.push_circle(12.0, 12.0, 4.0);
+                (0.0, 2.0, 24.0, 20.0)
             }
             _ => {
-                b.push_circle(10.0,10.0,7.0);b.move_to(15.0,15.0);b.line_to(22.0,22.0);
-                (2.0,2.0,21.0,21.0)
+                b.push_circle(10.0, 10.0, 7.0);
+                b.move_to(15.0, 15.0);
+                b.line_to(22.0, 22.0);
+                (2.0, 2.0, 21.0, 21.0)
             }
         };
         if let Some(path) = b.finish() {
             let scale = height.min(48) as f32 / bounds.3;
             let width = (bounds.2 * scale).round();
-            let transform = Transform::from_scale(width/bounds.2, scale).post_translate(
-                (r.0 as f32 + (r.2 as f32-width)/2.0).round() - bounds.0*width/bounds.2,
-                (r.1 as f32 + (r.3 as f32-height as f32)/2.0).round() - bounds.1*scale,
+            let transform = Transform::from_scale(width / bounds.2, scale).post_translate(
+                (r.0 as f32 + (r.2 as f32 - width) / 2.0).round() - bounds.0 * width / bounds.2,
+                (r.1 as f32 + (r.3 as f32 - height as f32) / 2.0).round() - bounds.1 * scale,
             );
             self.pixels.stroke_path(
                 &path,

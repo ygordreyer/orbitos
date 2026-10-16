@@ -28,7 +28,8 @@ pub(super) fn paint_bounds(c: &Component) -> Rect {
     }
     if c.layout == Some(Arrangement::Shelf) {
         let scale = c.paint.as_ref().unwrap().focus_scale.unwrap_or(1.0);
-        pad += ((c.rect.2.max(c.rect.3) as f32 * (scale - 1.0)) / 2.0).ceil() as u32 + 2;
+        let extent = c.item_extent.unwrap_or(c.rect.2).max(c.rect.3) + 2 * pad;
+        pad += ((extent as f32 * (scale - 1.0).max(0.0)) / 2.0).ceil() as u32 + 2;
     }
     let x = c.rect.0.saturating_sub(pad);
     let y = c.rect.1.saturating_sub(pad);
@@ -174,7 +175,7 @@ impl PreparedFrame {
             });
             pixels
         });
-        super::super::ink_blit::bitmap(&mut self.pixels, left, top, pixels.as_ref().as_ref());
+        bitmap(&mut self.pixels, left, top, pixels.as_ref().as_ref(), true);
     }
 
     pub(super) fn ink_glow(&mut self, r: Rect, c: &Component) {

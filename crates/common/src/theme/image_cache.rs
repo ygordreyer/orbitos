@@ -1,9 +1,48 @@
 use super::pack::{FadeEdge, Fit, ScreenId};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::{
     collections::VecDeque,
     sync::{Arc, Weak},
 };
 use tiny_skia::Pixmap;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SourceIdentity {
+    width: u32,
+    height: u32,
+    digest: [u8; 32],
+}
+
+thread_local! {
+    static IDENTITIES: RefCell<VecDeque<(Weak<Pixmap>, SourceIdentity)>> = const { RefCell::new(VecDeque::new()) };
+}
+
+pub(super) fn source_identity(source: &Arc<Pixmap>) -> SourceIdentity {
+    IDENTITIES.with(|identities| {
+        let mut identities = identities.borrow_mut();
+        if let Some(index) = identities
+            .iter()
+            .position(|(held, _)| held.ptr_eq(&Arc::downgrade(source)))
+        {
+            let entry = identities.remove(index).unwrap();
+            let identity = entry.1.clone();
+            identities.push_front(entry);
+            return identity;
+        }
+        let identity = SourceIdentity {
+            width: source.width(),
+            height: source.height(),
+            digest: Sha256::digest(source.data()).into(),
+        };
+        identities.retain(|(source, _)| source.strong_count() > 0);
+        if identities.len() >= 128 {
+            identities.pop_back();
+        }
+        identities.push_front((Arc::downgrade(source), identity.clone()));
+        identity
+    })
+}
 
 const PIXEL_LIMIT: usize = 1536 * 1024;
 const ENTRY_LIMIT: usize = 16;
@@ -25,7 +64,7 @@ pub(super) struct ImageKey {
 }
 struct Entry {
     key: ImageKey,
-    source: Weak<Pixmap>,
+    source: SourceIdentity,
     pixels: Arc<Pixmap>,
 }
 #[derive(Default)]
@@ -57,13 +96,11 @@ impl ImageCache {
     }
 
     pub fn get(&mut self, key: &ImageKey, source: &Arc<Pixmap>) -> Option<Arc<Pixmap>> {
-        let index = self.entries.iter().position(|entry| {
-            entry.key == *key
-                && entry
-                    .source
-                    .upgrade()
-                    .is_some_and(|held| Arc::ptr_eq(&held, source))
-        })?;
+        let identity = source_identity(source);
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.key == *key && entry.source == identity)?;
         let entry = self.entries.remove(index).unwrap();
         let pixels = entry.pixels.clone();
         self.entries.push_front(entry);
@@ -87,7 +124,7 @@ impl ImageCache {
         self.bytes += bytes;
         self.entries.push_front(Entry {
             key,
-            source: Arc::downgrade(source),
+            source: source_identity(source),
             pixels,
         });
     }
@@ -113,7 +150,7 @@ mod tests {
         }
     }
     #[test]
-    fn bounded_pixels_do_not_retain_sources_or_reuse_another_identity() {
+    fn bounded_pixels_reuse_identical_content_without_retaining_sources() {
         let mut cache = ImageCache::default();
         let source = Arc::new(Pixmap::new(2, 2).unwrap());
         let other = Arc::new((*source).clone());
@@ -123,9 +160,12 @@ mod tests {
             assert!(cache.entries.len() <= ENTRY_LIMIT);
         }
         assert!(cache.get(&key(19), &source).is_some());
-        assert!(cache.get(&key(19), &other).is_none());
+        assert!(cache.get(&key(19), &other).is_some());
+        let mut changed = (*other).clone();
+        changed.fill(tiny_skia::Color::WHITE);
+        assert!(cache.get(&key(19), &Arc::new(changed)).is_none());
         assert_eq!(Arc::strong_count(&source), 1);
         drop(source);
-        assert!(cache.entries.front().unwrap().source.upgrade().is_none());
+        assert!(cache.get(&key(19), &other).is_some());
     }
 }

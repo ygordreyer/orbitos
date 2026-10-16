@@ -77,6 +77,7 @@ fn changed_runs(source: &[u8], target: &[u8]) -> Vec<(usize, usize)> {
 }
 
 enum NavigationRasterPart {
+    Hero,
     Title,
     ShelfRow(usize),
     Peek,
@@ -172,6 +173,9 @@ impl PreparedFrame {
     ) -> std::collections::VecDeque<NavigationRasterWarm> {
         let mut work = std::collections::VecDeque::new();
         for c in &self.theme.pack().screens[&self.screen].components {
+            if self.theme.pack().ink() && c.kind == Kind::Image && c.binding == Some(Binding::SelectedHero) {
+                work.push_back(NavigationRasterWarm { component: c.clone(), input: input.clone(), part: NavigationRasterPart::Hero });
+            }
             if c.kind == Kind::Text && c.binding == Some(Binding::SelectedTitle) {
                 work.push_back(NavigationRasterWarm {
                     component: c.clone(),
@@ -198,8 +202,10 @@ impl PreparedFrame {
     }
     pub fn prewarm_navigation_raster(&mut self, work: NavigationRasterWarm) -> Result<()> {
         let c = &work.component;
+        if matches!(work.part, NavigationRasterPart::Hero) { return self.prewarm_ink_hero(&work.input, c); }
         let x = |index: usize| c.rect.0 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap());
         let rect = match work.part {
+            NavigationRasterPart::Hero => unreachable!(),
             NavigationRasterPart::Title => c.rect,
             NavigationRasterPart::ShelfRow(index) => shelf_tile_rect(c, x(index)),
             NavigationRasterPart::Peek => {
@@ -222,6 +228,7 @@ impl PreparedFrame {
         let targets = self.targets.len();
         let text_boxes = self.text_boxes.len();
         let result = match work.part {
+            NavigationRasterPart::Hero => unreachable!(),
             NavigationRasterPart::Title => self.component(c, &work.input),
             NavigationRasterPart::ShelfRow(index) => self.shelf_entry(
                 c,
@@ -667,7 +674,7 @@ impl PreparedFrame {
     fn draw_image(&mut self, rect: Rect, image: &std::sync::Arc<Pixmap>) {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Artwork);
         if self.theme.pack().ink() && !ink_blit::reference() {
-            ink_blit::draw(&mut self.pixels.as_mut(), rect.0 as i32, rect.1 as i32, image.as_ref().as_ref());
+            ink_renderer::bitmap(&mut self.pixels, rect.0 as i32, rect.1 as i32, image.as_ref().as_ref(), false);
             return;
         }
         super::blit::draw_cached(

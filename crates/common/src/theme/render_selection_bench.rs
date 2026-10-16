@@ -4,16 +4,34 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Instant};
 
 fn theme(id: &str) -> ThemeHandle {
+    theme_scheme(id, "")
+}
+fn theme_scheme(id: &str, scheme: &str) -> ThemeHandle {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .unwrap();
     let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+    let mut settings = std::collections::BTreeMap::from([(
+        "cover_shape".into(),
+        if id.ends_with("-tall") {
+            "tall"
+        } else {
+            "square"
+        }
+        .into(),
+    )]);
+    if !scheme.is_empty() {
+        settings.insert("color_scheme".into(), scheme.into());
+    }
     ThemeHandle::prepare(
         ThemeSnapshot::load_with_settings(
-            &root.join("themes").join(id.strip_suffix("-tall").unwrap_or(id)),
-            &std::collections::BTreeMap::from([("cover_shape".into(), if id.ends_with("-tall") { "tall" } else { "square" }.into())]),
-        ).unwrap(),
+            &root
+                .join("themes")
+                .join(id.strip_suffix("-tall").unwrap_or(id)),
+            &settings,
+        )
+        .unwrap(),
         &bank,
         1,
     )
@@ -213,6 +231,27 @@ fn ink_selection_benchmark() {
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>()
                         .into();
+                    let fresh =
+                        ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input))
+                            .unwrap();
+                    assert_eq!(
+                        display.0.data(),
+                        fresh.pixels.data(),
+                        "uncached {id} {screen:?} {step}"
+                    );
+                    assert_eq!(frame.targets, fresh.targets);
+                    assert_eq!(frame.text_boxes, fresh.text_boxes);
+                    if operation == "selection" && step >= 2 && screen == ScreenId::Library {
+                        let budget = match base {
+                            "orbit-hero" => 500_000,
+                            "big-picture" => 700_000,
+                            _ => u64::MAX,
+                        };
+                        assert!(
+                            counts["composed_pixels"].as_u64().unwrap() < budget,
+                            "composition {id}: {counts}"
+                        );
+                    }
                     println!("SELECTION_BENCH {counts}");
                     std::hint::black_box(display.0.data());
                 }
@@ -266,7 +305,9 @@ fn ink_retained_selection_status_and_tabs_match_fresh() {
                         .unwrap_or(()),
                     _ => {}
                 }
-                let fresh = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+                let fresh =
+                    ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input))
+                        .unwrap();
                 let frame =
                     PreparedFrame::prepare_reusing(theme.clone(), &input, previous).unwrap();
                 assert!(
@@ -359,30 +400,192 @@ fn ink_opaque_art_does_not_make_a_transparent_base_opaque() {
 
 #[test]
 fn ink_late_cover_completion_only_damages_the_cover_component() {
-    let theme=theme("big-picture");
-    let arts=art();
-    let mut input=model(&theme,ScreenId::Recents,0,&arts);
-    input.art.selected_cover=None;
-    let before=PreparedFrame::prepare(theme.clone(),&input).unwrap();
-    input.art.selected_cover=Some(arts[0].clone());
-    let after=PreparedFrame::prepare_reusing(theme.clone(),&input,Some(before)).unwrap();
-    let cover=theme.pack().screens[&ScreenId::Recents].components.iter().find(|c| c.binding==Some(Binding::SelectedCover)).unwrap().rect;
-    assert_eq!(after.damage,vec![cover]);
-    assert_eq!(after.pixels.data(),PreparedFrame::prepare(theme,&input).unwrap().pixels.data());
+    let theme = theme("big-picture");
+    let arts = art();
+    let mut input = model(&theme, ScreenId::Recents, 0, &arts);
+    input.art.selected_cover = None;
+    let before = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+    input.art.selected_cover = Some(arts[0].clone());
+    let after = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
+    let cover = theme.pack().screens[&ScreenId::Recents]
+        .components
+        .iter()
+        .find(|c| c.binding == Some(Binding::SelectedCover))
+        .unwrap()
+        .rect;
+    assert_eq!(after.damage, vec![cover]);
+    assert_eq!(
+        after.pixels.data(),
+        PreparedFrame::prepare(theme, &input).unwrap().pixels.data()
+    );
 }
 
 #[test]
 fn frame_art_budget_counts_shared_sources_once_and_rejects_unique_overflow() {
-    let theme=theme("big-picture");
-    let arts=art();
-    let mut input=model(&theme,ScreenId::Library,0,&arts);
-    let image=Arc::new(Pixmap::new(640,480).unwrap());
-    input.art.selected_cover=Some(image.clone());
-    input.art.selected_hero=Some(image.clone());
-    input.art.selected_logo=Some(image.clone());
-    input.art.next_cover=Some(image.clone());
-    input.art.entries=(0..16).map(|i|(i.to_string(),image.clone())).collect();
+    let theme = theme("big-picture");
+    let arts = art();
+    let mut input = model(&theme, ScreenId::Library, 0, &arts);
+    let image = Arc::new(Pixmap::new(640, 480).unwrap());
+    input.art.selected_cover = Some(image.clone());
+    input.art.selected_hero = Some(image.clone());
+    input.art.selected_logo = Some(image.clone());
+    input.art.next_cover = Some(image.clone());
+    input.art.entries = (0..16).map(|i| (i.to_string(), image.clone())).collect();
     input.validate(&theme).unwrap();
-    input.art.entries=(0..7).map(|i|(i.to_string(),Arc::new(Pixmap::new(640,480).unwrap()))).collect();
-    assert!(input.validate(&theme).unwrap_err().to_string().contains("Game art input budget exceeded"));
+    input.art.entries = (0..7)
+        .map(|i| (i.to_string(), Arc::new(Pixmap::new(640, 480).unwrap())))
+        .collect();
+    assert!(
+        input
+            .validate(&theme)
+            .unwrap_err()
+            .to_string()
+            .contains("Game art input budget exceeded")
+    );
+}
+
+#[test]
+fn ink_hero_cache_invalidates_art_theme_shape_scheme_and_underlay() {
+    let arts = art();
+    let mut previous = None;
+    let mut display = super::tests::TestDisplay(Pixmap::new(640, 480).unwrap());
+    for id in [
+        "orbit-hero",
+        "orbit-hero-tall",
+        "big-picture",
+        "big-picture-tall",
+    ] {
+        for scheme in ["white", "black"] {
+            let theme = theme_scheme(id, scheme);
+            for step in 0..8 {
+                let mut input = model(&theme, ScreenId::Library, step % 3, &arts);
+                if step == 3 {
+                    input.art.selected_hero = Some(Arc::new((*arts[0]).clone()));
+                }
+                if step == 4 {
+                    input.art.selected_hero = None;
+                }
+                if step == 5 {
+                    input.art.selected_logo = Some(arts[1].clone());
+                }
+                if step == 6 {
+                    input.focus.component = if id.starts_with("orbit") {
+                        "open-game"
+                    } else {
+                        "play"
+                    }
+                    .into();
+                    input.focus.item = Some("play".into());
+                }
+                let fresh =
+                    ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input))
+                        .unwrap();
+                let frame =
+                    PreparedFrame::prepare_reusing(theme.clone(), &input, previous).unwrap();
+                assert_eq!(
+                    frame.pixels.data(),
+                    fresh.pixels.data(),
+                    "{id} {scheme} {step}"
+                );
+                assert_eq!(frame.targets, fresh.targets);
+                assert_eq!(frame.text_boxes, fresh.text_boxes);
+                frame.paint_damage(&mut display);
+                assert_eq!(
+                    display.0.data(),
+                    fresh.pixels.data(),
+                    "damage {id} {scheme} {step}"
+                );
+                previous = Some(frame);
+            }
+        }
+    }
+}
+
+#[test]
+fn ink_hero_cache_matches_fresh_when_only_underlay_art_changes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let mut snapshot = ThemeSnapshot::load(&root.join("themes/big-picture")).unwrap();
+    let components = &mut Arc::get_mut(&mut snapshot.0)
+        .unwrap()
+        .pack
+        .screens
+        .get_mut(&ScreenId::Library)
+        .unwrap()
+        .components;
+    let index = components
+        .iter()
+        .position(|c| c.binding == Some(Binding::SelectedHero))
+        .unwrap();
+    let mut underlay = components[index].clone();
+    underlay.id = "hero-underlay".into();
+    underlay.binding = Some(Binding::SelectedCover);
+    underlay.rect.2 /= 2;
+    underlay.rect.3 /= 2;
+    components.insert(index, underlay);
+    let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+    let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+    let arts = art();
+    let mut input = model(&theme, ScreenId::Library, 0, &arts);
+    let mut previous = None;
+    let mut display = super::tests::TestDisplay(Pixmap::new(640, 480).unwrap());
+    for step in 0..6 {
+        input.art.selected_cover = Some(arts[step % arts.len()].clone());
+        let fresh =
+            ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input)).unwrap();
+        let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, previous).unwrap();
+        assert!(frame.pixels.data() == fresh.pixels.data(), "underlay {step}");
+        assert_eq!(frame.targets, fresh.targets);
+        assert_eq!(frame.text_boxes, fresh.text_boxes);
+        frame.paint_damage(&mut display);
+        assert!(
+            display.0.data() == fresh.pixels.data(),
+            "underlay damage {step}"
+        );
+        let cached = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        assert!(
+            cached.pixels.data() == fresh.pixels.data(),
+            "cached underlay {step}"
+        );
+        previous = Some(frame);
+    }
+}
+
+#[test]
+fn ink_stationary_shelf_focus_limits_damage_and_replay() {
+    let arts = art();
+    for id in [
+        "orbit-hero",
+        "orbit-hero-tall",
+        "big-picture",
+        "big-picture-tall",
+    ] {
+        let theme = theme(id);
+        let mut input = model(&theme, ScreenId::Library, 0, &arts);
+        let before = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        input.focus.item = Some("1".into());
+        let after = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
+        let shelf = theme.pack().screens[&ScreenId::Library]
+            .components
+            .iter()
+            .find(|c| c.layout == Some(Arrangement::Shelf))
+            .unwrap();
+        let center = shelf.rect.0
+            + 2 * (shelf.item_extent.unwrap() + shelf.gap.unwrap())
+            + shelf.item_extent.unwrap() / 2;
+        assert!(
+            !after.damage.iter().any(|r| center >= r.0
+                && center < r.0 + r.2
+                && shelf.rect.1 + 60 >= r.1
+                && shelf.rect.1 + 60 < r.1 + r.3),
+            "third card damaged {id}: {:?}",
+            after.damage
+        );
+        let fresh = ink_renderer::uncached(|| PreparedFrame::prepare(theme, &input)).unwrap();
+        assert_eq!(after.pixels.data(), fresh.pixels.data(), "{id}");
+        assert_eq!(after.targets, fresh.targets);
+        assert_eq!(after.text_boxes, fresh.text_boxes);
+    }
 }

@@ -60,10 +60,44 @@ impl Cache {
 }
 struct Entry {
     component: Component,
+    bounds: Rect,
     dependencies: retained::Inputs,
     before: Vec<u8>,
     targets: Vec<Target>,
     text: Vec<(String, Rect)>,
+}
+enum Paint {
+    Component,
+    Hero(Vec<Component>),
+    ShelfCard(usize),
+    ShelfPeek,
+}
+struct Operation<'a> {
+    component: Component,
+    input: std::borrow::Cow<'a, FrameInputs>,
+    bounds: Rect,
+    paint: Paint,
+}
+struct Hero {
+    theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
+    source: Option<crate::theme::image_cache::SourceIdentity>,
+    key: String,
+    before: Vec<u8>,
+    pixels: Vec<u8>,
+}
+const HERO_LIMIT: usize = 4 * 1024 * 1024;
+thread_local! {
+    static HEROES: RefCell<VecDeque<Hero>> = const { RefCell::new(VecDeque::new()) };
+}
+pub(super) fn union(a: Rect, b: Rect) -> Rect {
+    let x = a.0.min(b.0);
+    let y = a.1.min(b.1);
+    Rect(
+        x,
+        y,
+        (a.0 + a.2).max(b.0 + b.2) - x,
+        (a.1 + a.3).max(b.1 + b.3) - y,
+    )
 }
 fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
     let mut out = FrameInputs::new(input.screen);
@@ -83,11 +117,15 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
             if binding == Binding::KeyboardValue && input.focus.component == c.id {
                 out.focus = input.focus.clone();
             }
-            if c.logo { out.art.selected_logo = input.art.selected_logo.clone(); }
+            if c.logo {
+                out.art.selected_logo = input.art.selected_logo.clone();
+            }
             if binding == Binding::SelectedMetadata {
                 out.metadata = input.metadata.clone();
             }
-            if binding == Binding::SelectedBlurb { out.detail_lines = input.detail_lines.clone(); }
+            if binding == Binding::SelectedBlurb {
+                out.detail_lines = input.detail_lines.clone();
+            }
             if binding == Binding::SelectedFacts {
                 out.facts = input.facts.clone();
             }
@@ -180,8 +218,12 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
         _ => {}
     }
     if matches!(c.kind, Kind::Image | Kind::AssetImage) {
-        if c.binding == Some(Binding::SelectedLogo) {out.art.selected_logo = input.art.selected_logo.clone();}
-        if c.paint.as_ref().is_some_and(|p|p.action.is_some()) { out.focus = input.focus.clone(); }
+        if c.binding == Some(Binding::SelectedLogo) {
+            out.art.selected_logo = input.art.selected_logo.clone();
+        }
+        if c.paint.as_ref().is_some_and(|p| p.action.is_some()) && input.focus.component == c.id {
+            out.focus.component = c.id.clone();
+        }
     }
     out
 }
@@ -214,14 +256,21 @@ mod review_tests {
 
     #[test]
     fn logo_only_selection_change_repaints_retained_titles() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
         let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
-        let snapshots = [ThemeSnapshot::builtin("orbit").unwrap(),
-            ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap()];
+        let snapshots = [
+            ThemeSnapshot::builtin("orbit").unwrap(),
+            ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(),
+        ];
         for snapshot in snapshots {
             let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
             let mut input = FrameInputs::new(ScreenId::Library);
-            input.text.insert(Binding::SelectedTitle, "Same title".into());
+            input
+                .text
+                .insert(Binding::SelectedTitle, "Same title".into());
             let logo = |color| {
                 let mut p = Pixmap::new(80, 20).unwrap();
                 p.fill(color);
@@ -235,11 +284,16 @@ mod review_tests {
             assert!(!retained::matches(&saved, &input));
             let fresh = PreparedFrame::prepare(theme.clone(), &input).unwrap();
             assert_ne!(before.pixels.data(), fresh.pixels.data());
-            let after = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
+            let after =
+                PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
             assert_eq!(after.pixels.data(), fresh.pixels.data());
             input.art.selected_logo = None;
-            let removed = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(after)).unwrap();
-            assert_eq!(removed.pixels.data(), PreparedFrame::prepare(theme, &input).unwrap().pixels.data());
+            let removed =
+                PreparedFrame::prepare_reusing(theme.clone(), &input, Some(after)).unwrap();
+            assert_eq!(
+                removed.pixels.data(),
+                PreparedFrame::prepare(theme, &input).unwrap().pixels.data()
+            );
         }
     }
 
@@ -441,7 +495,7 @@ fn intersections(r: Rect, damage: &[Rect], y: u32) -> Vec<(usize, usize)> {
         .filter_map(|d| {
             let left = r.0.max(d.0);
             let right = (r.0 + r.2).min(d.0 + d.2);
-            (left < right).then_some(((left - r.0) as usize * 4, (right - r.0) as usize * 4))
+            (left < right).then(|| ((left - r.0) as usize * 4, (right - r.0) as usize * 4))
         })
         .collect();
     spans.sort_unstable();
@@ -454,6 +508,25 @@ fn intersections(r: Rect, damage: &[Rect], y: u32) -> Vec<(usize, usize)> {
         }
     }
     merged
+}
+fn replay_clip(r: Rect, damage: &[Rect]) -> Vec<Rect> {
+    let mut clip: Vec<Rect> = vec![];
+    for y in r.1..r.1 + r.3 {
+        for (left, right) in intersections(r, damage, y) {
+            let x = r.0 + left as u32 / 4;
+            let width = (right - left) as u32 / 4;
+            if let Some(previous) = clip
+                .iter_mut()
+                .rev()
+                .find(|c| c.0 == x && c.2 == width && c.1 + c.3 == y)
+            {
+                previous.3 += 1;
+            } else {
+                clip.push(Rect(x, y, width, 1));
+            }
+        }
+    }
+    clip
 }
 fn overlap(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
@@ -476,6 +549,120 @@ fn transfer(pixels: &mut Pixmap, r: Rect, data: &[u8], damage: &[Rect], inside: 
     }
 }
 impl PreparedFrame {
+    pub(in crate::theme::render) fn prewarm_ink_hero(
+        &mut self,
+        input: &FrameInputs,
+        hero: &Component,
+    ) -> Result<()> {
+        let components = &self.theme.pack().screens[&self.screen].components;
+        let Some(index) = components.iter().position(|c| c.id == hero.id) else {
+            return Ok(());
+        };
+        let mut group = vec![hero.clone()];
+        let mut bounds = effects::paint_bounds(hero);
+        for c in &components[index + 1..] {
+            if c.kind != Kind::Overlay
+                || c.binding.is_some()
+                || c.paint.as_ref().unwrap().gradient.is_none()
+            {
+                break;
+            }
+            bounds = union(bounds, effects::paint_bounds(c));
+            group.push(c.clone());
+        }
+        if group.len() == 1 {
+            return Ok(());
+        }
+        let Some(entry) = self
+            .ink_cache
+            .entries
+            .iter()
+            .find(|entry| entry.component == *hero && entry.bounds == bounds)
+        else {
+            return Ok(());
+        };
+        let saved = capture(&self.pixels, bounds);
+        restore(&mut self.pixels, bounds, &entry.before);
+        let result = self.ink_hero(&group, bounds, input);
+        restore(&mut self.pixels, bounds, &saved);
+        result
+    }
+    fn ink_hero(&mut self, group: &[Component], r: Rect, input: &FrameInputs) -> Result<()> {
+        let weak = self.theme.weak();
+        let source = input
+            .art
+            .selected_hero
+            .as_ref()
+            .map(crate::theme::image_cache::source_identity);
+        let key = format!("{:?}:{:?}", self.screen, group);
+        let hit = HEROES.with(|heroes| {
+            let mut heroes = heroes.borrow_mut();
+            let index = heroes.iter().position(|entry| {
+                entry.theme.ptr_eq(&weak)
+                    && entry.theme.strong_count() > 0
+                    && entry.source == source
+                    && entry.key == key
+                    && (r.1..r.1 + r.3).enumerate().all(|(row, y)| {
+                        let at = ((y * 640 + r.0) * 4) as usize;
+                        let src = row * r.2 as usize * 4;
+                        self.pixels.data()[at..at + r.2 as usize * 4]
+                            == entry.before[src..src + r.2 as usize * 4]
+                    })
+            });
+            let Some(index) = index else { return false };
+            let entry = heroes.remove(index).unwrap();
+            restore(&mut self.pixels, r, &entry.pixels);
+            heroes.push_front(entry);
+            true
+        });
+        if hit {
+            crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, (r.2 * r.3) as u64);
+            crate::perf_trace::count(
+                crate::perf_trace::Count::InkBitmapPixels,
+                (r.2 * r.3) as u64,
+            );
+            return Ok(());
+        }
+        // Include the underlay: regrouping rounded source-over layers changes integer rounding.
+        let bytes = (r.2 * r.3 * 8) as usize;
+        HEROES.with(|heroes| {
+            let mut heroes = heroes.borrow_mut();
+            heroes.retain(|entry| entry.theme.strong_count() > 0);
+            while !heroes.is_empty()
+                && (heroes.len() >= 8
+                    || heroes
+                        .iter()
+                        .map(|e| e.before.len() + e.pixels.len() + e.key.len())
+                        .sum::<usize>()
+                        + bytes
+                        + key.len()
+                        > HERO_LIMIT)
+            {
+                heroes.pop_back();
+            }
+        });
+        let before = capture(&self.pixels, r);
+        // Cache a complete hero even when its caller will replay only a damaged region.
+        with_replay_clip(None, || -> Result<()> {
+            for c in group {
+                self.ink_paint_component(c, input)?;
+            }
+            Ok(())
+        })?;
+        if bytes + key.len() <= HERO_LIMIT {
+            let pixels = capture(&self.pixels, r);
+            HEROES.with(|heroes| {
+                heroes.borrow_mut().push_front(Hero {
+                    theme: weak,
+                    source,
+                    key,
+                    before,
+                    pixels,
+                })
+            });
+        }
+        Ok(())
+    }
     pub(super) fn render_ink_retained(
         &mut self,
         input: &FrameInputs,
@@ -488,44 +675,103 @@ impl PreparedFrame {
             return self.render_ink_uncached(input, components);
         }
         let mut operations = Vec::new();
-        for c in components {
+        let mut pending = components.iter().peekable();
+        while let Some(c) = pending.next() {
             let rows = c.binding.and_then(|binding| input.rows.get(&binding));
-            if matches!(c.kind, Kind::Entries | Kind::SettingsRows)
-                && c.layout == Some(Arrangement::List)
+            if c.kind == Kind::Image
+                && c.binding == Some(Binding::SelectedHero)
+                && c.paint.as_ref().unwrap().action.is_none()
+            {
+                let mut group = vec![c.clone()];
+                let mut bounds = effects::paint_bounds(c);
+                while pending.peek().is_some_and(|next| {
+                    next.kind == Kind::Overlay
+                        && next.binding.is_none()
+                        && next.paint.as_ref().unwrap().gradient.is_some()
+                }) {
+                    let next = pending.next().unwrap();
+                    bounds = union(bounds, effects::paint_bounds(next));
+                    group.push(next.clone());
+                }
+                let paint = if group.len() > 1 {
+                    Paint::Hero(group)
+                } else {
+                    Paint::Component
+                };
+                operations.push(Operation {
+                    component: c.clone(),
+                    input: std::borrow::Cow::Borrowed(input),
+                    bounds,
+                    paint,
+                });
+            } else if matches!(c.kind, Kind::Entries | Kind::SettingsRows)
+                && matches!(c.layout, Some(Arrangement::List | Arrangement::Shelf))
                 && c.paint.as_ref().unwrap().opacity.unwrap_or(1.0) == 1.0
                 && rows.is_some_and(|rows| !rows.is_empty())
             {
+                let rows = rows.unwrap();
                 for (index, row) in rows
-                    .unwrap()
                     .iter()
                     .take(c.visible_count.unwrap_or(16) as usize)
                     .enumerate()
                 {
                     let mut part = c.clone();
-                    part.rect = Rect(
-                        c.rect.0,
-                        c.rect.1 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap()),
-                        c.rect.2,
-                        c.item_extent.unwrap(),
-                    );
-                    part.visible_count = Some(1);
+                    let (bounds, paint) = if c.layout == Some(Arrangement::Shelf) {
+                        (
+                            self.ink_shelf_bounds(c, row, index),
+                            Paint::ShelfCard(index),
+                        )
+                    } else {
+                        part.rect = Rect(
+                            c.rect.0,
+                            c.rect.1 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap()),
+                            c.rect.2,
+                            c.item_extent.unwrap(),
+                        );
+                        part.visible_count = Some(1);
+                        (effects::paint_bounds(&part), Paint::Component)
+                    };
                     let mut model = input.clone();
                     model.rows.insert(c.binding.unwrap(), vec![row.clone()]);
-                    operations.push((part, std::borrow::Cow::Owned(model)));
+                    model.art.next_cover = None;
+                    operations.push(Operation {
+                        component: part,
+                        input: std::borrow::Cow::Owned(model),
+                        bounds,
+                        paint,
+                    });
+                }
+                if c.layout == Some(Arrangement::Shelf) && c.paint.as_ref().unwrap().peek.is_some()
+                {
+                    let mut model = input.clone();
+                    model.focus = Default::default();
+                    model.selected.clear();
+                    operations.push(Operation {
+                        component: c.clone(),
+                        input: std::borrow::Cow::Owned(model),
+                        bounds: self.ink_shelf_bounds(c, rows.last().unwrap(), rows.len()),
+                        paint: Paint::ShelfPeek,
+                    });
                 }
             } else {
-                operations.push((c.clone(), std::borrow::Cow::Borrowed(input)));
+                operations.push(Operation {
+                    component: c.clone(),
+                    input: std::borrow::Cow::Borrowed(input),
+                    bounds: effects::paint_bounds(c),
+                    paint: Paint::Component,
+                });
             }
         }
         let underlay_bytes = operations
             .iter()
             .enumerate()
-            .map(|(index, (c, _))| {
+            .map(|(index, op)| {
+                let c = &op.component;
                 if index == 0 && c.kind == Kind::Background {
                     0
                 } else {
                     {
-                        let r = effects::paint_bounds(c);
+                        let r = op.bounds;
                         (r.2 * r.3 * 4) as usize
                     }
                 }
@@ -533,8 +779,8 @@ impl PreparedFrame {
             .sum::<usize>();
         let scratch_bytes = operations
             .iter()
-            .map(|(c, _)| {
-                let r = effects::paint_bounds(c);
+            .map(|op| {
+                let r = op.bounds;
                 (r.2 * r.3 * 4) as usize
             })
             .max()
@@ -576,7 +822,7 @@ impl PreparedFrame {
                 .entries
                 .iter()
                 .zip(&operations)
-                .all(|(a, (b, _))| a.component == *b);
+                .all(|(a, op)| a.component == op.component && a.bounds == op.bounds);
         self.targets.clear();
         self.text_boxes.clear();
         self.damage.clear();
@@ -596,9 +842,28 @@ impl PreparedFrame {
         } else {
             "ink_initial"
         });
-        for (index, (c, input)) in operations.iter().enumerate() {
-            let r = effects::paint_bounds(c);
-            let deps = dependencies(c, input);
+        for (index, op) in operations.iter().enumerate() {
+            let c = &op.component;
+            let input = op.input.as_ref();
+            let r = op.bounds;
+            let mut deps = dependencies(c, input);
+            if matches!(op.paint, Paint::ShelfCard(_)) {
+                deps.art.next_cover = None;
+            }
+            if matches!(op.paint, Paint::ShelfPeek) {
+                deps = FrameInputs::new(input.screen);
+                deps.art.next_cover = input.art.next_cover.clone();
+                if let Some(row) = input
+                    .rows
+                    .get(&c.binding.unwrap())
+                    .and_then(|rows| rows.last())
+                {
+                    if let Some(source) = input.art.entries.get(&row.id) {
+                        // The preview has no rows, so capture its fallback outside row artwork.
+                        deps.art.selected_cover = Some(source.clone());
+                    }
+                }
+            }
             let changed =
                 !incremental || !retained::matches(&cache.entries[index].dependencies, &deps);
             let affected = changed || self.damage.iter().any(|d| overlap(*d, r));
@@ -635,7 +900,20 @@ impl PreparedFrame {
             };
             let targets = self.targets.len();
             let text = self.text_boxes.len();
-            self.ink_paint_component(c, input)?;
+            let clip = (incremental && !changed && !covered).then(|| replay_clip(r, &self.damage));
+            with_replay_clip(clip, || -> Result<()> {
+                match &op.paint {
+                    Paint::Component => self.ink_paint_component(c, input)?,
+                    Paint::Hero(group) => self.ink_hero(group, r, input)?,
+                    Paint::ShelfCard(card) => {
+                        self.ink_shelf(c, &input.rows[&c.binding.unwrap()][0], *card, input, 1.0)?
+                    }
+                    Paint::ShelfPeek => {
+                        self.ink_shelf_peek(c, &input.rows[&c.binding.unwrap()], input)?
+                    }
+                }
+                Ok(())
+            })?;
             if !incremental && index == 0 && c.kind == Kind::Background && r == Rect(0, 0, 640, 480)
             {
                 cache.opaque_base = self
@@ -655,6 +933,7 @@ impl PreparedFrame {
             }
             let entry = Entry {
                 component: c.clone(),
+                bounds: r,
                 dependencies: retained::capture(&deps),
                 before,
                 targets: self.targets[targets..].to_vec(),
