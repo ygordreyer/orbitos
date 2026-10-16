@@ -71,7 +71,7 @@ impl Keyboard {
         drop(locale);
         drop(styles);
 
-        Self {
+        let mut keyboard = Self {
             res,
             value,
             cursor: rusttype::Point { x: 5, y: 2 },
@@ -79,17 +79,41 @@ impl Keyboard {
             is_password,
             button_hints,
             dirty: true,
+        };
+        if keyboard.semantic_layout() { keyboard.cursor = rusttype::Point { x: 0, y: 0 }; }
+        keyboard
+    }
+
+    fn semantic_layout(&self) -> bool {
+        self.res.0.borrow().get::<Option<crate::theme::fonts::ThemeHandle>>()
+            .and_then(Option::as_ref).is_some_and(|theme| theme.pack().screens[&crate::theme::pack::ScreenId::Keyboard]
+                .components.iter().any(|c| c.paint.as_ref().is_some_and(|p| p.keyboard_layout.as_deref() == Some("qwerty"))))
+    }
+
+    fn semantic_labels(&self) -> Vec<String> {
+        let mut labels = vec![String::new(); 45];
+        for (row, letters) in ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"].iter().enumerate() {
+            for (col, letter) in letters.chars().enumerate() {
+                labels[row * 11 + col] = match self.mode {
+                    KeyboardMode::Lowercase | KeyboardMode::Uppercase => letter.to_string(),
+                    KeyboardMode::Symbols => ["1234567890", "@#$%&*()-", "_=+?!/."][row].chars().nth(col).unwrap().to_string(),
+                    KeyboardMode::SymbolsExtra => ["[]{}<>\\|`~", "'\";:,.$%^", "&*()-_="][row].chars().nth(col).unwrap().to_string(),
+                };
+            }
         }
+        for (index, label) in [(33, "Backspace"), (34, "Clear"), (35, "Results"), (44, "Space")] { labels[index] = label.into(); }
+        labels
     }
 
     pub fn theme_inputs(&self) -> KeyboardThemeInputs {
+        let semantic = self.semantic_layout();
         KeyboardThemeInputs {
             display_value: if self.is_password {
                 "*".repeat(self.value.chars().count())
             } else {
                 self.value.clone()
             },
-            labels: KeyboardKey::iter()
+            labels: if semantic { self.semantic_labels() } else { KeyboardKey::iter()
                 .map(|key| {
                     if matches!(key, KeyboardKey::Space) {
                         "space".into()
@@ -97,12 +121,13 @@ impl Keyboard {
                         key.key(self.mode).into()
                     }
                 })
-                .collect(),
-            cursor: (self.cursor.x, self.cursor.y),
+                .collect() },
+            cursor: (if semantic { self.cursor.x.min([10, 9, 7, 3, 1][self.cursor.y] - 1) } else { self.cursor.x }, self.cursor.y),
             mode: match self.mode {
                 KeyboardMode::Lowercase => "lowercase",
                 KeyboardMode::Uppercase => "uppercase",
                 KeyboardMode::Symbols => "symbols",
+                KeyboardMode::SymbolsExtra => "symbols-extra",
             },
             masked: self.is_password,
         }
@@ -267,6 +292,80 @@ impl View for Keyboard {
         commands: Sender<Command>,
         bubble: &mut VecDeque<Command>,
     ) -> Result<bool> {
+        if self.semantic_layout() {
+            let counts = [10, 9, 7, 3, 1];
+            self.cursor.x = self.cursor.x.min(counts[self.cursor.y] - 1);
+            match event {
+                KeyEvent::Pressed(Key::Up) | KeyEvent::Autorepeat(Key::Up) => {
+                    self.cursor.y = (self.cursor.y + 4) % 5;
+                    self.cursor.x = self.cursor.x.min(counts[self.cursor.y] - 1);
+                }
+                KeyEvent::Pressed(Key::Down) | KeyEvent::Autorepeat(Key::Down) => {
+                    self.cursor.y = (self.cursor.y + 1) % 5;
+                    self.cursor.x = self.cursor.x.min(counts[self.cursor.y] - 1);
+                }
+                KeyEvent::Pressed(Key::Left) | KeyEvent::Autorepeat(Key::Left) => {
+                    self.cursor.x = (self.cursor.x + counts[self.cursor.y] - 1) % counts[self.cursor.y];
+                }
+                KeyEvent::Pressed(Key::Right) | KeyEvent::Autorepeat(Key::Right) => {
+                    self.cursor.x = (self.cursor.x + 1) % counts[self.cursor.y];
+                }
+                KeyEvent::Pressed(Key::A) => {
+                    match (self.cursor.y, self.cursor.x) {
+                        (3, 0) => { self.value.pop(); }
+                        (3, 1) => self.value.clear(),
+                        (3, 2) => {
+                            bubble.push_back(Command::ValueChanged(0, Value::String(self.value.clone())));
+                            bubble.push_back(Command::CloseView);
+                            commands.send(Command::Redraw).await?;
+                        }
+                        (4, _) => self.value.push(' '),
+                        (row, col) => {
+                            let label = self.semantic_labels()[row * 11 + col].clone();
+                            if matches!(self.mode, KeyboardMode::Lowercase) { self.value += &label.to_lowercase(); }
+                            else { self.value += &label; }
+                        }
+                    }
+                }
+                _ => return self.handle_legacy_key_event(event, commands, bubble).await,
+            }
+            self.dirty = true;
+            return Ok(true);
+        }
+        self.handle_legacy_key_event(event, commands, bubble).await
+    }
+
+    fn children(&self) -> Vec<&dyn View> { vec![] }
+    fn children_mut(&mut self) -> Vec<&mut dyn View> { vec![] }
+    fn bounding_box(&mut self, styles: &Stylesheet) -> Rect {
+        let size = self.res.get::<geom::Size>();
+
+        let key_size = styles.ui.ui_font.size;
+        let key_padding = 0;
+        let h = key_size as i32 * KEYBOARD_ROWS + key_padding * 5 + 8;
+        let y = size.h as i32
+            - h
+            - ButtonIcon::diameter(styles) as i32
+            - styles.ui.margin_x
+            - styles.ui.margin_x;
+
+        Rect::new(
+            0,
+            y - styles.ui.ui_font.size as i32 - styles.ui.margin_x,
+            size.w,
+            size.h - y as u32,
+        )
+    }
+
+    fn set_position(&mut self, _point: crate::geom::Point) {}
+
+    fn focus(&mut self) {}
+
+    fn blur(&mut self) {}
+}
+
+impl Keyboard {
+    async fn handle_legacy_key_event(&mut self, event: KeyEvent, commands: Sender<Command>, bubble: &mut VecDeque<Command>) -> Result<bool> {
         match event {
             KeyEvent::Pressed(Key::Up) | KeyEvent::Autorepeat(Key::Up) => {
                 self.cursor.y = (self.cursor.y as i32 - 1).rem_euclid(KEYBOARD_ROWS) as usize;
@@ -312,7 +411,8 @@ impl View for Keyboard {
                 self.mode = match self.mode {
                     KeyboardMode::Lowercase => KeyboardMode::Uppercase,
                     KeyboardMode::Uppercase => KeyboardMode::Symbols,
-                    KeyboardMode::Symbols => KeyboardMode::Lowercase,
+                    KeyboardMode::Symbols if self.semantic_layout() => KeyboardMode::SymbolsExtra,
+                    KeyboardMode::Symbols | KeyboardMode::SymbolsExtra => KeyboardMode::Lowercase,
                 };
                 self.dirty = true;
             }
@@ -327,39 +427,7 @@ impl View for Keyboard {
         Ok(true)
     }
 
-    fn children(&self) -> Vec<&dyn View> {
-        vec![]
-    }
 
-    fn children_mut(&mut self) -> Vec<&mut dyn View> {
-        vec![]
-    }
-
-    fn bounding_box(&mut self, styles: &Stylesheet) -> Rect {
-        let size = self.res.get::<geom::Size>();
-
-        let key_size = styles.ui.ui_font.size;
-        let key_padding = 0;
-        let h = key_size as i32 * KEYBOARD_ROWS + key_padding * 5 + 8;
-        let y = size.h as i32
-            - h
-            - ButtonIcon::diameter(styles) as i32
-            - styles.ui.margin_x
-            - styles.ui.margin_x;
-
-        Rect::new(
-            0,
-            y - styles.ui.ui_font.size as i32 - styles.ui.margin_x,
-            size.w,
-            size.h - y as u32,
-        )
-    }
-
-    fn set_position(&mut self, _point: crate::geom::Point) {}
-
-    fn focus(&mut self) {}
-
-    fn blur(&mut self) {}
 }
 
 #[rustfmt::skip]
@@ -536,7 +604,7 @@ impl KeyboardKey {
         match mode {
             KeyboardMode::Lowercase => self.lowercase(),
             KeyboardMode::Uppercase => self.uppercase(),
-            KeyboardMode::Symbols => self.symbol(),
+            KeyboardMode::Symbols | KeyboardMode::SymbolsExtra => self.symbol(),
         }
     }
 }
@@ -546,6 +614,7 @@ enum KeyboardMode {
     Lowercase,
     Uppercase,
     Symbols,
+    SymbolsExtra,
 }
 
 fn masked_value(value: &str, is_password: bool) -> String {
@@ -585,5 +654,54 @@ mod theme_capture_tests {
         keyboard.is_password = false;
         assert_eq!(keyboard.theme_inputs().display_value, keyboard.value());
         assert_eq!(keyboard.value(), "密碼é🦊");
+    }
+}
+
+#[cfg(test)]
+mod parity_c_controller_tests {
+    use super::*;
+    #[tokio::test]
+    async fn semantic_keys_follow_cursor_and_execute_commands() {
+        use crate::theme::{fonts::{FontBank, ThemeHandle}, runtime::ThemeSnapshot};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let ready = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(), &bank, 1).unwrap();
+        let res = Resources::new(type_map::TypeMap::new());
+        res.insert(Some(ready));
+        let mut keyboard = Keyboard { res: res.clone(), value: String::new(), cursor: rusttype::Point { x: 0, y: 0 }, mode: KeyboardMode::Lowercase,
+            is_password: false, button_hints: ButtonHints::new(res, vec![], vec![]), dirty: true };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let mut bubble = VecDeque::new();
+        keyboard.handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble).await.unwrap();
+        assert_eq!(keyboard.value(), "q");
+        assert_eq!(keyboard.theme_inputs().labels[0], "Q");
+        for event in [Key::Up, Key::Down, Key::Left, Key::Right].into_iter().cycle().take(100) {
+            keyboard.handle_key_event(KeyEvent::Pressed(event), tx.clone(), &mut bubble).await.unwrap();
+            let capture = keyboard.theme_inputs();
+            assert!(!capture.labels[capture.cursor.1 * 11 + capture.cursor.0].is_empty());
+        }
+        keyboard.value = "aé".into(); keyboard.cursor = rusttype::Point { x: 0, y: 3 };
+        keyboard.handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble).await.unwrap();
+        assert_eq!(keyboard.value(), "a");
+        keyboard.cursor.x = 1;
+        keyboard.handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble).await.unwrap();
+        assert_eq!(keyboard.value(), "");
+        keyboard.cursor = rusttype::Point { x: 9, y: 0 }; keyboard.mode = KeyboardMode::Symbols;
+        keyboard.handle_key_event(KeyEvent::Pressed(Key::A), tx.clone(), &mut bubble).await.unwrap();
+        assert_eq!(keyboard.value(), "0");
+        let mut available = std::collections::BTreeSet::new();
+        for mode in [KeyboardMode::Lowercase, KeyboardMode::Uppercase, KeyboardMode::Symbols, KeyboardMode::SymbolsExtra] {
+            keyboard.mode = mode;
+            for label in keyboard.semantic_labels().into_iter().filter(|label| label.chars().count() == 1) {
+                available.extend(label.chars());
+                available.extend(label.to_lowercase().chars());
+            }
+        }
+        assert!((b'!'..=b'~').all(|byte| available.contains(&(byte as char))));
+        keyboard.cursor = rusttype::Point { x: 2, y: 3 };
+        keyboard.handle_key_event(KeyEvent::Pressed(Key::A), tx, &mut bubble).await.unwrap();
+        assert!(matches!(bubble.pop_front(), Some(Command::ValueChanged(0, Value::String(value))) if value == "0"));
+        assert!(matches!(bubble.pop_front(), Some(Command::CloseView)));
+        assert!(matches!(rx.try_recv(), Ok(Command::Redraw)));
     }
 }

@@ -77,6 +77,9 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
                 binding,
                 input.text.get(&binding).cloned().unwrap_or_default(),
             );
+            if binding == Binding::KeyboardValue && input.focus.component == c.id {
+                out.focus = input.focus.clone();
+            }
             if binding == Binding::SelectedMetadata {
                 out.metadata = input.metadata.clone();
             }
@@ -163,11 +166,22 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
             out.keyboard_cursor = input.keyboard_cursor;
         }
         Kind::Status => out.status = input.status.clone(),
-        Kind::Hints => out.hints = input.hints.clone(),
+        Kind::Hints => {
+            out.hints = input.hints.clone();
+            out.suppress_hints = input.suppress_hints;
+        },
         Kind::Progress => out.progress = input.progress,
         _ => {}
     }
     out
+}
+fn paint_bounds(c: &Component) -> Rect {
+    if c.kind == Kind::Text && c.binding == Some(Binding::KeyboardValue) {
+        let r = c.rect;
+        let x = r.0.saturating_sub(3);
+        let y = r.1.saturating_sub(3);
+        Rect(x, y, (r.0 + r.2 + 3).min(640) - x, (r.1 + r.3 + 3).min(480) - y)
+    } else { c.rect }
 }
 fn capture(pixels: &Pixmap, r: Rect) -> Vec<u8> {
     #[cfg(test)]
@@ -477,13 +491,13 @@ impl PreparedFrame {
                 if index == 0 && c.kind == Kind::Background {
                     0
                 } else {
-                    (c.rect.2 * c.rect.3 * 4) as usize
+                    (paint_bounds(c).2 * paint_bounds(c).3 * 4) as usize
                 }
             })
             .sum::<usize>();
         let scratch_bytes = operations
             .iter()
-            .map(|(c, _)| (c.rect.2 * c.rect.3 * 4) as usize)
+            .map(|(c, _)| (paint_bounds(c).2 * paint_bounds(c).3 * 4) as usize)
             .max()
             .unwrap_or(0);
         if underlay_bytes + scratch_bytes > ACTIVE_LIMIT {
@@ -544,7 +558,7 @@ impl PreparedFrame {
             "ink_initial"
         });
         for (index, (c, input)) in operations.iter().enumerate() {
-            let r = c.rect;
+            let r = paint_bounds(c);
             let deps = dependencies(c, input);
             let changed =
                 !incremental || !retained::matches(&cache.entries[index].dependencies, &deps);

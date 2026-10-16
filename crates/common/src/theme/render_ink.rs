@@ -14,6 +14,7 @@ pub struct InkTextLayout {
     tracking: f32,
     upper: bool,
     color: ColorRole,
+    literal_color: Option<Color>,
     weight: u32,
     family: FontId,
 }
@@ -281,6 +282,7 @@ pub fn ink_text_layout(theme: &ThemeHandle, c: &Component, focused: bool) -> Ink
         tracking: run.letter_spacing.unwrap_or(0.0),
         upper: run.transform.as_deref() == Some("uppercase"),
         color: run.color.or(c.color).unwrap_or(ColorRole::Text),
+        literal_color: None,
         weight,
         family,
     }
@@ -349,6 +351,7 @@ impl PreparedFrame {
             center,
             value
         ) + &format!(":{}:{}:{}", rect.2, rect.3, count);
+        let key = format!("{key}:{:?}", ty.literal_color);
         let key = if guide { key + ":guide" } else { key };
         let weak = self.theme.weak();
         let cached = TEXT.with(|cache| {
@@ -370,7 +373,7 @@ impl PreparedFrame {
                 ty.lines(&value, rect.2, count, overflow)
             };
             let mut pix = ink_pixmap(rect.2, rect.3)?;
-            let color = self.color(ty.color);
+            let color = ty.literal_color.unwrap_or_else(|| self.color(ty.color));
             let cap = ty.cap();
             let block = cap + (lines.len().saturating_sub(1) as u32).saturating_mul(ty.line) as f32;
             for (i, line) in lines.iter().enumerate() {
@@ -766,6 +769,7 @@ impl PreparedFrame {
                 self.ink_surface(c.rect, c, c.color, false, None)
             }
             Kind::Text => {
+                if c.binding == Some(Binding::KeyboardValue) { return self.ink_query(c, input); }
                 if c.logo && self.logo(c, input)? { return Ok(()); }
                 let mut value = match c.binding.unwrap() {
                     Binding::ThemeName => self.theme.pack().name.trim_end_matches(" Tall").into(),
@@ -896,21 +900,26 @@ impl PreparedFrame {
                     copy.paint.as_mut().unwrap().run = None;
                     let mut ty = self.ink_type(&copy, false);
                     ty.color = action.color;
-                    let label = action
-                        .key
-                        .as_ref()
-                        .filter(|s| !s.is_empty())
-                        .map_or(action.label.clone(), |k| format!("{k}  {}", action.label));
-                    self.ink_text(
-                        &c.id,
-                        c.rect,
-                        &ty,
-                        &label,
-                        1,
-                        Align::Center,
-                        Overflow::Ellipsis,
-                        true,
-                    )?;
+                    let key = action.key.as_deref().filter(|s| !s.is_empty());
+                    let badge = key.map_or(0, |_| ty.cap().ceil() as u32 + 10);
+                    let gap = if key.is_some() { action.gap.unwrap_or(8) } else { 0 };
+                    let (advance, left, right) = ty.metrics(&ty.value(&action.label));
+                    let ink_width = (right - left).ceil() as u32;
+                    let label_width = (advance.ceil() as u32).max(ink_width);
+                    let total = badge + gap + ink_width;
+                    let inset = key.map_or(0.0, |key| {
+                        let (_, left, right) = ty.metrics(&ty.value(key));
+                        (badge as f32 - (right - left)) / 2.0
+                    });
+                    let mut x = (c.rect.0 as f32 + (c.rect.2 as f32 - total as f32 - inset) / 2.0).round().max(0.0) as u32;
+                    if let Some(key) = key {
+                        let rect = Rect(x, c.rect.1 + c.rect.3.saturating_sub(badge) / 2, badge, badge);
+                        self.ink_border(rect, action.color, 1, badge / 2, 1.0);
+                        self.ink_text(&c.id, rect, &ty, key, 1, Align::Center, Overflow::Ellipsis, true)?;
+                        x += badge + gap;
+                    }
+                    self.ink_text(&c.id, Rect(x, c.rect.1, label_width, c.rect.3), &ty,
+                        &action.label, 1, Align::Left, Overflow::Ellipsis, true)?;
                 } else if let Some(image) = self
                     .theme
                     .base()
@@ -1554,6 +1563,37 @@ impl PreparedFrame {
             );
         }
     }
+    fn ink_query(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+        self.panel(c.rect, ColorRole::Surface, 6);
+        self.ink_border(c.rect, ColorRole::Border, 2, 6, 1.0);
+        if input.focus.component == c.id {
+            let r = c.rect;
+            self.ink_border(Rect(r.0.saturating_sub(3), r.1.saturating_sub(3), r.2 + 6, r.3 + 6), ColorRole::Focus, 3, 9, 1.0);
+        }
+        let value = input.text.get(&Binding::KeyboardValue).map(String::as_str).unwrap_or("");
+        let mut ty = self.ink_type(c, false);
+        ty.upper = false;
+        if value.is_empty() {
+            ty.literal_color = Some(c.paint.as_ref().unwrap().placeholder_color
+                .map_or(Color::new(117, 117, 117), |color| self.color(color)));
+        }
+        self.ink_text(&c.id, Rect(c.rect.0 + 12, c.rect.1 + 2, c.rect.2.saturating_sub(24), c.rect.3.saturating_sub(4)),
+            &ty, if value.is_empty() { "Search games" } else { value }, 1, Align::Left, Overflow::Ellipsis, true)
+    }
+    fn ink_backspace(&mut self, rect: Rect, ty: &Type) {
+        let height = ty.cap().round().max(8.0);
+        let width = height * 1.55;
+        let x = rect.0 as f32 + (rect.2 as f32 - width) / 2.0;
+        let y = rect.1 as f32 + (rect.3 as f32 - height) / 2.0;
+        let mut path = tiny_skia::PathBuilder::new();
+        path.move_to(x + height * 0.4, y); path.line_to(x + width, y);
+        path.line_to(x + width, y + height); path.line_to(x + height * 0.4, y + height);
+        path.line_to(x, y + height / 2.0); path.close();
+        path.move_to(x + width * 0.48, y + height * 0.28); path.line_to(x + width * 0.78, y + height * 0.72);
+        path.move_to(x + width * 0.78, y + height * 0.28); path.line_to(x + width * 0.48, y + height * 0.72);
+        let mut paint = tiny_skia::Paint::default(); paint.set_color(self.color(ty.color).into()); paint.anti_alias = true;
+        self.pixels.stroke_path(&path.finish().unwrap(), &paint, &tiny_skia::Stroke { width: 1.4, line_join: tiny_skia::LineJoin::Round, ..Default::default() }, tiny_skia::Transform::identity(), None);
+    }
     fn ink_keyboard(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
         anyhow::ensure!(
             input.keyboard.len() == 45,
@@ -1572,15 +1612,17 @@ impl PreparedFrame {
         );
         let x = c.rect.0 + (c.rect.2 - width) / 2;
         let y = c.rect.1 + (c.rect.3 - height) / 2;
+        let semantic = c.paint.as_ref().unwrap().keyboard_layout.as_deref() == Some("qwerty");
         for row in 0..5u32 {
-            for col in 0..if row == 4 { 1 } else { 11 } {
+            let count = if semantic { [10, 9, 7, 3, 1][row as usize] } else if row == 4 { 1 } else { 11 };
+            for col in 0..count {
                 let index = if row == 4 { 44 } else { row * 11 + col };
-                let rect = Rect(
-                    x + col * (cell + gap),
-                    y + row * (cell + gap),
-                    if row == 4 { width } else { cell },
-                    cell,
-                );
+                let rect = if semantic && c.paint.as_ref().unwrap().row_align.as_deref() == Some("stretch") {
+                    let key_width = (c.rect.2 - (count - 1) * gap) as f32 / count as f32;
+                    let left = (col as f32 * (key_width + gap as f32)).round() as u32;
+                    let right = (col as f32 * (key_width + gap as f32) + key_width).round() as u32;
+                    Rect(c.rect.0 + left, y + row * (cell + gap), right - left, cell)
+                } else { Rect(x + col * (cell + gap), y + row * (cell + gap), if row == 4 { width } else { cell }, cell) };
                 let focused = input.keyboard_cursor == (col as usize, row as usize);
                 self.ink_surface(
                     rect,
@@ -1600,19 +1642,13 @@ impl PreparedFrame {
                 if focused {
                     ty.color = ColorRole::FocusText;
                 }
-                self.ink_text(
-                    &c.id,
-                    rect,
-                    &ty,
-                    input
-                        .keyboard
-                        .get(index as usize)
-                        .ok_or_else(|| anyhow::anyhow!("Missing ink keyboard key {index}"))?,
-                    1,
-                    Align::Center,
-                    Overflow::Ellipsis,
-                    true,
-                )?;
+                let value = input.keyboard.get(index as usize).ok_or_else(|| anyhow::anyhow!("Missing ink keyboard key {index}"))?;
+                if semantic && row == 3 && col == 0 {
+                    self.ink_backspace(rect, &ty);
+                } else {
+                    let label = if semantic && row == 3 && col == 1 { "Clear" } else if semantic && row == 3 && col == 2 { "Results" } else { value };
+                    self.ink_text(&c.id, rect, &ty, label, 1, Align::Center, Overflow::Ellipsis, true)?;
+                }
                 self.targets.push(Target {
                     component: c.id.clone(),
                     item: format!("key-{row}-{col}"),
@@ -1766,57 +1802,55 @@ impl PreparedFrame {
             self.panel(Rect(r.0 + 2, r.1 + 2, width, 8), color, 0);
         }
     }
+    fn ink_hint_text(&mut self, id: &str, rect: Rect, ty: &Type, text: &str, centered: bool) -> Result<()> {
+        self.ink_text(id, rect, ty, text, 1, if centered { Align::Center } else { Align::Left }, Overflow::Ellipsis, true)
+    }
     fn ink_hints(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+        if input.suppress_hints { return Ok(()); }
         let ty = self.ink_type(c, false);
-        let mut widths = vec![];
-        for hint in &input.hints {
-            let badge = if matches!(hint.button.as_str(), "A" | "B" | "X" | "Y") {
-                20
-            } else {
-                ty.metrics(&ty.value(&hint.button)).0.ceil() as u32 + 8
-            };
-            widths.push((badge, ty.metrics(&ty.value(&hint.label)).0.ceil() as u32));
-        }
-        let fixed = widths.iter().map(|(b, _)| b + 6).sum::<u32>()
-            + 14 * (widths.len().saturating_sub(1) as u32);
-        let wanted = widths.iter().map(|(_, w)| *w).sum::<u32>();
-        let ratio = if wanted > 0 {
-            c.rect.2.saturating_sub(fixed) as f32 / wanted as f32
-        } else {
-            1.0
-        };
-        let mut x = c.rect.0;
-        let y = c.rect.1 + c.rect.3.saturating_sub(20) / 2;
-        for (hint, (badge, label)) in input.hints.iter().zip(widths) {
-            if x + badge >= c.rect.0 + c.rect.2 {
-                break;
+        let overrides = c.paint.as_ref().unwrap().hint_items.as_ref().map(|items| items.iter().map(|item| crate::theme::frame::Hint {
+            button: item.button.clone().unwrap(), label: item.label.clone().unwrap()
+        }).collect::<Vec<_>>());
+        let hints = overrides.as_deref().unwrap_or(&input.hints);
+        if hints.is_empty() { return Ok(()); }
+        let measure = |text: &str| ty.metrics(&ty.value(text)).0.ceil() as u32;
+        let badges: Vec<u32> = hints.iter().map(|h| if matches!(h.button.as_str(), "A" | "B" | "X" | "Y") { 20 } else { measure(&h.button) + 10 }).collect();
+        let wanted: Vec<u32> = hints.iter().map(|h| measure(&h.label)).collect();
+        let one_row = c.max_lines == Some(1);
+        let (badge_gap, group_gap) = if one_row { (4, 8) } else { (6, 14) };
+        let mut labels = wanted.clone();
+        if one_row {
+            let fixed = badges.iter().sum::<u32>() + hints.len() as u32 * badge_gap + hints.len().saturating_sub(1) as u32 * group_gap;
+            anyhow::ensure!(fixed + hints.len() as u32 * 12 <= c.rect.2, "One-row keycap badges exceed bounds");
+            labels.iter_mut().for_each(|w| *w = (*w).min(12));
+            let mut remaining = c.rect.2 - fixed - labels.iter().sum::<u32>();
+            while remaining > 0 {
+                let mut added = false;
+                for (width, wanted) in labels.iter_mut().zip(&wanted) {
+                    if *width < *wanted && remaining > 0 { *width += 1; remaining -= 1; added = true; }
+                }
+                if !added { break; }
             }
-            let rect = Rect(x, y, badge, 20);
-            self.ink_surface(rect, c, Some(ColorRole::Surface), false, None);
-            self.ink_text(
-                &c.id,
-                rect,
-                &ty,
-                &hint.button,
-                1,
-                Align::Center,
-                Overflow::Ellipsis,
-                true,
-            )?;
-            let width = ((label as f32 * ratio.min(1.0)).floor() as u32)
-                .max(1)
-                .min((c.rect.0 + c.rect.2).saturating_sub(x + badge + 6).max(1));
-            self.ink_text(
-                &c.id,
-                Rect(x + badge + 6, c.rect.1, width, c.rect.3),
-                &ty,
-                &hint.label,
-                1,
-                Align::Left,
-                Overflow::Ellipsis,
-                true,
-            )?;
-            x += badge + 6 + width + 14;
+        }
+        let mut placements = Vec::new();
+        let (mut row, mut x) = (0, 0);
+        for (i, (&badge, &label)) in badges.iter().zip(&labels).enumerate() {
+            let width = badge + badge_gap + label;
+            anyhow::ensure!(width <= c.rect.2, "Keycap hints exceed row bounds");
+            if !one_row && x > 0 && x + width > c.rect.2 { row += 1; x = 0; }
+            placements.push((i, row, x)); x += width + group_gap;
+        }
+        let rows = row + 1;
+        anyhow::ensure!(rows <= c.max_lines.unwrap_or(2) && rows * 20 <= c.rect.3, "Keycap hints exceed component height");
+        let stride = if rows > 1 { ((c.rect.3 - 20) / (rows - 1)).clamp(20, 24) } else { 0 };
+        let start = if one_row { (c.rect.3 - 20) / 2 } else { c.rect.3 - (20 + (rows - 1) * stride) };
+        for (i, row, x) in placements {
+            let rect = Rect(c.rect.0 + x, c.rect.1 + start + row * stride, badges[i], 20);
+            self.panel(rect, ColorRole::Surface, 10);
+            self.ink_border(rect, ColorRole::Border, 1, 10, 1.0);
+            let mut badge_ty = ty.clone(); badge_ty.color = ColorRole::Text;
+            self.ink_hint_text(&c.id, rect, &badge_ty, &hints[i].button, true)?;
+            self.ink_hint_text(&c.id, Rect(rect.0 + badges[i] + badge_gap, rect.1, labels[i], 20), &ty, &hints[i].label, false)?;
         }
         Ok(())
     }
@@ -2306,4 +2340,26 @@ mod tests {
         }
         assert_eq!(ink_pixmap(640, 480).unwrap().data().len(), 640 * 480 * 4);
     }
+    #[test]
+    fn parity_c_image_action_keeps_complete_play_label() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for base in ["orbit-hero", "big-picture"] {
+            for shape in ["square", "tall"] {
+                let settings = std::collections::BTreeMap::from([("cover_shape".into(), shape.into())]);
+                let snapshot = ThemeSnapshot::load_with_settings(&root.join("themes").join(base), &settings).unwrap();
+                let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+                let c = theme.pack().screens[&ScreenId::Library].components.iter()
+                    .find(|c| c.paint.as_ref().is_some_and(|p| p.action_content.is_some())).unwrap().clone();
+                let frame = PreparedFrame::prepare(theme, &FrameInputs::new(ScreenId::Library)).unwrap();
+                let runs: Vec<_> = frame.text_boxes.iter().filter(|(id, _)| id == &c.id).collect();
+                assert_eq!(runs.len(), 2, "action key and label must be separate text runs");
+                let action = c.paint.as_ref().unwrap().action_content.as_ref().unwrap();
+                let mut label = c.clone(); label.role = Some(action.role); label.paint.as_mut().unwrap().run = None;
+                let ty = frame.ink_type(&label, false);
+                assert_eq!(ty.lines(&ty.value(&action.label), runs[1].1.2, 1, Overflow::Ellipsis), vec![ty.value(&action.label)]);
+            }
+        }
+    }
+
 }

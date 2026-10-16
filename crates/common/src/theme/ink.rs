@@ -169,6 +169,9 @@ pub struct ActionContent {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Paint {
+    pub hint_items: Option<Vec<Item>>,
+    pub keyboard_layout: Option<String>,
+    pub placeholder_color: Option<ColorRole>,
     pub icons: Vec<String>,
     pub run: Option<Run>,
     pub focus_run: Option<Run>,
@@ -220,6 +223,15 @@ impl Paint {
                     .all(|v| matches!(v.as_str(), "recents" | "library" | "apps" | "settings")),
             "Invalid navigation glyph"
         );
+        ensure!(self.keyboard_layout.as_deref().is_none_or(|v| v == "qwerty"), "Invalid keyboard layout");
+        if let Some(items) = &self.hint_items {
+            ensure!(items.len() <= 8, "Too many descriptor hints");
+            for item in items {
+                ensure!(item.id.is_none() && item.icon.is_none()
+                    && item.button.as_deref().is_some_and(super::frame::semantic_button)
+                    && item.label.as_ref().is_some_and(|v| v.chars().count() <= 64), "Invalid descriptor hint");
+            }
+        }
         let alpha = |a: f32| a.is_finite() && (0.0..=1.0).contains(&a);
         ensure!(self.opacity.is_none_or(alpha), "Invalid component opacity");
         ensure!(
