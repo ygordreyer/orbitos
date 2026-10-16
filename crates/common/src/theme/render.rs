@@ -24,6 +24,8 @@ use tiny_skia::{PixmapPaint, Transform};
 mod retained;
 #[path = "render_tiles.rs"]
 mod tiles;
+#[path = "ink_blit.rs"]
+mod ink_blit;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -42,6 +44,7 @@ pub struct PreparedFrame {
     component_metadata: Vec<retained::Metadata>,
     retained_layout: bool,
     tiles: tiles::Cache,
+    ink_cache: ink_renderer::retained::Cache,
     damage: Vec<Rect>,
     pub targets: Vec<Target>,
     pub text_boxes: Vec<(String, Rect)>,
@@ -260,6 +263,7 @@ impl PreparedFrame {
             component_metadata: vec![],
             retained_layout: false,
             tiles: Default::default(),
+            ink_cache: Default::default(),
             damage: vec![],
             targets: vec![],
             text_boxes: vec![],
@@ -268,6 +272,7 @@ impl PreparedFrame {
             && result.theme.generation() == theme.generation();
         if !same_theme {
             result.tiles = Default::default();
+            result.ink_cache = Default::default();
         }
         if !same_theme || result.previous_input.is_none() || result.screen != input.screen {
             result.retained_layout = retained::supported_screen(&theme, input.screen);
@@ -291,11 +296,12 @@ impl PreparedFrame {
             "initial_or_theme_change"
         });
         if result.theme.pack().ink() { result.render_ink(input)?; } else { result.render_components(input, incremental)?; }
-        if !eligible {
+        let retained_opaque_ink = result.theme.pack().ink() && result.ink_cache.opaque_base;
+        if !eligible && !retained_opaque_ink {
             crate::perf_trace::count(crate::perf_trace::Count::ScannedPixels, 640 * 480);
         }
         result.previous_input = eligible.then(|| retained::capture(input));
-        result.opaque = eligible
+        result.opaque = retained_opaque_ink || eligible
             || result
                 .pixels
                 .pixels()
@@ -387,6 +393,9 @@ impl PreparedFrame {
                 .draw(&mut dest, 0, 0, self.pixels.as_ref(), 1.0, None);
         }
     }
+    pub fn is_opaque(&self) -> bool {
+        self.opaque
+    }
     pub fn pixels(&self) -> &Pixmap {
         &self.pixels
     }
@@ -410,7 +419,11 @@ impl PreparedFrame {
     }
     fn panel(&mut self, rect: Rect, role: ColorRole, radius: u32) {
         let color = self.color(role);
-        fill_rounded_rect(&mut self.pixels.as_mut(), draw_rect(rect), radius, color);
+        if self.theme.pack().ink() && radius == 0 && color.a() == 255 && !ink_blit::reference() {
+            crate::display::fill_rect(&mut self.pixels.as_mut(), draw_rect(rect), color);
+        } else {
+            fill_rounded_rect(&mut self.pixels.as_mut(), draw_rect(rect), radius, color);
+        }
     }
     fn text(
         &mut self,
@@ -652,6 +665,10 @@ impl PreparedFrame {
     }
     fn draw_image(&mut self, rect: Rect, image: &std::sync::Arc<Pixmap>) {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Artwork);
+        if self.theme.pack().ink() && !ink_blit::reference() {
+            ink_blit::draw(&mut self.pixels.as_mut(), rect.0 as i32, rect.1 as i32, image.as_ref().as_ref());
+            return;
+        }
         super::blit::draw_cached(
             &mut self.pixels.as_mut(),
             rect.0 as i32,
@@ -1663,7 +1680,7 @@ mod tests {
     use super::*;
     include!("render_dl12_bench.rs");
     include!("render_dl15_tests.rs");
-    struct TestDisplay(Pixmap);
+    pub(super) struct TestDisplay(pub(super) Pixmap);
     impl Display for TestDisplay {
         fn width(&self) -> u32 {
             self.0.width()
@@ -1722,6 +1739,7 @@ mod tests {
             component_metadata: vec![],
             retained_layout: false,
             tiles: Default::default(),
+            ink_cache: Default::default(),
             damage: vec![],
             targets: vec![],
             text_boxes: vec![],
@@ -2011,3 +2029,7 @@ mod tests {
 mod ink_renderer;
 
 pub use ink_renderer::{InkTextLayout, ink_text_layout};
+
+#[cfg(all(test, feature = "perf-bench"))]
+#[path = "render_selection_bench.rs"]
+mod selection_bench;

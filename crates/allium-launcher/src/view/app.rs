@@ -84,6 +84,7 @@ where
     theme_scene: Option<crate::theme_adapter::ThemeScene>,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
+    theme_presented_screen: Option<common::theme::pack::ScreenId>,
     had_theme: bool,
     _phantom_battery: PhantomData<B>,
 }
@@ -196,6 +197,7 @@ where
             theme_scene: None,
             present_damage: None,
             theme_was_layered: false,
+            theme_presented_screen: None,
             had_theme: false,
             _phantom_battery: PhantomData,
         })
@@ -769,13 +771,20 @@ where
                 if !self.theme_dirty && !self.dirty {
                     return Ok(false);
                 }
-                if scene.frames.len() == 1 && !self.dirty && !self.theme_was_layered {
-                    self.present_damage = Some(scene.frames[0].paint_damage(display));
+                let top = scene.frames.last().unwrap();
+                let opaque_top = top.is_opaque();
+                let same_top = self.theme_presented_screen == Some(top.screen());
+                if !self.dirty && ((scene.frames.len() == 1 && !self.theme_was_layered)
+                    || (opaque_top && same_top)) {
+                    self.present_damage = Some(top.paint_damage(display));
+                } else if opaque_top {
+                    top.paint(display);
                 } else {
                     for frame in &scene.frames {
                         frame.paint(display);
                     }
                 }
+                self.theme_presented_screen = Some(top.screen());
                 self.theme_was_layered = scene.frames.len() != 1;
                 self.theme_dirty = false;
                 self.dirty = false;

@@ -18,6 +18,8 @@ pub struct InkTextLayout {
     family: FontId,
 }
 type Type = InkTextLayout;
+#[path = "render_ink_retained.rs"]
+pub(super) mod retained;
 impl InkTextLayout {
     // Sixteen lines fit the frame model's 8,192 source-character limit.
     pub const GUIDE_LINE_SOURCE_CHAR_LIMIT: usize = 512;
@@ -202,12 +204,43 @@ impl InkTextLayout {
         lines
     }
 }
+struct CachedShelf {
+    theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
+    source: Option<std::sync::Weak<Pixmap>>,
+    key: String,
+    pixels: Arc<Pixmap>,
+}
+thread_local! { static SHELVES: RefCell<VecDeque<CachedShelf>> = const { RefCell::new(VecDeque::new()) }; }
 struct CachedText {
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
     key: String,
     pixels: Arc<Pixmap>,
 }
 thread_local! {static SURFACES: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};static TEXT: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};}
+fn opacity_table(opacity: f32) -> Arc<[u8]> {
+    thread_local! { static TABLES: RefCell<VecDeque<(u32, Arc<[u8]>)>> = const { RefCell::new(VecDeque::new()) }; }
+    TABLES.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        let key = opacity.to_bits();
+        let index = if let Some(index) = tables.iter().position(|(bits, _)| *bits == key) {
+            index
+        } else {
+            let mut table = vec![0; 256 * 256].into_boxed_slice();
+            for old in 0..256 {
+                for value in 0..256 {
+                    table[old * 256 + value] =
+                        (old as f32 + (value as f32 - old as f32) * opacity).round() as u8;
+                }
+            }
+            if tables.len() == 8 {
+                tables.pop_back();
+            }
+            tables.push_front((key, table.into()));
+            0
+        };
+        tables[index].1.clone()
+    })
+}
 fn check_ink_dimensions(width: u32, height: u32) -> Result<()> {
     anyhow::ensure!(
         width > 0
@@ -378,14 +411,7 @@ impl PreparedFrame {
             }
             pix
         };
-        self.pixels.draw_pixmap(
-            rect.0 as i32,
-            rect.1 as i32,
-            pixels.as_ref().as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
+        super::ink_blit::bitmap(&mut self.pixels, rect.0 as i32, rect.1 as i32, pixels.as_ref().as_ref());
         self.text_boxes.push((id.into(), rect));
         Ok(())
     }
@@ -438,7 +464,7 @@ impl PreparedFrame {
                             .map(|e| e.pixels.data().len() + e.key.len())
                             .sum::<usize>()
                             + pixels.data().len()
-                            > 2 * 1024 * 1024)
+                            > if super::ink_blit::reference() { 2 * 1024 * 1024 } else { 6 * 1024 * 1024 })
                 {
                     cache.pop_back();
                 }
@@ -450,14 +476,7 @@ impl PreparedFrame {
             });
             pixels
         };
-        self.pixels.draw_pixmap(
-            rect.0 as i32,
-            rect.1 as i32,
-            pixels.as_ref().as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
+        super::ink_blit::bitmap(&mut self.pixels, rect.0 as i32, rect.1 as i32, pixels.as_ref().as_ref());
     }
     fn ink_surface_raw(
         &mut self,
@@ -594,10 +613,6 @@ impl PreparedFrame {
         }
     }
     pub(super) fn render_ink(&mut self, input: &FrameInputs) -> Result<()> {
-        self.pixels.data_mut().fill(0);
-        self.targets.clear();
-        self.text_boxes.clear();
-        self.damage = vec![Rect(0, 0, 640, 480)];
         let mut components = self.theme.pack().screens[&input.screen].components.clone();
         let state = primary_binding(input.screen)
             .and_then(|b| input.rows.get(&b))
@@ -611,33 +626,53 @@ impl PreparedFrame {
                 .is_none_or(|w| (w == "populated") == state)
         });
         self.ink_fit_dialog(&mut components, input);
-        for c in &components {
-            let opacity = c.paint.as_ref().unwrap().opacity.unwrap_or(1.0);
-            if opacity == 0.0 {
-                continue;
+        #[cfg(test)]
+        if std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
+            return self.render_ink_uncached(input, &components);
+        }
+        self.render_ink_retained(input, &components)
+    }
+    fn render_ink_uncached(&mut self, input: &FrameInputs, components: &[Component]) -> Result<()> {
+        self.pixels.data_mut().fill(0);
+        self.targets.clear();
+        self.text_boxes.clear();
+        self.damage = vec![Rect(0, 0, 640, 480)];
+        crate::perf_trace::render_reason("ink_uncached");
+        for c in components {
+            self.ink_paint_component(c, input)?;
+        }
+        Ok(())
+    }
+    fn ink_paint_component(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+        let opacity = c.paint.as_ref().unwrap().opacity.unwrap_or(1.0);
+        if opacity == 0.0 {
+            return Ok(());
+        }
+        let before = if opacity < 1.0 {
+            let mut v = vec![];
+            for y in c.rect.1..c.rect.1 + c.rect.3 {
+                let at = ((y * 640 + c.rect.0) * 4) as usize;
+                v.extend_from_slice(&self.pixels.data()[at..at + c.rect.2 as usize * 4]);
             }
-            let before = if opacity < 1.0 {
-                let mut v = vec![];
-                for y in c.rect.1..c.rect.1 + c.rect.3 {
-                    let at = ((y * 640 + c.rect.0) * 4) as usize;
-                    v.extend_from_slice(&self.pixels.data()[at..at + c.rect.2 as usize * 4]);
-                }
-                Some(v)
-            } else {
-                None
-            };
-            self.ink_component(c, input)?;
-            if let Some(before) = before {
-                for (row, y) in (c.rect.1..c.rect.1 + c.rect.3).enumerate() {
-                    let at = ((y * 640 + c.rect.0) * 4) as usize;
-                    for (channel, value) in self.pixels.data_mut()[at..at + c.rect.2 as usize * 4]
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        let old = before[row * c.rect.2 as usize * 4 + channel];
-                        *value =
-                            (old as f32 + (*value as f32 - old as f32) * opacity).round() as u8;
-                    }
+            Some(v)
+        } else {
+            None
+        };
+        self.ink_component(c, input)?;
+        if let Some(before) = before {
+            let table = (!super::ink_blit::reference()).then(|| opacity_table(opacity));
+            for (row, y) in (c.rect.1..c.rect.1 + c.rect.3).enumerate() {
+                let at = ((y * 640 + c.rect.0) * 4) as usize;
+                for (channel, value) in self.pixels.data_mut()[at..at + c.rect.2 as usize * 4]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let old = before[row * c.rect.2 as usize * 4 + channel];
+                    *value = if let Some(table) = &table {
+                        table[old as usize * 256 + *value as usize]
+                    } else {
+                        (old as f32 + (*value as f32 - old as f32) * opacity).round() as u8
+                    };
                 }
             }
         }
@@ -884,14 +919,7 @@ impl PreparedFrame {
                     .get(&input.screen)
                     .and_then(|a| a.get(&c.id))
                 {
-                    self.pixels.draw_pixmap(
-                        c.rect.0 as i32,
-                        c.rect.1 as i32,
-                        image.as_ref(),
-                        &PixmapPaint::default(),
-                        Transform::identity(),
-                        None,
-                    );
+                    super::ink_blit::bitmap(&mut self.pixels, c.rect.0 as i32, c.rect.1 as i32, image.as_ref());
                 }
             }
             Kind::Entries | Kind::SettingsRows => {
@@ -1244,6 +1272,104 @@ impl PreparedFrame {
         }
         Ok(())
     }
+    fn ink_shelf_tile(
+        &mut self,
+        c: &Component,
+        row: &Row,
+        input: &FrameInputs,
+        focused: bool,
+        preview: bool,
+        aw: u32,
+        ah: u32,
+        pad: u32,
+        scale: f32,
+    ) -> Result<Arc<Pixmap>> {
+        let p = c.paint.as_ref().unwrap();
+        let weak = self.theme.weak();
+        let source = input.art.entries.get(&row.id);
+        let key = format!("{:?}:{}:{}:{}:{}:{}", self.screen, c.id, c.rect.2, c.rect.3, focused, preview);
+        if !super::ink_blit::reference() {
+            let cached = SHELVES.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let index = cache.iter().position(|entry| {
+                    entry.theme.ptr_eq(&weak)
+                        && entry.theme.strong_count() > 0
+                        && entry.key == key
+                        && match (&entry.source, source) {
+                            (Some(a), Some(b)) => a.upgrade().is_some_and(|a| Arc::ptr_eq(&a, b)),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })?;
+                let entry = cache.remove(index).unwrap();
+                let pixels = entry.pixels.clone();
+                cache.push_front(entry);
+                Some(pixels)
+            });
+            if let Some(pixels) = cached {
+                return Ok(pixels);
+            }
+        }
+        let tile_height = ah.saturating_add(pad.saturating_mul(2));
+        let mut tile = ink_pixmap(c.item_extent.unwrap(), tile_height)?;
+        let old = std::mem::replace(&mut self.pixels, tile);
+        let case = Rect(0, 0, c.item_extent.unwrap(), ah + 2 * pad);
+        let mut copy = c.clone();
+        copy.rect = case;
+        self.ink_surface(case, &copy, c.frame_color, focused, None);
+        if let Some(source) = input.art.entries.get(&row.id) {
+            let rect = Rect(pad, pad, aw, ah);
+            let mut image_c = c.clone();
+            if preview {
+                image_c.blur_radius = p.peek.as_ref().and_then(|p| p.blur);
+            }
+            image_c.fit = Some(
+                if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {
+                    crate::theme::pack::Fit::Cover
+                } else {
+                    crate::theme::pack::Fit::Contain
+                },
+            );
+            let image = self.image_pixels_with_radius(
+                rect,
+                source,
+                &image_c,
+                c.radius.unwrap_or(0).saturating_sub(pad),
+            )?;
+            self.draw_image(rect, &image);
+        }
+        self.ink_focus(c, case, focused);
+        tile = std::mem::replace(&mut self.pixels, old);
+        let dw = (tile.width() as f32 * scale).round() as u32;
+        let dh = (tile.height() as f32 * scale).round() as u32;
+        if scale != 1.0 {
+            check_ink_dimensions(dw, dh)?;
+            tile =
+                crate::theme::runtime::fit_image(&tile, dw, dh, crate::theme::pack::Fit::Contain)?;
+        }
+
+        let pixels = Arc::new(tile);
+        if !super::ink_blit::reference() {
+            SHELVES.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                while !cache.is_empty()
+                    && (cache.len() >= 32
+                        || cache.iter().map(|e| e.pixels.data().len()).sum::<usize>()
+                            + pixels.data().len()
+                            > 2 * 1024 * 1024)
+                {
+                    cache.pop_back();
+                }
+                cache.push_front(CachedShelf {
+                    theme: weak,
+                    source: source.map(Arc::downgrade),
+                    key,
+                    pixels: pixels.clone(),
+                });
+            });
+        }
+        Ok(pixels)
+    }
     fn ink_shelf(
         &mut self,
         c: &Component,
@@ -1275,84 +1401,60 @@ impl PreparedFrame {
         };
         let focused =
             !preview && input.focus.component == c.id && input.focus.item.as_ref() == Some(&row.id);
-        let tile_height = ah.saturating_add(pad.saturating_mul(2));
-        let mut tile = ink_pixmap(c.item_extent.unwrap(), tile_height)?;
-        let old = std::mem::replace(&mut self.pixels, tile);
-        let case = Rect(0, 0, c.item_extent.unwrap(), ah + 2 * pad);
-        let mut copy = c.clone();
-        copy.rect = case;
-        self.ink_surface(case, &copy, c.frame_color, focused, None);
-        if let Some(source) = input.art.entries.get(&row.id) {
-            let rect = Rect(pad, pad, aw, ah);
-            let mut image_c = c.clone();
-            if preview {
-                image_c.blur_radius = p.peek.as_ref().and_then(|p| p.blur);
-            }
-            image_c.fit = Some(
-                if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {
-                    crate::theme::pack::Fit::Cover
-                } else {
-                    crate::theme::pack::Fit::Contain
-                },
-            );
-            let image = self.image_pixels_with_radius(
-                rect,
-                source,
-                &image_c,
-                c.radius.unwrap_or(0).saturating_sub(pad),
-            )?;
-            self.draw_image(rect, &image);
-        }
-        self.ink_focus(c, case, focused);
-        tile = std::mem::replace(&mut self.pixels, old);
         let scale = if focused {
             p.focus_scale.unwrap_or(1.0)
         } else {
             1.0
         };
-        let dw = (tile.width() as f32 * scale).round() as u32;
-        let dh = (tile.height() as f32 * scale).round() as u32;
-        if scale != 1.0 {
-            check_ink_dimensions(dw, dh)?;
-            tile =
-                crate::theme::runtime::fit_image(&tile, dw, dh, crate::theme::pack::Fit::Contain)?;
-        }
+        let tile = self.ink_shelf_tile(c, row, input, focused, preview, aw, ah, pad, scale)?;
+        let dw = tile.width();
+        let dh = tile.height();
         let atx = x as i32 - (dw as i32 - c.item_extent.unwrap() as i32) / 2;
         let aty = c.rect.1 as i32 - (dh as i32 - (ah + 2 * pad) as i32) / 2;
-        let mut mask = tiny_skia::Mask::new(640, 480).unwrap();
-        let path = tiny_skia::PathBuilder::from_rect(
-            tiny_skia::Rect::from_xywh(
-                c.rect.0 as f32,
-                c.rect.1 as f32,
-                c.rect.2 as f32,
-                c.rect.3 as f32,
-            )
-            .unwrap(),
-        );
-        mask.fill_path(
-            &path,
-            tiny_skia::FillRule::Winding,
-            false,
-            Transform::identity(),
-        );
-        if preview {
-            for y in 0..480usize {
-                let a = y * 640 + (x + width) as usize;
-                let b = (y + 1) * 640;
-                mask.data_mut()[a..b].fill(0);
+        if opacity == 1.0 && !super::ink_blit::reference() {
+            super::ink_blit::draw_clipped(
+                &mut self.pixels.as_mut(),
+                atx,
+                aty,
+                tile.as_ref().as_ref(),
+                (c.rect.0, c.rect.1, c.rect.2, c.rect.3),
+            );
+        } else {
+            let mut mask = tiny_skia::Mask::new(640, 480).unwrap();
+            let path = tiny_skia::PathBuilder::from_rect(
+                tiny_skia::Rect::from_xywh(
+                    c.rect.0 as f32,
+                    c.rect.1 as f32,
+                    c.rect.2 as f32,
+                    c.rect.3 as f32,
+                )
+                .unwrap(),
+            );
+            mask.fill_path(
+                &path,
+                tiny_skia::FillRule::Winding,
+                false,
+                Transform::identity(),
+            );
+            if preview {
+                for y in 0..480usize {
+                    let a = y * 640 + (x + width) as usize;
+                    let b = (y + 1) * 640;
+                    mask.data_mut()[a..b].fill(0);
+                }
             }
+            self.pixels.draw_pixmap(
+                atx,
+                aty,
+                tile.as_ref().as_ref(),
+                &PixmapPaint {
+                    opacity,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                Some(&mask),
+            );
         }
-        self.pixels.draw_pixmap(
-            atx,
-            aty,
-            tile.as_ref(),
-            &PixmapPaint {
-                opacity,
-                ..Default::default()
-            },
-            Transform::identity(),
-            Some(&mask),
-        );
         let show = !preview
             && p.caption_mode.as_deref() != Some("none")
             && (p.caption_mode.as_deref() != Some("focused") || focused);
@@ -1521,6 +1623,30 @@ impl PreparedFrame {
         Ok(())
     }
     fn ink_status(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+        // Fixed-width status icons may exceed a valid component's available space.
+        // Keep absolute coordinates to preserve path rasterization, and copy back only retained bounds.
+        let mut local = ink_pixmap(c.rect.0 + c.rect.2, c.rect.1 + c.rect.3)?;
+        let stride = self.pixels.width() as usize * 4;
+        let local_stride = local.width() as usize * 4;
+        let row_bytes = c.rect.2 as usize * 4;
+        for y in c.rect.1..c.rect.1 + c.rect.3 {
+            let at = y as usize * stride + c.rect.0 as usize * 4;
+            let to = y as usize * local_stride + c.rect.0 as usize * 4;
+            local.data_mut()[to..to + row_bytes]
+                .copy_from_slice(&self.pixels.data()[at..at + row_bytes]);
+        }
+        let framebuffer = std::mem::replace(&mut self.pixels, local);
+        let result = self.ink_status_contents(c, input);
+        let local = std::mem::replace(&mut self.pixels, framebuffer);
+        for y in c.rect.1..c.rect.1 + c.rect.3 {
+            let at = y as usize * stride + c.rect.0 as usize * 4;
+            let from = y as usize * local_stride + c.rect.0 as usize * 4;
+            self.pixels.data_mut()[at..at + row_bytes]
+                .copy_from_slice(&local.data()[from..from + row_bytes]);
+        }
+        result
+    }
+    fn ink_status_contents(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
         let ty = self.ink_type(c, false);
         let gap = self.theme.pack().alignment.as_ref().unwrap().status_gap;
         let color = ty.color;
