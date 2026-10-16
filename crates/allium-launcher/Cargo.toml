@@ -8,6 +8,7 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+perf-bench = ["common/perf-bench"]
 simulator = ["common/simulator"]
 miyoo = ["common/miyoo"]
 debug-ui = ["common/debug-ui"] # Draw bounding boxes
@@ -15,6 +16,7 @@ debug-ui-redraw = [] # Show only redraws
 
 [dependencies]
 anyhow.workspace = true
+libc = "=0.2.186"
 async-trait.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 tiny-skia.workspace = true

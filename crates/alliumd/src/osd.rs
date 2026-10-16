@@ -1,16 +1,24 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use common::constants::UI_FRAME_INTERVAL;
-use common::display::{Display, RectHold, draw_speaker_icon, draw_sun_icon, fill_rounded_rect};
+use common::display::{
+    Display, RectHold, draw_speaker_icon, draw_sun_icon, fill_rounded_rect,
+    overlay::{OverlaySurface, PreparedOverlay},
+};
 use common::geom::Rect;
 use common::platform::Platform;
 use common::stylesheet::Stylesheet;
+use common::theme::{
+    ThemeHandle,
+    frame::FrameInputs,
+    pack::{Binding, ScreenId},
+    render::PreparedFrame,
+};
+use log::warn;
 use tokio::time::Instant;
 
-/// How long the indicator stays on screen after the last change
 const HIDE_TIMEOUT: Duration = Duration::from_millis(1000);
-/// Twice per UI frame, since a launcher redraw flushes the whole screen
 const UI_REDRAW_PERIOD: Duration = Duration::from_micros(UI_FRAME_INTERVAL.as_micros() as u64 / 2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,98 +26,93 @@ pub enum OsdKind {
     Volume,
     Brightness,
 }
+impl OsdKind {
+    fn screen(self) -> ScreenId {
+        match self {
+            Self::Volume => ScreenId::OsdVolume,
+            Self::Brightness => ScreenId::OsdBrightness,
+        }
+    }
+}
 
-/// The plate and its contents, placed from the framebuffer size and the theme
 #[derive(Clone, Copy)]
 struct Plate {
     rect: Rect,
     icon: Rect,
     bar: Rect,
-    /// Corner rounding, kept equal to the horizontal padding
     radius: u32,
 }
-
 impl Plate {
-    fn new<D: Display>(display: &D, styles: &Stylesheet) -> Self {
-        let font_size = styles.ui.ui_font.size;
-        // Same theme-driven paddings as the launcher's toast popups
-        let padding_x = styles.ui.margin_x.max(0) as u32;
-        let padding_y = styles.ui.margin_y.max(0) as u32;
-        let icon_side = font_size * 2 / 3;
-
+    fn new(display: &impl Display, styles: &Stylesheet) -> Self {
+        let font = styles.ui.ui_font.size;
+        let px = styles.ui.margin_x.max(0) as u32;
+        let py = styles.ui.margin_y.max(0) as u32;
+        let icon = font * 2 / 3;
         let bar_w = display.width() / 4;
-        let bar_h = font_size / 3;
-        let plate_w = padding_x + icon_side + padding_x + bar_w + padding_x;
-        let plate_h = font_size + padding_y * 2;
-
-        // Clear the button hint row, positioned by ButtonHints::ensure_layout
-        let hint_h = styles.button_size().max(styles.button_hint_font_size()) as u32;
-        let bottom_margin = padding_x + hint_h + padding_y;
-
+        let bar_h = font / 3;
+        let w = px + icon + px + bar_w + px;
+        let h = font + py * 2;
+        let hint = styles.button_size().max(styles.button_hint_font_size()) as u32;
         let rect = Rect::new(
-            (display.width() as i32 - plate_w as i32) / 2,
-            display.height() as i32 - (plate_h + bottom_margin) as i32,
-            plate_w,
-            plate_h,
+            (display.width() as i32 - w as i32) / 2,
+            display.height() as i32 - (h + px + hint + py) as i32,
+            w,
+            h,
         );
         Self {
             rect,
             icon: Rect::new(
-                rect.x + padding_x as i32,
-                rect.y + ((plate_h - icon_side) / 2) as i32,
-                icon_side,
-                icon_side,
+                rect.x + px as i32,
+                rect.y + ((h - icon) / 2) as i32,
+                icon,
+                icon,
             ),
             bar: Rect::new(
-                rect.x + (padding_x + icon_side + padding_x) as i32,
-                rect.y + ((plate_h - bar_h) / 2) as i32,
+                rect.x + (px + icon + px) as i32,
+                rect.y + ((h - bar_h) / 2) as i32,
                 bar_w,
                 bar_h,
             ),
-            radius: padding_x,
+            radius: px,
         }
     }
 }
 
-/// How often the plate has to be rewritten to stay on screen
-enum Refresh {
-    /// Nothing repaints under us: re-flush periodically, restore the background on hide
-    Periodic { next_redraw: Instant },
-    /// The app rewrites the whole frame ~60/s, so a stamper thread owns the rect
+enum LegacyRefresh {
+    Periodic { next: Instant },
     Continuous(RectHold),
 }
-
-/// The framebuffer we draw on, and the plate placed on it
-struct Surface<P: Platform> {
-    display: P::Display,
+struct Legacy<D: Display> {
+    display: D,
     plate: Plate,
+    refresh: Option<LegacyRefresh>,
+    faulted: bool,
 }
-
-impl<P: Platform> Surface<P> {
-    fn new(platform: &mut P, styles: &Stylesheet) -> Result<Self> {
-        let mut display = platform.display_partial()?;
+impl<D: Display> Legacy<D> {
+    fn new(mut display: D, styles: &Stylesheet) -> Result<Self> {
         let plate = Plate::new(&display, styles);
-        // Nothing outside the plate is ever drawn or restored, so read no more of the frame
         display.read_rect(plate.rect)?;
         display.save()?;
-        Ok(Self { display, plate })
+        Ok(Self {
+            display,
+            plate,
+            refresh: None,
+            faulted: false,
+        })
     }
-
-    /// Hands the plate to a stamper thread, on platforms that have one
-    fn hold_plate(&mut self) -> Result<Option<RectHold>> {
-        self.display.hold_rect(self.plate.rect, self.plate.radius)
+    fn stop_writer(&mut self) -> Result<()> {
+        ensure!(
+            !self.faulted,
+            "Legacy OSD faulted; explicit recovery required"
+        );
+        if let Some(LegacyRefresh::Continuous(hold)) = self.refresh.take()
+            && let Err(error) = hold.stop_and_join()
+        {
+            self.faulted = true;
+            return Err(error);
+        }
+        Ok(())
     }
-
-    fn flush_plate(&mut self) -> Result<()> {
-        self.display.flush_rect(self.plate.rect)
-    }
-
-    /// Puts the pre-OSD background back where the plate was
-    fn restore_plate(&mut self) -> Result<()> {
-        self.display.load(self.plate.rect)?;
-        self.display.flush_rect(self.plate.rect)
-    }
-
     fn draw(&mut self, styles: &Stylesheet, kind: OsdKind, fraction: f32) -> Result<()> {
         let Plate {
             rect,
@@ -117,18 +120,13 @@ impl<P: Platform> Surface<P> {
             bar,
             radius,
         } = self.plate;
-
-        // Repaint over the saved background so a shrinking bar leaves no residue
         self.display.load(rect)?;
-
-        // Unlike ui.background_color, this one is opaque in every bundled theme
         fill_rounded_rect(
             &mut self.display.pixmap_mut(),
             rect,
             radius,
             styles.menu.background_color,
         );
-
         match kind {
             OsdKind::Volume => {
                 draw_speaker_icon(&mut self.display.pixmap_mut(), icon, styles.ui.text_color)
@@ -137,118 +135,360 @@ impl<P: Platform> Surface<P> {
                 draw_sun_icon(&mut self.display.pixmap_mut(), icon, styles.ui.text_color)
             }
         }
-
-        let bar_radius = bar.h / 2;
+        let radius = bar.h / 2;
         fill_rounded_rect(
             &mut self.display.pixmap_mut(),
             bar,
-            bar_radius,
+            radius,
             styles.ui.disabled_color,
         );
-        let fill_w = (bar.w as f32 * fraction.clamp(0.0, 1.0)).round() as u32;
-        if fill_w > 0 {
-            let fill = Rect::new(bar.x, bar.y, fill_w, bar.h);
+        let w = (bar.w as f32 * fraction.clamp(0.0, 1.0)).round() as u32;
+        if w > 0 {
             fill_rounded_rect(
                 &mut self.display.pixmap_mut(),
-                fill,
-                bar_radius.min(fill_w / 2),
+                Rect::new(bar.x, bar.y, w, bar.h),
+                radius.min(w / 2),
                 styles.ui.highlight_color,
             );
         }
-
         self.display.flush_rect(rect)
     }
-}
-
-/// State that exists only while the indicator is on screen
-struct Shown<P: Platform> {
-    surface: Surface<P>,
-    hide_at: Instant,
-    refresh: Refresh,
-}
-
-/// On-screen indicator drawn over whatever app owns the framebuffer.
-pub struct Osd<P: Platform> {
-    styles: Stylesheet,
-    shown: Option<Shown<P>>,
-}
-
-impl<P: Platform> Osd<P> {
-    pub fn new(styles: Stylesheet) -> Self {
-        Self {
-            styles,
-            shown: None,
-        }
-    }
-
-    /// When `tick()` is next due, or `None` while hidden — nothing to wake for.
-    pub fn next_wake(&self) -> Option<Instant> {
-        self.shown.as_ref().map(|shown| match shown.refresh {
-            Refresh::Periodic { next_redraw } => shown.hide_at.min(next_redraw),
-            Refresh::Continuous(_) => shown.hide_at,
-        })
-    }
-
-    pub fn show(
+    fn update(
         &mut self,
-        platform: &mut P,
+        styles: &Stylesheet,
         kind: OsdKind,
         fraction: f32,
         repainting: bool,
     ) -> Result<()> {
-        // Consuming the old state stops its stamper before the new content is drawn
-        let mut surface = match self.shown.take() {
-            Some(shown) => shown.surface,
-            None => Surface::new(platform, &self.styles)?,
-        };
-
-        surface.draw(&self.styles, kind, fraction)?;
-
+        self.stop_writer()?;
+        if let Err(error) = self.draw(styles, kind, fraction) {
+            self.faulted = true;
+            return Err(error);
+        }
         let now = Instant::now();
-        let periodic = Refresh::Periodic {
-            next_redraw: now + UI_REDRAW_PERIOD,
-        };
-        self.shown = Some(Shown {
-            // Must precede the `surface` move: hold_plate takes it by &mut
-            refresh: if repainting {
-                match surface.hold_plate()? {
-                    Some(hold) => Refresh::Continuous(hold),
-                    // Nothing stamps here, so fall back to the static-UI cadence
-                    None => periodic,
+        self.refresh = Some(if repainting {
+            match self.display.hold_rect(self.plate.rect, self.plate.radius) {
+                Ok(Some(hold)) => LegacyRefresh::Continuous(hold),
+                Ok(None) => LegacyRefresh::Periodic {
+                    next: now + UI_REDRAW_PERIOD,
+                },
+                Err(error) => {
+                    self.faulted = true;
+                    return Err(error);
                 }
-            } else {
-                periodic
-            },
-            surface,
-            hide_at: now + HIDE_TIMEOUT,
+            }
+        } else {
+            LegacyRefresh::Periodic {
+                next: now + UI_REDRAW_PERIOD,
+            }
         });
         Ok(())
     }
+    fn hide(&mut self) -> Result<()> {
+        ensure!(
+            !self.faulted,
+            "Legacy OSD faulted; explicit recovery required"
+        );
+        match self.refresh.take() {
+            Some(LegacyRefresh::Periodic { .. }) => {
+                self.display.load(self.plate.rect)?;
+                self.display.flush_rect(self.plate.rect)
+            }
+            Some(LegacyRefresh::Continuous(hold)) => hold.stop_and_join(),
+            None => Ok(()),
+        }
+        .inspect_err(|_| self.faulted = true)
+    }
+}
 
+struct Themed<D: Display> {
+    display: D,
+    surface: Option<OverlaySurface>,
+}
+impl<D: Display> Themed<D> {
+    fn install(mut display: D, candidate: &PreparedOverlay) -> Result<Self> {
+        let mut surface = None;
+        let result = OverlaySurface::replace(&mut display, &mut surface, Some(candidate));
+        match result {
+            Ok(()) => Ok(Self { display, surface }),
+            Err(_) if surface.is_some() => Ok(Self { display, surface }),
+            Err(error) => Err(error),
+        }
+    }
+    fn replace(&mut self, candidate: &PreparedOverlay) -> Result<()> {
+        OverlaySurface::replace(&mut self.display, &mut self.surface, Some(candidate))
+    }
+    fn hide(&mut self) -> Result<()> {
+        OverlaySurface::replace(&mut self.display, &mut self.surface, None)
+    }
+    fn theme(&self) -> Option<ThemeHandle> {
+        self.surface
+            .as_ref()
+            .map(|surface| surface.captured().snapshot().clone())
+    }
+    fn faulted(&self) -> bool {
+        self.surface.as_ref().is_some_and(OverlaySurface::faulted)
+    }
+}
+
+enum Presentation<D: Display> {
+    Legacy(Legacy<D>),
+    Themed(Themed<D>),
+}
+impl<D: Display> Presentation<D> {
+    fn faulted(&self) -> bool {
+        match self {
+            Self::Legacy(legacy) => legacy.faulted,
+            Self::Themed(themed) => themed.faulted(),
+        }
+    }
+}
+struct Shown<D: Display> {
+    presentation: Presentation<D>,
+    hide_at: Instant,
+}
+
+pub struct Osd<P: Platform> {
+    styles: Stylesheet,
+    shown: Option<Shown<P::Display>>,
+}
+impl<P: Platform> Osd<P> {
+    pub fn new(styles: Stylesheet) -> Self {
+        Self {
+            styles: styles.display_style(),
+            shown: None,
+        }
+    }
+    pub fn is_visible(&self) -> bool {
+        self.shown.is_some()
+    }
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.shown.as_ref().and_then(|shown| {
+            if shown.presentation.faulted() {
+                return None;
+            }
+            Some(match &shown.presentation {
+                Presentation::Legacy(Legacy {
+                    refresh: Some(LegacyRefresh::Periodic { next }),
+                    ..
+                }) => shown.hide_at.min(*next),
+                _ => shown.hide_at,
+            })
+        })
+    }
+    pub fn show(
+        &mut self,
+        platform: &mut P,
+        kind: OsdKind,
+        title: &str,
+        fraction: f32,
+        repainting: bool,
+        opening_theme: Option<ThemeHandle>,
+    ) -> Result<()> {
+        let fraction = fraction.clamp(0.0, 1.0);
+        if let Some(shown) = self.shown.as_mut() {
+            ensure!(
+                !shown.presentation.faulted(),
+                "OSD faulted; explicit recovery required"
+            );
+            match &mut shown.presentation {
+                Presentation::Legacy(legacy) => {
+                    legacy.update(&self.styles, kind, fraction, repainting)?
+                }
+                Presentation::Themed(themed) => {
+                    let theme = themed
+                        .theme()
+                        .ok_or_else(|| anyhow::anyhow!("Visible themed OSD lost its snapshot"))?;
+                    let candidate = prepare_overlay(theme, kind, title, fraction)?;
+                    themed.replace(&candidate)?;
+                }
+            }
+            shown.hide_at = Instant::now() + HIDE_TIMEOUT;
+            return Ok(());
+        }
+        if let Some(theme) = opening_theme {
+            match prepare_overlay(theme, kind, title, fraction) {
+                Ok(candidate) => {
+                    let mut display = platform.display_partial()?;
+                    if let Err(error) = display.check_overlay(&candidate) {
+                        warn!(
+                            "themed OSD unavailable before presentation, using Legacy: {error:#}"
+                        );
+                    } else {
+                        match Themed::install(display, &candidate) {
+                            Ok(themed) if !themed.faulted() => {
+                                self.shown = Some(Shown {
+                                    presentation: Presentation::Themed(themed),
+                                    hide_at: Instant::now() + HIDE_TIMEOUT,
+                                });
+                                return Ok(());
+                            }
+                            Ok(themed) => {
+                                self.shown = Some(Shown {
+                                    presentation: Presentation::Themed(themed),
+                                    hide_at: Instant::now() + HIDE_TIMEOUT,
+                                });
+                                anyhow::bail!("Themed OSD installation faulted during cleanup");
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Err(error) => warn!("failed to prepare themed OSD, using Legacy: {error:#}"),
+            }
+        }
+        let mut legacy = Legacy::new(platform.display_partial()?, &self.styles)?;
+        legacy.update(&self.styles, kind, fraction, repainting)?;
+        self.shown = Some(Shown {
+            presentation: Presentation::Legacy(legacy),
+            hide_at: Instant::now() + HIDE_TIMEOUT,
+        });
+        Ok(())
+    }
     pub fn tick(&mut self) -> Result<()> {
         let Some(shown) = self.shown.as_mut() else {
             return Ok(());
         };
+        ensure!(
+            !shown.presentation.faulted(),
+            "OSD faulted; explicit recovery required"
+        );
         let now = Instant::now();
         if now >= shown.hide_at {
             return self.hide();
         }
-        if let Refresh::Periodic { next_redraw } = &mut shown.refresh {
-            *next_redraw = now + UI_REDRAW_PERIOD;
-            shown.surface.flush_plate()?;
+        if let Presentation::Legacy(Legacy {
+            display,
+            plate,
+            refresh: Some(LegacyRefresh::Periodic { next }),
+            ..
+        }) = &mut shown.presentation
+        {
+            *next = now + UI_REDRAW_PERIOD;
+            display.flush_rect(plate.rect)?;
         }
         Ok(())
     }
-
     pub fn hide(&mut self) -> Result<()> {
-        let Some(mut shown) = self.shown.take() else {
+        let Some(shown) = self.shown.as_mut() else {
             return Ok(());
         };
-        match shown.refresh {
-            // The app repaints the frame itself; only static UI needs the background back
-            Refresh::Periodic { .. } => shown.surface.restore_plate()?,
-            Refresh::Continuous(hold) => drop(hold),
+        let result = match &mut shown.presentation {
+            Presentation::Legacy(legacy) => legacy.hide(),
+            Presentation::Themed(themed) => themed.hide(),
+        };
+        if result.is_ok() {
+            self.shown.take();
         }
-        Ok(())
+        result
+    }
+}
+
+fn prepare_frame(
+    theme: ThemeHandle,
+    kind: OsdKind,
+    title: &str,
+    fraction: f32,
+) -> Result<PreparedFrame> {
+    let mut input = FrameInputs::new(kind.screen());
+    input
+        .text
+        .insert(Binding::Title, title.chars().take(512).collect());
+    input.progress = Some(fraction.clamp(0.0, 1.0));
+    PreparedFrame::prepare(theme, &input)
+}
+fn prepare_overlay(
+    theme: ThemeHandle,
+    kind: OsdKind,
+    title: &str,
+    fraction: f32,
+) -> Result<PreparedOverlay> {
+    prepare_frame(theme, kind, title, fraction)?.into_overlay()
+}
+
+#[cfg(test)]
+mod theme_overlay_tests {
+    use super::*;
+    use common::constants::ALLIUM_FONTS_DIR;
+    use common::theme::{FontBank, runtime::ThemeSnapshot};
+
+    fn custom_handle(root: &std::path::Path) -> ThemeHandle {
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../common/src/theme/packs/orbit.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+        manifest["tokens"]["colors"]["surface"] = "#40608080".into();
+        for screen in ["osd_volume", "osd_brightness"] {
+            let id_screen = screen.replace('_', "-");
+            for (index, component) in manifest["screens"][screen]["components"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                component["id"] = format!("custom-{id_screen}-{index}").into();
+            }
+        }
+        std::fs::write(
+            root.join("theme.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../common/src/theme/packs/accent-band.png"),
+            root.join("assets/accent-band.png"),
+        )
+        .unwrap();
+        let bank = FontBank::bind(&ALLIUM_FONTS_DIR).unwrap();
+        ThemeHandle::prepare(ThemeSnapshot::load(root).unwrap(), &bank, 41).unwrap()
+    }
+
+    #[test]
+    fn descriptor_consumer_uses_custom_ids_partial_alpha_holes_and_exact_snapshot() {
+        let root = std::env::current_dir().unwrap().join("out").join(format!(
+            "allium-osd-custom-theme-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let theme = custom_handle(&root);
+        let frame = prepare_frame(theme.clone(), OsdKind::Volume, "Volume +", 0.65).unwrap();
+        assert_eq!(frame.snapshot().generation(), 41);
+        let alphas: Vec<_> = frame
+            .pixels()
+            .data()
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .copied()
+            .collect();
+        assert!(alphas.contains(&0));
+        assert!(alphas.iter().any(|alpha| (1..255).contains(alpha)));
+        let overlay = frame.into_overlay().unwrap();
+        assert_eq!(overlay.screen(), ScreenId::OsdVolume);
+        assert_eq!(
+            overlay.bounds(),
+            common::theme::pack::Rect(128, 360, 384, 88)
+        );
+        assert!(overlay.covered_bytes() < 384 * 88 * 4);
+        assert!(overlay.accounted_bytes() < 16 * 1024 * 1024);
+        if let Ok(proof) = std::env::var("ALLIUM_ORBIT_PROOF_DIR") {
+            std::fs::create_dir_all(&proof).unwrap();
+            prepare_frame(theme.clone(), OsdKind::Volume, "Volume +", 0.65)
+                .unwrap()
+                .pixels()
+                .save_png(std::path::PathBuf::from(&proof).join("native-orbit-volume-osd.png"))
+                .unwrap();
+            prepare_frame(theme, OsdKind::Brightness, "Brightness +", 0.40)
+                .unwrap()
+                .pixels()
+                .save_png(std::path::PathBuf::from(proof).join("native-orbit-brightness-osd.png"))
+                .unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

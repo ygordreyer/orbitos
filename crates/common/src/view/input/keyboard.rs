@@ -14,6 +14,16 @@ use crate::resources::Resources;
 use crate::stylesheet::Stylesheet;
 use crate::view::{ButtonHint, ButtonHints, ButtonIcon, View};
 
+/// Read-only theme capture. Password text is masked before entering this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardThemeInputs {
+    pub display_value: String,
+    pub labels: Vec<String>,
+    pub cursor: (usize, usize),
+    pub mode: &'static str,
+    pub masked: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Keyboard {
     res: Resources,
@@ -69,6 +79,32 @@ impl Keyboard {
             is_password,
             button_hints,
             dirty: true,
+        }
+    }
+
+    pub fn theme_inputs(&self) -> KeyboardThemeInputs {
+        KeyboardThemeInputs {
+            display_value: if self.is_password {
+                "*".repeat(self.value.chars().count())
+            } else {
+                self.value.clone()
+            },
+            labels: KeyboardKey::iter()
+                .map(|key| {
+                    if matches!(key, KeyboardKey::Space) {
+                        "space".into()
+                    } else {
+                        key.key(self.mode).into()
+                    }
+                })
+                .collect(),
+            cursor: (self.cursor.x, self.cursor.y),
+            mode: match self.mode {
+                KeyboardMode::Lowercase => "lowercase",
+                KeyboardMode::Uppercase => "uppercase",
+                KeyboardMode::Symbols => "symbols",
+            },
+            masked: self.is_password,
         }
     }
 
@@ -517,5 +553,37 @@ fn masked_value(value: &str, is_password: bool) -> String {
         "*".repeat(value.len())
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod theme_capture_tests {
+    use super::*;
+    #[test]
+    fn theme_keyboard_actual_modes_cursor_and_utf8_masking() {
+        let res = Resources::new(type_map::TypeMap::new());
+        let mut keyboard = Keyboard {
+            res: res.clone(),
+            value: "密碼é🦊".into(),
+            cursor: rusttype::Point { x: 10, y: 4 },
+            mode: KeyboardMode::Lowercase,
+            is_password: true,
+            button_hints: ButtonHints::new(res, vec![], vec![]),
+            dirty: true,
+        };
+        let lower = keyboard.theme_inputs();
+        assert_eq!(lower.labels.len(), 45);
+        assert_eq!(lower.labels[11], "q");
+        assert_eq!(lower.labels[44], "space");
+        assert_eq!(lower.cursor, (10, 4));
+        assert_eq!(lower.display_value, "****");
+        assert!(!format!("{lower:?}").contains("密碼"));
+        keyboard.mode = KeyboardMode::Uppercase;
+        assert_eq!(keyboard.theme_inputs().labels[11], "Q");
+        keyboard.mode = KeyboardMode::Symbols;
+        assert_eq!(keyboard.theme_inputs().labels[11], KeyboardKey::Q.symbol());
+        keyboard.is_password = false;
+        assert_eq!(keyboard.theme_inputs().display_value, keyboard.value());
+        assert_eq!(keyboard.value(), "密碼é🦊");
     }
 }

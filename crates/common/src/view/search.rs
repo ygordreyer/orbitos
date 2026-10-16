@@ -37,6 +37,10 @@ impl SearchView {
         }
     }
 
+    pub fn theme_inputs(&self) -> Option<crate::view::input::keyboard::KeyboardThemeInputs> {
+        self.keyboard.as_ref().map(Keyboard::theme_inputs)
+    }
+
     pub fn activate(&mut self) {
         self.state = SearchState::Active;
         self.keyboard = Some(Keyboard::new(self.res.clone(), String::new(), false));

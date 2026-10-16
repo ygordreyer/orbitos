@@ -20,7 +20,7 @@ use crate::display::settings::DisplaySettings;
 use crate::platform::KeyEvent;
 use crate::platform::Platform;
 use crate::platform::miyoo::evdev::EvdevKeys;
-use crate::platform::miyoo::framebuffer::FramebufferDisplay;
+pub use crate::platform::miyoo::framebuffer::FramebufferDisplay;
 
 use self::battery::{Miyoo283Battery, Miyoo354Battery};
 

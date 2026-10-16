@@ -1,4 +1,5 @@
 mod about;
+mod appearance;
 mod clock;
 mod display;
 mod language;
@@ -14,7 +15,6 @@ use self::display::Display;
 use self::language::Language;
 use self::power::Power;
 use self::system::SystemUpdate;
-use self::theme::Theme;
 use self::wifi::Wifi;
 
 use std::collections::VecDeque;
@@ -45,6 +45,16 @@ pub struct ChildState {
 }
 
 trait SettingsChild: View {
+    fn clear_theme(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn theme_models(
+        &mut self,
+        _: &common::theme::ThemeHandle,
+    ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        Ok(None)
+    }
+
     fn save(&self) -> ChildState;
 }
 
@@ -66,6 +76,10 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        self.child.is_none()
+    }
+
     pub fn new(rect: Rect, res: Resources, state: SettingsState) -> Result<Self> {
         let Rect { x, y, w, h } = rect;
 
@@ -110,7 +124,7 @@ impl Settings {
                 2 => Some(Box::new(Clock::new(rect, res.clone(), Some(child)))),
                 3 => Some(Box::new(Power::new(rect, res.clone(), Some(child)))),
                 4 => Some(Box::new(Display::new(rect, res.clone(), Some(child)))),
-                5 => Some(Box::new(Theme::new(rect, res.clone(), Some(child)))),
+                5 => Some(Box::new(appearance::Appearance::new(rect, res.clone()))),
                 6 => Some(Box::new(Language::new(rect, res.clone(), Some(child)))),
                 7 => Some(Box::new(About::new(rect, res.clone(), Some(child)))),
                 _ => None,
@@ -153,6 +167,67 @@ impl Settings {
         })
     }
 
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        self.list.set_visible_count_override(None)?;
+        if let Some(child) = self.child.as_mut() {
+            child.clear_theme()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        use common::theme::{
+            frame::{Focus, FrameInputs, Row},
+            pack::{Binding, ScreenId},
+        };
+        if let Some(child) = self.child.as_mut() {
+            return child.theme_models(handle);
+        }
+        let screen = ScreenId::SettingsRoot;
+        let count = crate::theme_adapter::capacity(handle, screen, Binding::SettingsRows);
+        self.list.set_visible_count_override(Some(count))?;
+        let locale = self.res.get::<Locale>();
+        let mut keys = vec![];
+        if self.has_wifi {
+            keys.extend(["settings-system-update-menu", "settings-wifi"]);
+        }
+        keys.extend([
+            "settings-clock",
+            "settings-power",
+            "settings-display",
+            "settings-theme",
+            "settings-language",
+            "settings-about",
+        ]);
+        let mut input = FrameInputs::new(screen);
+        input.text.insert(Binding::Title, locale.t("tab-settings"));
+        input.rows.insert(
+            Binding::SettingsRows,
+            keys.iter()
+                .enumerate()
+                .skip(self.list.window_start())
+                .take(count)
+                .map(|(i, key)| Row {
+                    id: format!("setting-{i}"),
+                    label: locale.t(key),
+                    value: if *key == "settings-theme" {
+                        handle.pack().name.clone()
+                    } else {
+                        String::new()
+                    },
+                    enabled: true,
+                })
+                .collect(),
+        );
+        input.focus = Focus {
+            component: crate::theme_adapter::component_id(handle, screen, Binding::SettingsRows),
+            item: Some(format!("setting-{}", self.list.selected())),
+        };
+        Ok(Some(vec![input]))
+    }
+
     pub fn save(&self) -> SettingsState {
         SettingsState {
             selected: self.list.selected(),
@@ -177,7 +252,12 @@ impl Settings {
             2 => self.child = Some(Box::new(Clock::new(self.rect, self.res.clone(), None))),
             3 => self.child = Some(Box::new(Power::new(self.rect, self.res.clone(), None))),
             4 => self.child = Some(Box::new(Display::new(self.rect, self.res.clone(), None))),
-            5 => self.child = Some(Box::new(Theme::new(self.rect, self.res.clone(), None))),
+            5 => {
+                self.child = Some(Box::new(appearance::Appearance::new(
+                    self.rect,
+                    self.res.clone(),
+                )))
+            }
             6 => self.child = Some(Box::new(Language::new(self.rect, self.res.clone(), None))),
             7 => self.child = Some(Box::new(About::new(self.rect, self.res.clone(), None))),
             _ => unreachable!("Invalid index"),
@@ -198,6 +278,13 @@ impl View for Settings {
 
         if self.dirty {
             display.load(self.bounding_box(styles))?;
+            if crate::theme_adapter::legacy_orbit(&self.res) {
+                common::display::fill_rect(
+                    &mut display.pixmap_mut(),
+                    self.rect,
+                    styles.ui.background_color,
+                );
+            }
             self.dirty = false;
         }
 

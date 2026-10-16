@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::{collections::HashMap, path::Path};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use common::command::Command;
 use common::database::Database;
 use common::game_info::GameInfo;
@@ -188,12 +188,14 @@ impl ConsoleMapper {
         game: &mut Game,
         disable_savestate_auto_load: bool,
     ) -> Result<Option<Command>> {
+        crate::network_runtime::guard_launch(&game.path)?;
         if !game.path.exists()
             && let Some(old) = Game::resync(&mut game.path)?
         {
             database.update_game_path(&old, &game.path)?;
         }
 
+        let content_path = crate::discs::content_path(&game.path)?;
         let image = game.image().map(Path::to_path_buf);
         database.increment_play_count(&game.clone().into())?;
 
@@ -227,7 +229,10 @@ impl ConsoleMapper {
                 } else {
                     ALLIUM_RETROARCH.display().to_string()
                 },
-                vec![libretro_core.to_string(), game.path.display().to_string()],
+                vec![
+                    libretro_core.to_string(),
+                    content_path.display().to_string(),
+                ],
                 true,
                 core.swap,
             ),
@@ -245,6 +250,37 @@ impl ConsoleMapper {
         debug!("Saving game info: {:?}", game_info);
         game_info.save()?;
         Ok(Some(Command::Exec(game_info.command())))
+    }
+
+    pub fn launch_game_with_disc(
+        &self,
+        database: &Database,
+        game: &mut Game,
+        playlist: &crate::discs::Playlist,
+        index: usize,
+    ) -> Result<Option<Command>> {
+        crate::network_runtime::guard_launch(&game.path)?;
+        let core_name = game
+            .core
+            .as_ref()
+            .or_else(|| self.get_console(&game.path)?.cores.first());
+        ensure!(
+            core_name.and_then(|name| self.cores.get(name)).is_some_and(
+                |core| matches!(&core.core, CoreType::RetroArch(name) if name == "pcsx_rearmed")
+            ),
+            "Startup disc choice is verified only for PCSX ReARMed"
+        );
+        let record = crate::discs::StartRecord::apply(playlist, index)?;
+        match self.launch_game(database, game, false) {
+            Ok(Some(Command::Exec(mut command))) => {
+                command.arg("--choose-disc");
+                Ok(Some(Command::Exec(command)))
+            }
+            result => {
+                record.rollback()?;
+                result
+            }
+        }
     }
 
     pub fn get_core_name(&self, core: &str) -> String {

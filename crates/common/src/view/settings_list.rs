@@ -22,6 +22,7 @@ pub struct SettingsList {
     right: Vec<Box<dyn View>>,
     entry_height: u32,
     top: usize,
+    visible_count_override: Option<usize>,
     selected: usize,
     focused: bool,
     dirty: bool,
@@ -44,6 +45,7 @@ impl SettingsList {
             right: Vec::new(),
             entry_height,
             top: 0,
+            visible_count_override: None,
             selected: 0,
             focused: false,
             dirty: true,
@@ -121,6 +123,49 @@ impl SettingsList {
         self.dirty = true;
     }
 
+    pub fn set_visible_count_override(&mut self, count: Option<usize>) -> Result<()> {
+        anyhow::ensure!(
+            count.is_none_or(|n| (1..=64).contains(&n)),
+            "Invalid visible row capacity"
+        );
+        if self.visible_count_override == count {
+            return Ok(());
+        }
+        self.visible_count_override = count;
+        let capacity = self.visible_count();
+        self.top = self
+            .top
+            .min(self.labels.len().saturating_sub(capacity))
+            .min(self.selected);
+        self.left.clear();
+        {
+            let styles = self.res.get::<Stylesheet>();
+            let mut y = self.rect.y + styles.ui.padding_y;
+            for i in 0..capacity {
+                self.left.push(Label::new(
+                    Point::new(
+                        self.rect.x + styles.ui.padding_x * Alignment::Left.sign(),
+                        y,
+                    ),
+                    self.labels[self.top + i].clone(),
+                    Alignment::Left,
+                    Some(self.rect.w.saturating_sub(styles.ui.padding_x as u32 * 2)),
+                ));
+                y += self.entry_height as i32 + styles.ui.list_margin;
+            }
+        }
+        if capacity > 0 {
+            self.select(self.selected);
+        }
+        self.has_layout = false;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn window_start(&self) -> usize {
+        self.top
+    }
+
     pub fn selected(&self) -> usize {
         self.selected
     }
@@ -142,6 +187,9 @@ impl SettingsList {
     }
 
     pub fn visible_count(&self) -> usize {
+        if let Some(count) = self.visible_count_override {
+            return count.min(self.labels.len()).min(self.right.len());
+        }
         let styles = self.res.get::<Stylesheet>();
         (self.rect.h as usize / (self.entry_height as usize + styles.ui.list_margin as usize))
             .min(self.labels.len())

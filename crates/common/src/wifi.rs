@@ -92,6 +92,50 @@ impl WiFiSettings {
         Ok(())
     }
 
+    #[cfg(not(feature = "miyoo"))]
+    pub async fn init_sequenced(&self) -> Result<()> {
+        self.init()
+    }
+
+    #[cfg(feature = "miyoo")]
+    pub async fn init_sequenced(&self) -> Result<()> {
+        if self.wifi {
+            wifi_on()?;
+            telnet_off()?;
+            sequence_ssh(
+                || run_ssh_script("ssh-off.sh"),
+                || run_ssh_script("ssh-on.sh"),
+                self.ssh,
+            )
+            .await?;
+            if self.ntp {
+                info!("Starting NTP...");
+                ntp_sync()?;
+            }
+            if self.telnet {
+                info!("Starting Telnet...");
+                telnet_on()?;
+            }
+            if self.ftp {
+                info!("Starting FTP...");
+                ftp_on()?;
+            }
+            if self.web_file_browser {
+                info!("Starting Web File Browser...");
+                web_file_browser_on()?;
+            }
+            if self.syncthing {
+                info!("Starting Syncthing...");
+                syncthing_on()?;
+            }
+            if self.scraper {
+                info!("Starting Box Art Scraper...");
+                scraper_on()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         let json = serde_json::to_string(&self).unwrap();
         File::create(ALLIUM_WIFI_SETTINGS.as_path())?.write_all(json.as_bytes())?;
@@ -632,4 +676,112 @@ pub fn ip_address() -> Option<String> {
 
     #[cfg(not(any(feature = "miyoo", feature = "simulator")))]
     return None;
+}
+
+#[cfg(feature = "miyoo")]
+async fn run_ssh_script(name: &str) -> Result<()> {
+    use anyhow::{Context, ensure};
+    let status = Command::new(crate::constants::ALLIUM_SCRIPTS_DIR.join(name))
+        .status()
+        .await
+        .with_context(|| format!("starting {name}"))?;
+    ensure!(status.success(), "{name} failed with {status}");
+    Ok(())
+}
+
+#[cfg(any(feature = "miyoo", test))]
+async fn sequence_ssh<Off, On, OffFuture, OnFuture>(off: Off, on: On, enabled: bool) -> Result<()>
+where
+    Off: FnOnce() -> OffFuture,
+    On: FnOnce() -> OnFuture,
+    OffFuture: std::future::Future<Output = Result<()>>,
+    OnFuture: std::future::Future<Output = Result<()>>,
+{
+    use anyhow::Context;
+    off().await.context("stopping SSH before startup")?;
+    if enabled {
+        on().await.context("starting SSH after stop completed")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ssh_sequence_tests {
+    use super::sequence_ssh;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn delayed_stop_completes_before_start_is_constructed() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stopping = events.clone();
+        let starting = events.clone();
+        sequence_ssh(
+            move || async move {
+                stopping.lock().unwrap().push("off-start");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                stopping.lock().unwrap().push("off-complete");
+                Ok(())
+            },
+            move || {
+                starting.lock().unwrap().push("on-constructed");
+                async move {
+                    starting.lock().unwrap().push("on-complete");
+                    Ok(())
+                }
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["off-start", "off-complete", "on-constructed", "on-complete"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_failure_never_constructs_start() {
+        let error = sequence_ssh(
+            || async { anyhow::bail!("stop fixture failed") },
+            || {
+                panic!("start must not be constructed after failed stop");
+                #[allow(unreachable_code)]
+                async {
+                    Ok(())
+                }
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("stopping SSH before startup: stop fixture failed"));
+    }
+
+    #[tokio::test]
+    async fn start_failure_is_surfaced_and_disabled_setting_never_starts() {
+        let error = sequence_ssh(
+            || async { Ok(()) },
+            || async { anyhow::bail!("start fixture failed") },
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("starting SSH after stop completed: start fixture failed")
+        );
+        sequence_ssh(
+            || async { Ok(()) },
+            || {
+                panic!("disabled SSH must not start");
+                #[allow(unreachable_code)]
+                async {
+                    Ok(())
+                }
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
 }

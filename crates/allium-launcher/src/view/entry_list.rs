@@ -17,18 +17,62 @@ use tokio::sync::mpsc::Sender;
 
 use crate::consoles::ConsoleMapper;
 use crate::entry::{Entry, Sort};
+use crate::view::disc_picker::DiscPicker;
+use crate::view::orbit::Orbit;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryListState<S> {
     pub sort: S,
     pub selected: usize,
+    #[serde(default)]
+    pub selected_path: Option<std::path::PathBuf>,
     pub child: Option<Box<EntryListState<S>>>,
+}
+
+pub(crate) struct NavigationWarm {
+    pub input: common::theme::frame::FrameInputs,
+    artwork: VecDeque<super::orbit::WarmArt>,
+    selected: usize,
+    first: usize,
+    count: usize,
 }
 
 #[derive(Debug)]
 pub struct CoreSelection {
     core: usize,
     cores: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SelectedInfo {
+    path: std::path::PathBuf,
+    generation: u64,
+    metadata: String,
+    metadata_runs: Vec<(String, String)>,
+    blurb: String,
+}
+impl SelectedInfo {
+    fn get<'a>(
+        slot: &'a mut Option<Self>,
+        game: &crate::entry::game::Game,
+        platform: &str,
+    ) -> &'a Self {
+        let generation = crate::view::details::metadata_generation();
+        if slot
+            .as_ref()
+            .is_none_or(|info| info.path != game.path || info.generation != generation)
+        {
+            let details = crate::view::details::Details::new(game, platform);
+            *slot = Some(Self {
+                path: game.path.clone(),
+                generation,
+                metadata: details.metadata,
+                metadata_runs: details.metadata_runs,
+                blurb: details.blurb,
+            });
+        }
+        slot.as_ref().unwrap()
+    }
 }
 
 #[derive(Debug)]
@@ -47,6 +91,11 @@ where
     core: Option<CoreSelection>,
     button_hints: ButtonHints<String>,
     pub child: Option<Box<EntryList<S>>>,
+    orbit: Option<Orbit>,
+    disc_picker: Option<DiscPicker>,
+    details: Option<crate::view::details::Details>,
+    semantic_info: Option<SelectedInfo>,
+    detail_action: usize,
 }
 
 impl<S> EntryList<S>
@@ -139,6 +188,11 @@ where
             core: None,
             button_hints,
             child: None,
+            orbit: None,
+            disc_picker: None,
+            details: None,
+            semantic_info: None,
+            detail_action: 0,
         };
 
         this.load_entries()?;
@@ -146,17 +200,474 @@ where
         Ok(this)
     }
 
+    pub fn enable_orbit(&mut self) {
+        self.orbit = Some(Orbit::new());
+        if let Some(child) = self.child.as_mut() {
+            child.enable_orbit();
+        } else {
+            self.prepare_orbit();
+        }
+    }
+
+    pub(crate) fn disc_picker_active(&self) -> bool {
+        self.disc_picker.is_some()
+            || self
+                .child
+                .as_ref()
+                .is_some_and(|child| child.disc_picker_active())
+    }
+
+    pub(crate) fn details_active(&self) -> bool {
+        self.details.is_some() || self.child.as_ref().is_some_and(|c| c.details_active())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orbit_cache_counts(&self) -> (usize, usize) {
+        let own = self.orbit.as_ref().map_or(0, Orbit::cache_entries);
+        if let Some(child) = &self.child {
+            let (total, ancestors) = child.orbit_cache_counts();
+            (own + total, own + ancestors)
+        } else {
+            (own, 0)
+        }
+    }
+
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        self.child.is_none()
+            && self.menu.is_none()
+            && self.details.is_none()
+            && self.disc_picker.is_none()
+    }
+
+    fn prepare_orbit(&mut self) {
+        if !matches!(self.entries.get(self.list.selected()), Some(Entry::Game(_))) {
+            self.semantic_info = None;
+        }
+        if self.child.is_some() {
+            self.semantic_info = None;
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.release_art();
+            }
+            return;
+        }
+        let themed = crate::theme_adapter::active(&self.res) && self.disc_picker.is_none();
+        if let Some(orbit) = self.orbit.as_mut() {
+            if themed {
+                orbit.defer_legacy();
+            } else {
+                orbit.prepare(&self.entries, self.list.selected());
+            }
+        }
+    }
+
+    pub(crate) fn navigation_warm_ready(&self) -> bool {
+        self.menu.is_none()
+            && self.core.is_none()
+            && self.details.is_none()
+            && self.disc_picker.is_none()
+            && self
+                .child
+                .as_ref()
+                .is_none_or(|child| child.navigation_warm_ready())
+    }
+
+    pub(crate) fn navigation_warm_art_step(&mut self, work: &mut NavigationWarm) -> bool {
+        if let Some(child) = self.child.as_mut() {
+            return child.navigation_warm_art_step(work);
+        }
+        let orbit = self.orbit.get_or_insert_with(Orbit::new);
+        if !work.artwork.is_empty() {
+            orbit.warm_art_step(&mut work.artwork);
+            return false;
+        }
+        work.input.art = orbit.theme_art(&self.entries, work.selected, work.first, work.count);
+        true
+    }
+
+    pub(crate) fn navigation_warm_model(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+        direction: isize,
+        mut input: common::theme::frame::FrameInputs,
+    ) -> Result<Option<NavigationWarm>> {
+        use common::theme::pack::{Binding, ScreenId};
+        if let Some(child) = self.child.as_mut() {
+            return child.navigation_warm_model(handle, direction, input);
+        }
+        if self.entries.len() < 2 || !self.root_tab_navigation_ready() {
+            return Ok(None);
+        }
+        let components = &handle.pack().screens[&ScreenId::Library].components;
+        if components.iter().any(|c| {
+            matches!(
+                c.binding,
+                Some(Binding::SelectedMetadata | Binding::SelectedBlurb)
+            )
+        }) {
+            return Ok(None);
+        }
+        let count = crate::theme_adapter::capacity(handle, ScreenId::Library, Binding::Entries);
+        let selected = (self.list.selected() as isize + direction)
+            .rem_euclid(self.entries.len() as isize) as usize;
+        let first = self.list.window_start();
+        let first = if selected < first {
+            selected
+        } else if selected >= first + count {
+            selected + 1 - count
+        } else {
+            first
+        };
+        let rows = self
+            .entries
+            .iter()
+            .skip(first)
+            .take(count)
+            .map(|entry| common::theme::frame::Row {
+                id: crate::theme_adapter::entry_id(entry.path()),
+                label: entry.name().into(),
+                value: String::new(),
+                enabled: true,
+            })
+            .collect();
+        input.rows.insert(Binding::Entries, rows);
+        let entry = &self.entries[selected];
+        let id = crate::theme_adapter::entry_id(entry.path());
+        input.focus.item = Some(id.clone());
+        input.selected.insert(Binding::Entries, id);
+        input
+            .text
+            .insert(Binding::SelectedTitle, entry.name().into());
+        Ok(Some(NavigationWarm {
+            input,
+            artwork: Orbit::navigation_art_work(&self.entries, selected, first, count),
+            selected,
+            first,
+            count,
+        }))
+    }
+
+    pub(crate) fn theme_models(
+        &mut self,
+        screen: common::theme::pack::ScreenId,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        use common::theme::{
+            frame::{Focus, FrameInputs, Hint, Row},
+            pack::{Binding, ScreenId},
+        };
+        if let Some(child) = self.child.as_mut() {
+            self.semantic_info = None;
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.release_art();
+            }
+            return child.theme_models(screen, handle);
+        }
+        let count = crate::theme_adapter::capacity(handle, screen, Binding::Entries);
+        self.list.set_visible_count_override(Some(count))?;
+        let first = self.list.window_start();
+        let selected = self.list.selected();
+        let mut input = FrameInputs::new(screen);
+        let locale = self.res.get::<Locale>();
+        let title = match screen {
+            ScreenId::Apps => locale.t("tab-apps"),
+            ScreenId::Recents => locale.t("tab-recents"),
+            ScreenId::SearchResults => locale.t("sort-search"),
+            _ => locale.t("tab-games"),
+        };
+        input.text.insert(Binding::Title, title);
+        input.rows.insert(
+            Binding::Entries,
+            self.entries
+                .iter()
+                .skip(first)
+                .take(count)
+                .map(|entry| Row {
+                    id: crate::theme_adapter::entry_id(entry.path()),
+                    label: entry.name().into(),
+                    value: if crate::network_runtime::download_id(entry.path()).is_some() {
+                        "Cloud".into()
+                    } else {
+                        String::new()
+                    },
+                    enabled: true,
+                })
+                .collect(),
+        );
+        if let Some(entry) = self.entries.get(selected) {
+            let id = crate::theme_adapter::entry_id(entry.path());
+            input.focus = Focus {
+                component: crate::theme_adapter::component_id(handle, screen, Binding::Entries),
+                item: Some(id.clone()),
+            };
+            input.selected.insert(Binding::Entries, id);
+            input
+                .text
+                .insert(Binding::SelectedTitle, entry.name().into());
+            if matches!(entry, Entry::Game(_)) {
+                input.hints = vec![
+                    Hint {
+                        button: "A".into(),
+                        label: "Play".into(),
+                    },
+                    Hint {
+                        button: "START".into(),
+                        label: "Details".into(),
+                    },
+                    Hint {
+                        button: "X".into(),
+                        label: "Search".into(),
+                    },
+                    Hint {
+                        button: "SELECT".into(),
+                        label: "Context".into(),
+                    },
+                    Hint {
+                        button: "B".into(),
+                        label: "Back".into(),
+                    },
+                    Hint {
+                        button: "L/R".into(),
+                        label: "Mode".into(),
+                    },
+                ];
+                if S::HAS_BUTTON_HINTS {
+                    input.hints.push(Hint {
+                        button: "Y".into(),
+                        label: "Sort".into(),
+                    });
+                }
+            }
+            let platform = self
+                .res
+                .get::<ConsoleMapper>()
+                .get_console(entry.path())
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let needs_info = handle.pack().screens[&screen].components.iter().any(|c| {
+                matches!(
+                    c.binding,
+                    Some(Binding::SelectedMetadata | Binding::SelectedBlurb)
+                )
+            });
+            if let Entry::Game(game) = entry
+                && needs_info
+            {
+                let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
+                if handle.pack().ink(){ input.metadata=info.metadata_runs.clone(); }
+                input
+                    .text
+                    .insert(Binding::SelectedMetadata, info.metadata.clone());
+                input
+                    .text
+                    .insert(Binding::SelectedBlurb, info.blurb.clone());
+            } else {
+                input.text.insert(
+                    Binding::SelectedMetadata,
+                    platform.chars().take(480).collect(),
+                );
+                input.text.insert(Binding::SelectedBlurb, String::new());
+            }
+        }
+        if !matches!(self.entries.get(selected), Some(Entry::Game(_))) {
+            self.semantic_info = None;
+        }
+        drop(locale);
+        let needs_art = self.details.is_some()
+            || handle.pack().screens[&screen]
+                .components
+                .iter()
+                .any(|c| c.kind == common::theme::pack::Kind::Image || c.art_size.unwrap_or(0) > 0);
+        let orbit = self.orbit.get_or_insert_with(Orbit::new);
+        orbit.set_ink_art(handle.pack().ink());
+        if needs_art {
+            orbit.prepare_window(&self.entries, selected, first, count);
+            input.art = orbit.theme_art(&self.entries, selected, first, count);
+        }
+        let mut models = vec![input];
+        if let Some(details) = &self.details {
+            let mut detail = FrameInputs::new(ScreenId::GameDetail);
+            if let Some(entry) = self.entries.get(selected) {
+                detail
+                    .text
+                    .insert(Binding::SelectedTitle, entry.name().into());
+            }
+            detail
+                .text
+                .insert(Binding::SelectedMetadata, details.metadata.clone());
+            if handle.pack().ink() {
+                detail.metadata=details.metadata_runs.clone(); detail.facts=details.facts.clone();
+                detail.text.insert(Binding::SelectedSource, details.source.clone());
+                detail.text.insert(Binding::Pagination,format!("{} / {}",details.page+1,details.pages.len()));
+                detail.text.insert(Binding::SelectedBlurb,details.pages[details.page].clone());
+            } else { detail.text.insert(Binding::SelectedBlurb, details.text()); }
+            detail.art = models[0].art.clone();
+            detail.rows.insert(Binding::Entries, vec![]);
+            detail.rows.insert(Binding::Actions, if handle.pack().ink(){
+                vec![Row{id:"play".into(),label:"Play".into(),value:String::new(),enabled:true},Row{id:"back".into(),label:"Back".into(),value:String::new(),enabled:true}]
+            }else{vec![]});
+            if handle.pack().ink(){detail.focus=Focus{component:crate::theme_adapter::component_id(handle,ScreenId::GameDetail,Binding::Actions),item:Some(if self.detail_action==0{"play"}else{"back"}.into())};}
+            detail.hints = vec![
+                Hint {
+                    button: "A".into(),
+                    label: "Play".into(),
+                },
+                Hint {
+                    button: "B".into(),
+                    label: "Back".into(),
+                },
+                Hint {
+                    button: "Dpad".into(),
+                    label: "More information".into(),
+                },
+            ];
+            models.push(detail);
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            let count =
+                crate::theme_adapter::capacity(handle, ScreenId::ContextMenu, Binding::Entries);
+            menu.set_visible_count_override(Some(count))?;
+            let locale = self.res.get::<Locale>();
+            let mut modal = FrameInputs::new(ScreenId::ContextMenu);
+            modal.text.insert(
+                Binding::Title,
+                self.entries
+                    .get(selected)
+                    .map(|e| e.name().into())
+                    .unwrap_or_default(),
+            );
+            modal.rows.insert(
+                Binding::Entries,
+                self.menu_entries
+                    .iter()
+                    .enumerate()
+                    .skip(menu.window_start())
+                    .take(count)
+                    .map(|(i, row)| Row {
+                        id: format!("menu-{i}"),
+                        label: row.text(&locale),
+                        value: String::new(),
+                        enabled: true,
+                    })
+                    .collect(),
+            );
+            modal.focus = Focus {
+                component: crate::theme_adapter::component_id(
+                    handle,
+                    ScreenId::ContextMenu,
+                    Binding::Entries,
+                ),
+                item: Some(format!("menu-{}", menu.selected())),
+            };
+            if handle.pack().ink(){modal.rows.insert(Binding::Actions,vec![Row{id:"back".into(),label:"Close".into(),value:String::new(),enabled:false}]);}
+            modal.hints = vec![
+                Hint {
+                    button: "A".into(),
+                    label: locale.t("button-select"),
+                },
+                Hint {
+                    button: "B".into(),
+                    label: locale.t("button-back"),
+                },
+            ];
+            models.push(modal);
+        }
+        if let Some(picker) = &self.disc_picker {
+            let count =
+                crate::theme_adapter::capacity(handle, ScreenId::DiscPicker, Binding::Discs);
+            let first = picker
+                .selected
+                .saturating_sub(count - 1)
+                .min(picker.playlist.discs.len().saturating_sub(count));
+            let mut modal = FrameInputs::new(ScreenId::DiscPicker);
+            modal
+                .text
+                .insert(Binding::Title, "Choose starting disc".into());
+            modal.rows.insert(
+                Binding::Discs,
+                picker
+                    .playlist
+                    .discs
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(count)
+                    .map(|(i, _)| Row {
+                        id: format!("disc-{i}"),
+                        label: format!("Disc {}", i + 1),
+                        value: String::new(),
+                        enabled: true,
+                    })
+                    .collect(),
+            );
+            modal.focus = Focus {
+                component: crate::theme_adapter::component_id(
+                    handle,
+                    ScreenId::DiscPicker,
+                    Binding::Discs,
+                ),
+                item: Some(format!("disc-{}", picker.selected)),
+            };
+            modal.text.insert(
+                Binding::Subtitle,
+                picker.error.clone().unwrap_or_else(|| {
+                    picker.playlist.discs[picker.selected]
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            );
+            if handle.pack().ink(){modal.rows.insert(Binding::Actions,vec![Row{id:"back".into(),label:"Cancel".into(),value:String::new(),enabled:false}]);}
+            modal.hints = vec![
+                Hint {
+                    button: "A".into(),
+                    label: "Play".into(),
+                },
+                Hint {
+                    button: "B".into(),
+                    label: "Cancel".into(),
+                },
+            ];
+            models.push(modal);
+        }
+        Ok(models)
+    }
+
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        crate::view::details::invalidate_metadata();
+        self.details = None;
+        self.semantic_info = None;
+        self.orbit = None;
+        self.list.set_visible_count_override(None)?;
+        if let Some(menu) = self.menu.as_mut() {
+            menu.set_visible_count_override(None)?;
+        }
+        if let Some(child) = self.child.as_mut() {
+            child.clear_theme()?;
+        }
+        Ok(())
+    }
     pub fn save(&self) -> EntryListState<S> {
         EntryListState {
             sort: self.sort.clone(),
             selected: self.list.selected(),
+            selected_path: self
+                .entries
+                .get(self.list.selected())
+                .map(|entry| entry.path().to_path_buf()),
             child: self.child.as_ref().map(|c| Box::new(c.save())),
         }
     }
 
     pub fn load(rect: Rect, res: Resources, state: EntryListState<S>) -> Result<Self> {
         let mut this = Self::new(rect, res.clone(), state.sort)?;
-        this.select(state.selected);
+        let selected = state
+            .selected_path
+            .as_ref()
+            .and_then(|path| this.entries.iter().position(|entry| entry.path() == path))
+            .unwrap_or(state.selected);
+        this.select(selected);
         if let Some(child) = state.child {
             this.child = Some(Box::new(Self::load(rect, res, *child)?));
         }
@@ -165,21 +676,52 @@ where
 
     pub fn select(&mut self, index: usize) {
         self.list.select(index);
+        if !matches!(self.entries.get(self.list.selected()), Some(Entry::Game(_))) {
+            self.semantic_info = None;
+        }
         debug!("Selected entry: {:?}", self.entries.get(index));
+        self.prepare_orbit();
     }
 
     async fn select_entry(&mut self, commands: Sender<Command>) -> Result<()> {
         if let Some(entry) = self.entries.get_mut(self.list.selected()) {
             match entry {
                 Entry::Directory(dir) => {
-                    let child = EntryList::new(
+                    let mut child = EntryList::new(
                         self.rect,
                         self.res.clone(),
                         self.sort.with_directory(dir.clone()),
                     )?;
+                    if let Some(orbit) = self.orbit.as_mut() {
+                        orbit.release_art();
+                        child.enable_orbit();
+                    }
+                    self.semantic_info = None;
                     self.child = Some(Box::new(child));
                 }
                 Entry::Game(game) => {
+                    if crate::network_runtime::begin(game, false)? {
+                        return Ok(());
+                    }
+                    if self.orbit.is_some() {
+                        match crate::discs::discover(&game.path) {
+                            Ok(Some(playlist)) if playlist.discs.len() > 1 => {
+                                self.disc_picker = Some(DiscPicker::new(playlist));
+                                self.orbit.as_mut().unwrap().redraw();
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                commands
+                                    .send(Command::Toast(
+                                        error.to_string(),
+                                        Some(std::time::Duration::from_secs(5)),
+                                    ))
+                                    .await?;
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
                     let command = self.res.get::<ConsoleMapper>().launch_game(
                         &self.res.get(),
                         game,
@@ -212,6 +754,8 @@ where
     }
 
     fn load_entries(&mut self) -> Result<()> {
+        crate::view::details::invalidate_metadata();
+        self.semantic_info = None;
         self.entries = self
             .sort
             .entries(&self.res.get(), &self.res.get(), &self.res.get())?;
@@ -228,6 +772,7 @@ where
             self.sort.preserve_selection(),
         );
 
+        self.prepare_orbit();
         Ok(())
     }
 
@@ -236,7 +781,9 @@ where
         let styles = self.res.get::<Stylesheet>();
         let locale = self.res.get::<Locale>();
 
-        let entry = self.entries.get(self.list.selected()).unwrap();
+        let Some(entry) = self.entries.get(self.list.selected()) else {
+            return Ok(());
+        };
         let entries = match entry {
             Entry::Game(game) => {
                 let mut entries = vec![
@@ -246,6 +793,12 @@ where
                     MenuEntry::RemoveFromRecents,
                     MenuEntry::RepopulateDatabase,
                 ];
+                if crate::network_runtime::registered(&game.path) {
+                    if let Some(id) = crate::network_runtime::download_offer_id(&game.path) {
+                        entries.push(MenuEntry::Download(id));
+                    }
+                    entries.push(MenuEntry::ManageStorage);
+                }
 
                 let cores = self
                     .res
@@ -319,6 +872,26 @@ where
 
         let mut drawn = false;
 
+        if let Some(picker) = self.disc_picker.as_mut() {
+            if picker.should_draw() || self.orbit.as_ref().is_some_and(Orbit::should_draw) {
+                if let Some(orbit) = self.orbit.as_mut() {
+                    orbit.draw(&self.entries, self.list.selected(), display, styles);
+                }
+                picker.draw(display, styles);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        if self.menu.is_some() {
+            if let Some(orbit) = self.orbit.as_mut() {
+                if orbit.should_draw() {
+                    orbit.draw(&self.entries, self.list.selected(), display, styles);
+                    self.menu.as_mut().unwrap().set_should_draw();
+                    drawn = true;
+                }
+            }
+        }
         if let Some(menu) = &mut self.menu {
             if menu.should_draw() {
                 let mut rect = menu.bounding_box(styles);
@@ -342,6 +915,14 @@ where
                 drawn = true;
             }
             return Ok(drawn);
+        }
+
+        if let Some(orbit) = self.orbit.as_mut() {
+            if orbit.should_draw() {
+                orbit.draw(&self.entries, self.list.selected(), display, styles);
+                return Ok(true);
+            }
+            return Ok(false);
         }
 
         drawn |= self.list.should_draw() && self.list.draw(display, styles)?;
@@ -391,6 +972,14 @@ where
         if let Some(child) = self.child.as_ref() {
             child.should_draw()
         } else {
+            if let Some(orbit) = self.orbit.as_ref() {
+                return orbit.should_draw()
+                    || self
+                        .disc_picker
+                        .as_ref()
+                        .is_some_and(DiscPicker::should_draw)
+                    || self.menu.as_ref().is_some_and(View::should_draw);
+            }
             self.menu
                 .as_ref()
                 .is_some_and(common::view::View::should_draw)
@@ -406,6 +995,12 @@ where
         } else {
             if let Some(menu) = self.menu.as_mut() {
                 menu.set_should_draw();
+            }
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.redraw();
+            }
+            if let Some(picker) = self.disc_picker.as_mut() {
+                picker.redraw();
             }
             self.list.set_should_draw();
             self.image.set_should_draw();
@@ -425,6 +1020,7 @@ where
                     bubble.retain_mut(|c| match c {
                         Command::CloseView => {
                             self.child = None;
+                            self.prepare_orbit();
                             self.set_should_draw();
                             false
                         }
@@ -433,6 +1029,75 @@ where
                     Ok(true)
                 }
                 false => Ok(false),
+            }
+        } else if self.details.is_some() && self.disc_picker.is_none() {
+            match event {
+                KeyEvent::Pressed(Key::Left | Key::Right) if crate::theme_adapter::snapshot(&self.res).is_some_and(|h|h.pack().ink()) => {self.detail_action=1-self.detail_action;self.set_should_draw();}
+                KeyEvent::Pressed(Key::B) => {
+                    self.details = None;
+                    self.set_should_draw();
+                }
+                KeyEvent::Pressed(Key::A) => {
+                    self.details = None;
+                    if self.detail_action==0 || !crate::theme_adapter::snapshot(&self.res).is_some_and(|h|h.pack().ink()){self.select_entry(commands).await?;}
+                    self.set_should_draw();
+                }
+                KeyEvent::Pressed(Key::Up | Key::Down)
+                | KeyEvent::Autorepeat(Key::Up | Key::Down) => {
+                    let forward = matches!(
+                        event,
+                        KeyEvent::Pressed(Key::Down) | KeyEvent::Autorepeat(Key::Down)
+                    );
+                    self.details.as_mut().unwrap().turn(forward);
+                    self.set_should_draw();
+                }
+                _ => {}
+            }
+            Ok(true)
+        } else if self.disc_picker.is_some() {
+            match event {
+                KeyEvent::Pressed(Key::Up | Key::Down)
+                | KeyEvent::Autorepeat(Key::Up | Key::Down) => {
+                    let forward = matches!(
+                        event,
+                        KeyEvent::Pressed(Key::Down) | KeyEvent::Autorepeat(Key::Down)
+                    );
+                    self.disc_picker.as_mut().unwrap().select(forward);
+                    Ok(true)
+                }
+                KeyEvent::Pressed(Key::B | Key::Select) => {
+                    self.disc_picker = None;
+                    self.orbit.as_mut().unwrap().redraw();
+                    Ok(true)
+                }
+                KeyEvent::Pressed(Key::A) => {
+                    let picker = self.disc_picker.as_ref().unwrap();
+                    let playlist = picker.playlist.clone();
+                    let index = picker.selected;
+                    let Some(Entry::Game(game)) = self.entries.get_mut(self.list.selected()) else {
+                        return Ok(true);
+                    };
+                    let result = self.res.get::<ConsoleMapper>().launch_game_with_disc(
+                        &self.res.get(),
+                        game,
+                        &playlist,
+                        index,
+                    );
+                    match result {
+                        Ok(Some(command)) => {
+                            self.disc_picker = None;
+                            commands.send(command).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let picker = self.disc_picker.as_mut().unwrap();
+                            picker.error = Some(error.to_string());
+                            picker.redraw();
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(true),
             }
         } else if let Some(menu) = self.menu.as_mut() {
             match event {
@@ -504,6 +1169,10 @@ where
                             match entry {
                                 Entry::Directory(_) | Entry::App(_) => {}
                                 Entry::Game(game) => {
+                                    if crate::network_runtime::begin(game, true)? {
+                                        self.menu = None;
+                                        return Ok(true);
+                                    }
                                     let command = self.res.get::<ConsoleMapper>().launch_game(
                                         &self.res.get(),
                                         game,
@@ -527,6 +1196,12 @@ where
                                 self.load_entries()?;
                                 commands.send(Command::Redraw).await?;
                             }
+                        }
+                        MenuEntry::ManageStorage => {
+                            crate::network_runtime::storage()?;
+                        }
+                        MenuEntry::Download(id) => {
+                            crate::network_runtime::prefill(id)?;
                         }
                         MenuEntry::RepopulateDatabase => {
                             commands.send(Command::Redraw).await?;
@@ -554,6 +1229,38 @@ where
                 _ => menu.handle_key_event(event, commands, bubble).await,
             }
         } else {
+            if self.orbit.is_some() {
+                match event {
+                    KeyEvent::Pressed(Key::Left | Key::Right | Key::Up | Key::Down)
+                    | KeyEvent::Autorepeat(Key::Left | Key::Right | Key::Up | Key::Down) => {
+                        if !self.entries.is_empty() {
+                            let forward = matches!(
+                                event,
+                                KeyEvent::Pressed(Key::Right | Key::Down)
+                                    | KeyEvent::Autorepeat(Key::Right | Key::Down)
+                            );
+                            let count = self.entries.len();
+                            let index = if forward {
+                                (self.list.selected() + 1) % count
+                            } else {
+                                (self.list.selected() + count - 1) % count
+                            };
+                            self.select(index);
+                        }
+                        return Ok(true);
+                    }
+                    KeyEvent::Pressed(Key::L | Key::R) => return Ok(false),
+                    _ if self.entries.is_empty()
+                        && matches!(
+                            event,
+                            KeyEvent::Pressed(Key::L2 | Key::R2 | Key::Select | Key::A)
+                        ) =>
+                    {
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
             match event {
                 KeyEvent::Pressed(Key::L2) => {
                     let selected = self.list.selected();
@@ -564,16 +1271,16 @@ where
                         .rev()
                         .skip(len - selected)
                         .map(|e| e.name().chars().next());
-                    println!("{:?}", entries.clone().collect::<Vec<_>>());
+
                     let Some(char) = entries.next() else {
-                        self.list.select(0);
+                        self.select(0);
                         return Ok(true);
                     };
 
                     if let Some(i) = entries.position(|c| c != char) {
-                        self.list.select(selected - i - 1);
+                        self.select(selected - i - 1);
                     } else {
-                        self.list.select(0);
+                        self.select(0);
                     }
                     Ok(true)
                 }
@@ -585,14 +1292,14 @@ where
                         .skip(selected)
                         .map(|e| e.name().chars().next());
                     let Some(char) = entries.next() else {
-                        self.list.select(self.entries.len() - 1);
+                        self.select(self.entries.len() - 1);
                         return Ok(true);
                     };
 
                     if let Some(i) = entries.position(|c| c != char) {
-                        self.list.select(selected + 1 + i);
+                        self.select(selected + 1 + i);
                     } else {
-                        self.list.select(self.entries.len() - 1);
+                        self.select(self.entries.len() - 1);
                     }
                     Ok(true)
                 }
@@ -604,6 +1311,31 @@ where
                     self.select_entry(commands).await?;
                     Ok(true)
                 }
+                KeyEvent::Pressed(Key::Start) if crate::theme_adapter::active(&self.res) => {
+                    if let Some(Entry::Game(game)) = self.entries.get(self.list.selected()) {
+                        let platform = self
+                            .res
+                            .get::<ConsoleMapper>()
+                            .get_console(&game.path)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        let mut details = crate::view::details::Details::new(game, &platform);
+                        if let Ok(Some(record)) = self.res.get::<Database>().select_game(&game.path)
+                        {
+                            details.add_history(
+                                record.play_count,
+                                record.play_time.num_minutes().max(0) as u64,
+                            );
+                        }
+                        if let Some(handle) = crate::theme_adapter::snapshot(&self.res) {
+                            details.reflow(&handle);
+                        }
+                        self.detail_action=0;
+                        self.details = Some(details);
+                        self.set_should_draw();
+                    }
+                    Ok(true)
+                }
                 KeyEvent::Pressed(Key::Y) => {
                     self.sort(self.sort.next())?;
                     Ok(true)
@@ -613,7 +1345,11 @@ where
                     Ok(true)
                 }
                 _ => {
+                    let selected = self.list.selected();
                     let res = self.list.handle_key_event(event, commands, bubble).await?;
+                    if self.list.selected() != selected {
+                        self.prepare_orbit();
+                    }
                     debug!(
                         "Selected entry: {:?}",
                         self.entries.get(self.list.selected())
@@ -656,6 +1392,8 @@ enum MenuEntry {
     Reset,
     RemoveFromRecents,
     RepopulateDatabase,
+    ManageStorage,
+    Download(String),
 }
 
 impl MenuEntry {
@@ -681,6 +1419,254 @@ impl MenuEntry {
             MenuEntry::Reset => locale.t("menu-reset"),
             MenuEntry::RemoveFromRecents => locale.t("menu-remove-from-recents"),
             MenuEntry::RepopulateDatabase => locale.t("menu-repopulate-database"),
+            MenuEntry::ManageStorage => "Manage storage".into(),
+            MenuEntry::Download(_) => "Download".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod perf_fix_tests {
+    use super::*;
+    use crate::entry::{directory::Directory, game::Game};
+    use std::path::PathBuf;
+
+    #[test]
+    fn metadata_generation_refreshes_selected_path_metadata_and_blurb() {
+        let root =
+            std::env::temp_dir().join(format!("allium-selected-info-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut game = Game::new(root.join("Game.chd"));
+        let xml = root.join("gamelist.xml");
+        std::fs::write(
+            &xml,
+            "<gameList><game><path>./Game.chd</path><desc>First</desc></game></gameList>",
+        )
+        .unwrap();
+        let mut slot = None;
+        crate::view::details::invalidate_metadata();
+        let first = SelectedInfo::get(&mut slot, &game, "PlayStation");
+        let generation = first.generation;
+        assert_eq!(first.blurb, "First");
+        assert!(first.metadata.contains("Year unavailable"));
+        std::fs::write(
+            &xml,
+            "<gameList><game><path>./Game.chd</path><desc>Replacement</desc></game></gameList>",
+        )
+        .unwrap();
+        game.release_date = chrono::NaiveDate::from_ymd_opt(1999, 1, 1);
+        assert_eq!(
+            SelectedInfo::get(&mut slot, &game, "PlayStation").blurb,
+            "First"
+        );
+        crate::view::details::invalidate_metadata();
+        let updated = SelectedInfo::get(&mut slot, &game, "PlayStation");
+        assert_ne!(updated.generation, generation);
+        assert_eq!(updated.blurb, "Replacement");
+        assert!(updated.metadata.contains("Released 1999"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Debug, Clone)]
+    struct EmptySort;
+    impl Sort for EmptySort {
+        const HAS_BUTTON_HINTS: bool = false;
+        fn button_hint(&self, _: &Locale) -> String {
+            String::new()
+        }
+        fn next(&self) -> Self {
+            self.clone()
+        }
+        fn with_directory(&self, _: Directory) -> Self {
+            self.clone()
+        }
+        fn entries(&self, _: &Database, _: &ConsoleMapper, _: &Locale) -> Result<Vec<Entry>> {
+            Ok(vec![])
+        }
+        fn preserve_selection(&self) -> bool {
+            false
+        }
+    }
+    fn list() -> EntryList<EmptySort> {
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(Database::in_memory().unwrap());
+        EntryList::new(Rect::new(0, 54, 640, 376), Resources::new(map), EmptySort).unwrap()
+    }
+    fn select_directory(list: &mut EntryList<EmptySort>) {
+        list.entries = vec![Entry::Directory(Directory::new(PathBuf::from("Child")))];
+        list.list.set_items(vec!["Child".into()], false);
+        list.semantic_info = Some(SelectedInfo {
+            path: "Game.chd".into(),
+            generation: 0,
+            metadata: "metadata".into(),
+            metadata_runs: vec![],
+            blurb: "blurb".into(),
+        });
+    }
+    #[tokio::test]
+    async fn semantic_info_is_cleared_when_entering_child_directory() {
+        let mut list = list();
+        select_directory(&mut list);
+        list.enable_orbit();
+        select_directory(&mut list);
+        let (send, _) = tokio::sync::mpsc::channel(1);
+        list.select_entry(send).await.unwrap();
+        assert!(list.child.is_some());
+        assert!(list.semantic_info.is_none());
+    }
+    #[test]
+    fn selecting_non_game_clears_semantic_info() {
+        let mut list = list();
+        select_directory(&mut list);
+        list.select(0);
+        assert!(list.semantic_info.is_none());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod ux4_tests {
+    use super::*;
+    use crate::entry::{directory::Directory, game::Game};
+    use std::path::{Path, PathBuf};
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct PathsSort {
+        paths: Vec<PathBuf>,
+    }
+    impl Sort for PathsSort {
+        const HAS_BUTTON_HINTS: bool = false;
+        fn button_hint(&self, _: &Locale) -> String {
+            String::new()
+        }
+        fn next(&self) -> Self {
+            self.clone()
+        }
+        fn with_directory(&self, _: Directory) -> Self {
+            self.clone()
+        }
+        fn entries(&self, _: &Database, _: &ConsoleMapper, _: &Locale) -> Result<Vec<Entry>> {
+            Ok(self
+                .paths
+                .iter()
+                .map(|p| {
+                    let mut g = Game::new(p.clone());
+                    g.name = "Same title".into();
+                    Entry::Game(g)
+                })
+                .collect())
+        }
+        fn preserve_selection(&self) -> bool {
+            false
+        }
+    }
+    fn resources() -> Resources {
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(Database::in_memory().unwrap());
+        Resources::new(map)
+    }
+    pub(crate) fn offers_download(game: Game) -> bool {
+        let mut list = EntryList::new(
+            Rect::new(0, 54, 640, 376),
+            resources(),
+            PathsSort {
+                paths: vec![game.path.clone()],
+            },
+        )
+        .unwrap();
+        list.entries = vec![Entry::Game(game)];
+        list.open_menu().unwrap();
+        list.menu_entries
+            .iter()
+            .any(|entry| matches!(entry, MenuEntry::Download(_)))
+    }
+    #[test]
+    fn ux4_focus_restores_identity_after_list_shift_and_duplicate_names() {
+        let res = resources();
+        let rect = Rect::new(0, 54, 640, 376);
+        let paths: Vec<PathBuf> = (0..21)
+            .map(|i| PathBuf::from(format!("Game-{i}.chd")))
+            .collect();
+        let mut list = EntryList::new(rect, res.clone(), PathsSort { paths }).unwrap();
+        list.select(18);
+        let mut saved = serde_json::to_value(list.save()).unwrap();
+        // The persisted identity must survive rebuilding the sorted list.
+        saved["sort"]["paths"].as_array_mut().unwrap().drain(0..2);
+        let restored =
+            EntryList::<PathsSort>::load(rect, res, serde_json::from_value(saved).unwrap())
+                .unwrap();
+        assert_eq!(restored.list.selected(), 16);
+        assert_eq!(
+            restored.entries[restored.list.selected()].path(),
+            Path::new("Game-18.chd")
+        );
+        assert_eq!(restored.save().selected, 16);
+    }
+    #[test]
+    fn ux4_recursive_selection_survives_parent_and_child_reordering() {
+        let res = resources();
+        let rect = Rect::new(0, 54, 640, 376);
+        let mut parent = EntryList::new(
+            rect,
+            res.clone(),
+            PathsSort {
+                paths: vec!["First.chd".into(), "Second.chd".into()],
+            },
+        )
+        .unwrap();
+        parent.select(1);
+        let mut child = EntryList::new(
+            rect,
+            res.clone(),
+            PathsSort {
+                paths: (0..21)
+                    .map(|i| PathBuf::from(format!("Child-{i}.chd")))
+                    .collect(),
+            },
+        )
+        .unwrap();
+        child.select(18);
+        parent.child = Some(Box::new(child));
+        let mut saved = serde_json::to_value(parent.save()).unwrap();
+        saved["sort"]["paths"].as_array_mut().unwrap().reverse();
+        saved["child"]["sort"]["paths"]
+            .as_array_mut()
+            .unwrap()
+            .drain(0..2);
+        let restored =
+            EntryList::<PathsSort>::load(rect, res, serde_json::from_value(saved).unwrap())
+                .unwrap();
+        assert_eq!(restored.list.selected(), 0);
+        let child = restored.child.unwrap();
+        assert_eq!(child.list.selected(), 16);
+        assert_eq!(child.entries[16].path(), Path::new("Child-18.chd"));
+    }
+    #[test]
+    fn ux4_legacy_json_and_missing_path_use_clamped_index() {
+        let res = resources();
+        let rect = Rect::new(0, 54, 640, 376);
+        for path in [None, Some("Missing.chd")] {
+            let mut json = serde_json::json!({"sort":{"paths":["One.chd","Two.chd"]},"selected":99,"child":null});
+            if let Some(path) = path {
+                json["selected_path"] = path.into();
+            }
+            let restored = EntryList::<PathsSort>::load(
+                rect,
+                res.clone(),
+                serde_json::from_value(json).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored.list.selected(), 1);
         }
     }
 }

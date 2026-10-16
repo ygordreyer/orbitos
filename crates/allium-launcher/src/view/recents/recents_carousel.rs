@@ -201,6 +201,9 @@ impl RecentsCarousel {
 
     async fn launch_game(&mut self, commands: Sender<Command>) -> Result<()> {
         if let Some(game) = self.games.get_mut(self.selected) {
+            if crate::network_runtime::begin(game, false)? {
+                return Ok(());
+            }
             let command =
                 self.res
                     .get::<ConsoleMapper>()

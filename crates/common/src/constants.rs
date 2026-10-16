@@ -40,6 +40,10 @@ lazy_static! {
         &env::var("ALLIUM_APPS_DIR").map_or_else(|_| ALLIUM_SD_ROOT.join("Apps"), PathBuf::from)
     );
 
+    pub static ref ALLIUM_ORBIT_ART_CACHE_DIR: PathBuf = env::var("ALLIUM_ORBIT_ART_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| ALLIUM_BASE_DIR.join("cache/orbit-art"));
+
     // Folders
     pub static ref ALLIUM_SCRIPTS_DIR: PathBuf = ALLIUM_BASE_DIR.join("scripts");
     pub static ref ALLIUM_TOOLS_DIR: PathBuf = ALLIUM_BASE_DIR.join("tools");

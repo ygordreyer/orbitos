@@ -1,30 +1,55 @@
-use std::sync::atomic::Ordering;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use framebuffer::Framebuffer;
+#[cfg(feature = "miyoo")]
+use framebuffer::{FixScreeninfo, Framebuffer, VarScreeninfo};
+#[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
+#[path = "framebuffer_test_iface.rs"]
+mod test_iface;
 use log::{debug, trace, warn};
+#[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
+use test_iface::{FixScreeninfo, Framebuffer, VarScreeninfo};
 use tiny_skia::{Pixmap, PixmapMut, PixmapRef};
 
 use crate::display::color::Color;
+use crate::display::overlay::{
+    CapturedOverlay, OverlayContent, OverlayFormat, OverlayLayout, OverlayLayoutSpec,
+    PreparedOverlay,
+};
 use crate::display::{Display, RectHold};
 use crate::geom::Rect;
 
 /// Pause between stamping passes, matching Onion; probing or yielding instead costs whole
 /// frames on this dual-core SoC
 const STAMP_PAUSE: Duration = Duration::from_micros(100);
+static NEXT_DISPLAY_ID: AtomicU64 = AtomicU64::new(1);
+
+#[path = "framebuffer_damage.rs"]
+mod framebuffer_damage;
+use framebuffer_damage::PageHistory;
 
 pub struct FramebufferDisplay {
+    page_history: Option<PageHistory>,
     pixmap: Pixmap,
     iface: Framebuffer,
-    saved: Vec<Pixmap>,
+    scratch: Vec<u8>,
+    capture_pread: bool,
+    saved: Vec<Arc<Pixmap>>,
+    reusable_snapshots: Vec<Pixmap>,
+    overlay_instance: u64,
+    overlay_mapping: Option<OverlayLayoutSpec>,
 }
 
 impl FramebufferDisplay {
     pub fn new() -> Result<FramebufferDisplay> {
         let mut display = Self::blank()?;
         let frame = display.bounding_box();
-        display.read_frame_rect(frame);
+        display.read_frame_rect(frame)?;
         Ok(display)
     }
 
@@ -36,53 +61,67 @@ impl FramebufferDisplay {
             iface.var_screen_info, iface.fix_screen_info,
         );
 
+        validate_layout(&iface, iface.var_screen_info.yoffset as usize)?;
         let width = iface.var_screen_info.xres;
         let height = iface.var_screen_info.yres;
         let pixmap = Pixmap::new(width, height)
             .ok_or_else(|| anyhow!("Failed to create pixmap {}x{}", width, height))?;
 
+        let overlay_instance = NEXT_DISPLAY_ID.fetch_add(1, Ordering::Relaxed);
+        let overlay_mapping = overlay_spec(
+            &iface,
+            overlay_instance,
+            &iface.var_screen_info,
+            &iface.fix_screen_info,
+        )
+        .ok();
         Ok(FramebufferDisplay {
+            page_history: None,
+            scratch: Vec::new(),
+            capture_pread: std::env::var("ALLIUM_FB_CAPTURE").is_ok_and(|v| v == "pread"),
             pixmap,
             iface,
             saved: Vec::new(),
+            reusable_snapshots: Vec::with_capacity(2),
+            overlay_instance,
+            overlay_mapping,
         })
     }
 
     /// Copies `rect` of the visible frame into the pixmap, unrotating it and BGRA to RGBA
-    fn read_frame_rect(&mut self, rect: Rect) {
+    fn read_frame_rect(&mut self, rect: Rect) -> Result<()> {
+        validate_layout(&self.iface, self.iface.var_screen_info.yoffset as usize)?;
         let width = self.pixmap.width() as usize;
         let height = self.pixmap.height() as usize;
         let bytes_per_pixel = (self.iface.var_screen_info.bits_per_pixel / 8) as usize;
         let xoffset = self.iface.var_screen_info.xoffset as usize;
         let yoffset = self.iface.var_screen_info.yoffset as usize;
         let location = (yoffset * width + xoffset) * bytes_per_pixel;
-
-        let x0 = rect.x.max(0) as usize;
-        let y0 = rect.y.max(0) as usize;
-        let x1 = (rect.right().max(0) as usize).min(width);
-        let y1 = (rect.bottom().max(0) as usize).min(height);
-
-        let frame = self.iface.read_frame();
-        let pixels = self.pixmap.pixels_mut();
-        for y in y0..y1 {
-            // The framebuffer is rotated 180 degrees, so both axes run backwards
-            let fb_y = height - 1 - y;
-            for x in x0..x1 {
-                let fb_x = width - 1 - x;
-                let fb_idx = location + (fb_y * width + fb_x) * bytes_per_pixel;
-                let color = Color::rgba(
-                    frame[fb_idx + 2],
-                    frame[fb_idx + 1],
-                    frame[fb_idx],
-                    frame[fb_idx + 3],
-                );
-                pixels[y * width + x] = color.into();
-            }
-        }
+        crate::platform::framebuffer_pixels::capture_rotated_bgra(
+            &mut self.scratch,
+            &mut self.pixmap,
+            bytes_per_pixel,
+            (
+                rect.x.max(0) as usize,
+                rect.y.max(0) as usize,
+                (rect.right().max(0) as usize).min(width),
+                (rect.bottom().max(0) as usize).min(height),
+            ),
+            |cached, offset| {
+                let at = location + offset;
+                if !self.capture_pread
+                    || self.iface.device.read_exact_at(cached, at as u64).is_err()
+                {
+                    cached.copy_from_slice(&self.iface.read_frame()[at..at + cached.len()]);
+                }
+            },
+        );
+        Ok(())
     }
 
     /// Packs `area` into fb-ordered rows, so the stamping thread only does memcpy
     fn stamp(&self, area: Rect, corner_radius: u32) -> Option<Stamp> {
+        validate_layout(&self.iface, 0).ok()?;
         let width = self.width() as usize;
         let height = self.height() as usize;
         let bytes_per_pixel = (self.iface.var_screen_info.bits_per_pixel / 8) as usize;
@@ -148,12 +187,24 @@ impl FramebufferDisplay {
         })
     }
 
-    fn write_rect(&mut self, rect: Rect) {
-        let yoffset = self.iface.var_screen_info.yoffset as usize;
-        self.write_rect_at(rect, yoffset);
+    fn refresh_present_layout(&mut self) -> Result<()> {
+        self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)?;
+        self.iface.fix_screen_info = Framebuffer::get_fix_screeninfo(&self.iface.device)?;
+        anyhow::ensure!(
+            self.iface.var_screen_info.xres == self.pixmap.width()
+                && self.iface.var_screen_info.yres == self.pixmap.height(),
+            "Framebuffer dimensions changed"
+        );
+        validate_layout(&self.iface, self.iface.var_screen_info.yoffset as usize)
     }
 
-    fn write_rect_at(&mut self, rect: Rect, yoffset: usize) {
+    fn write_rect(&mut self, rect: Rect) -> Result<()> {
+        let yoffset = self.iface.var_screen_info.yoffset as usize;
+        self.write_rect_at(rect, yoffset)
+    }
+
+    fn write_rect_at(&mut self, rect: Rect, yoffset: usize) -> Result<()> {
+        validate_layout(&self.iface, yoffset)?;
         let xoffset = self.iface.var_screen_info.xoffset as usize;
         let width = self.width() as usize;
         let height = self.height() as usize;
@@ -161,7 +212,7 @@ impl FramebufferDisplay {
         let location = (yoffset * width + xoffset) * bytes_per_pixel;
 
         if location + height * width * bytes_per_pixel > self.iface.frame.len() {
-            return;
+            return Ok(());
         }
 
         let x0 = rect.x.max(0) as usize;
@@ -169,25 +220,90 @@ impl FramebufferDisplay {
         let x1 = (rect.right().max(0) as usize).min(width);
         let y1 = (rect.bottom().max(0) as usize).min(height);
 
-        // Write pixmap to framebuffer with 180° rotation and BGRA format
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let idx = y * width + x;
-                let pixel = self.pixmap.pixels()[idx];
-
-                // Apply 180° rotation when writing to framebuffer
-                let fb_x = width - x - 1;
-                let fb_y = height - y - 1;
-                let fb_idx = location + (fb_y * width + fb_x) * bytes_per_pixel;
-
-                // Write as BGRA (use premultiplied values directly)
-                self.iface.frame[fb_idx] = pixel.blue();
-                self.iface.frame[fb_idx + 1] = pixel.green();
-                self.iface.frame[fb_idx + 2] = pixel.red();
-                self.iface.frame[fb_idx + 3] = pixel.alpha();
-            }
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(());
         }
+        crate::perf_trace::count(
+            crate::perf_trace::Count::FlushedPixels,
+            ((x1 - x0) * (y1 - y0)) as u64,
+        );
+        if bytes_per_pixel != 4 {
+            ensure_scratch(&mut self.scratch, width * height * bytes_per_pixel);
+        }
+        crate::platform::framebuffer_pixels::write_rotated_bgra(
+            &mut self.iface.frame,
+            &mut self.scratch,
+            self.pixmap.as_ref(),
+            location,
+            bytes_per_pixel,
+            (x0, y0, x1, y1),
+        );
+        Ok(())
     }
+}
+
+fn validate_layout(iface: &Framebuffer, yoffset: usize) -> Result<()> {
+    let var = &iface.var_screen_info;
+    crate::platform::framebuffer_pixels::validate_packed_layout(
+        var.xres as usize,
+        var.yres as usize,
+        (var.bits_per_pixel / 8) as usize,
+        iface.fix_screen_info.line_length as usize,
+        var.xoffset as usize,
+        yoffset,
+        iface.frame.len(),
+    )
+}
+
+fn ensure_scratch(scratch: &mut Vec<u8>, size: usize) {
+    if scratch.len() != size {
+        scratch.resize(size, 0);
+    }
+}
+
+fn overlay_spec(
+    iface: &Framebuffer,
+    instance: u64,
+    var: &VarScreeninfo,
+    fix: &FixScreeninfo,
+) -> Result<OverlayLayoutSpec> {
+    let meta = iface.device.metadata()?;
+    Ok(OverlayLayoutSpec {
+        instance,
+        device: (meta.dev(), meta.ino(), meta.rdev()),
+        backing_start: fix.smem_start,
+        organization: [var.grayscale, var.nonstd, fix.fb_type, fix.visual],
+        channel_msb_right: [
+            var.red.msb_right,
+            var.green.msb_right,
+            var.blue.msb_right,
+            var.transp.msb_right,
+        ],
+        orientation: [var.rotate, var.vmode],
+        width: var.xres,
+        height: var.yres,
+        virtual_width: var.xres_virtual,
+        virtual_height: var.yres_virtual,
+        xoffset: var.xoffset,
+        yoffset: var.yoffset,
+        row_stride: fix.line_length,
+        mapped_bytes: iface.frame.len(),
+        physical_bytes: fix.smem_len as usize,
+        format: OverlayFormat {
+            bits_per_pixel: var.bits_per_pixel,
+            red: (var.red.offset, var.red.length),
+            green: (var.green.offset, var.green.length),
+            blue: (var.blue.offset, var.blue.length),
+            alpha: (var.transp.offset, var.transp.length),
+        },
+    })
+}
+
+fn overlay_layout(iface: &Framebuffer, open: OverlayLayoutSpec) -> Result<OverlayLayout> {
+    let var = Framebuffer::get_var_screeninfo(&iface.device)?;
+    let fix = Framebuffer::get_fix_screeninfo(&iface.device)?;
+    let observed = overlay_spec(iface, open.instance, &var, &fix)?;
+    OverlayLayout::checked_binding(open, observed)
 }
 
 /// One row of the stamp: where it goes within a page, and its slice of `Stamp::bytes`
@@ -238,24 +354,25 @@ impl Display for FramebufferDisplay {
     }
 
     fn sync(&mut self) -> Result<()> {
+        self.page_history = None;
         self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)
             .map_err(|e| anyhow!("failed to get var_screen_info: {}", e))?;
 
-        let xoffset = self.iface.var_screen_info.xoffset as usize;
         let yoffset = self.iface.var_screen_info.yoffset as usize;
         let width = self.width() as usize;
         let height = self.height() as usize;
         let bytes_per_pixel = (self.iface.var_screen_info.bits_per_pixel / 8) as usize;
-        let location = (yoffset * width + xoffset) * bytes_per_pixel;
 
         let frame = self.bounding_box();
-        self.read_frame_rect(frame);
+        self.read_frame_rect(frame)?;
 
         if yoffset != 0 {
             let frame_size = width * height * bytes_per_pixel;
-            self.iface
-                .frame
-                .copy_within(location..location + frame_size, 0);
+            let _phase = crate::perf_trace::open_phase("page_normalize");
+            crate::platform::framebuffer_pixels::normalize_page(
+                &mut self.iface.frame,
+                &self.scratch[..frame_size],
+            );
             self.iface.var_screen_info.yoffset = 0;
             Framebuffer::put_var_screeninfo(&self.iface.device, &self.iface.var_screen_info)
                 .map_err(|e| anyhow!("failed to set var_screen_info: {}", e))?;
@@ -276,23 +393,70 @@ impl Display for FramebufferDisplay {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.write_rect(self.bounding_box());
+        self.refresh_present_layout()?;
+        self.write_rect(self.bounding_box())?;
+        self.page_history = PageHistory::new(&self.iface);
+        if let Some(history) = &mut self.page_history {
+            if let Some(page) = history.page(self.iface.var_screen_info.yoffset) {
+                history.presented(page);
+            }
+        }
         Ok(())
     }
 
     fn flush_rect(&mut self, area: Rect) -> Result<()> {
-        // Re-read offsets: the foreground app may have moved yoffset since creation
+        self.page_history = None;
+        // The foreground app may have moved yoffset since creation.
         self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)
             .map_err(|e| anyhow!("failed to get var_screen_info: {}", e))?;
-        self.write_rect(area);
+        self.write_rect(area)?;
+        Ok(())
+    }
+
+    fn flush_rects(&mut self, areas: &[Rect]) -> Result<()> {
+        self.refresh_present_layout()?;
+        let layout_changed = self
+            .page_history
+            .as_ref()
+            .is_some_and(|h| !h.matches(&self.iface));
+        if self.page_history.is_none() || layout_changed {
+            self.page_history = PageHistory::new(&self.iface);
+        }
+        let Some(history) = &mut self.page_history else {
+            crate::perf_trace::present_reason("untracked_layout");
+            return self.flush();
+        };
+        let Some(page) = history.page(self.iface.var_screen_info.yoffset) else {
+            crate::perf_trace::present_reason("unaligned_page");
+            return self.flush();
+        };
+        let valid = history.is_valid(page);
+        history.add(areas);
+        let damage = history.damage(page);
+        let full_damage = damage.len() == 1 && damage[0] == self.bounding_box();
+        crate::perf_trace::present_reason(if layout_changed {
+            "framebuffer_layout_changed"
+        } else if !valid {
+            "page_uninitialized"
+        } else if full_damage {
+            "damage_full"
+        } else {
+            "partial_page_history"
+        });
+        crate::perf_trace::damage(&damage);
+        for area in damage {
+            self.write_rect(area)?;
+        }
+        self.page_history.as_mut().unwrap().presented(page);
         Ok(())
     }
 
     fn read_rect(&mut self, area: Rect) -> Result<()> {
+        self.page_history = None;
         // Re-read offsets: the foreground app may have moved yoffset since creation
         self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)
             .map_err(|e| anyhow!("failed to get var_screen_info: {}", e))?;
-        self.read_frame_rect(area);
+        self.read_frame_rect(area)?;
         Ok(())
     }
 
@@ -313,9 +477,72 @@ impl Display for FramebufferDisplay {
         })))
     }
 
+    fn capture_overlay(&mut self, overlay: &PreparedOverlay) -> Result<CapturedOverlay> {
+        let open = self
+            .overlay_mapping
+            .ok_or_else(|| anyhow!("Overlay framebuffer open binding unavailable"))?;
+        let layout = overlay_layout(&self.iface, open)?;
+        CapturedOverlay::capture(overlay, layout, &self.iface.frame)
+    }
+
+    fn check_overlay(&mut self, overlay: &PreparedOverlay) -> Result<()> {
+        let open = self
+            .overlay_mapping
+            .ok_or_else(|| anyhow!("Overlay framebuffer open binding unavailable"))?;
+        let layout = overlay_layout(&self.iface, open)?;
+        layout.check_overlay(overlay)
+    }
+
+    fn present_overlay(
+        &mut self,
+        overlay: &CapturedOverlay,
+        content: OverlayContent,
+    ) -> Result<()> {
+        self.page_history = None;
+        let open = self
+            .overlay_mapping
+            .ok_or_else(|| anyhow!("Overlay framebuffer open binding unavailable"))?;
+        let layout = overlay_layout(&self.iface, open)?;
+        overlay.present(&layout, &mut self.iface.frame, content)
+    }
+
+    fn hold_overlay(&mut self, overlay: Arc<CapturedOverlay>) -> Result<Option<RectHold>> {
+        if !overlay.has_coverage() {
+            return Ok(None);
+        }
+        let instance = self.overlay_instance;
+        let mut iface = Framebuffer::new("/dev/fb0")?;
+        let open = overlay_spec(
+            &iface,
+            instance,
+            &iface.var_screen_info,
+            &iface.fix_screen_info,
+        )?;
+        let layout = overlay_layout(&iface, open)?;
+        overlay.check_layout(&layout)?;
+        let pause = overlay.stamp_pause();
+        let hold = RectHold::try_spawn(move |stop| {
+            while !stop.load(Ordering::Acquire) {
+                let current = overlay_layout(&iface, open)?;
+                overlay.present(&current, &mut iface.frame, OverlayContent::Composited)?;
+                std::thread::sleep(pause);
+            }
+            Ok(())
+        })?;
+        Ok(Some(hold))
+    }
+
     fn save(&mut self) -> Result<()> {
-        self.saved.push(self.pixmap.clone());
+        crate::display::save_reusing_snapshot(
+            &mut self.saved,
+            &self.pixmap,
+            &mut self.reusable_snapshots,
+        );
         Ok(())
+    }
+
+    fn save_unchanged(&mut self) -> Result<()> {
+        crate::display::save_unchanged_snapshot(&mut self.saved)
     }
 
     fn load(&mut self, mut rect: Rect) -> Result<()> {
@@ -354,7 +581,9 @@ impl Display for FramebufferDisplay {
     }
 
     fn pop(&mut self) -> bool {
-        self.saved.pop();
-        !self.saved.is_empty()
+        crate::display::pop_reusing_snapshot(&mut self.saved, &mut self.reusable_snapshots)
     }
 }
+
+#[cfg(all(feature = "perf-bench", not(feature = "miyoo")))]
+pub use test_iface::PresenterProbe;

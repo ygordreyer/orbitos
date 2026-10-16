@@ -1,3 +1,4 @@
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetroArchInfo {
     pub max_disk_slots: u8,
     pub disk_slot: u8,

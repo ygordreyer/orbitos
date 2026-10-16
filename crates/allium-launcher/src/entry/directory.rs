@@ -57,7 +57,7 @@ impl Default for Directory {
 impl Directory {
     pub fn new(path: PathBuf) -> Directory {
         let full_name = path
-            .file_stem()
+            .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("")
             .to_string();
@@ -73,7 +73,7 @@ impl Directory {
 
     pub fn with_name(path: PathBuf, name: String) -> Directory {
         let full_name = path
-            .file_stem()
+            .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("")
             .to_string();
@@ -333,9 +333,21 @@ impl Directory {
             entries.iter().map(|e| e.path()).collect::<Vec<_>>()
         );
 
+        let physical = match std::fs::read_dir(&self.path) {
+            Ok(entries) => Some(entries),
+            Err(_) if crate::network_runtime::virtual_directory(&self.path) => None,
+            Err(error) => {
+                return Err(anyhow!(
+                    "Failed to open directory: {:?}, {}",
+                    self.path,
+                    error
+                ));
+            }
+        };
         entries.extend(
-            std::fs::read_dir(&self.path)
-                .map_err(|e| anyhow!("Failed to open directory: {:?}, {}", self.path, e))?
+            physical
+                .into_iter()
+                .flatten()
                 .filter_map(std::result::Result::ok)
                 .filter_map(|entry| match Entry::new(entry.path(), console_mapper) {
                     Ok(Some(entry)) => Some(entry),
@@ -350,6 +362,7 @@ impl Directory {
             entries.iter().map(|e| e.path()).collect::<Vec<_>>()
         );
 
+        crate::network_runtime::merge_directory(&self.path, &mut entries);
         let mut uniques = HashSet::new();
         entries.retain(|e| uniques.insert(e.path().to_path_buf()));
 

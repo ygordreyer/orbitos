@@ -1,0 +1,2498 @@
+{
+  "schema_version": 2,
+  "id": "orbit",
+  "revision": "6-reference-polish",
+  "name": "Orbit",
+  "canvas": {
+    "width": 640,
+    "height": 480
+  },
+  "tokens": {
+    "colors": {
+      "background": "#f4f4eeff",
+      "surface": "#ffffffff",
+      "text": "#1e282eff",
+      "muted": "#52626aff",
+      "accent": "#08b8d8ff",
+      "focus": "#08b8d8ff",
+      "focus_text": "#112830ff",
+      "border": "#d1dedfff",
+      "scrim": "#18232a99"
+    },
+    "typography": {
+    "title": {
+      "font": "nunito",
+      "size": 26,
+      "line_height": 28
+      },
+      "body": {
+        "font": "nunito",
+        "size": 24,
+        "line_height": 24
+      },
+      "row": {
+        "font": "nunito",
+        "size": 24,
+        "line_height": 24
+      },
+    "hint": {
+      "font": "nunito",
+      "size": 16,
+      "line_height": 18
+      },
+      "label": {
+        "font": "nunito",
+        "size": 18,
+        "line_height": 18
+      },
+    "caption": {
+      "font": "nunito",
+      "size": 18,
+      "line_height": 18
+      },
+      "status": {
+        "font": "nunito",
+        "size": 18,
+        "line_height": 18
+      }
+    }
+  },
+  "screens": {
+    "library": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "hidden",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps",
+          "max_lines": 1
+        },
+        {
+          "id": "hero",
+          "kind": "image",
+          "rect": [
+            250,
+            54,
+            390,
+            164
+          ],
+          "binding": "selected_hero",
+          "fit": "cover",
+          "radius": 0,
+          "fade_edge": "left",
+          "fade_width": 112
+        },
+        {
+          "id": "selected-title",
+          "kind": "text",
+          "rect": [
+            24,
+            58,
+            238,
+            96
+          ],
+          "binding": "selected_title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 3,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "library-actions",
+          "kind": "navigation",
+          "rect": [
+            24,
+            212,
+            592,
+            26
+          ],
+          "binding": "navigation",
+          "group": "library_actions",
+          "role": "label",
+          "layout": "tabs",
+          "max_items": 3,
+          "item_extent": 136,
+          "gap": 16,
+          "padding": 4,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "entries",
+          "kind": "entries",
+          "rect": [
+            24,
+            238,
+            592,
+            196
+          ],
+          "binding": "entries",
+          "layout": "shelf",
+          "role": "caption",
+          "visible_count": 3,
+          "item_extent": 148,
+          "gap": 32,
+          "padding": 4,
+          "art_size": 140,
+          "caption_height": 40,
+          "caption_lines": 2,
+          "radius": 12,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "glow",
+          "focus_width": 2,
+          "glow_radius": 4
+        }
+      ]
+    },
+    "recents": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "search_results": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "apps": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "settings_root": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "settings_rows",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "settings_rows",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "settings_page": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "settings_rows",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "settings_rows",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "search": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "query",
+          "kind": "text",
+          "rect": [
+            24,
+            100,
+            592,
+            34
+          ],
+          "binding": "keyboard_value",
+          "role": "body",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "keyboard",
+          "kind": "keyboard",
+          "rect": [
+            24,
+            146,
+            592,
+            268
+          ],
+          "binding": "keyboard",
+          "role": "row",
+          "gap": 4,
+          "padding": 4,
+          "radius": 8
+        }
+      ]
+    },
+    "keyboard": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "query",
+          "kind": "text",
+          "rect": [
+            24,
+            100,
+            592,
+            34
+          ],
+          "binding": "keyboard_value",
+          "role": "body",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "keyboard",
+          "kind": "keyboard",
+          "rect": [
+            24,
+            146,
+            592,
+            268
+          ],
+          "binding": "keyboard",
+          "role": "row",
+          "gap": 4,
+          "padding": 4,
+          "radius": 8
+        }
+      ]
+    },
+    "disc_picker": {
+      "components": [
+        {
+          "id": "scrim",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "scrim",
+          "radius": 0
+        },
+        {
+          "id": "dialog",
+          "kind": "panel",
+          "rect": [
+            90,
+            64,
+            460,
+            352
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            106,
+            78,
+            428,
+            38
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            106,
+            130,
+            428,
+            176
+          ],
+          "binding": "discs",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 4,
+          "item_extent": 44,
+          "gap": 0,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        },
+        {
+          "id": "subtitle",
+          "kind": "text",
+          "rect": [
+            106,
+            314,
+            428,
+            44
+          ],
+          "binding": "subtitle",
+          "role": "label",
+          "color": "text",
+          "max_lines": 2,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            106,
+            366,
+            428,
+            36
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        }
+      ]
+    },
+    "context_menu": {
+      "components": [
+        {
+          "id": "scrim",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "scrim",
+          "radius": 0
+        },
+        {
+          "id": "dialog",
+          "kind": "panel",
+          "rect": [
+            90,
+            64,
+            460,
+            352
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            106,
+            78,
+            428,
+            38
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            106,
+            130,
+            428,
+            266
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 7,
+          "item_extent": 38,
+          "gap": 0,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        },
+        {
+          "id": "subtitle",
+          "kind": "text",
+          "rect": [
+            106,
+            314,
+            428,
+            44
+          ],
+          "binding": "subtitle",
+          "role": "label",
+          "color": "text",
+          "max_lines": 2,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            106,
+            366,
+            428,
+            36
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        }
+      ]
+    },
+    "toast": {
+      "components": [
+        {
+          "id": "scrim",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "scrim",
+          "radius": 0
+        },
+        {
+          "id": "dialog",
+          "kind": "panel",
+          "rect": [
+            90,
+            64,
+            460,
+            352
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            106,
+            78,
+            428,
+            38
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "message",
+          "kind": "text",
+          "rect": [
+            106,
+            132,
+            428,
+            176
+          ],
+          "binding": "message",
+          "role": "body",
+          "color": "text",
+          "max_lines": 6,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            106,
+            366,
+            428,
+            36
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        }
+      ]
+    },
+    "network_dialog": {
+      "components": [
+        {
+          "id": "scrim",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "scrim",
+          "radius": 0
+        },
+        {
+          "id": "dialog",
+          "kind": "panel",
+          "rect": [
+            90,
+            64,
+            460,
+            352
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            106,
+            78,
+            428,
+            38
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "message",
+          "kind": "text",
+          "rect": [
+            106,
+            130,
+            428,
+            44
+          ],
+          "binding": "message",
+          "role": "body",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "storage-rows",
+          "kind": "entries",
+          "rect": [
+            106,
+            180,
+            428,
+            132
+          ],
+          "binding": "storage_entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 3,
+          "item_extent": 44,
+          "gap": 0,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        },
+        {
+          "id": "progress",
+          "kind": "progress",
+          "rect": [
+            106,
+            320,
+            428,
+            12
+          ],
+          "binding": "progress",
+          "color": "accent",
+          "radius": 6
+        },
+        {
+          "id": "subtitle",
+          "kind": "text",
+          "rect": [
+            106,
+            342,
+            428,
+            22
+          ],
+          "binding": "subtitle",
+          "role": "label",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            106,
+            366,
+            428,
+            36
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        }
+      ]
+    },
+    "ingame_menu": {
+      "components": [
+        {
+          "id": "scrim",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "scrim",
+          "radius": 0
+        },
+        {
+          "id": "dialog",
+          "kind": "panel",
+          "rect": [
+            90,
+            64,
+            460,
+            352
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            106,
+            78,
+            428,
+            38
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            106,
+            130,
+            428,
+            266
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 7,
+          "item_extent": 38,
+          "gap": 0,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        },
+        {
+          "id": "subtitle",
+          "kind": "text",
+          "rect": [
+            106,
+            314,
+            428,
+            44
+          ],
+          "binding": "subtitle",
+          "role": "label",
+          "color": "text",
+          "max_lines": 2,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            106,
+            366,
+            428,
+            36
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        }
+      ]
+    },
+    "guide_selector": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            24,
+            104,
+            592,
+            300
+          ],
+          "binding": "guides",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 6,
+          "item_extent": 48,
+          "gap": 2,
+          "padding": 6,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        }
+      ]
+    },
+    "text_reader": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            36
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "guide",
+          "kind": "text",
+          "rect": [
+            24,
+            104,
+            592,
+            310
+          ],
+          "binding": "guide_text",
+          "role": "body",
+          "color": "text",
+          "max_lines": 12,
+          "overflow": "wrap",
+          "align": "left"
+        }
+      ]
+    },
+    "osd_volume": {
+      "components": [
+        {
+          "id": "plate",
+          "kind": "panel",
+          "rect": [
+            128,
+            360,
+            384,
+            88
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            144,
+            370,
+            352,
+            32
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "progress",
+          "kind": "progress",
+          "rect": [
+            144,
+            416,
+            352,
+            12
+          ],
+          "binding": "progress",
+          "color": "accent",
+          "radius": 4
+        }
+      ]
+    },
+    "osd_brightness": {
+      "components": [
+        {
+          "id": "plate",
+          "kind": "panel",
+          "rect": [
+            128,
+            360,
+            384,
+            88
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            144,
+            370,
+            352,
+            32
+          ],
+          "binding": "title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "progress",
+          "kind": "progress",
+          "rect": [
+            144,
+            416,
+            352,
+            12
+          ],
+          "binding": "progress",
+          "color": "accent",
+          "radius": 4
+        }
+      ]
+    },
+    "game_detail": {
+      "components": [
+        {
+          "id": "background",
+          "kind": "background",
+          "rect": [
+            0,
+            0,
+            640,
+            480
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "brand",
+          "kind": "text",
+          "rect": [
+            24,
+            10,
+            88,
+            32
+          ],
+          "binding": "theme_name",
+          "role": "title",
+          "color": "text",
+          "max_lines": 1,
+          "overflow": "ellipsis",
+          "align": "left"
+        },
+        {
+          "id": "navigation",
+          "kind": "navigation",
+          "rect": [
+            120,
+            9,
+            116,
+            32
+          ],
+          "binding": "navigation",
+          "group": "primary",
+          "role": "label",
+          "layout": "current",
+          "max_items": 4,
+          "item_extent": 116,
+          "gap": 0,
+          "padding": 5,
+          "radius": 8,
+          "focus_color": "accent",
+          "focus_width": 2
+        },
+        {
+          "id": "status-panel",
+          "kind": "panel",
+          "rect": [
+            432,
+            8,
+            184,
+            34
+          ],
+          "color": "surface",
+          "radius": 17
+        },
+        {
+          "id": "status",
+          "kind": "status",
+          "rect": [
+            440,
+            15,
+            176,
+            18
+          ],
+          "binding": "status",
+          "role": "status",
+          "color": "muted",
+          "layout": "horizontal",
+          "max_lines": 1,
+          "battery_style": "icon_percentage"
+        },
+        {
+          "id": "footer",
+          "kind": "panel",
+          "rect": [
+            0,
+            434,
+            640,
+            46
+          ],
+          "color": "background",
+          "radius": 0
+        },
+        {
+          "id": "hints",
+          "kind": "hints",
+          "rect": [
+            24,
+            436,
+            592,
+            44
+          ],
+          "binding": "hints",
+          "role": "hint",
+          "color": "muted",
+          "presentation": "keycaps"
+        },
+        {
+          "id": "title",
+          "kind": "text",
+          "rect": [
+            24,
+            54,
+            592,
+            56
+          ],
+          "binding": "selected_title",
+          "role": "title",
+          "color": "text",
+          "max_lines": 2,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "cover-frame",
+          "kind": "panel",
+          "rect": [
+            18,
+            120,
+            188,
+            306
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "cover",
+          "kind": "image",
+          "rect": [
+            24,
+            128,
+            176,
+            176
+          ],
+          "binding": "selected_cover",
+          "fit": "contain",
+          "radius": 8,
+          "fade_edge": "none",
+          "fade_width": 0
+        },
+        {
+          "id": "details-frame",
+          "kind": "panel",
+          "rect": [
+            214,
+            120,
+            408,
+            306
+          ],
+          "color": "surface",
+          "radius": 16
+        },
+        {
+          "id": "metadata",
+          "kind": "text",
+          "rect": [
+            230,
+            136,
+            376,
+            76
+          ],
+          "binding": "selected_metadata",
+          "role": "label",
+          "color": "text",
+          "max_lines": 4,
+          "overflow": "wrap",
+          "align": "left"
+        },
+        {
+          "id": "rows",
+          "kind": "entries",
+          "rect": [
+            230,
+            402,
+            376,
+            24
+          ],
+          "binding": "entries",
+          "layout": "list",
+          "role": "row",
+          "visible_count": 1,
+          "item_extent": 24,
+          "gap": 0,
+          "padding": 0,
+          "art_size": 0,
+          "caption_height": 0,
+          "caption_lines": 0,
+          "radius": 10,
+          "frame_color": "surface",
+          "focus_color": "accent",
+          "focus_style": "outline",
+          "focus_width": 2,
+          "glow_radius": 0
+        },
+        {
+          "id": "actions",
+          "kind": "dialog_actions",
+          "rect": [
+            26,
+            370,
+            172,
+            40
+          ],
+          "binding": "actions",
+          "role": "row",
+          "layout": "horizontal",
+          "radius": 6
+        },
+        {
+          "id": "synopsis",
+          "kind": "text",
+          "rect": [
+            230,
+            222,
+            376,
+            180
+          ],
+          "binding": "selected_blurb",
+          "role": "body",
+          "color": "text",
+          "max_lines": 7,
+          "overflow": "wrap",
+          "align": "left"
+        }
+      ]
+    }
+  },
+  "assets": {
+    "accent-band": {
+      "path": "assets/accent-band.png",
+      "sha256": "3366a8c322a48b2858d12bbe36ec38d57b9b0e4efe63fcc833018b7379acd347",
+      "width": 32,
+      "height": 8,
+      "bytes": 102,
+      "required": true
+    }
+  },
+  "customization": [],
+  "motion": "none"
+}

@@ -88,6 +88,8 @@ impl Image {
     }
 
     fn resize_image(src_image: &RgbaImage, new_width: u32, new_height: u32) -> Option<RgbaImage> {
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::ArtResize);
         let src = FirImage::from_vec_u8(
             src_image.width(),
             src_image.height(),
@@ -119,9 +121,13 @@ impl Image {
         mode: ImageMode,
         border_radius: u32,
     ) -> Option<RgbaImage> {
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::Read);
         let image = ::image::open(path)
             .map_err(|e| error!("Failed to load image at {}: {}", path.display(), e))
             .ok()?;
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::Decode);
         let mut image = match mode {
             ImageMode::Raw => image.to_rgba8(),
             ImageMode::Cover => {

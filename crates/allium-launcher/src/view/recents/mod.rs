@@ -29,6 +29,7 @@ impl Default for RecentsState {
         RecentsState::List(RecentsListState {
             sort: RecentsSort::LastPlayed,
             selected: 0,
+            selected_path: None,
             child: None,
         })
     }
@@ -41,6 +42,13 @@ pub enum Recents {
 }
 
 impl Recents {
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        match self {
+            Self::List(list) => list.root_tab_navigation_ready(),
+            Self::Carousel(_) => true,
+        }
+    }
+
     pub fn load_or_new(rect: Rect, res: Resources, state: Option<RecentsState>) -> Result<Self> {
         let use_carousel = res.get::<Stylesheet>().recents.use_recents_carousel;
 
@@ -65,6 +73,21 @@ impl Recents {
         }
     }
 
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        match self {
+            Self::List(list) => list.clear_theme(),
+            Self::Carousel(_) => Ok(()),
+        }
+    }
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        match self {
+            Self::List(list) => Ok(Some(list.theme_models(handle)?)),
+            Self::Carousel(_) => Ok(None),
+        }
+    }
     pub fn save(&self) -> RecentsState {
         match self {
             Self::Carousel(c) => RecentsState::Carousel(c.save()),

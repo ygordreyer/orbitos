@@ -11,6 +11,7 @@ path = "src/lib.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+perf-bench = []
 simulator = ["winit", "softbuffer"]
 miyoo = ["evdev", "framebuffer", "sysfs_gpio"]
 debug-ui = []
@@ -36,6 +37,9 @@ rusqlite_migration.workspace = true
 rusttype.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
+libc = "=0.2.186"
+png = "=0.18.1"
 strum = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 type-map.workspace = true

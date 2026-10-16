@@ -10,6 +10,12 @@ use common::locale::Locale;
 use common::platform::{DefaultPlatform, Key, KeyEvent, Platform};
 use common::resources::Resources;
 use common::stylesheet::Stylesheet;
+use common::theme::{
+    ThemeHandle,
+    frame::{Focus, FrameInputs, Hint, Row as ThemeRow, Status},
+    pack::{Binding, NavGroup, ScreenId},
+    render::PreparedFrame,
+};
 use common::view::{ButtonHint, ButtonHints, ScrollList, View};
 use tokio::sync::mpsc::Sender;
 
@@ -22,6 +28,9 @@ pub struct GuideSelector {
     button_hints: ButtonHints<String>,
     guides: Vec<PathBuf>,
     text_reader: Option<Box<TextReader>>,
+    theme_frame: Option<PreparedFrame>,
+    theme_dirty: bool,
+    status: Status,
 }
 
 impl GuideSelector {
@@ -107,6 +116,9 @@ impl GuideSelector {
             button_hints,
             guides,
             text_reader,
+            theme_frame: None,
+            theme_dirty: false,
+            status: Status::default(),
         }
     }
 
@@ -127,6 +139,11 @@ impl GuideSelector {
         self.text_reader.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepared_theme_frame(&self) -> Option<&PreparedFrame> {
+        self.theme_frame.as_ref()
+    }
+
     fn open_text_reader(&mut self) {
         if let Some(path) = self.guides.get(self.list.selected()) {
             self.text_reader = Some(Box::new(TextReader::new(
@@ -143,6 +160,113 @@ impl GuideSelector {
         }
         self.set_should_draw();
     }
+
+    pub fn refresh_theme(&mut self, status: Status) -> Result<()> {
+        self.status = status;
+        let theme = self.res.get::<Option<ThemeHandle>>().clone();
+        let Some(theme) = theme else {
+            self.theme_frame = None;
+            self.theme_dirty = false;
+            self.list.set_visible_count_override(None)?;
+            return Ok(());
+        };
+        if let Some(reader) = &mut self.text_reader {
+            reader.refresh_theme(self.status.clone())?;
+            self.theme_frame = None;
+            self.theme_dirty = false;
+            return Ok(());
+        }
+        let count = theme_capacity(&theme, ScreenId::GuideSelector, Binding::Guides);
+        self.list.set_visible_count_override(Some(count))?;
+        let first = self.list.window_start();
+        let selected = self.list.selected();
+        let locale = self.res.get::<Locale>();
+        let mut input = FrameInputs::new(ScreenId::GuideSelector);
+        input
+            .text
+            .insert(Binding::Title, locale.t("ingame-menu-guide"));
+        input.rows.insert(
+            Binding::Guides,
+            self.guides
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(count)
+                .map(|(index, path)| ThemeRow {
+                    id: format!("guide-{index}"),
+                    label: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    value: String::new(),
+                    enabled: true,
+                })
+                .collect(),
+        );
+        input.focus = Focus {
+            component: theme_component(&theme, ScreenId::GuideSelector, Binding::Guides),
+            item: Some(format!("guide-{selected}")),
+        };
+        input
+            .selected
+            .insert(Binding::Guides, format!("guide-{selected}"));
+        input.navigation.insert(
+            NavGroup::Primary,
+            vec![ThemeRow {
+                id: "guide".into(),
+                label: locale.t("ingame-menu-guide"),
+                value: String::new(),
+                enabled: true,
+            }],
+        );
+        input.hints = vec![
+            Hint {
+                button: "MENU".into(),
+                label: locale.t("ingame-menu-continue"),
+            },
+            Hint {
+                button: "A".into(),
+                label: locale.t("button-select"),
+            },
+            Hint {
+                button: "B".into(),
+                label: locale.t("button-back"),
+            },
+        ];
+        input.status = self.status.clone();
+        drop(locale);
+        self.theme_frame = Some(PreparedFrame::prepare(theme, &input)?);
+        self.theme_dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn disable_theme(&mut self) {
+        self.theme_frame = None;
+        self.theme_dirty = false;
+        if let Err(error) = self.list.set_visible_count_override(None) {
+            log::warn!("failed to reset Legacy guide viewport: {error:#}");
+        }
+        if let Some(reader) = &mut self.text_reader {
+            reader.disable_theme();
+        }
+        self.list.set_should_draw();
+        self.button_hints.set_should_draw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text_reader_mut(&mut self) -> Option<&mut TextReader> {
+        self.text_reader.as_deref_mut()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn theme_is_disabled_recursively(&self) -> bool {
+        self.theme_frame.is_none()
+            && self
+                .text_reader
+                .as_deref()
+                .is_none_or(TextReader::theme_is_disabled)
+    }
 }
 
 #[async_trait(?Send)]
@@ -152,6 +276,14 @@ impl View for GuideSelector {
         display: &mut <DefaultPlatform as Platform>::Display,
         styles: &Stylesheet,
     ) -> Result<bool> {
+        if let Some(frame) = &self.theme_frame {
+            if !self.theme_dirty {
+                return Ok(false);
+            }
+            frame.paint(display);
+            self.theme_dirty = false;
+            return Ok(true);
+        }
         if let Some(reader) = &mut self.text_reader {
             reader.draw(display, styles)
         } else {
@@ -166,6 +298,9 @@ impl View for GuideSelector {
     }
 
     fn should_draw(&self) -> bool {
+        if self.theme_frame.is_some() {
+            return self.theme_dirty;
+        }
         if let Some(reader) = &self.text_reader {
             reader.should_draw()
         } else {
@@ -174,6 +309,10 @@ impl View for GuideSelector {
     }
 
     fn set_should_draw(&mut self) {
+        if self.theme_frame.is_some() {
+            self.theme_dirty = true;
+            return;
+        }
         if let Some(reader) = &mut self.text_reader {
             reader.set_should_draw();
         } else {
@@ -244,4 +383,23 @@ impl View for GuideSelector {
     fn set_position(&mut self, _point: common::geom::Point) {
         unimplemented!()
     }
+}
+
+fn theme_capacity(theme: &ThemeHandle, screen: ScreenId, binding: Binding) -> usize {
+    theme.pack().screens[&screen]
+        .components
+        .iter()
+        .find(|component| component.binding == Some(binding))
+        .and_then(|component| component.visible_count)
+        .unwrap_or(1)
+        .clamp(1, 64) as usize
+}
+
+fn theme_component(theme: &ThemeHandle, screen: ScreenId, binding: Binding) -> String {
+    theme.pack().screens[&screen]
+        .components
+        .iter()
+        .find(|component| component.binding == Some(binding))
+        .map(|component| component.id.clone())
+        .unwrap_or_default()
 }

@@ -2,6 +2,7 @@
 #![warn(rust_2018_idioms)]
 
 mod allium_menu;
+pub mod open_trace;
 mod retroarch_info;
 pub mod view;
 

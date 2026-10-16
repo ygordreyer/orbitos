@@ -33,10 +33,23 @@ impl Clock {
             last_updated: Instant::now(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn fixture_expired(mut self) -> Self {
+        self.label.set_text("stale fixture clock".into());
+        self.last_updated = Instant::now() - CLOCK_UPDATE_INTERVAL;
+        self
+    }
+
 }
 
 #[async_trait(?Send)]
 impl View for Clock {
+    fn theme_status(&self) -> Option<crate::theme::frame::Status> {
+        Some(crate::theme::frame::Status {
+            clock: Some(self.label.text().into()),
+            ..Default::default()
+        })
+    }
     fn update(&mut self, _dt: Duration) {
         if self.last_updated.elapsed() >= CLOCK_UPDATE_INTERVAL {
             self.label.set_text(text());
@@ -87,5 +100,9 @@ impl View for Clock {
 }
 
 fn text() -> String {
+    #[cfg(all(feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
+    if let Ok(clock) = std::env::var("ALLIUM_PERF_CLOCK") {
+        return clock;
+    }
     format!("{}", Local::now().format("%H:%M"))
 }

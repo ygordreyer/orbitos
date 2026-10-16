@@ -22,6 +22,7 @@ struct BatteryCommandOutput {
 pub struct Miyoo354Battery {
     charging: bool,
     percentage: i32,
+    sampled: bool,
 }
 
 impl Miyoo354Battery {
@@ -29,12 +30,14 @@ impl Miyoo354Battery {
         Miyoo354Battery {
             charging: false,
             percentage: 100,
+            sampled: false,
         }
     }
 }
 
 impl Battery for Miyoo354Battery {
     fn update(&mut self) -> Result<()> {
+        self.sampled = false;
         let mut child = Command::new("/customer/app/axp_test")
             .stdout(Stdio::piped())
             .spawn()?;
@@ -49,9 +52,15 @@ impl Battery for Miyoo354Battery {
         let output: BatteryCommandOutput = serde_json::from_reader(child.stdout.unwrap())?;
         self.percentage = output.battery;
         self.charging = output.charging == 3;
+        self.sampled = true;
 
         trace!("battery: {}%", self.percentage);
         Ok(())
+    }
+
+    fn sample(&mut self) -> Result<Option<(i32, bool)>> {
+        self.update()?;
+        Ok(self.sampled.then_some((self.percentage, self.charging)))
     }
 
     fn percentage(&self) -> i32 {

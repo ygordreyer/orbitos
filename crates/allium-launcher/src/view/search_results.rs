@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use common::command::Command;
 use common::constants::RECENT_GAMES_LIMIT;
 use common::database::Database;
-use common::display::Display;
+use common::display::{Display, color::Color, fill_rect};
 use common::geom::{Alignment, Point, Rect};
 use common::locale::{Locale, LocaleFluentValue};
 use common::platform::{DefaultPlatform, Key, KeyEvent, Platform};
@@ -91,7 +91,7 @@ impl Sort for SearchResultsSort {
             }
         }
 
-        Ok(games
+        let mut entries = games
             .into_iter()
             .map(|game| {
                 let extension = game
@@ -120,7 +120,9 @@ impl Sort for SearchResultsSort {
                     screenshot_path: game.screenshot_path,
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        crate::network_runtime::search(query, &mut entries);
+        Ok(entries)
     }
 
     fn preserve_selection(&self) -> bool {
@@ -142,6 +144,17 @@ pub struct SearchResultsView {
 }
 
 impl SearchResultsView {
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        self.list.clear_theme()
+    }
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        self.list
+            .theme_models(common::theme::pack::ScreenId::SearchResults, handle)
+    }
+
     pub fn new(rect: Rect, res: Resources, query: String) -> Result<Self> {
         let Rect { x, y, w, h } = rect;
         let styles = res.get::<Stylesheet>();
@@ -283,6 +296,13 @@ impl View for SearchResultsView {
 
         if needs_full_redraw {
             display.load(self.rect)?;
+            if crate::theme_adapter::legacy_orbit(&self.res) {
+                fill_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(0, 0, 640, 480),
+                    super::orbit::background(),
+                );
+            }
 
             self.header.set_should_draw();
             self.result_count.set_should_draw();
@@ -290,8 +310,17 @@ impl View for SearchResultsView {
             self.button_hints.set_should_draw();
         }
 
-        drawn |= self.header.should_draw() && self.header.draw(display, styles)?;
-        drawn |= self.result_count.should_draw() && self.result_count.draw(display, styles)?;
+        if crate::theme_adapter::legacy_orbit(&self.res) {
+            let mut header_styles = styles.clone();
+            header_styles.ui.text_color = Color::new(35, 48, 51);
+            header_styles.ui.stroke_width = 0;
+            drawn |= self.header.should_draw() && self.header.draw(display, &header_styles)?;
+            drawn |= self.result_count.should_draw()
+                && self.result_count.draw(display, &header_styles)?;
+        } else {
+            drawn |= self.header.should_draw() && self.header.draw(display, styles)?;
+            drawn |= self.result_count.should_draw() && self.result_count.draw(display, styles)?;
+        }
 
         drawn |= self.list.should_draw() && self.list.draw(display, styles)?;
 
@@ -304,6 +333,18 @@ impl View for SearchResultsView {
             ))?;
             self.button_hints.set_should_draw();
             drawn |= self.button_hints.draw(display, styles)?;
+            if crate::theme_adapter::legacy_orbit(&self.res) {
+                fill_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(0, 425, 640, 55),
+                    super::orbit::background(),
+                );
+                super::orbit::font(styles, 16, Color::new(35, 48, 51)).draw(
+                    &mut display.pixmap_mut(),
+                    "A Select    B Back    Y Sort",
+                    Point::new(26, 455),
+                );
+            }
         }
 
         if self.search_view.is_active() {
@@ -337,6 +378,9 @@ impl View for SearchResultsView {
         commands: Sender<Command>,
         bubble: &mut VecDeque<Command>,
     ) -> Result<bool> {
+        if self.list.details_active() || self.list.disc_picker_active() {
+            return self.list.handle_key_event(event, commands, bubble).await;
+        }
         if self.search_view.is_active()
             && self
                 .search_view

@@ -29,16 +29,28 @@ pub struct Apps {
 }
 
 impl Apps {
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        self.list.root_tab_navigation_ready()
+    }
+
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        self.list.clear_theme()
+    }
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        self.list
+            .theme_models(common::theme::pack::ScreenId::Apps, handle)
+    }
+
     pub fn new(rect: Rect, _res: Resources, list: EntryList<AppsSort>) -> Result<Self> {
         Ok(Self { rect, list })
     }
 
     pub fn load_or_new(rect: Rect, res: Resources, state: Option<AppsState>) -> Result<Self> {
         let list = if let Some(state) = state {
-            let selected = state.selected;
-            let mut list = EntryList::load(rect, res.clone(), state)?;
-            list.select(selected);
-            list
+            EntryList::load(rect, res.clone(), state)?
         } else {
             EntryList::new(
                 rect,

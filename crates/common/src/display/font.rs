@@ -56,7 +56,101 @@ pub enum DecorationColor {
     Custom(Color),
 }
 
+pub(crate) struct PrefixMeasure<'a> {
+    style: &'a FontTextStyle,
+    previous: Option<GlyphId>,
+    x: f32,
+}
+impl PrefixMeasure<'_> {
+    pub fn push(&mut self, ch: char) -> u32 {
+        let scale = rusttype::Scale::uniform(self.style.font_size as f32);
+        let mut glyph = self.style.font.glyph(ch);
+        if glyph.id() == GlyphId(0) {
+            if let Some(fallback) = &self.style.font_fallback {
+                glyph = fallback.glyph(ch);
+            }
+        }
+        let glyph = glyph.scaled(scale);
+        if let Some(previous) = self.previous {
+            self.x += self.style.font.pair_kerning(scale, previous, glyph.id());
+        }
+        self.previous = Some(glyph.id());
+        self.x += glyph.h_metrics().advance_width;
+        self.x.ceil() as u32
+    }
+    pub fn reset(&mut self, line: &str) {
+        self.previous = None;
+        self.x = 0.0;
+        for ch in line.chars() {
+            self.push(ch);
+        }
+    }
+}
 impl FontTextStyle {
+    pub(crate) fn prefix_measure(&self) -> PrefixMeasure<'_> {
+        PrefixMeasure {
+            style: self,
+            previous: None,
+            x: 0.0,
+        }
+    }
+
+    /// Largest fitting single-line prefix, with the same glyph arithmetic as `measure`.
+    /// Returns the consumed bytes and the number of glyphs measured.
+    pub fn fitting_line_prefix(
+        &self,
+        text: &str,
+        source_limit: usize,
+        width: u32,
+        height: u32,
+    ) -> (usize, usize) {
+        // Without a kern table, advances are nonnegative (unsigned font metrics).
+        // Floating-point addition and ceil preserve that ordering. Fallback advances
+        // are also unsigned; measure always uses the primary font's kerning table.
+        // Other fonts scan every prefix, without assuming monotonicity.
+        let positive_scale = |font: &Font<'static>| {
+            let metrics = font.v_metrics_unscaled();
+            metrics.ascent > metrics.descent
+        };
+        let monotonic = matches!(&self.font, Font::Ref(face) if face.tables().kern.is_none())
+            && positive_scale(&self.font)
+            && self.font_fallback.as_ref().is_none_or(positive_scale);
+        let mut measure = self.prefix_measure();
+        let mut first = 0;
+        let mut fitting = 0;
+        let mut visited = 0;
+        for (at, ch) in text.char_indices().take(source_limit) {
+            if ch == '\n' {
+                break;
+            }
+            visited += 1;
+            let end = at + ch.len_utf8();
+            if first == 0 {
+                first = end;
+            }
+            let measured_width = measure.push(ch);
+            if measured_width <= width && self.font_size <= height {
+                fitting = end;
+            } else if monotonic {
+                break;
+            }
+        }
+        (fitting.max(first), visited)
+    }
+
+    /// Font allocations and size defining measurement, independent of paint colors.
+    pub fn measurement_identity(&self) -> (usize, Option<usize>, u32) {
+        let identity = |font: &Font<'static>| match font {
+            Font::Ref(face) => std::sync::Arc::as_ptr(face) as usize,
+            Font::Owned(face) => std::sync::Arc::as_ptr(face) as usize,
+        };
+        (
+            identity(&self.font),
+            self.font_fallback.as_ref().map(identity),
+            self.font_size,
+        )
+    }
+
     /// Creates a text style with transparent background.
     pub fn new(font: Font<'static>, text_color: Color, font_size: u32) -> Self {
         FontTextStyleBuilder::new(font)

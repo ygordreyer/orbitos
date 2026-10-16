@@ -8,6 +8,7 @@ mod image;
 mod input;
 mod label;
 mod list;
+pub mod menu_status;
 mod null;
 mod row;
 mod scroll_list;
@@ -31,7 +32,7 @@ pub use self::image::{Image, ImageMode};
 pub use self::input::button::Button;
 pub use self::input::color_picker::ColorPicker;
 pub use self::input::datetime::DateTime;
-pub use self::input::keyboard::Keyboard;
+pub use self::input::keyboard::{Keyboard, KeyboardThemeInputs};
 pub use self::input::number::Number;
 pub use self::input::percentage::Percentage;
 pub use self::input::select::Select;
@@ -59,6 +60,16 @@ use crate::stylesheet::Stylesheet;
 
 #[async_trait(?Send)]
 pub trait View {
+    fn stop_workers(&mut self) {
+        for child in self.children_mut() {
+            child.stop_workers();
+        }
+    }
+
+    fn theme_status(&self) -> Option<crate::theme::frame::Status> {
+        None
+    }
+
     /// Update the view.
     fn update(&mut self, dt: Duration) {
         self.children_mut().iter_mut().for_each(|c| c.update(dt));
@@ -155,6 +166,14 @@ pub fn draw_debug_bounds(
 
 #[async_trait(?Send)]
 impl View for Box<dyn View> {
+    fn stop_workers(&mut self) {
+        (**self).stop_workers()
+    }
+
+    fn theme_status(&self) -> Option<crate::theme::frame::Status> {
+        (**self).theme_status()
+    }
+
     fn update(&mut self, dt: Duration) {
         (**self).update(dt)
     }

@@ -18,6 +18,12 @@ use common::platform::{DefaultPlatform, Key, KeyEvent, Platform};
 use common::resources::Resources;
 use common::retroarch::RetroArchCommand;
 use common::stylesheet::Stylesheet;
+use common::theme::{
+    ThemeHandle,
+    frame::{Focus, FrameInputs, Hint, Row as ThemeRow},
+    pack::{Binding, ScreenId},
+    render::PreparedFrame,
+};
 use common::view::{
     ButtonHint, ButtonHints, Image, ImageMode, Label, NullView, SettingsList, StatusBar, View,
 };
@@ -36,6 +42,15 @@ pub struct IngameMenuState {
     selected_guide_path: Option<PathBuf>,
 }
 
+#[derive(PartialEq)]
+struct MenuFrameKey {
+    digest: String,
+    generation: u64,
+    locale: String,
+    game_path: PathBuf,
+    input: FrameInputs,
+}
+
 pub struct IngameMenu<B>
 where
     B: Battery + 'static,
@@ -51,6 +66,11 @@ where
     retroarch_info: Option<RetroArchInfo>,
     path: PathBuf,
     image: Image,
+    theme_frame: Option<PreparedFrame>,
+    theme_key: Option<MenuFrameKey>,
+    #[cfg(test)]
+    theme_prepares: usize,
+    theme_dirty: bool,
     _phantom_battery: PhantomData<B>,
 }
 
@@ -78,12 +98,20 @@ where
             None,
         );
 
-        let mut status_bar = StatusBar::new(
-            res.clone(),
-            Point::new(w as i32 - styles.ui.margin_y, y + styles.ui.margin_y),
-            battery,
-        );
+        let status_phase = common::perf_trace::menu_phase("status_bar");
+        let status_point = Point::new(w as i32 - styles.ui.margin_y, y + styles.ui.margin_y);
+        let cache = res
+            .0
+            .borrow()
+            .get::<common::view::menu_status::MenuStatusCache>()
+            .cloned();
+        let mut status_bar = if let Some(cache) = cache {
+            StatusBar::new_cached(res.clone(), status_point, cache.clone())
+        } else {
+            StatusBar::new(res.clone(), status_point, battery)
+        };
 
+        drop(status_phase);
         let mut button_hints = ButtonHints::new(
             res.clone(),
             vec![ButtonHint::new(
@@ -219,6 +247,11 @@ where
             retroarch_info,
             path,
             image,
+            theme_frame: None,
+            theme_key: None,
+            #[cfg(test)]
+            theme_prepares: 0,
+            theme_dirty: false,
             _phantom_battery: PhantomData,
         }
     }
@@ -241,6 +274,17 @@ where
         Ok(Self::new(rect, Default::default(), res, battery, info))
     }
 
+    pub(crate) fn read_only_state() -> IngameMenuState {
+        fs::read(ALLIUM_MENU_STATE.as_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn can_prewarm(state: &IngameMenuState) -> bool {
+        !state.is_guide_open && !state.is_text_reader_open
+    }
+
     pub fn save(&self) -> Result<()> {
         let file = File::create(ALLIUM_MENU_STATE.as_path())?;
         let state = IngameMenuState {
@@ -261,6 +305,154 @@ where
         }
         serde_json::to_writer(file, &state)?;
         Ok(())
+    }
+
+    pub(crate) fn reuse_theme_frame(&mut self, previous: &mut Self) {
+        self.theme_frame = previous.theme_frame.take();
+        self.theme_key = previous.theme_key.take();
+    }
+
+    pub(crate) fn refresh_status(&mut self) -> Result<()> {
+        let previous = self.status_bar.theme_inputs();
+        self.status_bar.update(std::time::Duration::ZERO);
+        if self.status_bar.theme_inputs() != previous {
+            self.refresh_theme()?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_theme(&mut self) -> Result<()> {
+        let theme = self.res.get::<Option<ThemeHandle>>().clone();
+        let Some(theme) = theme else {
+            self.theme_frame = None;
+            self.theme_key = None;
+            self.theme_dirty = false;
+            self.menu.set_visible_count_override(None)?;
+            return Ok(());
+        };
+        let status = self.status_bar.theme_inputs();
+        if let Some(selector) = &mut self.guide_selector {
+            selector.refresh_theme(status)?;
+            self.theme_frame = None;
+            self.theme_key = None;
+            self.theme_dirty = false;
+            return Ok(());
+        }
+        let count = theme_capacity(&theme, ScreenId::IngameMenu, Binding::Entries);
+        self.menu.set_visible_count_override(Some(count))?;
+        let first = self.menu.window_start();
+        let selected = self.menu.selected();
+        let locale = self.res.get::<Locale>();
+        let game = self.res.get::<GameInfo>();
+        let mut input = FrameInputs::new(ScreenId::IngameMenu);
+        input.text.insert(Binding::Title, game.name.clone());
+        let rows = self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(count)
+            .map(|(_, entry)| ThemeRow {
+                id: entry.theme_id().into(),
+                label: entry.as_str(&locale),
+                value: self.entry_value(*entry, &locale),
+                enabled: true,
+            })
+            .collect();
+        input.rows.insert(Binding::Entries, rows);
+        input.focus = Focus {
+            component: theme_component(&theme, ScreenId::IngameMenu, Binding::Entries),
+            item: self
+                .entries
+                .get(selected)
+                .map(|entry| entry.theme_id().into()),
+        };
+        input
+            .selected
+            .insert(Binding::Entries, self.entries[selected].theme_id().into());
+        input.text.insert(Binding::Subtitle, String::new());
+        input.hints = vec![
+            Hint {
+                button: "MENU".into(),
+                label: locale.t("ingame-menu-continue"),
+            },
+            Hint {
+                button: "A".into(),
+                label: locale.t("button-select"),
+            },
+            Hint {
+                button: "B".into(),
+                label: locale.t("button-back"),
+            },
+        ];
+        input.status = status;
+        let key = MenuFrameKey {
+            digest: theme.digest().into(),
+            generation: theme.generation(),
+            locale: locale.lang.to_string(),
+            game_path: game.path.clone(),
+            input,
+        };
+        drop(game);
+        drop(locale);
+        if self.theme_key.as_ref() == Some(&key) && self.theme_frame.is_some() {
+            let _phase = common::perf_trace::menu_phase("frame_cache_hit");
+            self.theme_dirty = true;
+            return Ok(());
+        }
+        self.theme_key = None;
+        #[cfg(test)]
+        {
+            self.theme_prepares += 1;
+        }
+        let _phase = common::perf_trace::menu_phase("frame_prepare");
+        self.theme_frame = Some(PreparedFrame::prepare_reusing(
+            theme,
+            &key.input,
+            self.theme_frame.take(),
+        )?);
+        self.theme_key = Some(key);
+        self.theme_dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn disable_theme(&mut self) {
+        self.theme_frame = None;
+        self.theme_key = None;
+        self.theme_dirty = false;
+        if let Err(error) = self.menu.set_visible_count_override(None) {
+            warn!("failed to reset Legacy menu viewport: {error:#}");
+        }
+        if let Some(selector) = &mut self.guide_selector {
+            selector.disable_theme();
+        }
+        self.name.set_should_draw();
+        self.status_bar.set_should_draw();
+        self.menu.set_should_draw();
+        self.image.set_should_draw();
+        self.button_hints.set_should_draw();
+    }
+
+    fn entry_value(&self, entry: MenuEntry, locale: &Locale) -> String {
+        let Some(info) = self.retroarch_info.as_ref() else {
+            return String::new();
+        };
+        if entry == MenuEntry::Continue && info.max_disk_slots > 1 {
+            let mut map = HashMap::new();
+            map.insert("disk".into(), (info.disk_slot + 1).into());
+            return locale.ta("ingame-menu-disk", &map);
+        }
+        if matches!(entry, MenuEntry::Save | MenuEntry::Load)
+            && let Some(slot) = info.state_slot
+        {
+            if slot == -1 {
+                return locale.t("ingame-menu-slot-auto");
+            }
+            let mut map = HashMap::new();
+            map.insert("slot".into(), slot.into());
+            return locale.ta("ingame-menu-slot", &map);
+        }
+        String::new()
     }
 
     async fn select_entry(&mut self, commands: Sender<Command>) -> Result<bool> {
@@ -291,6 +483,8 @@ where
                 commands.send(Command::Exit).await?;
             }
             MenuEntry::Reset => {
+                #[cfg(feature = "miyoo")]
+                common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Game);
                 RetroArchCommand::Unpause.send().await?;
                 RetroArchCommand::Reset.send().await?;
                 commands.send(Command::Exit).await?;
@@ -324,6 +518,8 @@ where
                 }
             }
             MenuEntry::Settings => {
+                #[cfg(feature = "miyoo")]
+                common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Game);
                 RetroArchCommand::Unpause.send().await?;
                 RetroArchCommand::MenuToggle.send().await?;
                 commands.send(Command::Exit).await?;
@@ -422,6 +618,16 @@ where
         display: &mut <DefaultPlatform as Platform>::Display,
         styles: &Stylesheet,
     ) -> Result<bool> {
+        if let Some(frame) = &self.theme_frame {
+            if !self.theme_dirty {
+                return Ok(false);
+            }
+            frame.paint(display);
+            self.theme_dirty = false;
+            return Ok(true);
+        }
+        let display_styles = styles.display_style();
+        let styles = &display_styles;
         let mut drawn = false;
 
         drawn |= self.name.should_draw() && self.name.draw(display, styles)?;
@@ -446,6 +652,9 @@ where
     }
 
     fn should_draw(&self) -> bool {
+        if self.theme_frame.is_some() {
+            return self.theme_dirty;
+        }
         self.name.should_draw()
             || self.status_bar.should_draw()
             || if let Some(selector) = &self.guide_selector {
@@ -458,6 +667,10 @@ where
     }
 
     fn set_should_draw(&mut self) {
+        if self.theme_frame.is_some() {
+            self.theme_dirty = true;
+            return;
+        }
         self.name.set_should_draw();
         self.status_bar.set_should_draw();
         if let Some(selector) = &mut self.guide_selector {
@@ -665,6 +878,18 @@ pub enum MenuEntry {
 }
 
 impl MenuEntry {
+    fn theme_id(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Save => "save",
+            Self::Load => "load",
+            Self::Reset => "reset",
+            Self::Guide => "guide",
+            Self::Settings => "settings",
+            Self::Quit => "quit",
+        }
+    }
+
     fn as_str(&self, locale: &Locale) -> String {
         match self {
             MenuEntry::Continue => locale.t("ingame-menu-continue"),
@@ -712,5 +937,576 @@ impl MenuEntry {
     fn index(&self, info: Option<&RetroArchInfo>, has_guides: bool) -> usize {
         let entries = MenuEntry::entries(info, has_guides);
         entries.iter().position(|e| e == self).unwrap_or(0)
+    }
+}
+
+fn theme_capacity(theme: &ThemeHandle, screen: ScreenId, binding: Binding) -> usize {
+    theme.pack().screens[&screen]
+        .components
+        .iter()
+        .find(|component| component.binding == Some(binding))
+        .and_then(|component| component.visible_count)
+        .unwrap_or(1)
+        .clamp(1, 64) as usize
+}
+
+fn theme_component(theme: &ThemeHandle, screen: ScreenId, binding: Binding) -> String {
+    theme.pack().screens[&screen]
+        .components
+        .iter()
+        .find(|component| component.binding == Some(binding))
+        .map(|component| component.id.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod theme_adapter_tests {
+    use super::*;
+    use common::{
+        constants::ALLIUM_FONTS_DIR,
+        geom::Size,
+        theme::{Boundary, ThemeRuntime},
+    };
+    use type_map::TypeMap;
+
+    #[derive(Clone)]
+    struct TestBattery;
+
+    impl Battery for TestBattery {
+        fn update(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn percentage(&self) -> i32 {
+            73
+        }
+
+        fn charging(&self) -> bool {
+            false
+        }
+    }
+
+    struct SlowBattery;
+    impl Battery for SlowBattery {
+        fn update(&mut self) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        }
+        fn percentage(&self) -> i32 {
+            73
+        }
+        fn charging(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    #[ignore = "host menu opening benchmark with injected 100 ms battery sample"]
+    fn perf5_host_menu_open_timing() {
+        let (theme, root) = orbit_handle();
+        for cached in [false, true] {
+            let cache = common::view::menu_status::MenuStatusCache::new(SlowBattery);
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let mut map = TypeMap::new();
+                map.insert(Stylesheet::load().unwrap());
+                map.insert(Locale::new("en-US"));
+                map.insert(Size { w: 640, h: 480 });
+                map.insert(GameInfo {
+                    name: "Kowai Shashin".into(),
+                    has_menu: true,
+                    ..Default::default()
+                });
+                map.insert(Some(theme.clone()));
+                if cached {
+                    map.insert(cache.clone());
+                }
+                let start = std::time::Instant::now();
+                let mut menu = IngameMenu::new(
+                    Rect::new(0, 0, 640, 480),
+                    IngameMenuState::default(),
+                    Resources::new(map),
+                    SlowBattery,
+                    None,
+                );
+                menu.refresh_theme().unwrap();
+                let mut platform = DefaultPlatform::new().unwrap();
+                let mut display = platform.display().unwrap();
+                menu.draw(&mut display, &Stylesheet::load().unwrap())
+                    .unwrap();
+                display.flush().unwrap();
+                samples.push(start.elapsed().as_micros());
+                if cached {
+                    cache.request_refresh();
+                }
+            }
+            println!(
+                "PERF5_HOST_MENU {}",
+                serde_json::json!({"cached": cached, "open_to_flush_us": samples, "injected_battery_ms": 100, "host_only": true})
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn perf6_resources(theme: ThemeHandle, clock: bool) -> Resources {
+        let mut map = TypeMap::new();
+        let mut styles = Stylesheet::load().unwrap();
+        styles.status_bar.show_clock = clock;
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(Size { w: 640, h: 480 });
+        map.insert(GameInfo {
+            name: "Kowai Shashin".into(),
+            has_menu: true,
+            ..Default::default()
+        });
+        map.insert(Some(theme));
+        map.insert(common::view::menu_status::MenuStatusCache::new(TestBattery));
+        Resources::new(map)
+    }
+
+    fn perf6_info() -> Option<RetroArchInfo> {
+        Some(RetroArchInfo {
+            max_disk_slots: 1,
+            disk_slot: 0,
+            state_slot: Some(0),
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "release host benchmark; real state file and six rows"]
+    async fn perf6_representative_host_open() {
+        let (theme, root) = orbit_handle();
+        let res = perf6_resources(theme, true);
+        let rect = Rect::new(0, 0, 640, 480);
+        let mut previous = IngameMenu::new(
+            rect,
+            IngameMenuState::default(),
+            res.clone(),
+            TestBattery,
+            perf6_info(),
+        );
+        previous.save().unwrap();
+        previous.refresh_theme().unwrap();
+        let mut platform = DefaultPlatform::new().unwrap();
+        let mut display = platform.display().unwrap();
+        let styles = Stylesheet::load().unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let mut menu = IngameMenu::load_or_new(rect, res.clone(), TestBattery, perf6_info())
+                .await
+                .unwrap();
+            assert_eq!(menu.entries.len(), 6);
+            menu.reuse_theme_frame(&mut previous);
+            menu.refresh_theme().unwrap();
+            menu.draw(&mut display, &styles).unwrap();
+            display.flush().unwrap();
+            samples.push(start.elapsed().as_micros());
+            previous = menu;
+        }
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        println!(
+            "PERF6_HOST {}",
+            serde_json::json!({"samples_us":samples,"median_us":sorted[2],"rows":6,"real_state_load":true,"release":!cfg!(debug_assertions),"mock_capture_and_flush":true})
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn perf6_frame_parity_each_selection() {
+        let (theme, root) = orbit_handle();
+        let mut hashes = Vec::new();
+        for six_rows in [false, true] {
+            let res = perf6_resources(theme.clone(), false);
+            let mut menu = IngameMenu::new(
+                Rect::new(0, 0, 640, 480),
+                IngameMenuState::default(),
+                res,
+                TestBattery,
+                if six_rows { perf6_info() } else { None },
+            );
+            for selected in 0..menu.entries.len() {
+                menu.menu.select(selected);
+                menu.refresh_theme().unwrap();
+                let bytes = menu.theme_frame.as_ref().unwrap().pixels().data();
+                hashes.push(serde_json::json!({"rows":menu.entries.len(),"selection":selected,"sha256":Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()}));
+            }
+        }
+        let result = serde_json::to_string_pretty(&hashes).unwrap();
+        if let Ok(path) = std::env::var("PERF6_FRAME_HASHES") {
+            fs::write(path, &result).unwrap();
+        }
+        println!("PERF6_FRAMES {result}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn perf6_cached_frame_invalidates_and_matches_uncached_pixels() {
+        let (theme, root) = orbit_handle();
+        let res = perf6_resources(theme.clone(), false);
+        let rect = Rect::new(0, 0, 640, 480);
+        let mut menu = IngameMenu::new(
+            rect,
+            IngameMenuState::default(),
+            res.clone(),
+            TestBattery,
+            perf6_info(),
+        );
+        menu.refresh_theme().unwrap();
+        menu.refresh_theme().unwrap();
+        assert_eq!(menu.theme_prepares, 1);
+        for change in 0..6 {
+            match change {
+                0 => menu.retroarch_info.as_mut().unwrap().state_slot = Some(7),
+                1 => menu.retroarch_info.as_mut().unwrap().max_disk_slots = 3,
+                2 => menu.menu.select(2),
+                3 => res.insert(Locale::new("pt-BR")),
+                4 => res.insert(GameInfo {
+                    name: "Fresh title".into(),
+                    ..Default::default()
+                }),
+                _ => {
+                    let bank = common::theme::FontBank::bind(&ALLIUM_FONTS_DIR).unwrap();
+                    let base = common::theme::runtime::ThemeSnapshot::builtin("orbit").unwrap();
+                    res.insert(Some(ThemeHandle::prepare(base, &bank, 999).unwrap()));
+                }
+            }
+            menu.refresh_theme().unwrap();
+            assert_eq!(menu.theme_prepares, change + 2);
+            let cached = menu.theme_frame.as_ref().unwrap().pixels().data().to_vec();
+            let key = menu.theme_key.as_ref().unwrap();
+            let current_theme = res.get::<Option<ThemeHandle>>().clone().unwrap();
+            let reference = PreparedFrame::prepare(current_theme, &key.input).unwrap();
+            assert_eq!(
+                cached,
+                reference.pixels().data(),
+                "invalidated frame {change}"
+            );
+            menu.refresh_theme().unwrap();
+            assert_eq!(menu.theme_prepares, change + 2);
+        }
+        menu.retroarch_info = None;
+        menu.entries = MenuEntry::entries(None, false);
+        menu.menu.select(0);
+        menu.refresh_theme().unwrap();
+        assert_eq!(
+            menu.theme_key.as_ref().unwrap().input.rows[&Binding::Entries].len(),
+            2
+        );
+        menu.disable_theme();
+        assert!(menu.theme_key.is_none() && menu.theme_frame.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn perf5_quit_keeps_screenshot_quit_exit_order() {
+        let mut map = TypeMap::new();
+        map.insert(Stylesheet::load().unwrap());
+        map.insert(Locale::new("en-US"));
+        map.insert(Size { w: 640, h: 480 });
+        map.insert(GameInfo {
+            path: std::env::current_dir().unwrap(),
+            ..Default::default()
+        });
+        map.insert(Option::<ThemeHandle>::None);
+        let mut menu = IngameMenu::new(
+            Rect::new(0, 0, 640, 480),
+            IngameMenuState::default(),
+            Resources::new(map),
+            TestBattery,
+            Some(RetroArchInfo {
+                max_disk_slots: 1,
+                disk_slot: 0,
+                state_slot: Some(0),
+            }),
+        );
+        menu.menu.select(
+            menu.entries
+                .iter()
+                .position(|e| *e == MenuEntry::Quit)
+                .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        menu.select_entry(tx).await.unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::SaveStateScreenshot { slot: -1, .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::RetroArchCommand(RetroArchCommand::Quit)
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), Command::Exit));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn orbit_handle() -> (ThemeHandle, PathBuf) {
+        let root = std::env::current_dir().unwrap().join("out").join(format!(
+            "allium-menu-theme-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let mut runtime =
+            ThemeRuntime::bind(&state, &root.join("missing-themes"), &ALLIUM_FONTS_DIR).unwrap();
+        runtime.choose("orbit").unwrap();
+        (
+            runtime.activate(Boundary::MenuOpening).snapshot.unwrap(),
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn ux4_menu_shows_all_actions_without_scroll_and_reuses_frame() {
+        let (builtin, root) = orbit_handle();
+        let bank = common::theme::FontBank::bind(&ALLIUM_FONTS_DIR).unwrap();
+        let snapshot = common::theme::runtime::ThemeSnapshot::load(std::path::Path::new(
+            &std::env::var("ALLIUM_UX4_PACK").unwrap(),
+        ))
+        .unwrap();
+        let external = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+        for theme in [builtin, external] {
+            for guide in [false, true] {
+                let mut map = TypeMap::new();
+                map.insert(Stylesheet::load().unwrap());
+                map.insert(Locale::new("en-US"));
+                map.insert(Size { w: 640, h: 480 });
+                map.insert(common::database::Database::in_memory().unwrap());
+                map.insert(GameInfo {
+                    name: "Kowai Shashin".into(),
+                    has_menu: true,
+                    guides: if guide {
+                        vec![root.join("Guide.txt")]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                });
+                map.insert(Some(theme.clone()));
+                let res = Resources::new(map);
+                let info = || {
+                    Some(RetroArchInfo {
+                        max_disk_slots: 1,
+                        disk_slot: 0,
+                        state_slot: Some(0),
+                    })
+                };
+                let mut menu = IngameMenu::new(
+                    Rect::new(0, 0, 640, 480),
+                    IngameMenuState::default(),
+                    res.clone(),
+                    TestBattery,
+                    info(),
+                );
+                menu.refresh_theme().unwrap();
+                let expected = if guide { 7 } else { 6 };
+                assert_eq!(menu.entries.len(), expected);
+                let frame = menu.theme_frame.as_ref().unwrap();
+                assert_eq!(
+                    frame
+                        .targets
+                        .iter()
+                        .filter(|t| t.component == "rows")
+                        .count(),
+                    expected
+                );
+                let storage = frame.pixels().data().as_ptr();
+                let (tx, _) = tokio::sync::mpsc::channel(16);
+                for _ in 1..expected {
+                    menu.handle_key_event(
+                        KeyEvent::Pressed(Key::Down),
+                        tx.clone(),
+                        &mut VecDeque::new(),
+                    )
+                    .await
+                    .unwrap();
+                    menu.refresh_theme().unwrap();
+                    assert_eq!(menu.menu.window_start(), 0);
+                    assert_eq!(
+                        menu.theme_frame.as_ref().unwrap().pixels().data().as_ptr(),
+                        storage
+                    );
+                }
+                if let Ok(proof) = std::env::var("ALLIUM_ORBIT_PROOF_DIR") {
+                    fs::create_dir_all(&proof).unwrap();
+                    menu.theme_frame
+                        .as_ref()
+                        .unwrap()
+                        .pixels()
+                        .save_png(std::path::Path::new(&proof).join(format!(
+                            "{}-ingame-{}-actions.png",
+                            theme.pack().id,
+                            expected
+                        )))
+                        .unwrap();
+                }
+                let mut next = IngameMenu::new(
+                    Rect::new(0, 0, 640, 480),
+                    IngameMenuState::default(),
+                    res,
+                    TestBattery,
+                    info(),
+                );
+                next.reuse_theme_frame(&mut menu);
+                next.refresh_theme().unwrap();
+                assert_eq!(
+                    next.theme_frame.as_ref().unwrap().pixels().data().as_ptr(),
+                    storage
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn themed_menu_renders_controller_rows_and_b_still_exits() {
+        let (theme, root) = orbit_handle();
+        let mut map = TypeMap::new();
+        map.insert(Stylesheet::load().unwrap());
+        map.insert(Locale::new("en-US"));
+        map.insert(Size { w: 640, h: 480 });
+        map.insert(common::database::Database::in_memory().unwrap());
+        map.insert(GameInfo {
+            name: "Controller Truth".into(),
+            has_menu: true,
+            ..Default::default()
+        });
+        map.insert(Some(theme));
+        let res = Resources::new(map);
+        let mut menu = IngameMenu::new(
+            Rect::new(0, 0, 640, 480),
+            IngameMenuState::default(),
+            res,
+            TestBattery,
+            None,
+        );
+        menu.refresh_theme().unwrap();
+
+        let frame = menu.theme_frame.as_ref().expect("themed frame");
+        assert_eq!(frame.pixels().width(), 640);
+        assert_eq!(frame.pixels().height(), 480);
+        assert!(frame.pixels().data().iter().any(|byte| *byte != 0));
+        if let Ok(proof) = std::env::var("ALLIUM_ORBIT_PROOF_DIR") {
+            fs::create_dir_all(&proof).unwrap();
+            frame
+                .pixels()
+                .save_png(PathBuf::from(&proof).join("native-orbit-ingame-menu.png"))
+                .unwrap();
+        }
+
+        let guide_a = root.join("guide-a.txt");
+        let guide_b = root.join("guide-b.txt");
+        fs::write(&guide_a, "Guide A").unwrap();
+        fs::write(&guide_b, "Guide B").unwrap();
+        menu.guide_selector = Some(GuideSelector::new(
+            Rect::new(0, 0, 640, 430),
+            menu.res.clone(),
+            vec![guide_a, guide_b],
+            1,
+            false,
+        ));
+        menu.refresh_theme().unwrap();
+        let guide_frame = menu
+            .guide_selector
+            .as_ref()
+            .and_then(GuideSelector::prepared_theme_frame)
+            .expect("themed guide frame");
+        assert!(guide_frame.pixels().data().iter().any(|byte| *byte != 0));
+        if let Ok(proof) = std::env::var("ALLIUM_ORBIT_PROOF_DIR") {
+            guide_frame
+                .pixels()
+                .save_png(PathBuf::from(proof).join("native-orbit-guide-selector.png"))
+                .unwrap();
+        }
+        menu.guide_selector = None;
+        menu.refresh_theme().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut bubble = VecDeque::new();
+        assert!(
+            !menu
+                .handle_key_event(KeyEvent::Pressed(Key::B), tx, &mut bubble)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(rx.recv().await, Some(Command::Exit)));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_prepare_failure_falls_back_after_guards_and_menu_still_exits() {
+        let (theme, root) = orbit_handle();
+        let guide = root.join("nested-guide.txt");
+        fs::write(&guide, "nested guide").unwrap();
+        let mut map = TypeMap::new();
+        map.insert(Stylesheet::load().unwrap());
+        map.insert(Locale::new("en-US"));
+        map.insert(Size { w: 640, h: 480 });
+        map.insert(common::database::Database::in_memory().unwrap());
+        map.insert(GameInfo {
+            name: "Fallback Fixture".into(),
+            guides: vec![guide.clone()],
+            has_menu: true,
+            ..Default::default()
+        });
+        map.insert(Some(theme));
+        let res = Resources::new(map);
+
+        // Nested construction under an ancestor resource borrow must not prepare or mutate the
+        // shared theme. Preparation is owned by the outer menu boundary after guards are gone.
+        let locale_guard = res.get::<Locale>();
+        let selector = GuideSelector::new(
+            Rect::new(0, 40, 640, 400),
+            res.clone(),
+            vec![guide],
+            0,
+            true,
+        );
+        assert!(res.get::<Option<ThemeHandle>>().is_some());
+        drop(locale_guard);
+
+        let mut menu = IngameMenu::new(
+            Rect::new(0, 0, 640, 480),
+            IngameMenuState::default(),
+            res.clone(),
+            TestBattery,
+            None,
+        );
+        menu.guide_selector = Some(selector);
+        menu.refresh_theme().unwrap();
+        menu.guide_selector
+            .as_mut()
+            .and_then(GuideSelector::text_reader_mut)
+            .unwrap()
+            .fail_next_theme_prepare();
+        assert!(menu.refresh_theme().is_err());
+
+        // AlliumMenu performs these operations in this order at the owning safe boundary.
+        res.insert(Option::<ThemeHandle>::None);
+        menu.disable_theme();
+        assert!(res.get::<Option<ThemeHandle>>().is_none());
+        assert!(
+            menu.guide_selector
+                .as_ref()
+                .unwrap()
+                .theme_is_disabled_recursively()
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let mut bubble = VecDeque::new();
+        assert!(
+            menu.handle_key_event(KeyEvent::Pressed(Key::Menu), tx, &mut bubble)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(rx.recv().await, Some(Command::Exit)));
+        fs::remove_dir_all(root).unwrap();
     }
 }

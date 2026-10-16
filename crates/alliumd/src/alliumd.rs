@@ -6,22 +6,23 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use allium_menu::{AlliumMenu, RetroArchInfo};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use common::battery::Battery;
 use common::constants::{
-    ALLIUM_GAME_INFO, ALLIUM_LAUNCHER, ALLIUM_SD_ROOT, ALLIUM_VERSION, ALLIUMD_STATE,
-    BATTERY_SHUTDOWN_THRESHOLD, BATTERY_UPDATE_INTERVAL, BATTERY_WARNING_THRESHOLD, IDLE_TIMEOUT,
-    MAX_BRIGHTNESS, MAX_VOLUME,
+    ALLIUM_BASE_DIR, ALLIUM_FONTS_DIR, ALLIUM_GAME_INFO, ALLIUM_LAUNCHER, ALLIUM_SD_ROOT,
+    ALLIUM_THEMES_DIR, ALLIUM_VERSION, ALLIUMD_STATE, BATTERY_SHUTDOWN_THRESHOLD,
+    BATTERY_UPDATE_INTERVAL, BATTERY_WARNING_THRESHOLD, IDLE_TIMEOUT, MAX_BRIGHTNESS, MAX_VOLUME,
 };
 use common::display::settings::DisplaySettings;
 use common::locale::{Locale, LocaleSettings};
 use common::power::{PowerButtonAction, PowerSettings, VolumeOnStartup};
 use common::retroarch::RetroArchCommand;
 use common::stylesheet::Stylesheet;
+use common::theme::{Boundary, ThemeHandle, ThemeRuntime};
 use common::wifi::WiFiSettings;
 use enum_map::EnumMap;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
@@ -45,37 +46,84 @@ pub struct AlliumDState {
     brightness: u8,
 }
 
+struct MenuSession {
+    info: Option<RetroArchInfo>,
+    theme: Option<ThemeHandle>,
+    game_info: GameInfo,
+    capture_deadline: Option<Instant>,
+    trace: allium_menu::open_trace::OpenTrace,
+}
+
+enum MenuRequest {
+    Open(MenuSession),
+    Prewarm,
+}
+
 /// Handle to the persistent menu thread
 struct MenuHandle {
-    tx: mpsc::Sender<Option<RetroArchInfo>>,
+    tx: mpsc::Sender<MenuRequest>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     _handle: JoinHandle<Result<()>>,
 }
 
 impl MenuHandle {
     fn new(styles: Stylesheet) -> Self {
-        let (tx, rx) = mpsc::channel::<Option<RetroArchInfo>>();
+        let (tx, rx) = mpsc::channel::<MenuRequest>();
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let rt = tokio::runtime::Handle::current();
 
         let handle = std::thread::spawn(move || -> Result<()> {
-            rt.block_on(async {
-                let platform = common::platform::DefaultPlatform::new()?;
-                let mut app = AlliumMenu::new(platform, styles).await?;
+            let result = rt.block_on(async {
+                let platform = common::platform::DefaultPlatform::new()
+                    .context("initializing menu platform")?;
+                let mut app = AlliumMenu::new(platform, styles)
+                    .await
+                    .context("initializing menu app")?;
 
-                while let Ok(info) = rx.recv() {
-                    if let Err(e) = app.prepare(info).await {
-                        log::error!("menu prepare failed: {:?}", e);
-                    } else if let Err(e) = app.run_event_loop().await {
-                        log::error!("menu run failed: {:?}", e);
+                let mut prewarmer = MenuPrewarmer::new();
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(MenuRequest::Open(session)) => {
+                            #[cfg(feature = "miyoo")]
+                            let foreground = common::platform::cpu_tuning::foreground();
+                            prewarmer.info = session.info.clone();
+                            app.set_open_trace(session.trace);
+                            let prepared = {
+                                let _phase = session.trace.phase("menu_prepare");
+                                app.prepare(session.info, session.theme, session.game_info)
+                                    .await
+                            };
+                            if let Err(e) = prepared {
+                                log::error!("menu prepare failed: {:?}", e);
+                            } else if let Err(e) = app
+                                .run_event_loop_after_settle(session.capture_deadline)
+                                .await
+                            {
+                                log::error!("menu run failed: {:?}", e);
+                            }
+                            if let Err(e) = app.save() {
+                                log::error!("menu save failed: {:?}", e);
+                            }
+                            #[cfg(feature = "miyoo")]
+                            drop(foreground);
+                            let _ = done_tx.send(());
+                        }
+                        Ok(MenuRequest::Prewarm) => {
+                            let _phase = common::perf_trace::menu_phase("press_prewarm");
+                            prewarmer.prepare(&mut app, true).await;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            prewarmer.prepare(&mut app, false).await
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
-                    if let Err(e) = app.save() {
-                        log::error!("menu save failed: {:?}", e);
-                    }
-                    let _ = done_tx.send(());
                 }
                 Ok(())
-            })
+            });
+            if let Err(error) = &result {
+                error!("menu thread failed: {error:#}");
+            }
+            result
         });
 
         MenuHandle {
@@ -86,11 +134,144 @@ impl MenuHandle {
     }
 }
 
+struct MenuPrewarmer {
+    game: Option<(std::path::PathBuf, i64)>,
+    info: Option<RetroArchInfo>,
+    runtime: Option<ThemeRuntime>,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl MenuPrewarmer {
+    fn new() -> Self {
+        Self {
+            game: None,
+            info: None,
+            modified: None,
+            runtime: ThemeRuntime::bind(
+                &ALLIUM_BASE_DIR.join("state"),
+                &ALLIUM_THEMES_DIR,
+                &ALLIUM_FONTS_DIR,
+            )
+            .ok(),
+        }
+    }
+
+    async fn prepare(&mut self, app: &mut AlliumMenu<DefaultPlatform>, on_press: bool) {
+        let modified = fs::metadata(ALLIUM_GAME_INFO.as_path())
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if !on_press && modified == self.modified && self.game.is_some() {
+            return;
+        }
+        self.modified = modified;
+        let Some(game) = fs::read(ALLIUM_GAME_INFO.as_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<GameInfo>(&bytes).ok())
+            .filter(|game| game.has_menu)
+        else {
+            self.game = None;
+            self.info = None;
+            return;
+        };
+        let _phase = common::perf_trace::menu_phase("game_prewarm");
+        let identity = (game.path.clone(), game.start_time.timestamp_millis());
+        let changed = self.game.as_ref() != Some(&identity);
+        if changed {
+            // Only offscreen pixels use this seed; release validates every value with GET_INFO.
+            self.info = Some(RetroArchInfo {
+                max_disk_slots: 1,
+                disk_slot: 0,
+                state_slot: Some(0),
+            });
+        }
+        self.game = Some(identity);
+        let theme = self
+            .runtime
+            .as_mut()
+            .and_then(|runtime| runtime.activate(Boundary::MenuOpening).snapshot);
+        if let Err(error) = app.prewarm(self.info.clone(), theme, game).await {
+            warn!("menu prewarm failed: {error:#}");
+        }
+    }
+}
+
+fn menu_press_is_unmodified(keys: &EnumMap<Key, bool>) -> bool {
+    keys.iter()
+        .all(|(key, pressed)| key == Key::Menu || !pressed)
+}
+
+fn parse_retroarch_info(reply: String) -> RetroArchInfo {
+    let mut fields = reply.split_ascii_whitespace().skip(1);
+    RetroArchInfo {
+        max_disk_slots: fields.next().map_or(0, |s| s.parse().unwrap_or(0)),
+        disk_slot: fields.next().map_or(0, |s| s.parse().unwrap_or(0)),
+        state_slot: fields.next().map(|s| s.parse().unwrap_or(0)),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BatteryReading {
+    percentage: i32,
+    charging: bool,
+}
+
+impl BatteryReading {
+    fn from_battery(battery: &impl Battery) -> Self {
+        Self {
+            percentage: battery.percentage(),
+            charging: battery.charging(),
+        }
+    }
+    fn percentage(self) -> i32 {
+        self.percentage
+    }
+    fn charging(self) -> bool {
+        self.charging
+    }
+}
+
+struct BatteryMonitor {
+    requests: mpsc::SyncSender<()>,
+    readings: tokio::sync::mpsc::UnboundedReceiver<BatteryReading>,
+    _thread: JoinHandle<()>,
+}
+
+impl BatteryMonitor {
+    fn new(mut battery: impl Battery + 'static) -> Result<Self> {
+        let (requests, receive) = mpsc::sync_channel(1);
+        let (send, readings) = tokio::sync::mpsc::unbounded_channel();
+        let thread = std::thread::Builder::new()
+            .name("daemon-battery".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                while receive.recv().is_ok() {
+                    if let Err(error) = battery.update() {
+                        error!("failed to update battery: {error}");
+                    }
+                    if send.send(BatteryReading::from_battery(&battery)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests,
+            readings,
+            _thread: thread,
+        })
+    }
+
+    fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+}
+
 pub struct AlliumD<P: Platform> {
     platform: P,
     main: Child,
     menu: MenuHandle,
     menu_open: bool,
+    menu_available: bool,
+    theme_runtime: Option<ThemeRuntime>,
     keys: EnumMap<Key, bool>,
     is_menu_pressed_alone: bool,
     is_terminating: bool,
@@ -163,10 +344,12 @@ async fn spawn_main() -> Result<Child> {
             debug!("found game info, resuming game");
             game_info.start_time = Utc::now();
             game_info.save()?;
+            common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Game);
             game_info.command().into()
         }
         None => {
             debug!("no game info found, launching launcher");
+            common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Frontend);
             use common::constants::ALLIUM_LAUNCHER;
             Command::new(ALLIUM_LAUNCHER.as_path())
         }
@@ -185,6 +368,10 @@ impl AlliumD<DefaultPlatform> {
         #[cfg(feature = "miyoo")]
         common::platform::miyoo::try_fix_resolution().await?;
 
+        #[cfg(feature = "miyoo")]
+        common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Frontend);
+
+        common::perf_trace::initialize();
         let mut platform = DefaultPlatform::new()?;
         let mut state = AlliumDState::load()?;
 
@@ -242,6 +429,14 @@ impl AlliumD<DefaultPlatform> {
         // One load per process: font data is Arc'd, so clones share it
         let styles = Stylesheet::load()?;
 
+        let theme_runtime = ThemeRuntime::bind(
+            &ALLIUM_BASE_DIR.join("state"),
+            &ALLIUM_THEMES_DIR,
+            &ALLIUM_FONTS_DIR,
+        )
+        .map_err(|error| warn!("Theme runtime unavailable, using Legacy menu/OSD: {error:#}"))
+        .ok();
+
         // Spawn the persistent menu thread at startup
         let menu = MenuHandle::new(styles.clone());
 
@@ -252,6 +447,8 @@ impl AlliumD<DefaultPlatform> {
             main,
             menu,
             menu_open: false,
+            menu_available: true,
+            theme_runtime,
             keys,
             is_menu_pressed_alone: false,
             is_terminating: false,
@@ -267,7 +464,9 @@ impl AlliumD<DefaultPlatform> {
 
         if DefaultPlatform::has_wifi() {
             info!("wifi detected, loading wifi settings");
-            WiFiSettings::load()?.init()?;
+            if let Err(error) = WiFiSettings::load()?.init_sequenced().await {
+                error!("WiFi/SSH startup failed; keeping daemon supervision active: {error:#}");
+            }
         }
 
         info!("starting event loop");
@@ -276,75 +475,65 @@ impl AlliumD<DefaultPlatform> {
             let mut sigint = tokio::signal::unix::signal(SignalKind::interrupt())?;
             let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
 
-            let mut battery_interval = Instant::now();
-
             // If battery is charging, suspend.
             let mut battery = self.platform.battery()?;
             battery.update()?;
-            if battery.charging() {
-                self.handle_charging().await?;
-            }
+            charging_startup(battery.charging(), Path::new("/tmp/stay_awake"), || {
+                self.handle_charging()
+            })
+            .await?;
 
+            let mut latest_battery = BatteryReading::from_battery(&battery);
+            let mut battery_monitor = BatteryMonitor::new(battery)?;
+            let mut battery_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + BATTERY_UPDATE_INTERVAL,
+                BATTERY_UPDATE_INTERVAL,
+            );
+            battery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut battery_led_task = None;
+            let mut idle_since = Instant::now();
 
             loop {
-                if battery_interval.elapsed() >= BATTERY_UPDATE_INTERVAL {
-                    battery_interval = Instant::now();
-                    trace!("updating battery");
-                    if let Err(e) = battery.update() {
-                        error!("failed to update battery: {}", e);
-                    }
-
-                    if battery.percentage() <= BATTERY_WARNING_THRESHOLD && !battery.charging() {
-                        if battery_led_task.is_none() {
-                            warn!(
-                                "battery is low ({}%), consider charging soon",
-                                battery.percentage()
-                            );
-
-                            battery_led_task = Some(tokio::spawn(async {
-                                loop {
-                                    <DefaultPlatform as Platform>::Battery::update_led(true);
-                                    tokio::time::sleep(std::time::Duration::from_millis(1750))
-                                        .await;
-                                    <DefaultPlatform as Platform>::Battery::update_led(false);
-                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                }
-                            }));
-                        }
-                    } else if let Some(task) = battery_led_task.take() {
-                        info!("aborting battery LED blink task");
-                        task.abort();
-                        <DefaultPlatform as Platform>::Battery::update_led(false);
-                    }
-
-                    if battery.percentage() <= BATTERY_SHUTDOWN_THRESHOLD && !battery.charging() {
-                        warn!("battery is low, shutting down");
-                        self.handle_quit().await?;
-                    }
-                }
-
                 let auto_sleep_duration = match self.power_settings.auto_sleep_duration_minutes {
                     0 => std::time::Duration::MAX, // disabled
                     t => std::time::Duration::new(t as u64 * 60, 0),
                 };
                 tokio::select! {
+                    _ = battery_interval.tick() => battery_monitor.request(),
+                    Some(reading) = battery_monitor.readings.recv() => {
+                        latest_battery = reading;
+                        self.handle_battery_reading(reading, &mut battery_led_task).await?;
+                    }
                     key_event = self.platform.poll() => {
                         self.handle_key_event(key_event).await?;
+                        idle_since = Instant::now();
                     }
                     _ = sleep_until_wake(self.osd.next_wake()) => {
                         if let Err(e) = self.osd.tick() {
                             error!("failed to update OSD: {}", e);
                         }
+                        idle_since = Instant::now();
                     }
-                    _ = self.menu.done_rx.recv() => {
-                        info!("menu finished, resuming game");
-                        self.menu_open = false;
+                    completion = self.menu.done_rx.recv(), if self.menu_available => {
+                        idle_since = Instant::now();
                         self.is_menu_pressed_alone = false;
-                        RetroArchCommand::Unpause.send().await?;
+                        match completion {
+                            Some(()) => {
+                                info!("menu finished, resuming game");
+                                self.menu_open = false;
+                                RetroArchCommand::Unpause.send().await?;
+                            }
+                            None => {
+                                error!("menu thread unavailable; disabling menu completion channel");
+                                if disable_menu(&mut self.menu_available, &mut self.menu_open) {
+                                    RetroArchCommand::Unpause.send().await?;
+                                }
+                            }
+                        }
                     }
-                    _ = tokio::time::sleep(auto_sleep_duration) => {
-                        if !self.power_settings.auto_sleep_when_charging && battery.charging() {
+                    _ = tokio::time::sleep(auto_sleep_duration.saturating_sub(idle_since.elapsed())) => {
+                        idle_since = Instant::now();
+                        if !self.power_settings.auto_sleep_when_charging && latest_battery.charging() {
                             info!("battery charging, don't auto sleep");
                         } else if Path::new("/tmp/stay_awake").exists() {
                             info!("/tmp/stay_awake exists, don't auto sleep");
@@ -354,6 +543,7 @@ impl AlliumD<DefaultPlatform> {
                         }
                     }
                     _ = self.main.wait() => {
+                        idle_since = Instant::now();
                         if !self.is_terminating {
                             info!("main process terminated, recording play time");
                             self.update_play_time()?;
@@ -382,7 +572,43 @@ impl AlliumD<DefaultPlatform> {
         }
     }
 
+    async fn handle_battery_reading(
+        &mut self,
+        reading: BatteryReading,
+        battery_led_task: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<()> {
+        if reading.percentage() <= BATTERY_WARNING_THRESHOLD && !reading.charging() {
+            if battery_led_task.is_none() {
+                warn!(
+                    "battery is low ({}%), consider charging soon",
+                    reading.percentage()
+                );
+
+                *battery_led_task = Some(tokio::spawn(async {
+                    loop {
+                        <DefaultPlatform as Platform>::Battery::update_led(true);
+                        tokio::time::sleep(std::time::Duration::from_millis(1750)).await;
+                        <DefaultPlatform as Platform>::Battery::update_led(false);
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }));
+            }
+        } else if let Some(task) = battery_led_task.take() {
+            info!("aborting battery LED blink task");
+            task.abort();
+            <DefaultPlatform as Platform>::Battery::update_led(false);
+        }
+
+        if reading.percentage() <= BATTERY_SHUTDOWN_THRESHOLD && !reading.charging() {
+            warn!("battery is low, shutting down");
+            self.handle_quit().await?;
+        }
+        Ok(())
+    }
+
     async fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<()> {
+        let release_trace = matches!(key_event, KeyEvent::Released(Key::Menu))
+            .then(allium_menu::open_trace::OpenTrace::start);
         debug!(
             "main: {:?}, ingame: {}, key_event: {:?}",
             self.main.id(),
@@ -393,7 +619,10 @@ impl AlliumD<DefaultPlatform> {
         // Handle menu key
         match key_event {
             KeyEvent::Pressed(Key::Menu) => {
-                self.is_menu_pressed_alone = true;
+                self.is_menu_pressed_alone = menu_press_is_unmodified(&self.keys);
+                if self.is_menu_pressed_alone && self.menu_available && !self.menu_open {
+                    let _ = self.menu.tx.send(MenuRequest::Prewarm);
+                }
             }
             KeyEvent::Pressed(_) => {
                 self.is_menu_pressed_alone = false;
@@ -479,39 +708,79 @@ impl AlliumD<DefaultPlatform> {
                     }
                 }
                 KeyEvent::Released(Key::Menu) if self.is_menu_pressed_alone => {
-                    if !self.menu_open
+                    let open_trace = release_trace.expect("MENU release trace");
+                    let _release = open_trace.phase("release");
+                    if self.menu_available
+                        && !self.menu_open
                         && self.is_ingame()
                         && self
                             .keys
                             .iter()
                             .all(|(k, pressed)| k == Key::Menu || !pressed)
-                        && let Some(game_info) = GameInfo::load()?
+                        && let Some(game_info) = {
+                            let _phase = common::perf_trace::menu_phase("game_info");
+                            GameInfo::read()?
+                        }
                         && game_info.has_menu
                     {
-                        let info = RetroArchCommand::GetInfo.send_recv().await?.map(|ret| {
-                            let mut rets = ret.split_ascii_whitespace().skip(1);
-                            let max_disk_slots = rets.next().map_or(0, |s| s.parse().unwrap_or(0));
-                            let disk_slot = rets.next().map_or(0, |s| s.parse().unwrap_or(0));
-                            let state_slot = rets.next().map(|s| s.parse().unwrap_or(0));
-                            RetroArchInfo {
-                                max_disk_slots,
-                                disk_slot,
-                                state_slot,
-                            }
-                        });
+                        let get_info_phase = open_trace.phase("get_info");
+                        let info = RetroArchCommand::GetInfo
+                            .send_recv()
+                            .await?
+                            .map(parse_retroarch_info);
 
-                        if info.is_some() {
-                            RetroArchCommand::Pause.send().await?;
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        drop(get_info_phase);
+                        // Stop the overlay writer before starting the pause settle window.
+                        {
+                            let _phase = open_trace.phase("osd_stop_join");
+                            self.hide_osd();
                         }
+                        let paused = info.is_some();
+                        let capture_deadline = if paused {
+                            let _phase = open_trace.phase("pause");
+                            RetroArchCommand::Pause.send().await?;
+                            Some(Instant::now() + std::time::Duration::from_millis(50))
+                        } else {
+                            None
+                        };
 
-                        // The plate would keep re-flushing over the menu until its timeout
-                        self.hide_osd();
-
+                        let theme = self.theme_runtime.as_mut().and_then(|runtime| {
+                            let _phase = open_trace.phase("theme_activation");
+                            let locale =
+                                fs::read(common::constants::ALLIUM_LOCALE_SETTINGS.as_path())
+                                    .ok()
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<LocaleSettings>(&bytes).ok()
+                                    })
+                                    .unwrap_or_default();
+                            let activation = runtime.activate_menu(&locale.lang);
+                            if let Some(message) = activation.diagnostic_once {
+                                warn!("{message}");
+                            }
+                            activation.snapshot
+                        });
                         self.menu_open = true;
-                        if self.menu.tx.send(info).is_err() {
+                        open_trace.event("open_dispatch", None);
+                        if self
+                            .menu
+                            .tx
+                            .send(MenuRequest::Open(MenuSession {
+                                info,
+                                theme,
+                                game_info,
+                                capture_deadline,
+                                trace: open_trace,
+                            }))
+                            .is_err()
+                        {
                             error!("failed to send to menu thread");
-                            self.menu_open = false;
+                            if failed_menu_send(
+                                &mut self.menu_available,
+                                &mut self.menu_open,
+                                paused,
+                            ) {
+                                RetroArchCommand::Unpause.send().await?;
+                            }
                         }
                     }
                     self.is_menu_pressed_alone = false;
@@ -556,6 +825,7 @@ impl AlliumD<DefaultPlatform> {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     battery.update()?;
                     if !battery.charging() {
+                        allium_menu::open_trace::drain_on_shutdown();
                         self.platform.shutdown()?;
                     }
                 }
@@ -627,6 +897,7 @@ impl AlliumD<DefaultPlatform> {
             .await?;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
+        allium_menu::open_trace::drain_on_shutdown();
         self.platform.shutdown()?;
 
         Ok(())
@@ -690,6 +961,7 @@ impl AlliumD<DefaultPlatform> {
         self.show_osd(
             OsdKind::Volume,
             self.state.volume as f32 / MAX_VOLUME as f32,
+            add.signum(),
         );
         self.platform.set_volume(self.state.volume)?;
         Ok(())
@@ -703,18 +975,40 @@ impl AlliumD<DefaultPlatform> {
         self.show_osd(
             OsdKind::Brightness,
             self.state.brightness as f32 / MAX_BRIGHTNESS as f32,
+            i32::from(add.signum()),
         );
         self.platform.set_brightness(self.state.brightness)?;
         Ok(())
     }
 
-    fn show_osd(&mut self, kind: OsdKind, fraction: f32) {
+    fn show_osd(&mut self, kind: OsdKind, fraction: f32, direction: i32) {
         let repainting = self.foreground_repaints() && !self.menu_open;
+        let title = self.locale.t(match (kind, direction.is_negative()) {
+            (OsdKind::Volume, false) => "hotkeys-volume-up",
+            (OsdKind::Volume, true) => "hotkeys-volume-down",
+            (OsdKind::Brightness, false) => "hotkeys-brightness-up",
+            (OsdKind::Brightness, true) => "hotkeys-brightness-down",
+        });
+        let theme = if self.osd.is_visible() {
+            None
+        } else {
+            self.theme_runtime.as_mut().and_then(|runtime| {
+                let activation = runtime.activate(Boundary::OsdOpening);
+                if let Some(message) = activation.diagnostic_once {
+                    warn!("{message}");
+                }
+                activation.snapshot
+            })
+        };
         // Cosmetic only: a failed overlay must not take down the daemon
-        if let Err(e) = self
-            .osd
-            .show(&mut self.platform, kind, fraction, repainting)
-        {
+        if let Err(e) = self.osd.show(
+            &mut self.platform,
+            kind,
+            &title,
+            fraction,
+            repainting,
+            theme,
+        ) {
             error!("failed to show OSD: {}", e);
         }
     }
@@ -748,4 +1042,220 @@ fn signal(child: &Child, signal: Signal) -> Result<()> {
         kill(pid, signal)?;
     }
     Ok(())
+}
+
+async fn charging_startup<F, Fut>(charging: bool, keep_awake: &Path, suspend: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if !charging {
+        return Ok(());
+    }
+    if keep_awake.exists() {
+        info!("/tmp/stay_awake exists, skipping charging suspend");
+        return Ok(());
+    }
+    suspend().await
+}
+
+/// Disable a failed menu exactly once; return whether an open menu needs unpausing.
+fn disable_menu(available: &mut bool, open: &mut bool) -> bool {
+    *available = false;
+    std::mem::take(open)
+}
+
+fn failed_menu_send(available: &mut bool, open: &mut bool, paused: bool) -> bool {
+    disable_menu(available, open);
+    paused
+}
+
+#[cfg(test)]
+mod perf6_tests {
+    use super::*;
+
+    struct HeldBattery {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Battery for HeldBattery {
+        fn update(&mut self) -> Result<()> {
+            self.started.take().unwrap().send(()).unwrap();
+            self.release.recv()?;
+            Ok(())
+        }
+        fn percentage(&self) -> i32 {
+            4
+        }
+        fn charging(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn battery_helper_does_not_block_input_runtime_and_keeps_low_sample() {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (release, hold) = mpsc::channel();
+        let mut monitor = BatteryMonitor::new(HeldBattery {
+            started: Some(started),
+            release: hold,
+        })
+        .unwrap();
+        monitor.request();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(monitor.readings.try_recv().is_err());
+        release.send(()).unwrap();
+        let reading =
+            tokio::time::timeout(std::time::Duration::from_secs(1), monitor.readings.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(reading.percentage(), 4);
+        assert!(!reading.charging());
+        assert!(reading.percentage() <= BATTERY_WARNING_THRESHOLD);
+        assert!(reading.percentage() <= BATTERY_SHUTDOWN_THRESHOLD);
+    }
+
+    #[test]
+    fn preheld_chord_cannot_arm_menu_tap() {
+        let mut keys = EnumMap::default();
+        assert!(menu_press_is_unmodified(&keys));
+        keys[Key::Right] = true;
+        assert!(!menu_press_is_unmodified(&keys));
+    }
+
+    #[test]
+    fn release_metadata_parser_retains_live_slot_and_disc() {
+        let info = parse_retroarch_info("GET_INFO 3 2 -1".into());
+        assert_eq!(
+            info,
+            RetroArchInfo {
+                max_disk_slots: 3,
+                disk_slot: 2,
+                state_slot: Some(-1)
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod menu_channel_tests {
+    use super::{disable_menu, failed_menu_send};
+
+    #[tokio::test]
+    async fn dropped_channel_is_disabled_and_timer_remains_polled() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        drop(tx);
+        let mut available = true;
+        let mut open = false;
+        let mut closed_events = 0;
+        loop {
+            tokio::select! {
+                completion = rx.recv(), if available => {
+                    assert_eq!(completion, None);
+                    closed_events += 1;
+                    assert!(!disable_menu(&mut available, &mut open));
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => break,
+            }
+        }
+        assert_eq!(closed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn valid_completion_survives_channel_then_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(()).unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(()));
+        assert_eq!(rx.recv().await, None);
+        let mut available = true;
+        let mut open = true;
+        assert!(disable_menu(&mut available, &mut open));
+        assert!(!available && !open);
+        assert!(!disable_menu(&mut available, &mut open));
+    }
+
+    #[test]
+    fn failed_send_race_clears_open_and_unpauses_only_actual_pause() {
+        for paused in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            drop(rx);
+            let mut available = true;
+            let mut open = true;
+            assert!(tx.send(()).is_err());
+            let unpause_count = usize::from(failed_menu_send(&mut available, &mut open, paused));
+            assert_eq!(unpause_count, if paused { 1 } else { 0 });
+            assert!(!available && !open);
+            // Later closed-channel notification must never issue a second unpause.
+            assert!(!disable_menu(&mut available, &mut open));
+        }
+    }
+}
+
+#[cfg(test)]
+mod charging_startup_tests {
+    use super::charging_startup;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "allium-charging-{}-{name}",
+            std::process::id()
+        ));
+        assert!(!path.exists());
+        path
+    }
+
+    #[tokio::test]
+    async fn owned_awake_marker_prevents_charging_side_effect_dispatch() {
+        let marker = fixture("protected");
+        std::fs::write(&marker, b"").unwrap();
+        let before = std::fs::metadata(&marker).unwrap();
+        let dispatched = Cell::new(0);
+        charging_startup(true, &marker, || async {
+            dispatched.set(dispatched.get() + 1);
+            anyhow::bail!("charging suspend must not run while protected")
+        })
+        .await
+        .unwrap();
+        assert_eq!(dispatched.get(), 0);
+        let after = std::fs::metadata(&marker).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_charging_keeps_one_suspend_dispatch_and_error_propagation() {
+        let marker = fixture("ordinary");
+        let dispatched = Cell::new(0);
+        let result = charging_startup(true, &marker, || async {
+            dispatched.set(dispatched.get() + 1);
+            anyhow::bail!("original charging error")
+        })
+        .await;
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "original charging error");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn noncharging_does_not_dispatch_or_create_keep_awake_marker() {
+        let marker = fixture("noncharging");
+        let dispatched = Cell::new(0);
+        charging_startup(false, &marker, || async {
+            dispatched.set(dispatched.get() + 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(dispatched.get(), 0);
+        assert!(!marker.exists());
+    }
 }

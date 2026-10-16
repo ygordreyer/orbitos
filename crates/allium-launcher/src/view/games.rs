@@ -27,12 +27,49 @@ pub type GamesState = EntryListState<GamesSort>;
 #[derive(Debug)]
 pub struct Games {
     rect: Rect,
+    res: Resources,
     list: EntryList<GamesSort>,
     button_hints: ButtonHints<String>,
 }
 
 impl Games {
-    pub fn new(rect: Rect, res: Resources, list: EntryList<GamesSort>) -> Result<Self> {
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        self.list.root_tab_navigation_ready()
+    }
+
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        self.list.clear_theme()
+    }
+    pub(crate) fn navigation_warm_model(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+        direction: isize,
+        input: common::theme::frame::FrameInputs,
+    ) -> Result<Option<super::entry_list::NavigationWarm>> {
+        self.list.navigation_warm_model(handle, direction, input)
+    }
+    pub(crate) fn navigation_warm_ready(&self) -> bool {
+        self.list.navigation_warm_ready()
+    }
+    pub(crate) fn navigation_warm_art_step(
+        &mut self,
+        work: &mut super::entry_list::NavigationWarm,
+    ) -> bool {
+        self.list.navigation_warm_art_step(work)
+    }
+
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        self.list
+            .theme_models(common::theme::pack::ScreenId::Library, handle)
+    }
+
+    pub fn new(rect: Rect, res: Resources, mut list: EntryList<GamesSort>) -> Result<Self> {
+        if crate::theme_adapter::legacy_orbit(&res) {
+            list.enable_orbit();
+        }
         let button_hints = {
             let locale = res.get::<Locale>();
             ButtonHints::new(
@@ -50,17 +87,25 @@ impl Games {
 
         Ok(Self {
             rect,
+            res: res.clone(),
             list,
             button_hints,
         })
     }
 
     pub fn load_or_new(rect: Rect, res: Resources, state: Option<GamesState>) -> Result<Self> {
+        let rect = if crate::theme_adapter::legacy_orbit(&res) {
+            Rect::new(
+                0,
+                super::orbit::HEADER_HEIGHT,
+                640,
+                super::orbit::CONTENT_HEIGHT,
+            )
+        } else {
+            rect
+        };
         let list = if let Some(state) = state {
-            let selected = state.selected;
-            let mut list = EntryList::load(rect, res.clone(), state)?;
-            list.select(selected);
-            list
+            EntryList::load(rect, res.clone(), state)?
         } else {
             EntryList::new(
                 rect,
@@ -70,6 +115,15 @@ impl Games {
         };
 
         Self::new(rect, res, list)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orbit_cache_counts(&self) -> (usize, usize) {
+        self.list.orbit_cache_counts()
+    }
+
+    pub(crate) fn disc_picker_active(&self) -> bool {
+        self.list.disc_picker_active()
     }
 
     pub fn save(&self) -> GamesState {
@@ -84,6 +138,9 @@ impl View for Games {
         display: &mut <DefaultPlatform as Platform>::Display,
         styles: &Stylesheet,
     ) -> Result<bool> {
+        if crate::theme_adapter::legacy_orbit(&self.res) {
+            return self.list.draw(display, styles);
+        }
         let mut drawn = false;
 
         if self.list.should_draw() {
@@ -96,7 +153,8 @@ impl View for Games {
     }
 
     fn should_draw(&self) -> bool {
-        self.list.should_draw() || self.button_hints.should_draw()
+        self.list.should_draw()
+            || (!crate::theme_adapter::legacy_orbit(&self.res) && self.button_hints.should_draw())
     }
 
     fn set_should_draw(&mut self) {
@@ -110,6 +168,10 @@ impl View for Games {
         commands: Sender<Command>,
         bubble: &mut VecDeque<Command>,
     ) -> Result<bool> {
+        // A nested disc picker owns every key before Games-level shortcuts.
+        if self.list.disc_picker_active() || self.list.details_active() {
+            return self.list.handle_key_event(event, commands, bubble).await;
+        }
         match event {
             KeyEvent::Pressed(Key::X) => {
                 commands.send(Command::StartSearch).await?;

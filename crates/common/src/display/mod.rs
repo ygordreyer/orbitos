@@ -1,6 +1,7 @@
 pub mod color;
 pub mod font;
 pub mod image;
+pub mod overlay;
 pub mod settings;
 
 use std::sync::Arc;
@@ -12,22 +13,57 @@ use tiny_skia::{
 };
 
 use crate::display::color::Color;
+use crate::display::overlay::{CapturedOverlay, OverlayContent, PreparedOverlay};
 use crate::geom::{Point, Rect, Size};
 
 /// A thread stamping a region over a repainting foreground app; it runs until this is dropped
 pub struct RectHold {
     stop: Arc<AtomicBool>,
+    writer: Option<std::thread::JoinHandle<Result<()>>>,
 }
 
 impl RectHold {
     /// Runs `stamp` on a thread until the returned hold is dropped; it polls the flag it is handed
     pub fn spawn(stamp: impl FnOnce(&AtomicBool) + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        std::thread::spawn({
+        let writer = std::thread::spawn({
             let stop = Arc::clone(&stop);
-            move || stamp(&stop)
+            move || {
+                stamp(&stop);
+                Ok(())
+            }
         });
-        Self { stop }
+        Self {
+            stop,
+            writer: Some(writer),
+        }
+    }
+    pub fn try_spawn(
+        stamp: impl FnOnce(&AtomicBool) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::Builder::new()
+            .name("overlay-hold".into())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || stamp(&stop)
+            })?;
+        Ok(Self {
+            stop,
+            writer: Some(writer),
+        })
+    }
+    /// Stop and acknowledge completion before restoring pixels/capturing new geometry.
+    /// Call without holding any Display/framebuffer lock the writer may need.
+    /// Existing Drop remains stop-only; OS I/O can block, so no deadline is promised.
+    pub fn stop_and_join(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(writer) = self.writer.take() {
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("Framebuffer hold writer panicked"))??;
+        }
+        Ok(())
     }
 }
 
@@ -74,11 +110,20 @@ pub trait Display: Sized {
 
     /// Flush any pending changes to the display
     fn flush(&mut self) -> Result<()> {
+        crate::perf_trace::count(
+            crate::perf_trace::Count::FlushedPixels,
+            self.width() as u64 * self.height() as u64,
+        );
         Ok(())
     }
 
     /// Flush a region of the display; defaults to a full flush
     fn flush_rect(&mut self, _area: Rect) -> Result<()> {
+        self.flush()
+    }
+
+    /// Present a damage batch. Platforms without partial presentation flush once.
+    fn flush_rects(&mut self, _areas: &[Rect]) -> Result<()> {
         self.flush()
     }
 
@@ -93,6 +138,26 @@ pub trait Display: Sized {
         Ok(None)
     }
 
+    fn capture_overlay(&mut self, _overlay: &PreparedOverlay) -> Result<CapturedOverlay> {
+        anyhow::bail!("Masked overlay unsupported by this Display")
+    }
+
+    fn check_overlay(&mut self, _overlay: &PreparedOverlay) -> Result<()> {
+        anyhow::bail!("Masked overlay unsupported by this Display")
+    }
+
+    fn present_overlay(
+        &mut self,
+        _overlay: &CapturedOverlay,
+        _content: OverlayContent,
+    ) -> Result<()> {
+        anyhow::bail!("Masked overlay unsupported by this Display")
+    }
+
+    fn hold_overlay(&mut self, _overlay: Arc<CapturedOverlay>) -> Result<Option<RectHold>> {
+        anyhow::bail!("Masked overlay unsupported by this Display")
+    }
+
     /// Sync with the display hardware
     fn sync(&mut self) -> Result<()> {
         Ok(())
@@ -100,6 +165,10 @@ pub trait Display: Sized {
 
     /// Save the current display state
     fn save(&mut self) -> Result<()>;
+
+    fn save_unchanged(&mut self) -> Result<()> {
+        self.save()
+    }
 
     /// Load a previously saved display state
     fn load(&mut self, area: Rect) -> Result<()>;
@@ -112,6 +181,32 @@ pub trait Display: Sized {
 
 /// Fill a rectangle on the pixmap
 pub fn fill_rect(pixmap: &mut PixmapMut<'_>, rect: Rect, color: Color) {
+    let w = rect
+        .right()
+        .min(pixmap.width() as i32)
+        .saturating_sub(rect.x.max(0))
+        .max(0) as u64;
+    let h = rect
+        .bottom()
+        .min(pixmap.height() as i32)
+        .saturating_sub(rect.y.max(0))
+        .max(0) as u64;
+    crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, w * h);
+    if color.a() == 255 {
+        let width = pixmap.width() as usize;
+        let x0 = rect.x.max(0).min(pixmap.width() as i32) as usize;
+        let x1 = rect.right().max(0).min(pixmap.width() as i32) as usize;
+        if x0 >= x1 {
+            return;
+        }
+        let y0 = rect.y.max(0).min(pixmap.height() as i32) as usize;
+        let y1 = rect.bottom().max(0).min(pixmap.height() as i32) as usize;
+        let pixel = color.into();
+        for y in y0..y1 {
+            pixmap.pixels_mut()[y * width + x0..y * width + x1].fill(pixel);
+        }
+        return;
+    }
     let paint = Paint {
         shader: tiny_skia::Shader::SolidColor(color.into()),
         blend_mode: BlendMode::SourceOver,
@@ -135,6 +230,17 @@ pub fn fill_rect(pixmap: &mut PixmapMut<'_>, rect: Rect, color: Color) {
 
 /// Fill a rounded rectangle on the pixmap
 pub fn fill_rounded_rect(pixmap: &mut PixmapMut<'_>, rect: Rect, radius: u32, color: Color) {
+    let w = rect
+        .right()
+        .min(pixmap.width() as i32)
+        .saturating_sub(rect.x.max(0))
+        .max(0) as u64;
+    let h = rect
+        .bottom()
+        .min(pixmap.height() as i32)
+        .saturating_sub(rect.y.max(0))
+        .max(0) as u64;
+    crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, w * h);
     let paint = Paint {
         shader: tiny_skia::Shader::SolidColor(color.into()),
         blend_mode: BlendMode::SourceOver,
@@ -332,4 +438,155 @@ pub fn build_rounded_rect_path(rect: Rect, radius: u32) -> Option<Path> {
 
     pb.close();
     pb.finish()
+}
+
+#[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
+pub(crate) fn save_shared_snapshot(
+    saved: &mut Vec<std::sync::Arc<tiny_skia::Pixmap>>,
+    pixels: &tiny_skia::Pixmap,
+) {
+    let next = saved
+        .last()
+        .filter(|last| last.as_ref() == pixels)
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(pixels.clone()));
+    saved.push(next);
+}
+
+#[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
+pub(crate) fn save_unchanged_snapshot(saved: &mut Vec<Arc<tiny_skia::Pixmap>>) -> Result<()> {
+    let last = saved
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("No saved image"))?
+        .clone();
+    saved.push(last);
+    Ok(())
+}
+
+#[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
+pub(crate) fn save_reusing_snapshot(
+    saved: &mut Vec<Arc<tiny_skia::Pixmap>>,
+    pixels: &tiny_skia::Pixmap,
+    reusable: &mut Vec<tiny_skia::Pixmap>,
+) {
+    if let Some(last) = saved.last().filter(|last| last.as_ref() == pixels) {
+        saved.push(last.clone());
+        return;
+    }
+    let mut next = reusable
+        .pop()
+        .filter(|p| p.width() == pixels.width() && p.height() == pixels.height())
+        .unwrap_or_else(|| pixels.clone());
+    next.data_mut().copy_from_slice(pixels.data());
+    saved.push(Arc::new(next));
+}
+
+#[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
+pub(crate) fn pop_reusing_snapshot(
+    saved: &mut Vec<Arc<tiny_skia::Pixmap>>,
+    reusable: &mut Vec<tiny_skia::Pixmap>,
+) -> bool {
+    if let Some(image) = saved.pop().and_then(|image| Arc::try_unwrap(image).ok()) {
+        if reusable.len() < 2 {
+            reusable.push(image);
+        }
+    }
+    !saved.is_empty()
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    #[test]
+    fn ux4_identical_saves_share_pixels_and_changed_saves_stay_independent() {
+        let mut pixels = tiny_skia::Pixmap::new(640, 480).unwrap();
+        let mut saved = vec![];
+        super::save_shared_snapshot(&mut saved, &pixels);
+        super::save_shared_snapshot(&mut saved, &pixels);
+        assert!(std::sync::Arc::ptr_eq(&saved[0], &saved[1]));
+        pixels.data_mut()[0] = 255;
+        super::save_shared_snapshot(&mut saved, &pixels);
+        assert!(!std::sync::Arc::ptr_eq(&saved[1], &saved[2]));
+        assert_eq!(saved[0].data()[0], 0);
+        assert_eq!(saved[2].data()[0], 255);
+    }
+    #[test]
+    fn unchanged_save_preserves_two_restore_levels_and_original_screenshot() {
+        let mut pixels = tiny_skia::Pixmap::new(640, 480).unwrap();
+        pixels.data_mut()[17] = 83;
+        let mut saved = vec![];
+        super::save_shared_snapshot(&mut saved, &pixels);
+        super::save_unchanged_snapshot(&mut saved).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&saved[0], &saved[1]));
+        pixels.data_mut()[17] = 129;
+        assert_eq!(saved[0].data()[17], 83);
+        pixels
+            .data_mut()
+            .copy_from_slice(saved.last().unwrap().data());
+        saved.pop();
+        assert_eq!(pixels.data()[17], 83);
+        pixels.data_mut()[17] = 255;
+        pixels
+            .data_mut()
+            .copy_from_slice(saved.last().unwrap().data());
+        saved.pop();
+        assert_eq!(pixels.data()[17], 83);
+        assert!(saved.is_empty());
+        assert!(super::save_unchanged_snapshot(&mut saved).is_err());
+    }
+
+    #[test]
+    fn snapshots_reuse_both_legacy_buffers_across_opens() {
+        let mut pixels = tiny_skia::Pixmap::new(640, 480).unwrap();
+        let mut saved = vec![];
+        let mut reusable = vec![];
+        let mut storage = vec![];
+        for session in 0..4 {
+            pixels.data_mut()[17] = session;
+            super::save_reusing_snapshot(&mut saved, &pixels, &mut reusable);
+            pixels.data_mut()[17] = session + 64;
+            super::save_reusing_snapshot(&mut saved, &pixels, &mut reusable);
+            assert_eq!(saved[0].data()[17], session);
+            assert_eq!(saved[1].data()[17], session + 64);
+            let mut pointers: Vec<_> = saved.iter().map(|p| p.data().as_ptr()).collect();
+            pointers.sort();
+            if session == 0 {
+                storage = pointers;
+            } else {
+                assert_eq!(pointers, storage);
+            }
+            assert!(super::pop_reusing_snapshot(&mut saved, &mut reusable));
+            assert!(!super::pop_reusing_snapshot(&mut saved, &mut reusable));
+            assert_eq!(reusable.len(), 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dl17_stroke_tests {
+    #[test]
+    fn opaque_stroke_preserves_interior_and_matches_translucent_shape() {
+        let mut opaque = tiny_skia::Pixmap::new(20, 20).unwrap();
+        let mut alpha = opaque.clone();
+        let rect = crate::geom::Rect::new(3, 3, 14, 14);
+        super::stroke_rect(
+            &mut opaque.as_mut(),
+            rect,
+            2.0,
+            super::color::Color::rgba(80, 90, 100, 255),
+        );
+        super::stroke_rect(
+            &mut alpha.as_mut(),
+            rect,
+            2.0,
+            super::color::Color::rgba(80, 90, 100, 254),
+        );
+        assert_eq!(opaque.pixel(10, 10).unwrap().alpha(), 0);
+        assert!(
+            opaque
+                .pixels()
+                .iter()
+                .zip(alpha.pixels())
+                .all(|(a, b)| (a.alpha() == 0) == (b.alpha() == 0))
+        );
+    }
 }

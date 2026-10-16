@@ -180,3 +180,33 @@ Allium is only possible thanks to the Miyoo Mini community, including but not li
 Need help? Want to contribute? Join the Allium community on Discord:
 
 👉 https://discord.gg/eSvVqe6c8n
+
+## Download completion diagnostics
+
+When the install target is missing, Download is available even if the retained
+index says Cached. After transfer, the existing dialog shows Verifying while
+the worker checks SHA-256 hashes and publishes the install.
+
+On the Miyoo, enable the existing trace flag before restarting the launcher:
+
+```sh
+touch /tmp/allium-perf-trace
+```
+
+Reproduce the download without pressing a key after the transfer. Collect
+`/tmp/allium-network-trace.log` and `/tmp/allium-perf-trace.log` before reboot.
+The network log records worker result delivery, result polling, Completed or
+Failed modal changes, dirty returns, frame drawing and successful flush return.
+It also records every event-loop wake and, while a job or modal exists, every
+loop iteration, including `active` and the wake cause (`frame_timer`, `network_timer`, `input`,
+`command`, `signal`, or `other`). `monotonic_us` joins events across threads;
+`pid` and `thread` identify their source. A worker send and a UI receive can be
+logged in either order when the threads run concurrently.
+
+Both logs are capped at 256 KiB. The network log rolls over to retain recent
+events during long verification, so its oldest events can disappear. The
+performance log keeps its existing stop-at-cap behavior. Tracing adds no timers
+or wakeups. With the flag absent it performs no event formatting, allocation,
+clock reads or log writes. Remove the flag and restart the launcher to disable
+tracing; flag detection is cached for the process lifetime. A successful flush
+return proves the platform call returned, not that the LCD physically updated.

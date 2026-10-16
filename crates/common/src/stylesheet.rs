@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::ALLIUM_SD_ROOT;
 use crate::{
-    constants::{ALLIUM_FONTS_DIR, ALLIUM_THEME_STATE, ALLIUM_THEMES_DIR},
+    constants::{ALLIUM_BASE_DIR, ALLIUM_FONTS_DIR, ALLIUM_THEME_STATE, ALLIUM_THEMES_DIR},
     display::color::Color,
 };
 
@@ -75,26 +75,35 @@ impl StylesheetColor {
     }
 }
 
-/// Memory-maps a font instead of reading the whole file upfront. The CJK fallback alone is 17 MB,
-/// while mmap loads pages on demand as glyphs are rasterized.
-///
-/// Mappings are cached by path and kept alive for the lifetime of the process, since
-/// `Font<'static>` can outlive the scope where the font was loaded.
 fn map_font(path: &Path) -> Result<&'static [u8]> {
-    static MAPPED: LazyLock<Mutex<HashMap<PathBuf, &'static [u8]>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    map_font_file(&File::open(path)?)
+}
 
+pub(crate) fn map_font_file(file: &File) -> Result<&'static [u8]> {
+    use std::os::unix::fs::MetadataExt;
+    type Identity = (u64, u64, u64, i64, i64);
+    static MAPPED: LazyLock<Mutex<HashMap<Identity, &'static [u8]>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0,
+        "Invalid font file"
+    );
+    let identity = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    );
     let mut mapped = MAPPED.lock().expect("no panics under this lock");
-    if let Some(bytes) = mapped.get(path) {
+    if let Some(bytes) = mapped.get(&identity) {
         return Ok(bytes);
     }
-
-    let file = File::open(path)?;
-    // SAFETY: theme fonts are not written while Allium runs; a concurrent truncation would be
-    // undefined behaviour, the standard caveat for any mapped file.
-    let mmap = unsafe { Mmap::map(&file)? };
+    // Font<'static> can outlive any view; trusted font files must never be truncated in place.
+    let mmap = unsafe { Mmap::map(file)? };
     let bytes: &'static [u8] = &Box::leak(Box::new(mmap))[..];
-    mapped.insert(path.to_path_buf(), bytes);
+    mapped.insert(identity, bytes);
     Ok(bytes)
 }
 
@@ -338,6 +347,18 @@ pub struct Stylesheet {
 }
 
 impl Stylesheet {
+    pub fn orbit_enabled() -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("ALLIUM_ORBIT").as_deref() == Ok("1")
+                || ALLIUM_BASE_DIR.join("state/orbit-enabled").is_file()
+        });
+        *ENABLED
+    }
+
+    pub fn display_style(&self) -> Self {
+        self.clone()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

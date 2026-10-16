@@ -78,3 +78,21 @@ codegen-units = 1
 # so size is not as important as speed.
 [profile.release.package.allium-launcher]
 opt-level = 3
+
+[profile.release.package.common]
+opt-level = 3
+
+[profile.release.package.tiny-skia]
+opt-level = 3
+
+[profile.release.package.tiny-skia-path]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.fast_image_resize]
+opt-level = 3
+
+[profile.release.package.rusttype]
+opt-level = 3

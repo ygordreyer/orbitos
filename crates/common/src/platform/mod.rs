@@ -1,3 +1,14 @@
+#[cfg(any(test, feature = "miyoo"))]
+#[path = "miyoo/cpu_tuning.rs"]
+pub mod cpu_tuning;
+
+#[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
+mod framebuffer_pixels;
+
+#[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
+#[path = "miyoo/framebuffer.rs"]
+mod framebuffer_host_tests;
+
 #[cfg(not(any(feature = "miyoo", feature = "simulator")))]
 mod mock;
 
@@ -103,3 +114,6 @@ pub enum Key {
     LidClose,
     Unknown,
 }
+
+#[cfg(all(feature = "perf-bench", not(feature = "miyoo")))]
+pub use framebuffer_host_tests::PresenterProbe;

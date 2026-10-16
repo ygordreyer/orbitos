@@ -79,7 +79,7 @@ impl Game {
     }
 
     pub fn from_db(game: DbGame) -> Option<Game> {
-        if !game.path.exists() {
+        if !game.path.exists() && !crate::network_runtime::registered(&game.path) {
             return None;
         }
         let full_name = game

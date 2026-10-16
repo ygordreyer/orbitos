@@ -31,6 +31,21 @@ pub struct RecentsList {
 }
 
 impl RecentsList {
+    pub(crate) fn root_tab_navigation_ready(&self) -> bool {
+        self.list.root_tab_navigation_ready()
+    }
+
+    pub(crate) fn clear_theme(&mut self) -> Result<()> {
+        self.list.clear_theme()
+    }
+    pub(crate) fn theme_models(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        self.list
+            .theme_models(common::theme::pack::ScreenId::Recents, handle)
+    }
+
     pub fn new(rect: Rect, res: Resources, list: EntryList<RecentsSort>) -> Result<Self> {
         let styles = res.get::<Stylesheet>();
 

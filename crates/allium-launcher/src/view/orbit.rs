@@ -1,0 +1,1205 @@
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use common::display::color::Color;
+use common::display::font::{FontTextStyle, FontTextStyleBuilder};
+use common::display::{Display, fill_rect, fill_rounded_rect};
+use common::geom::{Point, Rect};
+use common::platform::{DefaultPlatform, Platform};
+use common::stylesheet::Stylesheet;
+use tiny_skia::{Pixmap, PixmapPaint, Transform};
+
+use crate::entry::Entry;
+
+pub fn background() -> Color {
+    Color::new(243, 244, 238)
+}
+fn hero_background() -> Color {
+    Color::new(231, 235, 224)
+}
+fn text_color() -> Color {
+    Color::new(35, 48, 51)
+}
+fn muted_color() -> Color {
+    Color::new(96, 118, 105)
+}
+pub const HEADER_HEIGHT: i32 = 54;
+pub const FOOTER_Y: i32 = 430;
+pub const CONTENT_HEIGHT: u32 = 376;
+const COVER_SIZE: u32 = 132;
+const THEME_COVER_SIZE: u32 = 140;
+const CARD_STRIDE: i32 = 176;
+const SHELF_CARDS: usize = 3;
+const CACHE_ENTRIES: usize = 16;
+const CACHE_PIXEL_BYTES: usize = 3 * 1024 * 1024;
+const MAX_PNG_BYTES: u64 = 512 * 1024;
+
+pub fn enabled() -> bool {
+    Stylesheet::orbit_enabled()
+}
+
+thread_local! {
+    static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn invalidate_art() {
+    ART_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
+fn art_generation() -> u64 {
+    ART_GENERATION.with(std::cell::Cell::get)
+}
+
+#[derive(Debug)]
+struct CachedArt {
+    path: PathBuf,
+    image: Option<std::sync::Arc<Pixmap>>,
+}
+
+pub(crate) enum WarmArt {
+    Cover(Entry),
+    CoverFallback(Entry),
+    Hero(Entry),
+}
+
+#[derive(Debug)]
+pub struct Orbit {
+    cache: VecDeque<CachedArt>,
+    generation: u64,
+    legacy_ready: bool,
+    ink_art: bool,
+    retired: Vec<std::sync::Weak<Pixmap>>,
+    dirty: bool,
+}
+
+impl Orbit {
+    pub fn new() -> Self {
+        Self {
+            cache: VecDeque::new(),
+            generation: art_generation(),
+            legacy_ready: false,
+            ink_art: false,
+            retired: Vec::new(),
+            dirty: true,
+        }
+    }
+
+    pub(crate) fn defer_legacy(&mut self) {
+        self.legacy_ready = false;
+        self.dirty = true;
+    }
+
+    pub fn prepare(&mut self, entries: &[Entry], selected: usize) {
+        self.refresh_art();
+        self.dirty = true;
+        if let Some(entry) = entries.get(selected) {
+            self.cache_art(art_path(entry, "heroes"), (360, 210));
+        }
+        self.legacy_ready = true;
+        let first = shelf_start(selected, entries.len());
+        for entry in entries.iter().skip(first).take(SHELF_CARDS + 1) {
+            self.cache_art(art_path(entry, "covers"), (101, 101));
+        }
+    }
+
+    pub(crate) fn set_ink_art(&mut self, enabled: bool) {
+        if self.ink_art != enabled { self.release_art(); self.ink_art=enabled; }
+    }
+
+    pub(crate) fn prepare_window(
+        &mut self,
+        entries: &[Entry],
+        selected: usize,
+        first: usize,
+        count: usize,
+    ) {
+        self.refresh_art();
+        for entry in entries
+            .iter()
+            .skip(first)
+            .take(count.min(CACHE_ENTRIES - 1))
+        {
+            self.cache_theme_cover(entry);
+        }
+        if let Some(entry) = entries.get(selected) {
+            self.cache_art(art_path(entry, "heroes"), (360, 210));
+            self.cache_theme_cover(entry);
+        }
+        if let Some(next) = peek_game(entries, first, count) {
+            self.cache_theme_cover(&entries[next]);
+        }
+    }
+    pub(crate) fn navigation_art_work(
+        entries: &[Entry],
+        selected: usize,
+        first: usize,
+        count: usize,
+    ) -> VecDeque<WarmArt> {
+        let mut work: VecDeque<_> = entries
+            .iter()
+            .skip(first)
+            .take(count.min(CACHE_ENTRIES - 1))
+            .cloned()
+            .map(WarmArt::Cover)
+            .collect();
+        if let Some(entry) = entries.get(selected) {
+            work.push_back(WarmArt::Hero(entry.clone()));
+            work.push_back(WarmArt::Cover(entry.clone()));
+        }
+        if let Some(next) = peek_game(entries, first, count) {
+            work.push_back(WarmArt::Cover(entries[next].clone()));
+        }
+        work
+    }
+    pub(crate) fn warm_art_step(&mut self, work: &mut VecDeque<WarmArt>) {
+        self.refresh_art();
+        let Some(task) = work.pop_front() else {
+            return;
+        };
+        let (entry, fallback) = match task {
+            WarmArt::Hero(entry) => {
+                self.cache_art(art_path(&entry, "heroes"), (360, 210));
+                return;
+            }
+            WarmArt::Cover(entry) => (entry, false),
+            WarmArt::CoverFallback(entry) => (entry, true),
+        };
+        let path = art_path(&entry, "stock");
+        if self.cache.iter().any(|item| item.path == path) {
+            return;
+        }
+        let image = if fallback {
+            load_prepared_art(
+                &art_path(&entry, "covers"),
+                (101, 101),
+                COVER_SIZE,
+                COVER_SIZE,
+                false,
+            )
+        } else {
+            load_prepared_art(&path, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false)
+        };
+        if image.is_none() && !fallback {
+            work.push_front(WarmArt::CoverFallback(entry));
+        } else {
+            self.insert_cached(CachedArt {
+                path,
+                image: image.map(std::sync::Arc::new),
+            });
+        }
+    }
+    pub(crate) fn theme_art(
+        &self,
+        entries: &[Entry],
+        selected: usize,
+        first: usize,
+        count: usize,
+    ) -> common::theme::frame::Art {
+        let mut art = common::theme::frame::Art::default();
+        if let Some(entry) = entries.get(selected) {
+            art.selected_hero = self.image(entry, "heroes").cloned();
+            art.selected_cover = self.theme_cover_image(entry).cloned();
+        }
+        if let Some(next) = peek_game(entries, first, count) {
+            art.next_cover = self.theme_cover_image(&entries[next]).cloned();
+        }
+        for entry in entries.iter().skip(first).take(count) {
+            if let Some(image) = self.theme_cover_image(entry) {
+                art.entries
+                    .insert(crate::theme_adapter::entry_id(entry.path()), image.clone());
+            }
+        }
+        art
+    }
+
+    fn cache_theme_cover(&mut self, entry: &Entry) {
+        let original = art_path(entry, "stock");
+        if let Some(index) = self.cache.iter().position(|item| item.path == original) {
+            let item = self.cache.remove(index).unwrap();
+            self.cache.push_front(item);
+            common::perf_trace::hit(common::perf_trace::ArtHit::Ram);
+            #[cfg(feature = "perf-bench")]
+            common::perf::hit(common::perf::Op::RamHit);
+            return;
+        }
+        let image = if self.ink_art { load_ink_cover(&original) } else { load_prepared_art(&original, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false) }
+            .or_else(|| {
+                load_prepared_art(
+                    &art_path(entry, "covers"),
+                    (101, 101),
+                    COVER_SIZE,
+                    COVER_SIZE,
+                    false,
+                )
+            })
+            .map(std::sync::Arc::new);
+        self.insert_cached(CachedArt {
+            path: original,
+            image,
+        });
+    }
+
+    fn theme_cover_image(&self, entry: &Entry) -> Option<&std::sync::Arc<Pixmap>> {
+        self.cached_image(&art_path(entry, "stock"))
+    }
+
+    fn cached_image(&self, path: &Path) -> Option<&std::sync::Arc<Pixmap>> {
+        self.cache
+            .iter()
+            .find(|item| item.path == path)?
+            .image
+            .as_ref()
+    }
+
+    fn cache_art(&mut self, path: PathBuf, dimensions: (u32, u32)) {
+        if let Some(index) = self.cache.iter().position(|item| item.path == path) {
+            let item = self.cache.remove(index).unwrap();
+            self.cache.push_front(item);
+            common::perf_trace::hit(common::perf_trace::ArtHit::Ram);
+            #[cfg(feature = "perf-bench")]
+            common::perf::hit(common::perf::Op::RamHit);
+            return;
+        }
+        let (width, height, crop) = if dimensions == (101, 101) {
+            (COVER_SIZE, COVER_SIZE, false)
+        } else {
+            (390, 189, true)
+        };
+        self.insert_cached(CachedArt {
+            image: load_prepared_art(&path, dimensions, width, height, crop)
+                .map(std::sync::Arc::new),
+            path,
+        });
+    }
+
+    fn source_bytes(&mut self) -> usize {
+        self.retired.retain(|image| image.strong_count() != 0);
+        self.cache
+            .iter()
+            .filter_map(|item| item.image.as_ref())
+            .map(|image| image.data().len())
+            .sum::<usize>()
+            + self
+                .retired
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .map(|image| image.data().len())
+                .sum::<usize>()
+    }
+
+    fn retire(&mut self, item: CachedArt) {
+        if let Some(image) = item
+            .image
+            .filter(|image| std::sync::Arc::strong_count(image) > 1)
+        {
+            self.retired.push(std::sync::Arc::downgrade(&image));
+        }
+    }
+
+    fn insert_cached(&mut self, item: CachedArt) {
+        let bytes = item.image.as_ref().map_or(0, |image| image.data().len());
+        while self.cache.len() >= CACHE_ENTRIES || self.source_bytes() + bytes > CACHE_PIXEL_BYTES {
+            let Some(old) = self.cache.pop_back() else {
+                return;
+            };
+            self.retire(old);
+        }
+        self.cache.push_front(item);
+    }
+
+    fn image(&self, entry: &Entry, kind: &str) -> Option<&std::sync::Arc<Pixmap>> {
+        let path = art_path(entry, kind);
+        self.cached_image(&path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proof_long_title(
+        display: &mut <DefaultPlatform as Platform>::Display,
+        styles: &Stylesheet,
+        path: PathBuf,
+    ) {
+        let mut game = crate::entry::game::Game::new(path);
+        game.name =
+            "Ridge Racer Type 4 Anniversary Championship with a very long title".to_string();
+        let title = font(styles, 32, text_color());
+        let lines = wrapped(&title, &game.name, 340, 3);
+        assert!((2..=3).contains(&lines.len()));
+        assert!(lines.iter().all(|line| title.measure(line).w <= 340));
+        let entries = [Entry::Game(game)];
+        let mut orbit = Self::new();
+        orbit.prepare(&entries, 0);
+        orbit.draw(&entries, 0, display, styles);
+    }
+
+    fn refresh_art(&mut self) {
+        let generation = art_generation();
+        if self.generation != generation {
+            self.release_art();
+            self.generation = generation;
+        }
+    }
+
+    pub fn release_art(&mut self) {
+        while let Some(item) = self.cache.pop_back() { self.retire(item); }
+        self.source_bytes();
+        self.legacy_ready = false;
+        self.dirty = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_entries(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn should_draw(&self) -> bool {
+        self.dirty
+    }
+    pub fn redraw(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn draw(
+        &mut self,
+        entries: &[Entry],
+        selected: usize,
+        display: &mut <DefaultPlatform as Platform>::Display,
+        styles: &Stylesheet,
+    ) {
+        if !self.legacy_ready || self.generation != art_generation() {
+            self.prepare(entries, selected);
+        }
+        fill_rect(
+            &mut display.pixmap_mut(),
+            Rect::new(0, HEADER_HEIGHT, 640, CONTENT_HEIGHT),
+            background(),
+        );
+        fill_rect(
+            &mut display.pixmap_mut(),
+            Rect::new(0, HEADER_HEIGHT, 640, 189),
+            hero_background(),
+        );
+        let small = font(styles, 16, muted_color());
+        let title = font(styles, 32, text_color());
+        let caption = font(styles, 18, muted_color());
+        if let Some(entry) = entries.get(selected) {
+            if let Some(image) = self.image(entry, "heroes") {
+                blit(display, image, Point::new(250, HEADER_HEIGHT));
+            }
+            draw_readability_gradient(display);
+            if let Some(status) = crate::network_runtime::badge(entry.path()) {
+                small.draw(&mut display.pixmap_mut(), &status, Point::new(124, 69));
+            }
+            small.draw(&mut display.pixmap_mut(), "LIBRARY", Point::new(24, 69));
+            let lines = wrapped(&title, entry.name(), 340, 3);
+            for (index, line) in lines.iter().enumerate() {
+                title.draw(
+                    &mut display.pixmap_mut(),
+                    line,
+                    Point::new(24, 93 + index as i32 * 32),
+                );
+            }
+            fill_rounded_rect(
+                &mut display.pixmap_mut(),
+                Rect::new(24, 197, 178, 37),
+                14,
+                Color::new(255, 255, 255),
+            );
+            font(styles, 20, text_color()).draw(
+                &mut display.pixmap_mut(),
+                "A  Select / Play",
+                Point::new(36, 205),
+            );
+            small.draw(
+                &mut display.pixmap_mut(),
+                &format!("{} / {}", selected + 1, entries.len()),
+                Point::new(549, 215),
+            );
+        } else {
+            title.draw(
+                &mut display.pixmap_mut(),
+                "No games here",
+                Point::new(29, 104),
+            );
+            small.draw(
+                &mut display.pixmap_mut(),
+                "B returns to the parent directory",
+                Point::new(29, 158),
+            );
+        }
+        small.draw(&mut display.pixmap_mut(), "Library", Point::new(22, 247));
+        let first = shelf_start(selected, entries.len());
+        for (index, entry) in entries.iter().enumerate().skip(first).take(SHELF_CARDS) {
+            let x = 22 + (index - first) as i32 * CARD_STRIDE;
+            let y = if index == selected { 270 } else { 273 };
+            if index == selected {
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x - 4, y - 4, COVER_SIZE + 8, COVER_SIZE + 8),
+                    12,
+                    Color::new(143, 236, 238),
+                );
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x - 2, y - 2, COVER_SIZE + 4, COVER_SIZE + 4),
+                    10,
+                    Color::new(45, 190, 200),
+                );
+            }
+            fill_rounded_rect(
+                &mut display.pixmap_mut(),
+                Rect::new(x, y, COVER_SIZE, COVER_SIZE),
+                9,
+                Color::new(255, 255, 255),
+            );
+            if let Some(image) = self.image(entry, "covers") {
+                blit(display, image, Point::new(x, y));
+            } else {
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x + 4, y + 4, COVER_SIZE - 8, COVER_SIZE - 8),
+                    6,
+                    Color::new(215, 225, 209),
+                );
+                font(styles, 22, muted_color()).draw(
+                    &mut display.pixmap_mut(),
+                    "...",
+                    Point::new(x + 48, y + 51),
+                );
+            }
+            if crate::network_runtime::badge(entry.path()).is_some_and(|status| status != "Cached")
+            {
+                // Small software-rendered cloud; artwork remains the persistent card identity.
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x + 98, y + 101, 27, 22),
+                    8,
+                    Color::new(45, 190, 200),
+                );
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x + 102, y + 111, 19, 8),
+                    3,
+                    Color::new(255, 255, 255),
+                );
+                fill_rounded_rect(
+                    &mut display.pixmap_mut(),
+                    Rect::new(x + 106, y + 105, 10, 13),
+                    4,
+                    Color::new(255, 255, 255),
+                );
+            }
+            let label = wrapped(&caption, entry.name(), 158, 1);
+            if let Some(line) = label.first() {
+                caption.draw(&mut display.pixmap_mut(), line, Point::new(x, y + 136));
+            }
+        }
+        self.dirty = false;
+    }
+}
+
+fn shelf_start(selected: usize, count: usize) -> usize {
+    selected.min(count.saturating_sub(SHELF_CARDS))
+}
+
+fn art_path(entry: &Entry, kind: &str) -> PathBuf {
+    if let Some(path) = crate::network_runtime::art_path(entry.path(), kind) {
+        return path;
+    }
+    let name = match entry {
+        Entry::Directory(_) => entry.path().file_name(),
+        _ => entry.path().file_stem(),
+    }
+    .unwrap_or_default();
+    let mut filename = name.to_os_string();
+    filename.push(match kind {
+        "heroes" => ".hero.png",
+        "stock" => ".png",
+        _ => ".orbit.png",
+    });
+    entry
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("Imgs")
+        .join(filename)
+}
+
+fn load_ink_cover(path: &Path) -> Option<Pixmap> {
+    let file=File::open(path).ok()?;
+    if file.metadata().ok()?.len()>MAX_PNG_BYTES{return None;}
+    let source=decode_png_bytes(&read_png_bytes(file)?,(0,0))?;
+    let scale=(176.0/source.width() as f32).min(264.0/source.height() as f32).min(1.0);
+    let width=(source.width() as f32*scale).round().max(1.0) as u32;
+    let height=(source.height() as f32*scale).round().max(1.0) as u32;
+    resize_art(source,width,height,false)
+}
+
+fn load_prepared_art(
+    path: &Path,
+    dimensions: (u32, u32),
+    width: u32,
+    height: u32,
+    crop: bool,
+) -> Option<Pixmap> {
+    #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+    crate::allium_launcher::navigation_warm_tests::art_load();
+    let _phase = common::perf_trace::phase(common::perf_trace::Phase::ArtLoad);
+    common::perf_trace::frontend_io_op();
+    let file = File::open(path).ok()?;
+    common::perf_trace::frontend_io_op();
+    let metadata = file.metadata().ok();
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.len() > MAX_PNG_BYTES)
+    {
+        return None;
+    }
+    common::perf_trace::frontend_io_op();
+    let bytes = read_png_bytes(file)?;
+    let key = metadata.as_ref().and_then(|metadata| {
+        crate::art_cache::ArtKey::new(path, metadata, &bytes, dimensions, (width, height), crop)
+    });
+    let cache_dir = common::constants::ALLIUM_ORBIT_ART_CACHE_DIR.as_path();
+    if let Some(image) = key.as_ref().and_then(|key| key.load(cache_dir)) {
+        common::perf_trace::hit(common::perf_trace::ArtHit::Disk);
+        #[cfg(feature = "perf-bench")]
+        common::perf::hit(common::perf::Op::DiskHit);
+        return Some(image);
+    }
+    let image = resize_art(decode_png_bytes(&bytes, dimensions)?, width, height, crop)?;
+    if let Some(key) = key {
+        key.store(cache_dir, &image);
+    }
+    Some(image)
+}
+
+#[cfg(test)]
+fn load_final_png(path: &Path, dimensions: (u32, u32)) -> Option<Pixmap> {
+    common::perf_trace::frontend_io_op();
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_PNG_BYTES {
+        return None;
+    }
+    decode_final_png(file, dimensions)
+}
+
+#[cfg(test)]
+fn decode_final_png(file: File, dimensions: (u32, u32)) -> Option<Pixmap> {
+    decode_png_bytes(&read_png_bytes(file)?, dimensions)
+}
+
+fn read_png_bytes(file: File) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    #[cfg(feature = "perf-bench")]
+    common::perf::hit(common::perf::Op::Read);
+    file.take(MAX_PNG_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn decode_png_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
+    if bytes.len() < 24 || bytes.len() as u64 > MAX_PNG_BYTES || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    if dimensions == (0, 0) {
+        if width < 64
+            || height < 64
+            || width > 1024
+            || height > 1024
+            || width.checked_mul(height)? > 1024 * 1024
+        {
+            return None;
+        }
+    } else if (width, height) != dimensions {
+        return None;
+    }
+    common::perf_trace::hit(common::perf_trace::ArtHit::Decode);
+    let image = Pixmap::decode_png(&bytes).ok()?;
+    #[cfg(feature = "perf-bench")]
+    common::perf::hit(common::perf::Op::Decode);
+    ((image.width(), image.height()) == (width, height)).then_some(image)
+}
+fn resize_art(image: Pixmap, width: u32, height: u32, crop: bool) -> Option<Pixmap> {
+    #[cfg(feature = "perf-bench")]
+    common::perf::hit(common::perf::Op::ArtResize);
+    let pixels = image::RgbaImage::from_raw(image.width(), image.height(), image.data().to_vec())?;
+    let resized_height = if crop {
+        (image.height() * width).div_ceil(image.width())
+    } else {
+        height
+    };
+    let resized = image::imageops::resize(
+        &pixels,
+        width,
+        resized_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let final_image = if crop {
+        image::imageops::crop_imm(&resized, 0, (resized_height - height) / 2, width, height)
+            .to_image()
+    } else {
+        resized
+    };
+    Pixmap::from_vec(
+        final_image.into_raw(),
+        tiny_skia::IntSize::from_wh(width, height)?,
+    )
+}
+
+pub fn font(styles: &Stylesheet, size: u32, color: Color) -> FontTextStyle {
+    FontTextStyleBuilder::new(styles.ui.ui_font.font())
+        .font_fallback(styles.cjk_font.font())
+        .font_size(size)
+        .text_color(color)
+        .build()
+}
+
+pub(crate) fn wrapped(
+    style: &FontTextStyle,
+    text: &str,
+    width: u32,
+    max_lines: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let next = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if style.measure(&next).w > width && !line.is_empty() {
+            lines.push(line);
+            line = word.to_string();
+            if lines.len() == max_lines {
+                break;
+            }
+        } else {
+            line = next;
+        }
+    }
+    if lines.len() < max_lines && !line.is_empty() {
+        lines.push(line);
+    }
+    for line in &mut lines {
+        while style.measure(line).w > width {
+            line.pop();
+            if line.is_empty() {
+                break;
+            }
+        }
+    }
+    lines
+}
+
+fn blit(display: &mut <DefaultPlatform as Platform>::Display, image: &Pixmap, point: Point) {
+    display.pixmap_mut().draw_pixmap(
+        point.x,
+        point.y,
+        image.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
+
+fn draw_readability_gradient(display: &mut <DefaultPlatform as Platform>::Display) {
+    for x in 250..480 {
+        let alpha = if x < 307 {
+            245
+        } else {
+            ((480 - x) * 245 / 173) as u8
+        };
+        fill_rect(
+            &mut display.pixmap_mut(),
+            Rect::new(x, HEADER_HEIGHT, 1, 189),
+            hero_background().with_a(alpha),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_directory_art_uses_full_basename_but_games_keep_stems() {
+        use crate::entry::{directory::Directory, game::Game};
+        let directory = Entry::Directory(Directory::new(PathBuf::from(
+            "Roms/PS/Mega Man Legends 2 PSP Improvements (v1.1)",
+        )));
+        assert_eq!(
+            art_path(&directory, "heroes"),
+            PathBuf::from("Roms/PS/Imgs/Mega Man Legends 2 PSP Improvements (v1.1).hero.png")
+        );
+        assert_eq!(
+            art_path(&directory, "covers"),
+            PathBuf::from("Roms/PS/Imgs/Mega Man Legends 2 PSP Improvements (v1.1).orbit.png")
+        );
+        let playlist = Entry::Game(Game::new(PathBuf::from(
+            "Roms/PS/Legend of Dragoon, The (USA).m3u",
+        )));
+        assert_eq!(
+            art_path(&playlist, "heroes"),
+            PathBuf::from("Roms/PS/Imgs/Legend of Dragoon, The (USA).hero.png")
+        );
+        let cue = Entry::Game(Game::new(PathBuf::from(
+            "Roms/PS/Mega Man Legends 2 PSP Improvements (v1.1)/Mega Man Legends 2 (USA).cue",
+        )));
+        assert_eq!(
+            art_path(&cue, "covers"),
+            PathBuf::from(
+                "Roms/PS/Mega Man Legends 2 PSP Improvements (v1.1)/Imgs/Mega Man Legends 2 (USA).orbit.png"
+            )
+        );
+    }
+
+    #[test]
+    fn shelf_keeps_selection_inside_three_cards() {
+        for count in 0..100 {
+            for selected in 0..count {
+                let first = shelf_start(selected, count);
+                assert!(first <= selected && selected < first + SHELF_CARDS);
+            }
+        }
+        assert_eq!(shelf_start(0, 0), 0);
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn native_orbit_readability_art_and_four_disc_frames() {
+        use crate::entry::{directory::Directory, game::Game};
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        let mut display = DefaultPlatform::new().unwrap().display().unwrap();
+        let game_path =
+            common::constants::ALLIUM_GAMES_DIR.join("PS/R4 - Ridge Racer Type 4 (USA).chd");
+        let evidence = PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_DIR").unwrap());
+        std::fs::create_dir_all(&evidence).unwrap();
+        let entries = [
+            Entry::Game(Game::new(game_path)),
+            Entry::Directory(Directory::new(
+                common::constants::ALLIUM_GAMES_DIR
+                    .join("PS/Mega Man Legends 2 PSP Improvements (v1.1)"),
+            )),
+        ];
+        let mut orbit = Orbit::new();
+        orbit.prepare(&entries, 0);
+        let cover = orbit
+            .image(&entries[0], "covers")
+            .expect("existing owned real-art fixture");
+        assert_eq!((cover.width(), cover.height()), (132, 132));
+        let hero = orbit.image(&entries[0], "heroes").unwrap();
+        assert_eq!((hero.width(), hero.height()), (390, 189));
+        assert!(273 + COVER_SIZE as i32 + 4 + 18 <= FOOTER_Y);
+        let caption = font(&styles, 18, text_color());
+        assert!(
+            wrapped(&caption, entries[1].name(), 158, 1)
+                .iter()
+                .all(|line| caption.measure(line).w <= 158)
+        );
+        orbit.draw(&entries, 1, &mut display, &styles);
+        display
+            .pixmap()
+            .to_owned()
+            .save_png(evidence.join("native-readable-dotted-title.png"))
+            .unwrap();
+        let mut picker = super::super::disc_picker::DiscPicker::new(crate::discs::Playlist {
+            path: PathBuf::from("Legend of Dragoon, The (USA).m3u"),
+            discs: (1..=4)
+                .map(|i| crate::discs::Disc {
+                    path: PathBuf::from(format!("Legend of Dragoon, The (USA) (Disc {i}).chd")),
+                    available: true,
+                })
+                .collect(),
+            core_compatible: true,
+        });
+        picker.select(true);
+        picker.draw(&mut display, &styles);
+        display
+            .pixmap()
+            .to_owned()
+            .save_png(evidence.join("native-readable-four-discs.png"))
+            .unwrap();
+        assert!(!picker.should_draw());
+        for _ in 0..4 {
+            picker.playlist.discs.push(crate::discs::Disc {
+                path: PathBuf::from("Extra disc.chd"),
+                available: true,
+            });
+        }
+        picker.selected = 7;
+        picker.draw(&mut display, &styles);
+        display
+            .pixmap()
+            .to_owned()
+            .save_png(evidence.join("native-readable-eight-disc-window.png"))
+            .unwrap();
+    }
+
+    #[test]
+    fn incorrect_dimensions_and_invalid_png_are_rejected_before_decode() {
+        let path = std::env::temp_dir().join(format!("allium-orbit-{}.png", std::process::id()));
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.resize(24, 0);
+        data[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, data).unwrap();
+        assert!(load_final_png(&path, (101, 101)).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+fn peek_game(entries: &[Entry], first: usize, count: usize) -> Option<usize> {
+    let next = first.checked_add(count)?;
+    matches!(entries.get(next), Some(Entry::Game(_))).then_some(next)
+}
+
+#[cfg(test)]
+mod next_cover_tests {
+    use super::*;
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn captured_case_art_prefers_clean_original_and_keeps_prepared_fallback() {
+        use common::theme::{ThemeRuntime, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, render::PreparedFrame};
+        use crate::entry::game::Game;
+        let captured = PathBuf::from(std::env::var("ALLIUM_ACTUAL_CASE_ART_DIR").unwrap());
+        let proof = PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_DIR").unwrap());
+        std::fs::create_dir_all(&proof).unwrap();
+        let root = PathBuf::from("/private/tmp").join(format!("allium-actual-case-art-{}", std::process::id()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        std::fs::create_dir_all(root.join(".allium/state")).unwrap();
+        std::fs::create_dir_all(root.join(".allium/fonts")).unwrap();
+        std::fs::create_dir_all(root.join("Themes")).unwrap();
+        std::fs::create_dir_all(root.join("Roms/PS/Imgs")).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for font in ["Nunito.ttf", "NotoSansCJK.otf"] {
+            std::fs::copy(common::constants::ALLIUM_FONTS_DIR.join(font), root.join(".allium/fonts").join(font)).unwrap();
+        }
+        let game_path = root.join("Roms/PS/Mega Man Legends 2 PSP Improvements (v1.1).chd");
+        let entry = Entry::Game(Game::new(game_path));
+        let original = art_path(&entry, "stock");
+        let prepared = art_path(&entry, "covers");
+        std::fs::copy(captured.join("megaman-original.png"), &original).unwrap();
+        std::fs::copy(captured.join("megaman-orbit.png"), &prepared).unwrap();
+        let mut runtime = ThemeRuntime::bind(&root.join(".allium/state"), &root.join("Themes"), &root.join(".allium/fonts")).unwrap();
+        let handle = runtime.choose("orbit").unwrap().snapshot.unwrap();
+        let entries = [entry];
+        let mut orbit = Orbit::new();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let art = orbit.theme_art(&entries, 0, 0, 1);
+        let clean = art.selected_cover.as_ref().unwrap().clone();
+        let expected = resize_art(load_final_png(&original, (0, 0)).unwrap(), THEME_COVER_SIZE, THEME_COVER_SIZE, false).unwrap();
+        assert_eq!((clean.width(), clean.height()), (140, 140));
+        assert_eq!(clean.data(), expected.data(), "themed case uses actual clean original");
+        let again = orbit.theme_art(&entries, 0, 0, 1);
+        assert!(std::sync::Arc::ptr_eq(&clean, again.selected_cover.as_ref().unwrap()));
+        assert!(orbit.cache_entries() <= CACHE_ENTRIES);
+        let mut input = FrameInputs::new(ScreenId::Library);
+        input.rows.insert(Binding::Entries, vec![Row { id: crate::theme_adapter::entry_id(entries[0].path()), label: entries[0].name().into(), value: String::new(), enabled: true }]);
+        input.art = art;
+        PreparedFrame::prepare(handle.clone(), &input).unwrap().pixels().save_png(proof.join("actual-megaman-clean-rounded-case.png")).unwrap();
+
+        std::fs::remove_file(&original).unwrap();
+        orbit.release_art();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let fallback = orbit.theme_art(&entries, 0, 0, 1);
+        assert_eq!((fallback.selected_cover.as_ref().unwrap().width(), fallback.selected_cover.as_ref().unwrap().height()), (COVER_SIZE, COVER_SIZE));
+        input.art = fallback;
+        PreparedFrame::prepare(handle, &input).unwrap().pixels().save_png(proof.join("actual-megaman-prepared-fallback-case.png")).unwrap();
+
+        let window = (0..9)
+            .map(|i| Entry::Game(Game::new(root.join(format!("Roms/PS/Window {i}.chd")))))
+            .collect::<Vec<_>>();
+        for entry in &window {
+            std::fs::copy(&prepared, art_path(entry, "covers")).unwrap();
+        }
+        orbit.release_art();
+        orbit.prepare_window(&window, 7, 0, 8);
+        let full = orbit.theme_art(&window, 7, 0, 8);
+        assert_eq!(full.entries.len(), 8, "all eight visible prepared fallbacks survive");
+        assert!(full.next_cover.is_some(), "ninth game's preview survives");
+        assert_eq!(orbit.cache_entries(), 10, "nine logical covers and one hero miss");
+        for entry in window.iter().take(8) {
+            assert!(full.entries.contains_key(&crate::theme_adapter::entry_id(entry.path())));
+        }
+        let repeated = orbit.theme_art(&window, 7, 0, 8);
+        assert!(std::sync::Arc::ptr_eq(full.next_cover.as_ref().unwrap(), repeated.next_cover.as_ref().unwrap()));
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn actual_theme_art_identity_reuses_prepared_preview_and_invalidates() {
+        use common::theme::{
+            ThemeRuntime,
+            frame::FrameInputs,
+            pack::{Binding, ScreenId},
+            render::PreparedFrame,
+        };
+        let root = common::constants::ALLIUM_SD_ROOT.as_path();
+        let mut runtime = ThemeRuntime::bind(
+            &root.join(".allium/state"),
+            &root.join("Themes"),
+            &root.join(".allium/fonts"),
+        )
+        .unwrap();
+        let handle = runtime.choose("orbit").unwrap().snapshot.unwrap();
+        let entries = [
+            Entry::Game(crate::entry::game::Game::new(
+                root.join("Roms/PS/R4 - Ridge Racer Type 4 (USA).chd"),
+            )),
+            Entry::Game(crate::entry::game::Game::new(
+                root.join("Roms/PS/Silent Hill (USA).chd"),
+            )),
+            Entry::Game(crate::entry::game::Game::new(
+                root.join("Roms/PS/Preview Fixture.chd"),
+            )),
+        ];
+        let extra = root.join("Roms/PS/Imgs/Preview Fixture.orbit.png");
+        std::fs::copy(
+            root.join("Roms/PS/Imgs/R4 - Ridge Racer Type 4 (USA).orbit.png"),
+            &extra,
+        )
+        .unwrap();
+        let mut orbit = Orbit::new();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let first = orbit.theme_art(&entries, 0, 0, 1);
+        let original_cover = first.selected_cover.as_ref().unwrap().clone();
+        let second = orbit.theme_art(&entries, 0, 0, 1);
+        assert!(std::sync::Arc::ptr_eq(
+            first.next_cover.as_ref().unwrap(),
+            second.next_cover.as_ref().unwrap()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            first.selected_cover.as_ref().unwrap(),
+            second.selected_cover.as_ref().unwrap()
+        ));
+        let mut input = FrameInputs::new(ScreenId::Library);
+        input.rows.insert(Binding::Entries, vec![]);
+        input.art = first;
+        PreparedFrame::prepare(handle.clone(), &input).unwrap();
+        let cached = handle.debug_prepared_preview_identity().unwrap();
+        input.art = second;
+        PreparedFrame::prepare(handle.clone(), &input).unwrap();
+        assert_eq!(handle.debug_prepared_preview_identity(), Some(cached));
+        orbit.prepare_window(&entries, 1, 1, 1);
+        let changed = orbit.theme_art(&entries, 1, 1, 1);
+        assert!(!std::sync::Arc::ptr_eq(
+            input.art.next_cover.as_ref().unwrap(),
+            changed.next_cover.as_ref().unwrap()
+        ));
+        input.art = changed;
+        PreparedFrame::prepare(handle.clone(), &input).unwrap();
+        assert_ne!(handle.debug_prepared_preview_identity(), Some(cached));
+        input.art = orbit.theme_art(&entries, 2, 2, 1);
+        assert!(input.art.next_cover.is_none());
+        PreparedFrame::prepare(handle.clone(), &input).unwrap();
+        assert!(handle.debug_prepared_preview_identity().is_none());
+        orbit.release_art();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let reloaded = orbit.theme_art(&entries, 0, 0, 1);
+        assert!(!std::sync::Arc::ptr_eq(
+            &original_cover,
+            reloaded.selected_cover.as_ref().unwrap()
+        ));
+        std::fs::remove_file(extra).unwrap();
+    }
+    #[test]
+    fn next_cover_follows_visible_window_without_wrap() {
+        let entries = vec![
+            Entry::Game(crate::entry::game::Game::new("First.chd".into())),
+            Entry::Game(crate::entry::game::Game::new("Second.chd".into())),
+        ];
+        assert_eq!(peek_game(&entries, 0, 1), Some(1));
+        assert_eq!(peek_game(&entries, 0, 2), None);
+        assert_eq!(peek_game(&entries, usize::MAX, 1), None);
+        assert_eq!(peek_game(&entries, 1, 1), None);
+        assert_eq!(peek_game(&entries[..1], 0, 1), None);
+        assert_eq!(peek_game(&[], 0, 1), None);
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::entry::game::Game;
+
+    fn write_art(path: &Path, width: u32, height: u32, red: u8) {
+        let mut pixels = Pixmap::new(width, height).unwrap();
+        pixels.fill(tiny_skia::Color::from_rgba8(red, 0, 0, 255));
+        pixels.save_png(path).unwrap();
+    }
+    #[test]
+    fn art_invalidation_reloads_replaced_files_and_previous_misses() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("allium-art-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let entries = [Entry::Game(Game::new(root.join("Game.chd")))];
+        let cover = art_path(&entries[0], "stock");
+        let hero = art_path(&entries[0], "heroes");
+        let prepared = art_path(&entries[0], "covers");
+        write_art(&prepared, 101, 101, 20);
+        let mut orbit = Orbit::new();
+        orbit.prepare(&entries, 0);
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let old = orbit.theme_art(&entries, 0, 0, 1);
+        let old_legacy = orbit.image(&entries[0], "covers").unwrap().clone();
+        assert!(old.selected_hero.is_none());
+        assert_eq!(old.selected_cover.as_ref().unwrap().width(), COVER_SIZE);
+        write_art(&cover, 240, 240, 90);
+        write_art(&prepared, 101, 101, 100);
+        write_art(&hero, 360, 210, 110);
+        orbit.prepare(&entries, 0);
+        orbit.prepare_window(&entries, 0, 0, 1);
+        assert!(orbit.theme_art(&entries, 0, 0, 1).selected_hero.is_none());
+        crate::view::details::invalidate_metadata();
+        let mut platform = DefaultPlatform::new().unwrap();
+        let mut display = platform.display().unwrap();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        orbit.draw(&entries, 0, &mut display, &styles);
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let new = orbit.theme_art(&entries, 0, 0, 1);
+        assert_eq!(
+            new.selected_cover.as_ref().unwrap().width(),
+            THEME_COVER_SIZE
+        );
+        assert_eq!(new.selected_cover.as_ref().unwrap().data()[0], 90);
+        assert_eq!(new.selected_hero.as_ref().unwrap().data()[0], 110);
+        assert!(!std::sync::Arc::ptr_eq(
+            old.selected_cover.as_ref().unwrap(),
+            new.selected_cover.as_ref().unwrap()
+        ));
+        assert_eq!(orbit.image(&entries[0], "covers").unwrap().data()[0], 100);
+        assert!(!std::sync::Arc::ptr_eq(
+            &old_legacy,
+            orbit.image(&entries[0], "covers").unwrap()
+        ));
+        use common::theme::{
+            ThemeRuntime,
+            frame::FrameInputs,
+            pack::{Binding, ScreenId},
+            render::PreparedFrame,
+        };
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::create_dir_all(root.join("Themes")).unwrap();
+        let mut runtime = ThemeRuntime::bind(
+            &root.join("state"),
+            &root.join("Themes"),
+            &common::constants::ALLIUM_FONTS_DIR.canonicalize().unwrap(),
+        )
+        .unwrap();
+        let handle = runtime.choose("orbit").unwrap().snapshot.unwrap();
+        let mut input = FrameInputs::new(ScreenId::Library);
+        input.rows.insert(Binding::Entries, vec![]);
+        input.art = new.clone();
+        let first_frame = PreparedFrame::prepare(handle.clone(), &input)
+            .unwrap()
+            .pixels()
+            .data()
+            .to_vec();
+        let held = new.selected_cover.unwrap();
+        write_art(&cover, 240, 240, 180);
+        write_art(&hero, 360, 210, 190);
+        invalidate_art();
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let replaced = orbit.theme_art(&entries, 0, 0, 1);
+        assert_eq!(replaced.selected_cover.as_ref().unwrap().data()[0], 180);
+        assert_eq!(replaced.selected_hero.as_ref().unwrap().data()[0], 190);
+        assert!(!std::sync::Arc::ptr_eq(
+            &held,
+            replaced.selected_cover.as_ref().unwrap()
+        ));
+        input.art = replaced;
+        let second_frame = PreparedFrame::prepare(handle, &input).unwrap();
+        assert_ne!(
+            first_frame,
+            second_frame.pixels().data(),
+            "final-pixel cache follows the new source identity"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod performance_round_tests {
+    use super::*;
+    #[test]
+    fn deferred_legacy_is_lazy_and_source_budget_counts_retained_arcs() {
+        let mut orbit = Orbit::new();
+        orbit.prepare(&[], 0);
+        assert!(orbit.legacy_ready);
+        orbit.defer_legacy();
+        assert!(!orbit.legacy_ready);
+        assert!(orbit.should_draw());
+        assert_eq!(orbit.cache_entries(), 0);
+        let held = std::sync::Arc::new(Pixmap::new(390, 189).unwrap());
+        orbit.insert_cached(CachedArt {
+            path: PathBuf::from("held"),
+            image: Some(held.clone()),
+        });
+        orbit.release_art();
+        assert_eq!(orbit.source_bytes(), 294840);
+        for i in 0..32 {
+            orbit.insert_cached(CachedArt {
+                path: PathBuf::from(format!("hero{i}")),
+                image: Some(std::sync::Arc::new(Pixmap::new(390, 189).unwrap())),
+            });
+            assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
+        }
+        drop(held);
+        orbit.release_art();
+        assert_eq!(orbit.source_bytes(), 0);
+        assert!(orbit.retired.is_empty());
+    }
+    #[test]
+    fn replaced_full_window_survives_while_previous_model_holds_art() {
+        let mut orbit = Orbit::new();
+        let mut previous = Vec::new();
+        for i in 0..16 {
+            let image = std::sync::Arc::new(if i == 15 {
+                Pixmap::new(390, 189).unwrap()
+            } else {
+                Pixmap::new(140, 140).unwrap()
+            });
+            previous.push(image.clone());
+            orbit.insert_cached(CachedArt { path: PathBuf::from(format!("old{i}")), image: Some(image) });
+        }
+        for i in 0..16 {
+            let image = std::sync::Arc::new(if i == 15 {
+                Pixmap::new(390, 189).unwrap()
+            } else {
+                Pixmap::new(140, 140).unwrap()
+            });
+            orbit.insert_cached(CachedArt { path: PathBuf::from(format!("new{i}")), image: Some(image) });
+            assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
+        }
+        for i in 0..16 {
+            assert!(orbit.cached_image(&PathBuf::from(format!("new{i}"))).is_some());
+        }
+        assert_eq!(orbit.source_bytes(), 2 * (294840 + 15 * 78400));
+        drop(previous);
+        assert_eq!(orbit.source_bytes(), 294840 + 15 * 78400);
+    }
+    #[test]
+    fn oversized_opened_source_is_rejected_before_payload_read() {
+        let path = std::env::temp_dir().join(format!("allium-oversize-{}.png", std::process::id()));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_PNG_BYTES + 1).unwrap();
+        #[cfg(feature = "perf-bench")]
+        common::perf::take();
+        assert!(load_prepared_art(&path, (0, 0), 140, 140, false).is_none());
+        #[cfg(feature = "perf-bench")]
+        {
+            let counts = common::perf::take();
+            assert_eq!(
+                (counts.read_attempts, counts.decodes, counts.disk_hits),
+                (0, 0, 0)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}

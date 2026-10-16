@@ -58,6 +58,8 @@ impl View for Toast {
         display: &mut <DefaultPlatform as Platform>::Display,
         styles: &Stylesheet,
     ) -> Result<bool> {
+        let display_styles = styles.display_style();
+        let styles = &display_styles;
         let w = display.size().w;
         let h = display.size().h;
 

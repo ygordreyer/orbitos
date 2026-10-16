@@ -23,6 +23,7 @@ pub struct ScrollList {
     alignment: Alignment,
     entry_height: u32,
     top: usize,
+    visible_count_override: Option<usize>,
     selected: usize,
     background_color: Option<StylesheetColor>,
     dirty: bool,
@@ -53,6 +54,7 @@ impl ScrollList {
             alignment,
             entry_height,
             top: 0,
+            visible_count_override: None,
             selected: 0,
             background_color: None,
             dirty: true,
@@ -145,11 +147,53 @@ impl ScrollList {
         self.dirty = true;
     }
 
+    pub fn set_visible_count_override(&mut self, count: Option<usize>) -> Result<()> {
+        anyhow::ensure!(
+            count.is_none_or(|n| (1..=64).contains(&n)),
+            "Invalid visible row capacity"
+        );
+        if self.visible_count_override == count {
+            return Ok(());
+        }
+        self.visible_count_override = count;
+        let capacity = self.visible_count();
+        self.top = self
+            .top
+            .min(self.items.len().saturating_sub(capacity))
+            .min(self.selected);
+        self.children.clear();
+        {
+            let styles = self.res.get::<Stylesheet>();
+            let mut y = self.rect.y + styles.ui.padding_y;
+            for i in 0..capacity {
+                self.children.push(Label::new(
+                    Point::new(self.rect.x + styles.ui.padding_x * self.alignment.sign(), y),
+                    self.items[self.top + i].clone(),
+                    self.alignment,
+                    Some(self.rect.w.saturating_sub(styles.ui.padding_x as u32 * 2)),
+                ));
+                y += self.entry_height as i32 + styles.ui.list_margin;
+            }
+        }
+        if capacity > 0 {
+            self.select(self.selected);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn window_start(&self) -> usize {
+        self.top
+    }
+
     pub fn selected(&self) -> usize {
         self.selected
     }
 
     pub fn visible_count(&self) -> usize {
+        if let Some(count) = self.visible_count_override {
+            return count.min(self.items.len());
+        }
         let styles = self.res.get::<Stylesheet>();
         ((self.rect.h as usize) / (self.entry_height as usize + styles.ui.list_margin as usize))
             .min(self.items.len())

@@ -88,13 +88,46 @@ impl Default for MockPlatform {
 }
 
 pub struct MockDisplay {
+    #[cfg(feature = "perf-bench")]
+    probe_damage: Vec<Rect>,
     pixmap: Pixmap,
+    recording: Option<Recording>,
+}
+
+struct Recording {
+    saved: Vec<Pixmap>,
+    presented: Vec<Pixmap>,
 }
 
 impl MockDisplay {
+    #[cfg(feature = "perf-bench")]
+    pub fn take_probe_damage(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.probe_damage)
+    }
+
+    pub fn record_presentations(&mut self) {
+        self.recording = Some(Recording {
+            saved: Vec::new(),
+            presented: Vec::new(),
+        });
+    }
+
+    pub fn take_presented_frames(&mut self) -> Vec<Pixmap> {
+        std::mem::take(
+            &mut self
+                .recording
+                .as_mut()
+                .expect("recording enabled")
+                .presented,
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             pixmap: Pixmap::new(SCREEN_WIDTH, SCREEN_HEIGHT).expect("Failed to create mock pixmap"),
+            recording: None,
+            #[cfg(feature = "perf-bench")]
+            probe_damage: vec![],
         }
     }
 }
@@ -133,16 +166,66 @@ impl Display for MockDisplay {
         Ok(())
     }
 
-    fn save(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
+        #[cfg(feature = "perf-bench")]
+        {
+            self.probe_damage = vec![self.bounding_box()];
+        }
+        crate::perf_trace::count(
+            crate::perf_trace::Count::FlushedPixels,
+            self.width() as u64 * self.height() as u64,
+        );
+        if let Some(recording) = &mut self.recording {
+            recording.presented.push(self.pixmap.clone());
+        }
         Ok(())
     }
 
-    fn load(&mut self, _area: Rect) -> Result<()> {
+    fn flush_rects(&mut self, areas: &[Rect]) -> Result<()> {
+        #[cfg(feature = "perf-bench")]
+        {
+            self.probe_damage = areas.to_vec();
+        }
+        crate::perf_trace::count(
+            crate::perf_trace::Count::FlushedPixels,
+            areas.iter().map(|a| a.w as u64 * a.h as u64).sum(),
+        );
+        if let Some(recording) = &mut self.recording {
+            recording.presented.push(self.pixmap.clone());
+        }
+        Ok(())
+    }
+
+    fn save(&mut self) -> Result<()> {
+        if let Some(recording) = &mut self.recording {
+            recording.saved.push(self.pixmap.clone());
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, area: Rect) -> Result<()> {
+        if let Some(recording) = &self.recording {
+            let saved = recording
+                .saved
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("No saved image"))?;
+            let width = self.pixmap.width() as usize;
+            for y in area.y.max(0)..area.bottom().min(self.pixmap.height() as i32) {
+                let start = y as usize * width + area.x.max(0) as usize;
+                let end = y as usize * width + area.right().min(width as i32) as usize;
+                if start < end {
+                    self.pixmap.pixels_mut()[start..end]
+                        .copy_from_slice(&saved.pixels()[start..end]);
+                }
+            }
+        }
         Ok(())
     }
 
     fn pop(&mut self) -> bool {
-        true
+        self.recording
+            .as_mut()
+            .is_none_or(|recording| recording.saved.pop().is_some())
     }
 }
 

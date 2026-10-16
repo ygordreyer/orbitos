@@ -84,18 +84,23 @@ impl GameInfo {
 
     /// Loads the current game info from file, if exists.
     pub fn load() -> Result<Option<Self>> {
+        let game_info = Self::read()?;
+        if game_info.as_ref().is_some_and(Self::needs_swap) {
+            debug!("enabling swap");
+            Command::new(ALLIUM_SCRIPTS_DIR.join("swap-on.sh"))
+                .spawn()?
+                .wait()?;
+        }
+        Ok(game_info)
+    }
+
+    pub fn read() -> Result<Option<Self>> {
         Ok(if ALLIUM_GAME_INFO.exists() {
             let file = File::open(ALLIUM_GAME_INFO.as_path())?;
             let Ok(game_info) = serde_json::from_reader::<_, Self>(file) else {
                 fs::remove_file(ALLIUM_GAME_INFO.as_path())?;
                 return Ok(None);
             };
-            if game_info.needs_swap() {
-                debug!("enabling swap");
-                Command::new(ALLIUM_SCRIPTS_DIR.join("swap-on.sh"))
-                    .spawn()?
-                    .wait()?;
-            }
             Some(game_info)
         } else {
             None
@@ -182,4 +187,56 @@ pub fn find_guides(path: &Path) -> Vec<PathBuf> {
         }
     }
     guides
+}
+
+#[cfg(test)]
+mod ux4_tests {
+    use super::*;
+    #[test]
+    fn ux4_read_does_not_spawn_swap_but_load_still_does() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            allium_base_dir_for_test()
+                .to_string_lossy()
+                .contains("native-orbit-fixture")
+        );
+        fs::create_dir_all(ALLIUM_GAME_INFO.parent().unwrap()).unwrap();
+        fs::create_dir_all(&*ALLIUM_SCRIPTS_DIR).unwrap();
+        let script = ALLIUM_SCRIPTS_DIR.join("swap-on.sh");
+        let marker = ALLIUM_SCRIPTS_DIR.join("swap-marker");
+        let old_info = fs::read(&*ALLIUM_GAME_INFO).ok();
+        let old_script = fs::read(&script).ok();
+        let game = GameInfo {
+            needs_swap: true,
+            ..Default::default()
+        };
+        game.save().unwrap();
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let read = GameInfo::read();
+        let spawned = marker.exists();
+        let loaded = GameInfo::load();
+        let load_spawned = marker.exists();
+        fs::remove_file(&marker).ok();
+        if let Some(bytes) = old_info {
+            fs::write(&*ALLIUM_GAME_INFO, bytes).unwrap();
+        } else {
+            fs::remove_file(&*ALLIUM_GAME_INFO).unwrap();
+        }
+        if let Some(bytes) = old_script {
+            fs::write(script, bytes).unwrap();
+        } else {
+            fs::remove_file(script).unwrap();
+        }
+        assert!(read.unwrap().unwrap().needs_swap);
+        assert!(!spawned, "metadata read invoked swap helper");
+        assert!(loaded.unwrap().unwrap().needs_swap && load_spawned);
+    }
+    fn allium_base_dir_for_test() -> &'static Path {
+        &crate::constants::ALLIUM_BASE_DIR
+    }
 }
