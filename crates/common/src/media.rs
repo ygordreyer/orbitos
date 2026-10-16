@@ -69,6 +69,7 @@ struct Cache {
     source_order: std::collections::VecDeque<(PathBuf, usize)>,
     skipped_sources: BTreeMap<PathBuf, Fingerprint>,
     skipped_bytes: usize,
+    suppress_new_sources: bool,
     defer_cold: bool,
     local_containers: BTreeMap<PathBuf, Option<PathBuf>>,
     paths: BTreeMap<(PathBuf, Kind), Option<PathBuf>>,
@@ -94,15 +95,16 @@ impl Cache {
     }
 
     fn remember_skipped_source(&mut self, path: PathBuf, fingerprint: Fingerprint) {
-        self.forget_skipped_source(&path);
-        let bytes = source_bytes(&path);
-        let limit = marker_budget(self.budget.unwrap_or(METADATA_BUDGET));
-        if bytes > limit {
+        if let Some(previous) = self.skipped_sources.get_mut(&path) {
+            *previous = fingerprint;
             return;
         }
-        while self.skipped_bytes + bytes > limit {
-            let discarded = self.skipped_sources.keys().next().unwrap().clone();
-            self.forget_skipped_source(&discarded);
+        let bytes = source_bytes(&path);
+        let limit = marker_budget(self.budget.unwrap_or(METADATA_BUDGET));
+        if self.skipped_bytes + bytes > limit {
+            // Forgetting an eviction would make it cold again and restart admission churn.
+            self.suppress_new_sources = true;
+            return;
         }
         self.skipped_bytes += bytes;
         self.bytes += bytes;
@@ -125,6 +127,10 @@ impl Cache {
         if !index.valid || self.sources.get(path) == Some(&index.fingerprint) {
             return false;
         }
+        self.resolves_resident_names(path)
+    }
+
+    fn resolves_resident_names(&self, path: &Path) -> bool {
         let Some(parent) = path.parent() else {
             return false;
         };
@@ -139,17 +145,27 @@ impl Cache {
         {
             return false;
         }
-        // Resolving a missing child source can expose an already indexed ancestor's names.
+        // Child resolution can expose an ancestor's exact identities or game containers.
         self.names.iter().any(|(source, names)| {
             source != path
                 && source
                     .parent()
                     .is_some_and(|ancestor| parent.starts_with(ancestor))
-                && names.keys().any(|game| game.starts_with(parent))
+                && names
+                    .keys()
+                    .any(|game| game.starts_with(parent) || parent.starts_with(game))
         })
     }
 
     fn insert_source(&mut self, path: PathBuf, index: NameIndex) -> bool {
+        if index.valid
+            && self
+                .sources
+                .get(&path)
+                .is_some_and(|previous| *previous != index.fingerprint)
+        {
+            self.suppress_new_sources = false;
+        }
         let resolution_changed = self.source_resolution_changes_names(&path, &index);
         if let Some(at) = self.source_order.iter().position(|(p, _)| p == &path) {
             let (_, bytes) = self.source_order.remove(at).unwrap();
@@ -192,6 +208,10 @@ impl Cache {
     }
 
     fn discard_source(&mut self, path: &Path) {
+        // Freed resident capacity must remain usable after a transient record-read failure.
+        if self.sources.contains_key(path) {
+            self.suppress_new_sources = false;
+        }
         self.forget_skipped_source(path);
         if let Some(at) = self.source_order.iter().position(|(p, _)| p == path) {
             let (_, bytes) = self.source_order.remove(at).unwrap();
@@ -541,11 +561,19 @@ fn read_name_index_records(
 }
 
 fn load_source(path: &Path, cache: &mut Cache) {
+    let was_skipped = cache.skipped_sources.contains_key(path);
     if let Some(previous) = cache.skipped_sources.get(path) {
         if *previous == source_fingerprint(path) {
             return;
         }
         cache.forget_skipped_source(path);
+    }
+    if cache.suppress_new_sources
+        && !was_skipped
+        && !cache.sources.contains_key(path)
+        && !cache.resolves_resident_names(path)
+    {
+        return;
     }
     if cache.defer_cold {
         if KEEP_NAME_INDEXES.with(std::cell::Cell::get) && cache.sources.contains_key(path) {
@@ -1244,6 +1272,7 @@ mod tests {
                 }
                 xml.push_str("</gameList>");
                 fs::write(dir.join("gamelist.xml"), xml).unwrap();
+                let admit_source = CACHE.with(|c| !c.borrow().suppress_new_sources);
                 check_directory(&dir);
                 CACHE.with(|c| {
                     let c = c.borrow();
@@ -1253,7 +1282,10 @@ mod tests {
                     assert_eq!(c.bytes, charged + c.skipped_bytes);
                     assert_eq!(c.names.len(), c.sources.len());
                     assert_eq!(c.source_order.len(), c.sources.len());
-                    assert!(c.names.contains_key(&dir.join("gamelist.xml")));
+                    assert_eq!(
+                        c.names.contains_key(&dir.join("gamelist.xml")),
+                        admit_source
+                    );
                 });
             }
             CACHE.with(|c| {
@@ -1474,6 +1506,328 @@ mod tests {
         }
         assert!(counts.values().all(|count| *count == 1), "jobs: {counts:?}");
         assert_eq!(final_generation, settled, "idle generation did not settle");
+    }
+
+    #[test]
+    fn metadata_marker_overflow_hydration_jobs_and_generation_settle() {
+        invalidate();
+        defer_cold_sources();
+        let budget = 32 * 1024;
+        set_metadata_budget(budget);
+        let root =
+            std::env::temp_dir().join(format!("allium-marker-overflow-{}", std::process::id()));
+        let mut games = Vec::new();
+        for n in 0..12 {
+            let dir = root.join(format!("Roms/S{n:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            let mut xml = String::from("<gameList>");
+            for game in 0..40 {
+                xml.push_str(&format!(
+                    "<game><path>G{game}.chd</path><name>{}</name></game>",
+                    "N".repeat(900)
+                ));
+            }
+            xml.push_str("</gameList>");
+            fs::write(dir.join("gamelist.xml"), xml).unwrap();
+            games.push(dir.join("G0.chd"));
+        }
+        let sources = games
+            .iter()
+            .map(|game| game.parent().unwrap().join("gamelist.xml"))
+            .collect::<Vec<_>>();
+        assert!(
+            sources.iter().map(|path| source_bytes(path)).sum::<usize>() > marker_budget(budget)
+        );
+        assert!(
+            sources
+                .iter()
+                .map(|path| read_name_index(path, budget).bytes)
+                .sum::<usize>()
+                > resident_budget(budget)
+        );
+        let (send, jobs) = std::sync::mpsc::sync_channel::<IndexJob>(1);
+        let (done, recv) = std::sync::mpsc::sync_channel(1);
+        let old_worker = INDEX_WORKER.with(|slot| {
+            slot.replace(Some(IndexWorker {
+                send,
+                recv,
+                pending: Default::default(),
+                waiting: Default::default(),
+            }))
+        });
+        let drive = || {
+            let mut counts = BTreeMap::<PathBuf, usize>::new();
+            let mut settled = 0;
+            for round in 0..300 {
+                for game in &games {
+                    let _ = cached_name(game);
+                }
+                if let Ok((path, budget, epoch, previous)) = jobs.try_recv() {
+                    *counts.entry(path.clone()).or_default() += 1;
+                    let index = (previous != Some(source_fingerprint(&path)))
+                        .then(|| read_name_index(&path, budget.min(INDEX_WORKER_BUDGET)));
+                    done.send((path, index, epoch)).unwrap();
+                }
+                poll_name_indexes();
+                CACHE.with(|c| {
+                    let c = c.borrow();
+                    assert!(c.bytes <= budget);
+                    assert!(c.skipped_bytes <= marker_budget(budget));
+                });
+                if round == 100 {
+                    settled = name_generation();
+                }
+            }
+            (counts, settled, name_generation())
+        };
+        let first = drive();
+        invalidate();
+        set_metadata_budget(budget);
+        let refreshed = drive();
+        INDEX_WORKER.with(|slot| {
+            slot.replace(old_worker);
+        });
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+        for (counts, settled, final_generation) in [first, refreshed] {
+            for source in &sources {
+                assert_eq!(
+                    counts.get(source),
+                    Some(&1),
+                    "reindexed {}",
+                    source.display()
+                );
+            }
+            assert!(counts.values().all(|count| *count == 1), "jobs: {counts:?}");
+            assert_eq!(final_generation, settled, "idle generation did not settle");
+        }
+    }
+
+    #[test]
+    fn metadata_suppression_resolves_children_of_resident_ancestor_names() {
+        invalidate();
+        defer_cold_sources();
+        let budget = 32 * 1024;
+        set_metadata_budget(budget);
+        let root =
+            std::env::temp_dir().join(format!("allium-suppressed-ancestor-{}", std::process::id()));
+        let dir = root.join("Roms/PS");
+        fs::create_dir_all(dir.join("Nested/Discs")).unwrap();
+        let ancestor = dir.join("gamelist.xml");
+        fs::write(&ancestor, "<gameList><game><path>Nested/Discs/Exact.cue</path><name>Ancestor title</name></game><game><path>Nested/Discs/Closer.cue</path><name>Shadowed title</name></game><game><path>Container</path><name>Container title</name></game></gameList>").unwrap();
+        fs::write(dir.join("Nested/gamelist.xml"), "<gameList><game><path>Discs/Closer.cue</path><name>Child title</name></game></gameList>").unwrap();
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            cache.insert_source(ancestor.clone(), read_name_index(&ancestor, budget));
+            // Exact identities in outer sources must be ruled out before container fallback.
+            for name in ["gamelist.xml", "miyoogamelist.xml"] {
+                let outer = root.join("Roms").join(name);
+                cache.insert_source(outer.clone(), read_name_index(&outer, budget));
+            }
+            for n in 0..8 {
+                cache.remember_skipped_source(root.join(format!("Skipped{n}/gamelist.xml")), None);
+            }
+            assert!(cache.suppress_new_sources);
+        });
+        let (send, jobs) = std::sync::mpsc::sync_channel::<IndexJob>(1);
+        let (done, recv) = std::sync::mpsc::sync_channel(1);
+        let old_worker = INDEX_WORKER.with(|slot| {
+            slot.replace(Some(IndexWorker {
+                send,
+                recv,
+                pending: Default::default(),
+                waiting: Default::default(),
+            }))
+        });
+        let exact = dir.join("Nested/Discs/Exact.cue");
+        let closer = dir.join("Nested/Discs/Closer.cue");
+        let launch = dir.join("Container/Discs/Launch.cue");
+        set_game_containers([(launch.clone(), dir.join("Container"))]);
+        let mut counts = BTreeMap::<PathBuf, usize>::new();
+        let mut settled = 0;
+        let mut names = (None, None, None);
+        for round in 0..300 {
+            names = (
+                cached_name(&exact),
+                cached_name(&closer),
+                cached_name(&launch),
+            );
+            if let Ok((path, budget, epoch, previous)) = jobs.try_recv() {
+                *counts.entry(path.clone()).or_default() += 1;
+                let index = (previous != Some(source_fingerprint(&path)))
+                    .then(|| read_name_index(&path, budget.min(INDEX_WORKER_BUDGET)));
+                done.send((path, index, epoch)).unwrap();
+            }
+            poll_name_indexes();
+            CACHE.with(|c| {
+                let cache = c.borrow();
+                assert!(cache.suppress_new_sources);
+                assert!(cache.sources.contains_key(&ancestor));
+                assert!(cache.bytes <= budget);
+                assert!(cache.skipped_bytes <= marker_budget(budget));
+            });
+            if round == 100 {
+                settled = name_generation();
+            }
+        }
+        let final_generation = name_generation();
+        INDEX_WORKER.with(|slot| {
+            slot.replace(old_worker);
+        });
+        fs::remove_dir_all(root).unwrap();
+        set_game_containers(std::iter::empty());
+        invalidate();
+        assert_eq!(names.0.as_deref(), Some("Ancestor title"));
+        assert_eq!(names.1.as_deref(), Some("Child title"));
+        assert_eq!(names.2.as_deref(), Some("Container title"));
+        assert!(counts.values().all(|count| *count == 1), "jobs: {counts:?}");
+        assert_eq!(final_generation, settled, "idle generation did not settle");
+    }
+
+    #[test]
+    fn metadata_suppression_retries_discarded_source_after_read_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "allium-suppressed-read-retry-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("gamelist.xml");
+        let game = root.join("G.chd");
+        fs::write(
+            &path,
+            "<gameList><game><path>G.chd</path><name>Recovered title</name></game></gameList>",
+        )
+        .unwrap();
+        let budget = 32 * 1024;
+        let mut cache = Cache {
+            budget: Some(budget),
+            ..Cache::default()
+        };
+        cache.insert_source(path.clone(), read_name_index(&path, budget));
+        for n in 0..8 {
+            cache.remember_skipped_source(root.join(format!("Skipped{n}/gamelist.xml")), None);
+        }
+        assert!(cache.suppress_new_sources);
+        let markers = cache.skipped_sources.clone();
+        let fingerprint = source_fingerprint(&path);
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(source_fingerprint(&path), fingerprint);
+        let failed = source(&path, &game, &mut cache).is_none();
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(failed, "unreadable record unexpectedly loaded");
+        assert!(!cache.sources.contains_key(&path));
+        assert_eq!(source_fingerprint(&path), fingerprint);
+        load_source(&path, &mut cache);
+        let recovered = source(&path, &game, &mut cache).map(|record| record.data.name.clone());
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(recovered.as_deref(), Some("Recovered title"));
+        assert_eq!(cache.skipped_sources, markers);
+        assert!(cache.bytes <= budget);
+        assert!(cache.skipped_bytes <= marker_budget(budget));
+    }
+
+    #[test]
+    fn metadata_suppression_budget_growth_admits_new_source() {
+        invalidate();
+        let root = std::env::temp_dir().join(format!(
+            "allium-suppressed-budget-growth-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("Cold")).unwrap();
+        let path = root.join("gamelist.xml");
+        let cold = root.join("Cold/gamelist.xml");
+        let xml = "<gameList><game><path>G.chd</path><name>New title</name></game></gameList>";
+        fs::write(&path, xml).unwrap();
+        fs::write(&cold, xml).unwrap();
+        set_metadata_budget(128 * 1024);
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            cache.insert_source(path.clone(), read_name_index(&path, 128 * 1024));
+            for n in 0..4 {
+                cache.remember_skipped_source(root.join(format!("Skipped{n}/gamelist.xml")), None);
+            }
+            assert!(!cache.suppress_new_sources);
+        });
+        set_metadata_budget(16 * 1024);
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            assert!(cache.suppress_new_sources);
+            assert!(cache.bytes <= 16 * 1024);
+            load_source(&cold, &mut cache);
+            assert!(!cache.sources.contains_key(&cold));
+        });
+        let markers = CACHE.with(|c| c.borrow().skipped_sources.clone());
+        assert!(!markers.is_empty());
+        set_metadata_budget(128 * 1024);
+        let indexed = CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            assert_eq!(cache.skipped_sources, markers);
+            for source in markers.keys() {
+                load_source(source, &mut cache);
+                assert!(!cache.sources.contains_key(source));
+            }
+            load_source(&cold, &mut cache);
+            assert!(cache.bytes <= 128 * 1024);
+            assert!(cache.skipped_bytes <= marker_budget(128 * 1024));
+            cache.names.get(&cold).and_then(|names| {
+                names
+                    .get(&root.join("Cold/G.chd"))
+                    .map(|entry| entry.name.clone())
+            })
+        });
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+        assert_eq!(indexed.as_deref(), Some("New title"));
+    }
+
+    #[test]
+    fn metadata_marker_overflow_preserves_markers_until_resident_change() {
+        let root =
+            std::env::temp_dir().join(format!("allium-marker-refresh-{}", std::process::id()));
+        fs::create_dir_all(root.join("Cold")).unwrap();
+        let path = root.join("gamelist.xml");
+        let cold = root.join("Cold/gamelist.xml");
+        let xml = "<gameList><game><path>G.chd</path><name>Original</name></game></gameList>";
+        fs::write(&path, xml).unwrap();
+        fs::write(&cold, xml).unwrap();
+        let mut cache = Cache {
+            budget: Some(32 * 1024),
+            ..Cache::default()
+        };
+        load_source(&path, &mut cache);
+        let marked = root.join("Skipped0/gamelist.xml");
+        for n in 0..8 {
+            cache.remember_skipped_source(root.join(format!("Skipped{n}/gamelist.xml")), None);
+        }
+        assert!(cache.suppress_new_sources);
+        assert!(cache.skipped_sources.contains_key(&marked));
+        let marker_bytes = cache.skipped_bytes;
+        cache.remember_skipped_source(marked.clone(), None);
+        assert_eq!(cache.skipped_bytes, marker_bytes);
+        load_source(&cold, &mut cache);
+        assert!(!cache.sources.contains_key(&cold));
+        load_source(&path, &mut cache);
+        assert!(!cache.insert_source(path.clone(), read_name_index(&path, 32 * 1024)));
+        assert!(cache.suppress_new_sources);
+        fs::create_dir_all(marked.parent().unwrap()).unwrap();
+        fs::write(&marked, xml).unwrap();
+        load_source(&marked, &mut cache);
+        assert!(cache.sources.contains_key(&marked));
+        assert!(cache.suppress_new_sources);
+        fs::write(&path, xml.replace("Original", "Changed resident title")).unwrap();
+        load_source(&path, &mut cache);
+        assert!(!cache.suppress_new_sources);
+        load_source(&cold, &mut cache);
+        assert!(cache.sources.contains_key(&cold));
+        let markers = cache.skipped_sources.clone();
+        cache.remember_skipped_source(PathBuf::from("X".repeat(32 * 1024)), None);
+        assert!(cache.suppress_new_sources);
+        assert_eq!(cache.skipped_sources, markers);
+        assert!(cache.skipped_bytes <= marker_budget(32 * 1024));
+        assert!(cache.bytes <= 32 * 1024);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1992,8 +2346,12 @@ pub fn set_metadata_budget(bytes: usize) {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let budget = bytes.min(METADATA_BUDGET);
+        if budget > cache.budget.unwrap_or(METADATA_BUDGET) {
+            cache.suppress_new_sources = false;
+        }
         cache.budget = Some(budget);
         while cache.skipped_bytes > marker_budget(budget) {
+            cache.suppress_new_sources = true;
             let path = cache.skipped_sources.keys().next().unwrap().clone();
             cache.forget_skipped_source(&path);
         }
@@ -2002,10 +2360,7 @@ pub fn set_metadata_budget(bytes: usize) {
                 continue;
             }
             if cache.evict_source().is_none() {
-                let Some(path) = cache.skipped_sources.keys().next().cloned() else {
-                    break;
-                };
-                cache.forget_skipped_source(&path);
+                break;
             }
         }
     });
