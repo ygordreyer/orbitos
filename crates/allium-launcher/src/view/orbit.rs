@@ -1255,6 +1255,7 @@ mod refresh_tests {
         pixels.save_png(path).unwrap();
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn art_invalidation_reloads_replaced_files_and_previous_misses() {
         let root = std::env::temp_dir()
             .canonicalize()
@@ -1443,6 +1444,7 @@ mod media_contract_tests {
     use super::*;
     use crate::entry::game::Game;
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn resolved_shape_selects_separate_tall_cover_and_fits_square_fallback() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../common/tests/fixtures/media-sd/Roms/TEST")
@@ -1469,6 +1471,7 @@ mod media_contract_tests {
         assert_eq!(fallback.width(), 64);
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn fitted_prepared_art_preserves_aspect_and_disk_cache_dimensions() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../common/tests/fixtures/media-sd/Roms/TEST/media/logos/Complete.png");
