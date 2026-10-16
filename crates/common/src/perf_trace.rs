@@ -39,9 +39,10 @@ pub enum Count {
     ChangedPixels,
     ImageHit,
     ImageMiss,
+    InkBitmapPixels,
 }
 struct Trace {
-    counts: [u64; 13],
+    counts: [u64; 14],
     file: File,
     cpu: [u64; 8],
     hits: [u64; 3],
@@ -80,7 +81,7 @@ fn install(path: &str) -> std::io::Result<()> {
         TRACE.with(|trace| {
             *trace.borrow_mut() = Some(Trace {
                 file,
-                counts: [0; 13],
+                counts: [0; 14],
                 cpu: [0; 8],
                 hits: [0; 3],
                 started: None,
@@ -189,7 +190,7 @@ pub fn begin_render() {
             t.cpu = [0; 8];
             t.cpu[0] = input;
             t.hits = [0; 3];
-            t.counts = [0; 13];
+            t.counts = [0; 14];
             t.started = Some(Instant::now());
             t.render_us = monotonic_us();
             t.attempt += 1;
@@ -216,7 +217,7 @@ pub fn drawn_frame() {
         let line = serde_json::json!({
             "text_hits":trace.counts[0], "text_misses":trace.counts[1], "text_evictions":trace.counts[2],
             "blit_map_builds":trace.counts[3], "copied_pixels":trace.counts[4], "flushed_pixels":trace.counts[5],
-            "composed_pixels": trace.counts[6], "converted_pixels": trace.counts[7],
+            "composed_pixels": trace.counts[6], "ink_bitmap_pixels": trace.counts[13], "legacy_composed_pixels": trace.counts[6].saturating_sub(trace.counts[13]), "converted_pixels": trace.counts[7],
             "compared_pixels": trace.counts[8], "scanned_pixels": trace.counts[9],
             "changed_pixels":trace.counts[10],
             "image_hits":trace.counts[11], "image_misses":trace.counts[12],
@@ -651,7 +652,7 @@ pub fn start_probe(path: &str) {
 pub fn probe_counts() -> serde_json::Value {
     TRACE.with(|t| {
         let t = t.borrow(); let t = t.as_ref().unwrap();
-        serde_json::json!({"composed_pixels":t.counts[6],"copied_pixels":t.counts[4],
+        serde_json::json!({"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
             "converted_pixels":t.counts[7],"flushed_pixels":t.counts[5],
             "compared_pixels":t.counts[8],"scanned_pixels":t.counts[9],"changed_pixels":t.counts[10],
             "image_hits":t.counts[11],"image_misses":t.counts[12],

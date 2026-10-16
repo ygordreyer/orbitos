@@ -566,6 +566,7 @@ impl ThemeSnapshot {
             }
         }
         // Source pixmaps drop here. Accounting conservatively includes their preparation peak.
+        let image_cache = super::image_cache::ImageCache::for_pack(pack.ink());
         Ok(Self(Arc::new(ResolvedTheme {
             pack,
             digest: resolved_digest,
@@ -573,7 +574,7 @@ impl ThemeSnapshot {
             prepared_assets,
             decoded_bytes: decoded,
             image_masks,
-            image_cache: std::sync::Mutex::new(Default::default()),
+            image_cache: std::sync::Mutex::new(image_cache),
             preview_cache: std::sync::Mutex::new(None),
         })))
     }

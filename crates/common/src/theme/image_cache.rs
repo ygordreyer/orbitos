@@ -32,8 +32,30 @@ struct Entry {
 pub(super) struct ImageCache {
     entries: VecDeque<Entry>,
     bytes: usize,
+    ink: bool,
 }
 impl ImageCache {
+    pub fn for_pack(ink: bool) -> Self {
+        #[cfg(test)]
+        if std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
+            return Self::default();
+        }
+        Self {
+            ink,
+            ..Self::default()
+        }
+    }
+    fn pixel_limit(&self) -> usize {
+        if self.ink {
+            4 * 1024 * 1024
+        } else {
+            PIXEL_LIMIT
+        }
+    }
+    fn entry_limit(&self) -> usize {
+        if self.ink { 32 } else { ENTRY_LIMIT }
+    }
+
     pub fn get(&mut self, key: &ImageKey, source: &Arc<Pixmap>) -> Option<Arc<Pixmap>> {
         let index = self.entries.iter().position(|entry| {
             entry.key == *key
@@ -49,17 +71,17 @@ impl ImageCache {
     }
     pub fn reserve(&mut self, bytes: usize) {
         while !self.entries.is_empty()
-            && (self.bytes + bytes > PIXEL_LIMIT || self.entries.len() >= ENTRY_LIMIT)
+            && (self.bytes + bytes > self.pixel_limit() || self.entries.len() >= self.entry_limit())
         {
             self.bytes -= self.entries.pop_back().unwrap().pixels.data().len();
         }
     }
     pub fn insert(&mut self, key: ImageKey, source: &Arc<Pixmap>, pixels: Arc<Pixmap>) {
         let bytes = pixels.data().len();
-        if bytes > PIXEL_LIMIT {
+        if bytes > self.pixel_limit() {
             return;
         }
-        while self.bytes + bytes > PIXEL_LIMIT || self.entries.len() == ENTRY_LIMIT {
+        while self.bytes + bytes > self.pixel_limit() || self.entries.len() == self.entry_limit() {
             self.bytes -= self.entries.pop_back().unwrap().pixels.data().len();
         }
         self.bytes += bytes;
