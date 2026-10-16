@@ -16,7 +16,7 @@ Per system folder on the SD card: `/mnt/SDCARD/Roms/<SYS>/`.
 | `covers` | Front box art, native aspect (the Square frame source) | long side at most 480 px | PNG or JPG |
 | `covers-tall` | Portrait front cover, 2:3 aspect (the Tall frame source), scraped from its own source, never a crop of `covers` | 320x480 | PNG or JPG |
 | `logos` | Clear logo (wheel), transparent background | fits 480x200 | PNG with alpha |
-| `backgrounds` | Fanart or key art | 640x480, center cropped | JPG |
+| `backgrounds` | Fanart or key art | at most 640x480, center cropped, never upscaled | JPG |
 | `screenshots` | In-game screenshot | at most 640x480 | PNG or JPG |
 | `titlescreens` | Title screen | at most 640x480 | PNG or JPG |
 | `box3d` | 3D box render | long side at most 480 px | PNG with alpha |
