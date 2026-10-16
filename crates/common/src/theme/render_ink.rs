@@ -1890,7 +1890,10 @@ mod tests {
             for suffix in ["", "-tall"] {
                 let id = format!("{base}{suffix}");
                 let theme = ThemeHandle::prepare(
-                    ThemeSnapshot::load(&root.join(format!("themes/{id}"))).unwrap(),
+                    ThemeSnapshot::load_with_settings(
+                        &root.join(format!("themes/{base}")),
+                        &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty() { "square" } else { "tall" }.into())]),
+                    ).unwrap(),
                     &bank,
                     1,
                 )
@@ -2133,7 +2136,10 @@ mod tests {
             for suffix in ["", "-tall"] {
                 let id = format!("{base}{suffix}");
                 let theme = ThemeHandle::prepare(
-                    ThemeSnapshot::load(&root.join(format!("themes/{id}"))).unwrap(),
+                    ThemeSnapshot::load_with_settings(
+                        &root.join(format!("themes/{base}")),
+                        &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty() { "square" } else { "tall" }.into())]),
+                    ).unwrap(),
                     &bank,
                     1,
                 )

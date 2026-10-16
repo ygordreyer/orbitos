@@ -2,49 +2,21 @@
   {
     "id": "orbit-hero",
     "name": "Orbit Hero",
-    "shape": "square",
-    "manifest_bytes": 46837
-  },
-  {
-    "id": "orbit-hero-tall",
-    "name": "Orbit Hero Tall",
-    "shape": "tall",
-    "manifest_bytes": 46835
+    "manifest_bytes": 67307
   },
   {
     "id": "orbit-row",
     "name": "Orbit Row",
-    "shape": "square",
-    "manifest_bytes": 49634
-  },
-  {
-    "id": "orbit-row-tall",
-    "name": "Orbit Row Tall",
-    "shape": "tall",
-    "manifest_bytes": 49641
+    "manifest_bytes": 64427
   },
   {
     "id": "big-picture",
     "name": "Big Picture",
-    "shape": "square",
-    "manifest_bytes": 47009
-  },
-  {
-    "id": "big-picture-tall",
-    "name": "Big Picture Tall",
-    "shape": "tall",
-    "manifest_bytes": 47021
+    "manifest_bytes": 60219
   },
   {
     "id": "compact-plus",
     "name": "Compact+",
-    "shape": "square",
-    "manifest_bytes": 54689
-  },
-  {
-    "id": "compact-plus-tall",
-    "name": "Compact+ Tall",
-    "shape": "tall",
-    "manifest_bytes": 54393
+    "manifest_bytes": 82658
   }
 ]

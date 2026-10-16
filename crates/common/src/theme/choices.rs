@@ -30,6 +30,24 @@ pub struct ThemeChoices {
     pub choices: Vec<ThemeChoice>,
     pub rejected: Vec<String>,
 }
+pub const LAUNCHER_PACKS: [&str; 4] = ["orbit-hero", "orbit-row", "big-picture", "compact-plus"];
+impl ThemeChoices {
+    pub fn launcher_picker(mut self) -> Self {
+        self.choices.retain(|c| {
+            c.kind == ChoiceKind::External
+                && c.id
+                    .as_deref()
+                    .is_some_and(|id| LAUNCHER_PACKS.contains(&id))
+        });
+        self.choices.sort_by_key(|c| {
+            LAUNCHER_PACKS
+                .iter()
+                .position(|id| Some(*id) == c.id.as_deref())
+                .unwrap()
+        });
+        self
+    }
+}
 impl ThemeChoice {
     fn pack(pack: Pack, hash: String, kind: ChoiceKind) -> Self {
         Self {
@@ -161,5 +179,40 @@ fn clear_errno() {
 fn clear_errno() {
     unsafe {
         *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn launcher_picker_only_four_external_packs_in_declared_order() {
+        let mut choices = builtins().unwrap();
+        for id in [
+            "compact-plus",
+            "orbit-row-tall",
+            "unrelated",
+            "orbit-row",
+            "big-picture",
+            "orbit-hero",
+        ] {
+            let mut pack = Pack::builtin("compact").unwrap();
+            pack.id = id.into();
+            choices.choices.push(ThemeChoice::pack(
+                pack,
+                "0".repeat(64),
+                ChoiceKind::External,
+            ));
+        }
+        let filtered = choices.launcher_picker();
+        assert_eq!(
+            filtered
+                .choices
+                .iter()
+                .map(|c| c.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            LAUNCHER_PACKS
+        );
+        assert!(builtins().unwrap().launcher_picker().choices.is_empty());
     }
 }

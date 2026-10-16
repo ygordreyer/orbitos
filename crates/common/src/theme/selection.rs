@@ -1,7 +1,7 @@
 //! Owned selection record; explicit selection never invokes legacy Stylesheet::save.
-use super::fonts::ThemeHandle;
 #[cfg(test)]
 use super::fonts::FontBank;
+use super::fonts::ThemeHandle;
 use super::pack::{valid_digest, valid_id};
 use super::runtime::{RootBinding, ThemeSnapshot, anchored_root, bounded_read, opened};
 use anyhow::{Result, ensure};
@@ -16,7 +16,7 @@ use std::{
 };
 
 const NAME: &str = "ui-theme.json";
-const RECORD_LIMIT: usize = 2048;
+const RECORD_LIMIT: usize = 32768;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
@@ -25,6 +25,10 @@ pub struct Selection {
     pub revision: String,
     pub digest: String,
     pub generation: u64,
+    #[serde(default)]
+    pub settings: super::settings::Values,
+    #[serde(default)]
+    pub theme_settings: std::collections::BTreeMap<String, super::settings::Values>,
 }
 impl Selection {
     fn validate(&self) -> Result<()> {
@@ -46,7 +50,22 @@ impl Selection {
                 && self.generation > 0,
             "Invalid theme selection"
         );
+        ensure!(
+            self.theme_settings.len() <= 34,
+            "Too many saved theme settings"
+        );
+        for id in self.theme_settings.keys() {
+            ensure!(valid_id(id), "Invalid saved theme ID");
+        }
         Ok(())
+    }
+    pub(super) fn saved_settings(&self, id: &str) -> super::settings::Values {
+        let (active, values) = super::settings::migrate(&self.id, &self.settings);
+        if active == id {
+            values
+        } else {
+            self.theme_settings.get(id).cloned().unwrap_or_default()
+        }
     }
     pub fn from_snapshot(s: &ThemeSnapshot, generation: u64) -> Self {
         Self {
@@ -55,6 +74,8 @@ impl Selection {
             revision: s.0.pack.revision.clone(),
             digest: s.0.digest.clone(),
             generation,
+            settings: s.0.settings.clone(),
+            theme_settings: Default::default(),
         }
     }
 }
@@ -154,6 +175,19 @@ impl SelectionStore {
     pub fn select(&self, snapshot: &ThemeHandle) -> Result<Selection> {
         self.with_write_lock(|| self.select_locked(snapshot))
     }
+    pub(super) fn migrate(
+        &self,
+        snapshot: &ThemeHandle,
+        expected: &Selection,
+    ) -> Result<Selection> {
+        self.with_write_lock(|| {
+            ensure!(
+                self.read()?.as_ref() == Some(expected),
+                "Theme selection changed before migration"
+            );
+            self.select_locked(snapshot)
+        })
+    }
     fn select_locked(&self, snapshot: &ThemeHandle) -> Result<Selection> {
         let old = self.read()?; // malformed/symlink/unknown bytes are preserved, not overwritten.
         let generation = old.as_ref().map_or(Ok(1), |v| {
@@ -167,6 +201,19 @@ impl SelectionStore {
             revision: snapshot.pack().revision.clone(),
             digest: snapshot.digest().into(),
             generation,
+            settings: snapshot.settings().clone(),
+            theme_settings: {
+                let mut maps = old
+                    .as_ref()
+                    .map(|v| v.theme_settings.clone())
+                    .unwrap_or_default();
+                if let Some(old) = &old {
+                    let (id, values) = super::settings::migrate(&old.id, &old.settings);
+                    maps.insert(id, values);
+                }
+                maps.insert(snapshot.pack().id.clone(), snapshot.settings().clone());
+                maps
+            },
         };
         next.validate()?;
         let bytes = serde_json::to_vec(&next)?;
@@ -222,6 +269,8 @@ impl SelectionStore {
             }
         }
         result?;
+        #[cfg(test)]
+        super::runtime::review_count(3);
         Ok(next)
     }
     /// Remove only a validated, unchanged owned record under the same writer guard.
@@ -325,6 +374,8 @@ mod tests {
         assert_eq!(store.read().unwrap().unwrap().id, "compact");
         let second = store.select(&ready("orbit")).unwrap();
         assert_eq!(second.generation, 2);
+        assert!(store.migrate(&ready("compact"), &first).is_err());
+        assert_eq!(store.read().unwrap().unwrap(), second);
         assert_eq!(
             std::fs::read(root.join("protected-settings")).unwrap(),
             b"unchanged"

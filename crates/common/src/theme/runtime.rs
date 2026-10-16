@@ -18,11 +18,24 @@ use std::{
 };
 use tiny_skia::Pixmap;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static REVIEW_COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+#[cfg(test)]
+pub(super) fn review_count(index: usize) {
+    REVIEW_COUNTS.with(|c| {
+        let mut counts = c.get();
+        counts[index] += 1;
+        c.set(counts);
+    });
+}
 #[derive(Clone)]
 pub struct ThemeSnapshot(pub(super) Arc<ResolvedTheme>);
 pub struct ResolvedTheme {
     pub pack: Pack,
     pub digest: String,
+    pub settings: super::settings::Values,
     pub prepared_assets: BTreeMap<ScreenId, BTreeMap<String, Pixmap>>,
     pub decoded_bytes: u64,
     pub image_masks: BTreeMap<ScreenId, BTreeMap<String, Pixmap>>,
@@ -227,6 +240,8 @@ pub(super) fn bounded_read(root: &File, path: &str, limit: usize) -> Result<Vec<
     Ok(bytes)
 }
 fn png(bytes: &[u8], asset: &Asset) -> Result<Pixmap> {
+    #[cfg(test)]
+    review_count(1);
     ensure!(
         bytes.len() as u64 == asset.bytes && digest(bytes) == asset.sha256,
         "Theme asset size/hash mismatch"
@@ -477,14 +492,28 @@ impl ThemeSnapshot {
     }
     pub fn load(root: &Path) -> Result<Self> {
         let held = anchored_root(root)?;
-        Self::load_held(&held)
+        Self::load_held(&held, &Default::default())
     }
-    pub(super) fn load_held(held: &File) -> Result<Self> {
+    pub fn load_with_settings(root: &Path, settings: &super::settings::Values) -> Result<Self> {
+        Self::load_held(&anchored_root(root)?, settings)
+    }
+    pub(super) fn load_held(held: &File, settings: &super::settings::Values) -> Result<Self> {
+        #[cfg(test)]
+        review_count(0);
         let bytes = bounded_read(held, "theme.json", MANIFEST_LIMIT)?;
-        Self::prepare(&bytes, |path, limit| bounded_read(held, path, limit))
+        Self::prepare_options(&bytes, settings, |path, limit| {
+            bounded_read(held, path, limit)
+        })
     }
-    fn prepare(bytes: &[u8], mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>) -> Result<Self> {
-        let pack = Pack::parse(bytes)?;
+    fn prepare(bytes: &[u8], read: impl FnMut(&str, usize) -> Result<Vec<u8>>) -> Result<Self> {
+        Self::prepare_options(bytes, &Default::default(), read)
+    }
+    fn prepare_options(
+        bytes: &[u8],
+        settings: &super::settings::Values,
+        mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let (pack, settings, resolved_digest) = super::settings::resolve(bytes, settings)?;
         let mut originals = BTreeMap::new();
         let mut decoded = 0;
         for (id, asset) in &pack.assets {
@@ -539,7 +568,8 @@ impl ThemeSnapshot {
         // Source pixmaps drop here. Accounting conservatively includes their preparation peak.
         Ok(Self(Arc::new(ResolvedTheme {
             pack,
-            digest: digest(bytes),
+            digest: resolved_digest,
+            settings,
             prepared_assets,
             decoded_bytes: decoded,
             image_masks,

@@ -1563,23 +1563,23 @@ fn ink_pack_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes").canonicalize().unwrap()
 }
 #[test]
-fn theme_port_eight_variants_parse_validate_and_discover() {
+fn theme_port_four_packs_options_parse_validate_and_discover() {
     use super::pack::Pack;
     let root=ink_pack_root();
     let state=std::env::temp_dir().join(format!("allium-ink-choice-{}",std::process::id()));std::fs::create_dir_all(&state).unwrap();let state=state.canonicalize().unwrap();
     let mut runtime=super::ThemeRuntime::bind(&state,&root,&font_root()).unwrap();
     let choices=runtime.choices().unwrap();
     assert!(choices.rejected.is_empty(),"{:?}",choices.rejected);
-    assert_eq!(choices.choices.len(),11);
+    assert_eq!(choices.choices.len(),7);
     for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {
         for suffix in ["","-tall"] {
-            let id=format!("{base}{suffix}");let bytes=std::fs::read(root.join(&id).join("theme.json")).unwrap();
+            let id=format!("{base}{suffix}");let bytes=std::fs::read(root.join(base).join("theme.json")).unwrap();
             let p=Pack::parse(&bytes).unwrap_or_else(|e|panic!("{id}: {e:#}"));
-            assert_eq!(p.id,id);assert!(p.ink());assert!(bytes.len()<=65_536);
-            assert!(choices.choices.iter().any(|c|c.id.as_deref()==Some(&id)));
-            assert_eq!(p.alignment.as_ref().unwrap().cover_shape,if suffix.is_empty(){"square"}else{"tall"});
-            ThemeSnapshot::load(&root.join(&id)).unwrap();
-            let activation=runtime.choose(&id).unwrap();assert_eq!(activation.snapshot.unwrap().pack().id,id);
+            assert_eq!(p.id,base);assert!(p.ink());assert!(bytes.len()<=super::pack::MANIFEST_LIMIT);
+            assert!(choices.choices.iter().any(|c|c.id.as_deref()==Some(base)));
+            assert_eq!(p.settings[0].id, "cover_shape");
+            ThemeSnapshot::load_with_settings(&root.join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap();
+            let activation=runtime.choose(&id).unwrap();assert_eq!(activation.snapshot.unwrap().pack().id,base);
         }
     }
     std::fs::remove_dir_all(state).unwrap();
@@ -1588,9 +1588,10 @@ fn theme_port_eight_variants_parse_validate_and_discover() {
 fn theme_port_all_variants_all_screens_real_raster() {
     let root=ink_pack_root();let bank=FontBank::bind(&font_root()).unwrap();
     for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {
-        let id=format!("{base}{suffix}");let ready=ThemeHandle::prepare(ThemeSnapshot::load(&root.join(&id)).unwrap(),&bank,500).unwrap();
+        let id=format!("{base}{suffix}");let ready=ThemeHandle::prepare(ThemeSnapshot::load_with_settings(&root.join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap(),&bank,500).unwrap();
         for screen in ScreenId::ALL {
             let mut input=frame(screen);
+            input.art = Default::default();
             let title=match screen{ScreenId::Apps=>"Apps",ScreenId::Recents=>"Recents",ScreenId::SettingsRoot=>"Settings",ScreenId::SettingsPage=>"Display",ScreenId::Search|ScreenId::Keyboard=>"Search",ScreenId::SearchResults=>"Search results",ScreenId::DiscPicker=>"Choose a disc",ScreenId::ContextMenu=>"Game actions",ScreenId::IngameMenu=>"In-game menu",ScreenId::NetworkDialog=>"Manage storage",ScreenId::Toast=>"Ready",ScreenId::OsdVolume=>"Volume",ScreenId::OsdBrightness=>"Brightness",ScreenId::GuideSelector=>"Guide Watch",ScreenId::TextReader=>"Real Racing Roots",_=>"Library"};
             input.text.insert(Binding::Title,title.into());
             input.selected.insert(Binding::Navigation,match screen{ScreenId::Apps|ScreenId::GuideSelector|ScreenId::TextReader=>"apps",ScreenId::SettingsRoot|ScreenId::SettingsPage=>"settings",ScreenId::Recents=>"recents",_=>"library"}.into());
@@ -1627,6 +1628,10 @@ fn theme_port_all_variants_all_screens_real_raster() {
                     rendered.pixels().pixels()[at] != other.pixels().pixels()[at]
                 })), "{id}/{screen:?}: focused row pixels did not change");
             }
+            let hash = super::runtime::digest(rendered.pixels().data());
+            println!("THEME_FRAME {id} {screen:?} {hash}");
+            let expected: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!("settings-frame-hashes.json")).unwrap();
+            assert_eq!(hash, expected[&format!("{id}/{screen:?}")], "{id}/{screen:?}");
             assert!(rendered.pixels().pixels().iter().any(|p|p.alpha()>0));
             for t in &rendered.targets {assert!(t.rect.0+t.rect.2<=640&&t.rect.1+t.rect.3<=480,"{id}/{screen:?} {t:?}");}
             if let Ok(out)=std::env::var("ALLIUM_THEME_PORT_FRAMES") {
@@ -1713,7 +1718,7 @@ fn theme_port_populated_recents_search_and_keyboard_focus_changes_both_targets()
     for base in ["orbit-hero", "orbit-row", "big-picture", "compact-plus"] {
         for suffix in ["", "-tall"] {
             let id = format!("{base}{suffix}");
-            let ready = ThemeHandle::prepare(ThemeSnapshot::load(&ink_pack_root().join(&id)).unwrap(), &bank, 1).unwrap();
+            let ready = ThemeHandle::prepare(ThemeSnapshot::load_with_settings(&ink_pack_root().join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty(){"square"}else{"tall"}.into())])).unwrap(), &bank, 1).unwrap();
             for screen in [ScreenId::Recents, ScreenId::Search, ScreenId::Keyboard] {
                 let mut input = frame(screen);
                 let binding = if screen == ScreenId::Recents { Binding::Entries } else { Binding::Keyboard };

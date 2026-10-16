@@ -1204,10 +1204,8 @@ mod charging_startup_tests {
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "allium-charging-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("allium-charging-{}-{name}", std::process::id()));
         assert!(!path.exists());
         path
     }
@@ -1257,5 +1255,53 @@ mod charging_startup_tests {
         .unwrap();
         assert_eq!(dispatched.get(), 0);
         assert!(!marker.exists());
+    }
+}
+
+#[cfg(test)]
+mod theme_settings_tests {
+    use common::theme::{Boundary, ThemeRuntime};
+    #[test]
+    fn daemon_menu_and_osd_resolve_launcher_settings_digest() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let state = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("alliumd-settings-{}", std::process::id()));
+        std::fs::create_dir(&state).unwrap();
+        let bind = || {
+            ThemeRuntime::bind(
+                &state,
+                &repo.join("themes"),
+                &repo.join("static/.allium/fonts"),
+            )
+            .unwrap()
+        };
+        let mut launcher = bind();
+        launcher.choose("compact-plus").unwrap();
+        let mut daemon = bind();
+        for shape in ["square", "tall"] {
+            launcher.choose_setting("cover_shape", shape).unwrap();
+            for color in ["orange", "big-picture", "white", "black"] {
+                let active = launcher
+                    .choose_setting("color_scheme", color)
+                    .unwrap()
+                    .snapshot
+                    .unwrap();
+                launcher.flush_settings().unwrap();
+                for boundary in [Boundary::MenuOpening, Boundary::OsdOpening] {
+                    let loaded = daemon.activate(boundary);
+                    assert!(loaded.status.diagnostic.is_none());
+                    let loaded = loaded.snapshot.unwrap();
+                    assert_eq!(loaded.digest(), active.digest());
+                    assert_eq!(loaded.generation(), active.generation());
+                    assert_eq!(loaded.settings(), active.settings());
+                }
+            }
+        }
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

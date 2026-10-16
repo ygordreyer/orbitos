@@ -58,6 +58,7 @@ pub fn choices(res: &Resources) -> Result<ThemeChoices> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Theme library unavailable"))?
         .choices()
+        .map(ThemeChoices::launcher_picker)
 }
 pub fn choose(res: &Resources, id: Option<&str>) -> Result<()> {
     let (snapshot, status) = {
@@ -77,6 +78,32 @@ pub fn choose(res: &Resources, id: Option<&str>) -> Result<()> {
     };
     res.insert(snapshot);
     let _ = status;
+    Ok(())
+}
+pub fn choose_setting(res: &Resources, setting: &str, option: &str) -> Result<()> {
+    let active = {
+        let shared = res.get::<SharedThemeService>();
+        let mut service = shared.borrow_mut();
+        let active = service
+            .runtime
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Theme library unavailable"))?
+            .choose_setting(setting, option)?;
+        service.status = active.status.clone();
+        active
+    };
+    res.insert(active.snapshot);
+    Ok(())
+}
+pub fn flush_settings(res: &Resources) -> Result<()> {
+    let shared = res.get::<SharedThemeService>();
+    let mut service = shared.borrow_mut();
+    let runtime = service
+        .runtime
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Theme library unavailable"))?;
+    runtime.flush_settings()?;
+    service.status = runtime.status().clone();
     Ok(())
 }
 pub fn capacity(handle: &ThemeHandle, screen: ScreenId, binding: Binding) -> usize {
@@ -99,9 +126,7 @@ pub fn shell(input: &mut FrameInputs, res: &Resources, selected: usize) {
                 enabled: true,
             }],
         );
-        input
-            .selected
-            .insert(Binding::Navigation, "details".into());
+        input.selected.insert(Binding::Navigation, "details".into());
     } else {
         let labels = [
             locale.t("tab-recents"),
