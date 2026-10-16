@@ -112,6 +112,8 @@ impl ThemeHandle {
         Arc::downgrade(&self.0)
     }
     pub fn prepare(base: ThemeSnapshot, bank: &FontBank, generation: u64) -> Result<Self> {
+        #[cfg(test)]
+        super::runtime::review_count(2);
         let mut fonts = BTreeMap::new();
         for (role, t) in &base.0.pack.tokens.typography {
             fonts.insert(*role, bank.load(t.font)?);
@@ -152,6 +154,9 @@ impl ThemeHandle {
     }
     pub fn pack(&self) -> &super::pack::Pack {
         &self.0.base.0.pack
+    }
+    pub fn settings(&self) -> &super::settings::Values {
+        &self.0.base.0.settings
     }
     pub fn digest(&self) -> &str {
         &self.0.base.0.digest

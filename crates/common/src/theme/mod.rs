@@ -5,6 +5,7 @@ pub mod pack;
 pub mod render;
 pub mod runtime;
 pub mod selection;
+pub mod settings;
 pub mod session;
 pub use session::{Activation, Boundary, ThemeRuntime, ThemeStatus};
 #[cfg(test)]

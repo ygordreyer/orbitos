@@ -2,7 +2,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const MANIFEST_LIMIT: usize = 65_536;
+// Includes bounded option patches with whole-array replacements.
+pub const MANIFEST_LIMIT: usize = 131_072;
 pub const ASSET_DECODED_LIMIT: u64 = 4 * 1024 * 1024;
 
 macro_rules! vocabulary {
@@ -324,6 +325,8 @@ pub struct Canvas {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pack {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<super::settings::Setting>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alignment: Option<super::ink::Alignment>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -364,6 +367,15 @@ pub fn valid_digest(v: &str) -> bool {
 
 impl Pack {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.len() <= MANIFEST_LIMIT, "Theme manifest exceeds limit");
+        let mut parser = serde_json::Deserializer::from_slice(bytes);
+        UniqueJson::deserialize(&mut parser)?;
+        parser.end()?;
+        super::settings::validate(&serde_json::from_slice(bytes)?)?;
+        let base = Self::parse_descriptor(bytes)?;
+        Ok(base)
+    }
+    pub(super) fn parse_descriptor(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= MANIFEST_LIMIT,
             "Theme manifest exceeds limit"

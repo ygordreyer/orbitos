@@ -901,6 +901,20 @@ mod orbit_proof {
     async fn native_launcher_theme_controller_real_render_and_legacy() {
         assert!(ALLIUM_SD_ROOT.ends_with("native-orbit-fixture"));
         assert!(ALLIUM_SD_ROOT.starts_with("/private/tmp"));
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut installed = Vec::new();
+        for id in common::theme::choices::LAUNCHER_PACKS {
+            let target = ALLIUM_THEMES_DIR.join(id);
+            if !target.exists() {
+                fs::create_dir_all(target.join("assets")).unwrap();
+                fs::copy(repo.join("themes").join(id).join("theme.json"), target.join("theme.json")).unwrap();
+                for asset in fs::read_dir(repo.join("themes").join(id).join("assets")).unwrap() {
+                    let asset = asset.unwrap();
+                    fs::copy(asset.path(), target.join("assets").join(asset.file_name())).unwrap();
+                }
+                installed.push(target);
+            }
+        }
         prepare_art();
         if ALLIUM_LAUNCHER_STATE.exists() {
             fs::remove_file(ALLIUM_LAUNCHER_STATE.as_path()).unwrap();
@@ -908,6 +922,7 @@ mod orbit_proof {
         let evidence = std::path::PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_DIR").unwrap());
         let mut app = AlliumLauncher::new(DefaultPlatform::new().unwrap()).unwrap();
         let raw = serde_json::to_vec(&*app.res.get::<Stylesheet>()).unwrap();
+        crate::theme_adapter::choose(&app.res, None).unwrap();
         assert!(crate::theme_adapter::snapshot(&app.res).is_none());
         let (tx, mut rx) = tokio::sync::mpsc::channel(20);
         app.view.proof_select_tab(1);
@@ -1022,17 +1037,17 @@ mod orbit_proof {
             .to_owned()
             .save_png(evidence.join("launcher-appearance.png"))
             .unwrap();
-        press(&mut app, Key::Down, &tx).await;
-        press(&mut app, Key::A, &tx).await;
+        press(&mut app, Key::Right, &tx).await;
         render_theme(&mut app);
-        assert_eq!(
-            crate::theme_adapter::snapshot(&app.res).unwrap().pack().id,
-            "compact"
-        );
+        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().pack().id, "orbit-hero");
+        press(&mut app, Key::Down, &tx).await;
+        press(&mut app, Key::Right, &tx).await;
+        render_theme(&mut app);
+        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().settings()["cover_shape"], "tall");
         app.display
             .pixmap()
             .to_owned()
-            .save_png(evidence.join("launcher-appearance-compact.png"))
+            .save_png(evidence.join("launcher-appearance-tall.png"))
             .unwrap();
         press(&mut app, Key::B, &tx).await;
         assert!(
@@ -1047,7 +1062,7 @@ mod orbit_proof {
         app.display
             .pixmap()
             .to_owned()
-            .save_png(evidence.join("launcher-compact-context.png"))
+            .save_png(evidence.join("launcher-theme-settings-context.png"))
             .unwrap();
         press(&mut app, Key::B, &tx).await;
         let context_command = rx.try_recv().expect("context cancel requests redraw");
@@ -1056,10 +1071,15 @@ mod orbit_proof {
         assert!(rx.try_recv().is_err(), "context cancel emits only Redraw");
         render_theme(&mut app);
         app.view.proof_select_tab(3);
-        press(&mut app, Key::A, &tx).await; // Reopen actual Appearance controller.
-        press(&mut app, Key::Up, &tx).await; // Compact -> Orbit.
-        press(&mut app, Key::Up, &tx).await; // Orbit -> Legacy.
-        press(&mut app, Key::A, &tx).await; // Guarded reset via actual handler.
+        press(&mut app, Key::A, &tx).await;
+        press(&mut app, Key::Left, &tx).await;
+        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().pack().id, "compact-plus");
+        press(&mut app, Key::Down, &tx).await;
+        press(&mut app, Key::Down, &tx).await;
+        press(&mut app, Key::Left, &tx).await;
+        assert_eq!(crate::theme_adapter::snapshot(&app.res).unwrap().settings()["color_scheme"], "black");
+        press(&mut app, Key::B, &tx).await;
+        crate::theme_adapter::choose(&app.res, None).unwrap();
         app.view.set_should_draw();
         render_theme(&mut app);
         assert!(crate::theme_adapter::snapshot(&app.res).is_none());
@@ -1071,13 +1091,14 @@ mod orbit_proof {
         assert_eq!(state(&app)["games"], identity);
         assert!(
             rx.try_recv().is_err(),
-            "Appearance Legacy reset emits no command"
+            "Theme options emit no command"
         );
-        eprintln!("APPEARANCE_CHOOSE_COMMANDS=[]; LEGACY_RESET_COMMANDS=[]");
+        eprintln!("THEME_OPTION_COMMANDS=[]");
         assert_eq!(
             app.res.get::<Stylesheet>().display_style().ui.text_color,
             app.res.get::<Stylesheet>().ui.text_color
         );
+        for path in installed { fs::remove_dir_all(path).unwrap(); }
     }
 
     #[tokio::test]

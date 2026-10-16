@@ -5,7 +5,6 @@ mod display;
 mod language;
 mod power;
 mod system;
-mod theme;
 mod wifi;
 
 use crate::view::settings::clock::Clock;

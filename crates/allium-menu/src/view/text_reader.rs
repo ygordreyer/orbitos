@@ -1343,7 +1343,10 @@ mod theme_adapter_tests {
         for base in ["orbit-hero", "orbit-row", "big-picture", "compact-plus"] {
             for suffix in ["", "-tall"] {
                 snapshots.push(
-                    ThemeSnapshot::load(&repo.join(format!("themes/{base}{suffix}"))).unwrap(),
+                    ThemeSnapshot::load_with_settings(
+                        &repo.join(format!("themes/{base}")),
+                        &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty() { "square" } else { "tall" }.into())]),
+                    ).unwrap(),
                 );
             }
         }
@@ -1540,7 +1543,10 @@ mod theme_adapter_tests {
             if matches!(id, "orbit" | "compact") {
                 ThemeSnapshot::builtin(id).unwrap()
             } else {
-                ThemeSnapshot::load(&repo.join("themes").join(id)).unwrap()
+                {
+                    let (base, settings) = common::theme::settings::migrate(id, &Default::default());
+                    ThemeSnapshot::load_with_settings(&repo.join("themes").join(base), &settings).unwrap()
+                }
             },
             &bank,
             1,
