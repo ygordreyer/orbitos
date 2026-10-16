@@ -10,6 +10,8 @@ pub mod session;
 pub use session::{Activation, Boundary, ThemeRuntime, ThemeStatus};
 #[cfg(test)]
 mod proof_tests;
+#[cfg(test)]
+mod parity_b_tests;
 pub use fonts::{FontBank, ThemeHandle};
 pub use pack::{Component, Kind, Pack, Rect, ScreenId};
 

@@ -42,6 +42,8 @@ impl Toggle {
 
 #[async_trait(?Send)]
 impl View for Toggle {
+    fn theme_value(&self) -> String { if self.value { "On" } else { "Off" }.into() }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,

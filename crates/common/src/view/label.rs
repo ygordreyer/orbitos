@@ -240,6 +240,8 @@ where
         }
     }
 
+    fn theme_value(&self) -> String { self.text.as_ref().to_owned() }
+
     fn draw(
         &mut self,
         display: &mut <DefaultPlatform as Platform>::Display,
