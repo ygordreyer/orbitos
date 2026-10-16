@@ -201,7 +201,7 @@ impl Settings {
             "settings-about",
         ]);
         let mut input = FrameInputs::new(screen);
-        input.text.insert(Binding::Title, locale.t("tab-settings"));
+        input.text.insert(Binding::Title, common::product::NAME.into());
         input.rows.insert(
             Binding::SettingsRows,
             keys.iter()
@@ -385,7 +385,12 @@ fn page_models(
     list.set_visible_count_override(Some(count))?;
     let locale = list.resources().get::<Locale>();
     let mut input = FrameInputs::new(screen);
-    input.text.insert(Binding::Title, locale.t(title_key));
+    let title = if title_key == "settings-about" {
+        common::product::NAME.to_owned()
+    } else {
+        locale.t(title_key)
+    };
+    input.text.insert(Binding::Title, title.clone());
     input.rows.insert(Binding::SettingsRows, list.theme_rows());
     input.focus = Focus {
         component: crate::theme_adapter::component_id(handle, screen, Binding::SettingsRows),
@@ -407,7 +412,7 @@ fn page_models(
     let mut models = vec![input];
     if let Some(capture) = list.theme_keyboard() {
         let mut keyboard = FrameInputs::new(ScreenId::Keyboard);
-        keyboard.text.insert(Binding::Title, locale.t(title_key));
+        keyboard.text.insert(Binding::Title, title);
         keyboard
             .text
             .insert(Binding::KeyboardValue, capture.display_value);

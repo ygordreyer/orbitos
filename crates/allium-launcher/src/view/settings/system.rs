@@ -113,10 +113,10 @@ impl SystemUpdate {
         let mut values: Vec<Box<dyn View>> = vec![];
 
         // Current Version
-        labels.push(locale.t("settings-system-allium-version"));
+        labels.push(locale.t("settings-about-version"));
         values.push(Box::new(Label::new(
             Point::zero(),
-            ALLIUM_VERSION.clone(),
+            common::product::VERSION.to_owned(),
             Alignment::Right,
             None,
         )));
