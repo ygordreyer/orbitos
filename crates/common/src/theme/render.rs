@@ -2045,7 +2045,7 @@ mod tests {
 #[path = "render_ink.rs"]
 mod ink_renderer;
 
-pub use ink_renderer::{InkTextLayout, ink_text_layout};
+pub use ink_renderer::{InkTextLayout, ink_text_layout, ink_detail_pages};
 
 #[cfg(all(test, feature = "perf-bench"))]
 #[path = "render_selection_bench.rs"]

@@ -31,6 +31,7 @@ fn dl15_library() -> (ThemeHandle, FrameInputs) {
         .iter()
         .enumerate()
         .map(|(i, label)| Row {
+            subtitle: String::new(),
             id: i.to_string(),
             label: (*label).into(),
             value: String::new(),
@@ -351,6 +352,7 @@ fn dl17_list_input(theme: &ThemeHandle, screen: ScreenId, selected: usize) -> Fr
     input.status.clock = Some("12:34".into());
     let rows: Vec<_> = (0..6)
         .map(|i| Row {
+            subtitle: String::new(),
             id: i.to_string(),
             label: format!("Row {i}"),
             value: if screen == ScreenId::SettingsRoot {
@@ -371,6 +373,7 @@ fn dl17_list_input(theme: &ThemeHandle, screen: ScreenId, selected: usize) -> Fr
         NavGroup::Primary,
         (0..4)
             .map(|i| Row {
+                subtitle: String::new(),
                 id: i.to_string(),
                 label: format!("Tab {i}"),
                 value: String::new(),

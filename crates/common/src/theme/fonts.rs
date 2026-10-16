@@ -137,6 +137,87 @@ impl ThemeHandle {
         self.0.fonts[&role].clone()
     }
     pub(super) fn ink_font(&self, id: FontId, weight: u32) -> Font<'static> {
+        static WEIGHTS: std::sync::OnceLock<BTreeMap<(FontId, u32), Font<'static>>> =
+            std::sync::OnceLock::new();
+        let weights = WEIGHTS.get_or_init(|| {
+            BTreeMap::from([
+                (
+                    (FontId::Nunito, 300),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-300.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 400),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-400.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 500),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-500.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 600),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-600.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 700),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-700.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 800),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-800.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Nunito, 900),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Nunito-900.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 300),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-300.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 400),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-400.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 500),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-500.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 600),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-600.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 700),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-700.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 800),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-800.ttf") as &[u8])
+                        .unwrap(),
+                ),
+                (
+                    (FontId::Roboto, 900),
+                    Font::try_from_bytes(include_bytes!("packs/fonts/Roboto-900.ttf") as &[u8])
+                        .unwrap(),
+                ),
+            ])
+        });
+        if weight >= 300 {
+            if let Some(font) = weights.get(&(id, weight.min(900))) {
+                return font.clone();
+            }
+        }
         if id == FontId::BarlowCondensed && weight >= 700 {
             return Font::try_from_bytes(
                 include_bytes!("packs/fonts/BarlowCondensed-Bold.ttf") as &[u8]
@@ -212,7 +293,7 @@ impl ThemeHandle {
         let weight = run
             .and_then(|r| r.weight)
             .or_else(|| self.pack().ink_typography.get(&role).and_then(|r| r.weight))
-            .unwrap_or(400);
+            .unwrap_or(0);
         crate::display::font::FontTextStyle::with_fallback(
             self.ink_font(font, weight),
             color,

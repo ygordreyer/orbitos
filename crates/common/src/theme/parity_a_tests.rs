@@ -108,20 +108,11 @@ fn audit_input(
                     f.art.entries.insert(id.clone(), image);
                 }
             }
-            let val = if row["value"].as_str().is_some_and(|s| !s.is_empty()) {
-                audit_value(row, "value")
-            } else if c
-                .and_then(|c| c.paint.as_ref())
-                .is_some_and(|p| p.subtitle.is_some())
-            {
-                audit_value(row, "subtitle")
-            } else {
-                String::new()
-            };
             rows.push(Row {
                 id,
                 label: audit_value(row, "title"),
-                value: val,
+                value: audit_value(row, "value"),
+                subtitle: audit_value(row, "subtitle"),
                 enabled: row["disabled"] != true,
             });
         }
@@ -139,6 +130,7 @@ fn audit_input(
                 id: audit_value(row, "id"),
                 label: audit_value(row, "title"),
                 value: String::new(),
+                subtitle: String::new(),
                 enabled: true,
             })
             .collect();

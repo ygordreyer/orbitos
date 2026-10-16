@@ -102,12 +102,26 @@ where
     idle_media_key: Option<(usize, usize, usize, u64, bool, bool)>,
     idle_media_work: VecDeque<super::orbit::WarmArt>,
     detail_action: usize,
+    image_focus: Option<common::theme::frame::Focus>,
+    theme_screen: Option<common::theme::pack::ScreenId>,
 }
 
 impl<S> EntryList<S>
 where
     S: Sort,
 {
+    fn image_actions(handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId) -> Vec<common::theme::frame::Focus> {
+        handle.pack().screens[&screen].components.iter().filter_map(|c| {
+            let action=c.paint.as_ref()?.action.as_deref()?;
+            (matches!(c.kind,common::theme::pack::Kind::Image|common::theme::pack::Kind::AssetImage) && action=="play").then(|| common::theme::frame::Focus {component:c.id.clone(),item:Some(action.into())})
+        }).collect()
+    }
+    fn detail_targets(handle: &common::theme::ThemeHandle) -> Vec<common::theme::frame::Focus> {
+        use common::theme::{frame::Focus,pack::{ScreenId,Binding}};
+        let component=crate::theme_adapter::component_id(handle,ScreenId::GameDetail,Binding::Actions);
+        let mut targets=vec![Focus{component:component.clone(),item:Some("play".into())},Focus{component,item:Some("back".into())}];
+        targets.extend(Self::image_actions(handle,ScreenId::GameDetail));targets
+    }
     pub fn new(rect: Rect, res: Resources, sort: S) -> Result<Self> {
         let Rect { x, y, w, .. } = rect;
 
@@ -201,6 +215,8 @@ where
             idle_media_key: None,
             idle_media_work: VecDeque::new(),
             detail_action: 0,
+            image_focus: None,
+            theme_screen: None,
         };
 
         this.load_entries()?;
@@ -385,6 +401,7 @@ where
             .skip(first)
             .take(count)
             .map(|entry| common::theme::frame::Row {
+                subtitle: String::new(),
                 id: crate::theme_adapter::entry_id(entry.path()),
                 label: entry.name().into(),
                 value: String::new(),
@@ -461,7 +478,10 @@ where
         self.list.set_visible_count_override(Some(count))?;
         let first = self.list.window_start();
         let selected = self.list.selected();
+        if self.theme_screen != Some(screen) {self.image_focus=None;}
+        self.theme_screen=Some(screen);
         let mut input = FrameInputs::new(screen);
+        input.pagination = Some(common::theme::frame::Pagination {page: selected / count.max(1) + 1, total: self.entries.len().max(1).div_ceil(count.max(1))});
         let locale = self.res.get::<Locale>();
         let title = match screen {
             ScreenId::Apps => locale.t("tab-apps"),
@@ -477,6 +497,7 @@ where
                 .skip(first)
                 .take(count)
                 .map(|entry| Row {
+                    subtitle: self.res.get::<ConsoleMapper>().get_console(entry.path()).map(|c|c.name.clone()).unwrap_or_default(),
                     id: crate::theme_adapter::entry_id(entry.path()),
                     label: entry.name().into(),
                     value: if crate::network_runtime::download_id(entry.path()).is_some() {
@@ -587,9 +608,14 @@ where
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art(&self.entries, selected, first, count);
         }
+        if let Some(focus)=&self.image_focus {
+            if Self::image_actions(handle,screen).contains(focus) {input.focus=focus.clone();}
+        }
         let mut models = vec![input];
         if let Some(details) = &self.details {
             let mut detail = FrameInputs::new(ScreenId::GameDetail);
+            detail.pagination = Some(common::theme::frame::Pagination { page: details.page + 1, total: details.pages.len() });
+            detail.detail_lines = details.section_pages.get(details.page).cloned().unwrap_or_default();
             if let Some(entry) = self.entries.get(selected) {
                 detail
                     .text
@@ -621,12 +647,14 @@ where
                 if handle.pack().ink() {
                     vec![
                         Row {
+                            subtitle: String::new(),
                             id: "play".into(),
                             label: "Play".into(),
                             value: String::new(),
                             enabled: true,
                         },
                         Row {
+                            subtitle: String::new(),
                             id: "back".into(),
                             label: "Back".into(),
                             value: String::new(),
@@ -638,21 +666,8 @@ where
                 },
             );
             if handle.pack().ink() {
-                detail.focus = Focus {
-                    component: crate::theme_adapter::component_id(
-                        handle,
-                        ScreenId::GameDetail,
-                        Binding::Actions,
-                    ),
-                    item: Some(
-                        if self.detail_action == 0 {
-                            "play"
-                        } else {
-                            "back"
-                        }
-                        .into(),
-                    ),
-                };
+                let targets=Self::detail_targets(handle);
+                detail.focus=targets[self.detail_action % targets.len()].clone();
             }
             detail.hints = vec![
                 Hint {
@@ -694,6 +709,7 @@ where
                     .skip(menu.window_start())
                     .take(count)
                     .map(|(i, row)| Row {
+                        subtitle: String::new(),
                         id: format!("menu-{i}"),
                         label: row.text(&locale),
                         value: String::new(),
@@ -713,6 +729,7 @@ where
                 modal.rows.insert(
                     Binding::Actions,
                     vec![Row {
+                        subtitle: String::new(),
                         id: "back".into(),
                         label: "Close".into(),
                         value: String::new(),
@@ -753,6 +770,7 @@ where
                     .skip(first)
                     .take(count)
                     .map(|(i, _)| Row {
+                        subtitle: String::new(),
                         id: format!("disc-{i}"),
                         label: format!("Disc {}", i + 1),
                         value: String::new(),
@@ -783,6 +801,7 @@ where
                 modal.rows.insert(
                     Binding::Actions,
                     vec![Row {
+                        subtitle: String::new(),
                         id: "back".into(),
                         label: "Cancel".into(),
                         value: String::new(),
@@ -809,6 +828,7 @@ where
         crate::view::details::invalidate_metadata();
         self.details = None;
         self.semantic_info = None;
+        self.image_focus = None;
         self.orbit = None;
         self.list.set_visible_count_override(None)?;
         if let Some(menu) = self.menu.as_mut() {
@@ -1210,7 +1230,9 @@ where
                     if crate::theme_adapter::snapshot(&self.res)
                         .is_some_and(|h| h.pack().ink()) =>
                 {
-                    self.detail_action = 1 - self.detail_action;
+                    let handle=crate::theme_adapter::snapshot(&self.res).unwrap();
+                    let count=Self::detail_targets(&handle).len();
+                    self.detail_action=if matches!(event,KeyEvent::Pressed(Key::Right)){(self.detail_action+1)%count}else{(self.detail_action+count-1)%count};
                     self.set_should_draw();
                 }
                 KeyEvent::Pressed(Key::B) => {
@@ -1219,10 +1241,10 @@ where
                 }
                 KeyEvent::Pressed(Key::A) => {
                     self.details = None;
-                    if self.detail_action == 0
-                        || !crate::theme_adapter::snapshot(&self.res)
-                            .is_some_and(|h| h.pack().ink())
-                    {
+                    let play=crate::theme_adapter::snapshot(&self.res).filter(|h|h.pack().ink()).is_none_or(|h| {
+                        let targets=Self::detail_targets(&h);targets[self.detail_action % targets.len()].item.as_deref()==Some("play")
+                    });
+                    if play {
                         self.select_entry(commands).await?;
                     }
                     self.set_should_draw();
@@ -1414,6 +1436,23 @@ where
                 _ => menu.handle_key_event(event, commands, bubble).await,
             }
         } else {
+            if let Some(handle)=crate::theme_adapter::snapshot(&self.res).filter(|h|h.pack().ink() && self.theme_screen==Some(common::theme::pack::ScreenId::Library)) {
+                let actions=Self::image_actions(&handle,common::theme::pack::ScreenId::Library);
+                if self.image_focus.is_some() {
+                    match event {
+                        KeyEvent::Pressed(Key::Down|Key::B) => {self.image_focus=None;self.set_should_draw();return Ok(true);}
+                        KeyEvent::Pressed(Key::Left|Key::Right) => {
+                            if !actions.is_empty(){let current=actions.iter().position(|f|Some(f)==self.image_focus.as_ref()).unwrap_or(0);let next=if matches!(event,KeyEvent::Pressed(Key::Right)){(current+1)%actions.len()}else{(current+actions.len()-1)%actions.len()};self.image_focus=Some(actions[next].clone());self.set_should_draw();}
+                            return Ok(true);
+                        }
+                        KeyEvent::Pressed(Key::A) => {self.image_focus=None;self.select_entry(commands).await?;self.set_should_draw();return Ok(true);}
+                        KeyEvent::Pressed(Key::Up) => return Ok(false),
+                        _ => {}
+                    }
+                } else if matches!(event,KeyEvent::Pressed(Key::Up)) && !actions.is_empty() && !self.entries.is_empty() {
+                    self.image_focus=Some(actions[0].clone());self.set_should_draw();return Ok(true);
+                }
+            }
             if self.orbit.is_some() {
                 match event {
                     KeyEvent::Pressed(Key::Left | Key::Right | Key::Up | Key::Down)

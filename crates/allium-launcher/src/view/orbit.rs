@@ -1,3 +1,5 @@
+#[path = "orbit_portrait.rs"]
+mod portrait;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
@@ -260,6 +262,7 @@ impl Orbit {
                     common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
                 };
                 if let Some(path) = path {
+                    if path == self.cover_path(&entry) { return; }
                     if !self.cache.iter().any(|item| item.path == path) {
                         let image = if self.ink_art {
                             load_ink_cover(&path)
@@ -297,6 +300,9 @@ impl Orbit {
                 } else {
                     load_prepared_art(&path, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false)
                 };
+                let image = if self.ink_art && self.tall_art && common::media::cached_resolve(entry.path(),common::media::Kind::TallCover).is_none() {
+                    image.and_then(portrait::compose)
+                } else {image};
                 if image.is_none() && !fallback {
                     work.push_front(WarmArt::CoverFallback(entry));
                 } else {
@@ -1145,6 +1151,7 @@ mod next_cover_tests {
         input.rows.insert(
             Binding::Entries,
             vec![Row {
+                subtitle: String::new(),
                 id: crate::theme_adapter::entry_id(entries[0].path()),
                 label: entries[0].name().into(),
                 value: String::new(),
@@ -1521,8 +1528,9 @@ mod media_contract_tests {
         let tall = orbit.theme_art(&entries, 0, 0, 2).selected_cover.unwrap();
         assert_eq!(tall.width() * 3, tall.height() * 2);
         let fallback = orbit.theme_art(&entries, 1, 0, 2).selected_cover.unwrap();
-        assert_eq!(fallback.width(), fallback.height());
+        assert_eq!(fallback.width() * 3, fallback.height() * 2);
         assert_eq!(fallback.width(), 64);
+        assert!(std::sync::Arc::ptr_eq(&fallback,&orbit.theme_art(&entries,1,0,2).selected_cover.unwrap()));
     }
     #[test]
     fn fitted_prepared_art_preserves_aspect_and_disk_cache_dimensions() {

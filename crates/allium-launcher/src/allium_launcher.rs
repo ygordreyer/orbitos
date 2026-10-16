@@ -598,6 +598,7 @@ fn set_wallpaper(display: &mut impl Display, path: &Path) -> Result<()> {
 
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 mod orbit_proof {
+    include!("parity_capture_tests.rs");
     use super::*;
     use common::constants::{ALLIUM_BASE_DIR, ALLIUM_LAUNCHER_STATE};
     use serde_json::Value;

@@ -354,6 +354,7 @@ where
             .skip(first)
             .take(count)
             .map(|(_, entry)| ThemeRow {
+                subtitle: String::new(),
                 id: entry.theme_id().into(),
                 label: entry.as_str(&locale),
                 value: self.entry_value(*entry, &locale),
@@ -966,7 +967,7 @@ mod theme_adapter_tests {
     use common::{
         constants::ALLIUM_FONTS_DIR,
         geom::Size,
-        theme::{Boundary, ThemeRuntime},
+        theme::{FontBank, runtime::ThemeSnapshot},
     };
     use type_map::TypeMap;
 
@@ -1256,13 +1257,9 @@ mod theme_adapter_tests {
         ));
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
-        let mut runtime =
-            ThemeRuntime::bind(&state, &root.join("missing-themes"), &ALLIUM_FONTS_DIR).unwrap();
-        runtime.choose("orbit").unwrap();
-        (
-            runtime.activate(Boundary::MenuOpening).snapshot.unwrap(),
-            root,
-        )
+        let bank = FontBank::bind(&ALLIUM_FONTS_DIR).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::builtin("orbit").unwrap(), &bank, 1).unwrap();
+        (theme, root)
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 pub struct InkTextLayout {
     font: Font<'static>,
     fallback: Font<'static>,
-    size: u32,
+    size: f32,
     line: u32,
     tracking: f32,
     upper: bool,
@@ -21,6 +21,10 @@ pub struct InkTextLayout {
 type Type = InkTextLayout;
 #[path = "render_ink_effects.rs"]
 mod effects;
+#[path = "render_ink_parity.rs"]
+mod parity;
+pub use parity::ink_detail_pages;
+use parity::symbol;
 #[path = "render_ink_retained.rs"]
 pub(super) mod retained;
 impl InkTextLayout {
@@ -88,7 +92,7 @@ impl InkTextLayout {
     fn guide_lines(&self, value: &str, width: u32, count: u32) -> Vec<String> {
         let mut rest = value;
         let mut lines = Vec::new();
-        for _ in 0..count.min(16) {
+        for _ in 0..count {
             if rest.is_empty() {
                 break;
             }
@@ -127,9 +131,9 @@ impl InkTextLayout {
             }
             let advance = glyph.h_metrics().advance_width;
             prev = Some(glyph.id());
-            if let Some(bb) = glyph.positioned(point(x, 0.0)).pixel_bounding_box() {
-                left = left.min(bb.min.x as f32);
-                right = right.max(bb.max.x as f32);
+            if let Some(bb) = glyph.exact_bounding_box() {
+                left = left.min(x + bb.min.x);
+                right = right.max(x + bb.max.x);
             }
             x += advance + self.tracking;
         }
@@ -143,9 +147,8 @@ impl InkTextLayout {
         self.font
             .glyph('H')
             .scaled(Scale::uniform(self.size as f32))
-            .positioned(point(0.0, 0.0))
-            .pixel_bounding_box()
-            .map_or(self.size as f32 * 0.7, |b| -b.min.y as f32)
+            .exact_bounding_box()
+            .map_or(self.size * 0.7, |b| -b.min.y)
     }
     fn baseline(&self) -> f32 {
         let v = self.font.v_metrics(Scale::uniform(self.size as f32));
@@ -274,12 +277,12 @@ pub fn ink_text_layout(theme: &ThemeHandle, c: &Component, focused: bool) -> Ink
     let weight = run.weight.unwrap_or(if family == FontId::BarlowCondensed {
         600
     } else {
-        400
+        0
     });
     Type {
         font: theme.ink_font(family, weight),
         fallback: theme.fallback_font(),
-        size: run.size.unwrap(),
+        size: run.size.unwrap() as f32,
         line: run.line_height.unwrap(),
         tracking: run.letter_spacing.unwrap_or(0.0),
         upper: run.transform.as_deref() == Some("uppercase"),
@@ -653,6 +656,7 @@ impl PreparedFrame {
                 .as_deref()
                 .is_none_or(|w| (w == "populated") == state)
         });
+        self.ink_empty_stack(&mut components);
         self.ink_fit_dialog(&mut components, input);
         #[cfg(test)]
         if std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
@@ -835,18 +839,14 @@ impl PreparedFrame {
                         })
                         .unwrap_or_default(),
                     Binding::Pagination => {
-                        let count = primary_binding(input.screen)
-                            .and_then(|b| input.rows.get(&b))
-                            .map_or(0, Vec::len);
-                        if p.hide_single && count <= c.visible_count.unwrap_or(16) as usize {
-                            String::new()
-                        } else {
-                            input
-                                .text
-                                .get(&Binding::Pagination)
-                                .cloned()
-                                .unwrap_or_default()
-                        }
+                        let pagination = input.pagination.or_else(|| {
+                            let text = input.text.get(&Binding::Pagination)?;
+                            let (page, total) = text.split_once('/')?;
+                            Some(crate::theme::frame::Pagination { page: page.trim().parse().ok()?, total: total.trim().parse().ok()? })
+                        });
+                        pagination.filter(|page| !p.hide_single || page.total > 1).map(|page| {
+                            format!("{} / {}", page.page, page.total)
+                        }).unwrap_or_default()
                     }
                     b => input.text.get(&b).cloned().unwrap_or_default(),
                 };
@@ -855,7 +855,9 @@ impl PreparedFrame {
                         value = value[at + 2..].into();
                     }
                 }
-                if matches!(
+                if c.binding == Some(Binding::SelectedBlurb) && !input.detail_lines.is_empty() {
+                    self.ink_details(c, &input.detail_lines)?;
+                } else if matches!(
                     c.binding,
                     Some(Binding::SelectedMetadata | Binding::SelectedFacts)
                 ) && (p.label.is_some()
@@ -880,9 +882,7 @@ impl PreparedFrame {
             }
             Kind::Image => {
                 if c.binding == Some(Binding::SelectedLogo) {
-                    if self.logo(c, input)? {
-                        return Ok(());
-                    }
+                    if self.logo(c, input)? { self.ink_image_action(c, input); return Ok(()); }
                     let title = input
                         .text
                         .get(&Binding::SelectedTitle)
@@ -934,6 +934,7 @@ impl PreparedFrame {
                         }
                     }
                 }
+                self.ink_image_action(c, input);
             }
             Kind::AssetImage => {
                 if let Some(action) = &p.action_content {
@@ -1011,6 +1012,7 @@ impl PreparedFrame {
                         );
                     }
                 }
+                self.ink_image_action(c, input);
             }
             Kind::Entries | Kind::SettingsRows => {
                 let rows = input
@@ -1046,6 +1048,7 @@ impl PreparedFrame {
                         .or_else(|| input.art.entries.get(&rows.last().unwrap().id));
                     if let Some(source) = source {
                         let row = Row {
+                            subtitle: String::new(),
                             id: "ink-preview".into(),
                             label: String::new(),
                             value: String::new(),
@@ -1161,7 +1164,7 @@ impl PreparedFrame {
         } else if active {
             p.active_fill
         } else {
-            c.frame_color.or(if action {
+            c.frame_color.or(if c.kind == Kind::Navigation || action && p.action_style.is_none() && p.primary_style.is_none() {
                 Some(ColorRole::Surface)
             } else {
                 None
@@ -1220,7 +1223,14 @@ impl PreparedFrame {
                 _ => {}
             }
         }
-        let mut ty = self.ink_type(c, focused);
+        let mut action_component = c.clone();
+        if action {
+            if let Some(role) = p.action_font_role {
+                action_component.role = Some(role);
+                action_component.paint.as_mut().unwrap().run = None;
+            }
+        }
+        let mut ty = self.ink_type(&action_component, focused);
         if action {
             if let Some(color) = surface.text {
                 ty.color = color;
@@ -1260,99 +1270,35 @@ impl PreparedFrame {
             p.text_align.unwrap_or(Align::Left)
         };
         let rect = Rect(r.0 + inset, r.1, r.2.saturating_sub(2 * inset).max(1), r.3);
-        if let Some(sub) = &p.subtitle {
-            if !row.value.is_empty() {
-                let mut st = self.ink_subtype(c, sub);
-                if focused {
-                    st.color = p
-                        .focus_text
-                        .unwrap_or(if c.focus_style == Some(FocusStyle::Fill) {
-                            ColorRole::FocusText
-                        } else {
-                            st.color
-                        });
-                }
-                let height = ty.cap() + st.line as f32;
-                let top = (r.3 as f32 - height) / 2.0;
-                let title = Rect(rect.0, (r.1 as f32 + top).max(0.0) as u32, rect.2, ty.line);
-                let subrect = Rect(
-                    rect.0,
-                    (r.1 as f32 + top + ty.line as f32).max(0.0) as u32,
-                    rect.2,
-                    st.line.min(r.3),
-                );
-                self.ink_text(
-                    &c.id,
-                    title,
-                    &ty,
-                    &row.label,
-                    1,
-                    align,
-                    Overflow::Ellipsis,
-                    false,
-                )?;
-                self.ink_text(
-                    &c.id,
-                    subrect,
-                    &st,
-                    &row.value,
-                    1,
-                    align,
-                    Overflow::Ellipsis,
-                    false,
-                )?;
-            } else {
-                self.ink_text(
-                    &c.id,
-                    rect,
-                    &ty,
-                    &row.label,
-                    1,
-                    align,
-                    Overflow::Ellipsis,
-                    true,
-                )?;
-            }
-        } else if !row.value.is_empty() && align == Align::Left {
-            let value_width = (ty.metrics(&ty.value(&row.value)).0.ceil() as u32).min(rect.2 / 2);
-            let left = Rect(
-                rect.0,
-                rect.1,
-                rect.2.saturating_sub(value_width + 12).max(1),
-                rect.3,
-            );
-            self.ink_text(
-                &c.id,
-                left,
-                &ty,
-                &row.label,
-                1,
-                Align::Left,
-                Overflow::Ellipsis,
-                true,
-            )?;
-            self.ink_text(
-                &c.id,
-                Rect(
-                    rect.0 + rect.2 - value_width,
-                    rect.1,
-                    value_width.max(1),
-                    rect.3,
-                ),
-                &ty,
-                &row.value,
-                1,
-                Align::Right,
-                Overflow::Ellipsis,
-                true,
-            )?;
-        } else {
-            let label = if !row.value.is_empty() {
-                format!("{}  {}", row.label, row.value)
-            } else {
-                row.label.clone()
-            };
-            self.ink_text(&c.id, rect, &ty, &label, 1, align, Overflow::Ellipsis, true)?;
+        let sub = p.subtitle.as_ref().filter(|_| !row.subtitle.is_empty()).map(|run| self.ink_subtype(c, run));
+        let mut lines = vec![(&row.label, ty.clone())];
+        if let Some(mut st) = sub {
+            if focused { st.color = p.subtitle.as_ref().and_then(|r| r.focus_color).or(p.focus_text).unwrap_or(if c.focus_style == Some(FocusStyle::Fill) { ColorRole::FocusText } else { st.color }); }
+            lines.push((&row.subtitle, st));
+        }
+        let mut relative = Vec::new();
+        let mut y = 0.0;
+        for (text, style) in &lines { relative.push(y + style.ink_bounds(text).0); y += style.line as f32; }
+        let top = lines.iter().enumerate().map(|(i,(text,t))| relative[i] - if symbol(text) { t.ink_bounds(text).0 } else { t.cap() }).fold(f32::INFINITY, f32::min);
+        let bottom = lines.iter().enumerate().map(|(i,(text,t))| relative[i] + if symbol(text) { t.ink_bounds(text).1 } else { 0.0 }).fold(f32::NEG_INFINITY, f32::max);
+        let shift = r.1 as f32 + (r.3 as f32 - (bottom-top))/2.0 - top;
+        let baselines: Vec<_> = relative.iter().map(|b| (b+shift).round()).collect();
+        let mut vt = self.ink_type(&action_component, false); vt.color = ty.color; vt.size *= 0.82;
+        let value_width = if row.value.is_empty() { 0.0 } else { vt.metrics(&vt.value(&row.value)).0.ceil().min(r.2 as f32 * 0.38) };
+        let copy_width = (rect.2 as f32 - if value_width > 0.0 { value_width + 7.0 } else { 0.0 }).max(1.0);
+        let title_ink = ty.metrics(&ty.value(&row.label));
+        let title_width = copy_width.min(title_ink.2-title_ink.1);
+        let vi = vt.metrics(&vt.value(&row.value));
+        let value_extent = value_width.min(vi.2-vi.1);
+        let centered = align == Align::Center && value_width > 0.0;
+        let start = r.0 as f32 + (r.2 as f32-title_width-value_extent-7.0)/2.0;
+        for (i,(text,style)) in lines.iter().enumerate() {
+            let (x,width) = if centered && i==0 { (start,title_width) } else { (rect.0 as f32,if align == Align::Center { rect.2 as f32 } else { copy_width }) };
+            self.ink_baseline(&c.id, Rect(x.round().max(0.0) as u32,r.1,width.max(1.0).floor() as u32,r.3),style,text,align,baselines[i])?;
+        }
+        if value_width > 0.0 {
+            let x = if centered { start+title_width+7.0 } else { (rect.0+rect.2) as f32-value_width };
+            self.ink_baseline(&c.id,Rect(x.round().max(0.0) as u32,r.1,if centered {value_extent} else {value_width}.max(1.0).floor() as u32,r.3),&vt,&row.value,if centered {Align::Center} else {Align::Right},baselines[0])?;
         }
         if row.enabled {
             self.targets.push(Target {
@@ -1598,38 +1544,42 @@ impl PreparedFrame {
     }
     fn ink_nav_icon(&mut self, r: Rect, icon: &str, height: u32, color: ColorRole) {
         let mut b = tiny_skia::PathBuilder::new();
-        match icon {
+        let bounds = match icon {
             "apps" => {
-                for (x, y) in [(2.0, 2.0), (14.0, 2.0), (2.0, 14.0), (14.0, 14.0)] {
-                    b.push_rect(tiny_skia::Rect::from_xywh(x, y, 8.0, 8.0).unwrap());
-                }
+                for (x,y) in [(4.0,4.0),(14.0,4.0),(4.0,14.0),(14.0,14.0)] { b.push_rect(tiny_skia::Rect::from_xywh(x,y,6.0,6.0).unwrap()); }
+                (3.0,3.0,18.0,18.0)
             }
             "library" => {
-                for x in [2.0, 9.0, 16.0] {
-                    b.push_rect(tiny_skia::Rect::from_xywh(x, 3.0, 5.0, 18.0).unwrap());
-                }
+                for x in [4.0,10.0] {b.push_rect(tiny_skia::Rect::from_xywh(x,5.0,5.0,15.0).unwrap());}
+                b.move_to(16.0,5.0);b.line_to(20.0,4.0);b.line_to(23.0,19.0);b.line_to(19.0,20.0);b.close();
+                (3.0,3.0,21.0,18.0)
             }
             "recents" => {
-                b.push_circle(12.0, 12.0, 9.0);
-                b.move_to(12.0, 5.0);
-                b.line_to(12.0, 12.0);
-                b.line_to(17.0, 15.0);
+                b.move_to(12.0,4.0);
+                b.cubic_to(16.418278,4.0,20.0,7.581722,20.0,12.0);
+                b.cubic_to(20.0,16.418278,16.418278,20.0,12.0,20.0);
+                b.cubic_to(7.581722,20.0,4.0,16.418278,4.0,12.0);
+                b.move_to(4.0,4.0);b.line_to(4.0,10.0);b.line_to(10.0,10.0);
+                b.move_to(12.0,7.0);b.line_to(12.0,12.0);b.line_to(16.0,14.0);
+                (3.0,3.0,18.0,18.0)
+            }
+            "settings" => {
+                b.move_to(12.0,3.0);
+                for (x,y) in [(15.0,6.0),(19.0,5.0),(20.0,9.0),(23.0,12.0),(20.0,15.0),(19.0,19.0),(15.0,18.0),(12.0,21.0),(9.0,18.0),(5.0,19.0),(4.0,15.0),(1.0,12.0),(4.0,9.0),(5.0,5.0),(9.0,6.0)] {b.line_to(x,y);}b.close();
+                b.push_circle(12.0,12.0,4.0);
+                (0.0,2.0,24.0,20.0)
             }
             _ => {
-                b.push_circle(12.0, 12.0, 6.0);
-                b.push_circle(12.0, 12.0, 2.0);
-                for i in 0..8 {
-                    let a = i as f32 * std::f32::consts::FRAC_PI_4;
-                    b.move_to(12.0 + 7.0 * a.cos(), 12.0 + 7.0 * a.sin());
-                    b.line_to(12.0 + 10.0 * a.cos(), 12.0 + 10.0 * a.sin());
-                }
+                b.push_circle(10.0,10.0,7.0);b.move_to(15.0,15.0);b.line_to(22.0,22.0);
+                (2.0,2.0,21.0,21.0)
             }
-        }
+        };
         if let Some(path) = b.finish() {
-            let scale = height.min(48) as f32 / 24.0;
-            let transform = Transform::from_scale(scale, scale).post_translate(
-                r.0 as f32 + (r.2 as f32 - 24.0 * scale) / 2.0,
-                r.1 as f32 + (r.3 as f32 - 24.0 * scale) / 2.0,
+            let scale = height.min(48) as f32 / bounds.3;
+            let width = (bounds.2 * scale).round();
+            let transform = Transform::from_scale(width/bounds.2, scale).post_translate(
+                (r.0 as f32 + (r.2 as f32-width)/2.0).round() - bounds.0*width/bounds.2,
+                (r.1 as f32 + (r.3 as f32-height as f32)/2.0).round() - bounds.1*scale,
             );
             self.pixels.stroke_path(
                 &path,
@@ -2258,11 +2208,6 @@ fn primary_binding(screen: ScreenId) -> Option<Binding> {
 fn raster(pix: &mut Pixmap, ty: &Type, text: &str, x: f32, baseline: f32, color: Color) {
     let mut x = x;
     let mut prev = None;
-    let bold = if ty.family != FontId::BarlowCondensed && ty.weight > 400 {
-        (ty.weight - 400) as f32 / 700.0
-    } else {
-        0.0
-    };
     for ch in text.chars() {
         let font = ty.face(ch);
         let glyph = font.glyph(ch).scaled(Scale::uniform(ty.size as f32));
@@ -2277,9 +2222,6 @@ fn raster(pix: &mut Pixmap, ty: &Type, text: &str, x: f32, baseline: f32, color:
                 let xx = bb.min.x + gx as i32;
                 let yy = bb.min.y + gy as i32;
                 blend(pix, xx, yy, color, coverage);
-                if bold > 0.0 {
-                    blend(pix, xx + 1, yy, color, coverage * bold);
-                }
             });
         }
         x += advance + ty.tracking;
@@ -2532,6 +2474,7 @@ mod tests {
         *slot = c.clone();
         pack.validate().unwrap();
         let row = Row {
+            subtitle: String::new(),
             id: "focused".into(),
             label: "Caption".into(),
             value: String::new(),

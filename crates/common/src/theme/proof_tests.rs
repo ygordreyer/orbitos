@@ -40,18 +40,21 @@ fn frame(screen: ScreenId) -> FrameInputs {
     }
     let games = vec![
         Row {
+            subtitle: String::new(),
             id: "wipeout".into(),
             label: "WipEout 3".into(),
             value: "".into(),
             enabled: true,
         },
         Row {
+            subtitle: String::new(),
             id: "r4".into(),
             label: "R4 - Ridge Racer Type 4".into(),
             value: "".into(),
             enabled: true,
         },
         Row {
+            subtitle: String::new(),
             id: "ctr".into(),
             label: "Crash Team Racing".into(),
             value: "".into(),
@@ -62,6 +65,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::SettingsRows,
         vec![Row {
+            subtitle: String::new(),
             id: "theme".into(),
             label: "Theme".into(),
             value: "Preset".into(),
@@ -72,6 +76,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
         Binding::Discs,
         (1..=4)
             .map(|i| Row {
+                subtitle: String::new(),
                 id: format!("disc-{i}"),
                 label: format!("Disc {i}"),
                 value: format!("game-disc-{i}.chd"),
@@ -82,6 +87,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::StorageEntries,
         vec![Row {
+            subtitle: String::new(),
             id: "cached".into(),
             label: "Large cached game".into(),
             value: "1.4 GiB".into(),
@@ -91,6 +97,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
     f.rows.insert(
         Binding::Guides,
         vec![Row {
+            subtitle: String::new(),
             id: "guide".into(),
             label: "Guidebook".into(),
             value: "".into(),
@@ -101,12 +108,14 @@ fn frame(screen: ScreenId) -> FrameInputs {
         Binding::Actions,
         vec![
             Row {
+                subtitle: String::new(),
                 id: "confirm".into(),
                 label: "Confirm".into(),
                 value: "".into(),
                 enabled: true,
             },
             Row {
+                subtitle: String::new(),
                 id: "cancel".into(),
                 label: "Back".into(),
                 value: "".into(),
@@ -119,6 +128,7 @@ fn frame(screen: ScreenId) -> FrameInputs {
         ["Recents", "Library", "Apps", "Settings"]
             .into_iter()
             .map(|s| Row {
+                subtitle: String::new(),
                 id: s.to_lowercase(),
                 label: s.into(),
                 value: "".into(),
@@ -542,6 +552,7 @@ fn theme_foundation_invalid_font_model_names_nav_and_caption_metrics() {
     assert!(f.validate(&theme).is_err());
     f.text.remove(&Binding::ThemeName);
     f.navigation.get_mut(&NavGroup::Primary).unwrap().push(Row {
+        subtitle: String::new(),
         id: "unavailable".into(),
         label: "Unexpected".into(),
         value: "".into(),
@@ -1463,6 +1474,7 @@ fn ux4_seven_menu_rows_fit_builtin_and_external_pack() {
                 Binding::Entries,
                 (0..7)
                     .map(|i| Row {
+                        subtitle: String::new(),
                         id: format!("action-{i}"),
                         label: if screen == ScreenId::ContextMenu {
                             [
@@ -1805,7 +1817,7 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
         let mut input=frame(ScreenId::Recents);input.focus=Focus::default();
         let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media-sd/Roms/TEST");
         let entry=crate::media::metadata(&fixture.join("Complete.sfc"));
-        input.rows.insert(Binding::Entries,vec![Row{id:"recent-fixture".into(),label:entry.name.clone(),value:String::new(),enabled:true}]);
+        input.rows.insert(Binding::Entries,vec![Row{subtitle:String::new(),id:"recent-fixture".into(),label:entry.name.clone(),value:String::new(),enabled:true}]);
         input.selected.insert(Binding::Entries,"recent-fixture".into());
         input.text.insert(Binding::SelectedTitle,entry.name.clone());
         let kind=if suffix.is_empty(){crate::media::Kind::Cover}else{crate::media::Kind::TallCover};
@@ -1824,3 +1836,5 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
 mod parity_a;
 #[path = "parity_c_tests.rs"]
 mod parity_c_tests;
+#[path = "parity_tests.rs"]
+mod parity_d;

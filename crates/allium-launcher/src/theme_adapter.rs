@@ -116,10 +116,12 @@ pub fn capacity(handle: &ThemeHandle, screen: ScreenId, binding: Binding) -> usi
 }
 pub fn shell(input: &mut FrameInputs, res: &Resources, selected: usize) {
     let locale = res.get::<common::locale::Locale>();
-    if input.screen == ScreenId::GameDetail {
+    if input.screen == ScreenId::GameDetail
+        && !res.0.borrow().get::<Option<ThemeHandle>>().and_then(|h|h.as_ref()).is_some_and(|h| h.pack().ink()) {
         input.navigation.insert(
             NavGroup::Primary,
             vec![Row {
+                subtitle: String::new(),
                 id: "details".into(),
                 label: "Details".into(),
                 value: String::new(),
@@ -140,6 +142,7 @@ pub fn shell(input: &mut FrameInputs, res: &Resources, selected: usize) {
                 .iter()
                 .enumerate()
                 .map(|(i, label)| Row {
+                    subtitle: String::new(),
                     id: format!("tab-{i}"),
                     label: label.clone(),
                     value: String::new(),
@@ -149,7 +152,7 @@ pub fn shell(input: &mut FrameInputs, res: &Resources, selected: usize) {
         );
         input
             .selected
-            .insert(Binding::Navigation, format!("tab-{selected}"));
+            .insert(Binding::Navigation, format!("tab-{}", if input.screen == ScreenId::GameDetail { 1 } else { selected }));
     }
     input.navigation.insert(NavGroup::LibraryActions, vec![]);
     if input.hints.is_empty() {

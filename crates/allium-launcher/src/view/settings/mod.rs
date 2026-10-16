@@ -201,6 +201,7 @@ impl Settings {
             "settings-about",
         ]);
         let mut input = FrameInputs::new(screen);
+        input.pagination = Some(common::theme::frame::Pagination {page: self.list.selected()/count.max(1)+1,total: keys.len().max(1).div_ceil(count.max(1))});
         input.text.insert(Binding::Title, locale.t("tab-settings"));
         input.rows.insert(
             Binding::SettingsRows,
@@ -209,6 +210,7 @@ impl Settings {
                 .skip(self.list.window_start())
                 .take(count)
                 .map(|(i, key)| Row {
+                    subtitle: String::new(),
                     id: format!("setting-{i}"),
                     label: locale.t(key),
                     value: if *key == "settings-theme" {

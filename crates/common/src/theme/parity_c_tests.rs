@@ -34,13 +34,12 @@ fn audit_input(record: &serde_json::Value, ready: &ThemeHandle, root: &Path, ass
         for (i,row) in m[name].as_array().into_iter().flatten().filter(|r|r["empty"]!=true).take(count).enumerate(){
             let id=row["actionId"].as_str().or(row["gameId"].as_str()).or(row["id"].as_str()).map(str::to_owned).unwrap_or_else(||format!("{name}-{i}"));
             if let Some(source)=row["image"].as_str().filter(|_|c.is_some()){if let Some(image)=audit_art(root,assets,source,160,180){f.art.entries.insert(id.clone(),image);}}
-            let val=if row["value"].as_str().is_some_and(|s|!s.is_empty()){audit_value(row,"value")}else if c.and_then(|c|c.paint.as_ref()).is_some_and(|p|p.subtitle.is_some()){audit_value(row,"subtitle")}else{String::new()};
-            rows.push(Row{id,label:audit_value(row,"title"),value:val,enabled:row["disabled"]!=true});
+            rows.push(Row{id,label:audit_value(row,"title"),value:audit_value(row,"value"),subtitle:audit_value(row,"subtitle"),enabled:row["disabled"]!=true});
         }
         f.rows.insert(binding,rows);
     }
     for (name,group) in [("primary",NavGroup::Primary),("library_actions",NavGroup::LibraryActions)] {
-        let rows=m["navigation_groups"][name].as_array().unwrap().iter().map(|row|Row{id:audit_value(row,"id"),label:audit_value(row,"title"),value:String::new(),enabled:true}).collect();f.navigation.insert(group,rows);
+        let rows=m["navigation_groups"][name].as_array().unwrap().iter().map(|row|Row{id:audit_value(row,"id"),label:audit_value(row,"title"),value:String::new(),subtitle:String::new(),enabled:true}).collect();f.navigation.insert(group,rows);
     }
     let nav=m["activeNav"].as_u64().unwrap_or(1) as usize;
     if let Some(row)=f.navigation[&NavGroup::Primary].get(nav){f.selected.insert(Binding::Navigation,row.id.clone());}
