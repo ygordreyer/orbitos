@@ -842,9 +842,12 @@ where
             menu.set_visible_count_override(Some(count))?;
             let locale = self.res.get::<Locale>();
             let mut modal = FrameInputs::new(ScreenId::ContextMenu);
-            modal.art.selected_logo = models
-                .first()
-                .and_then(|model| model.art.selected_logo.clone());
+            if let Some(model) = models.first() {
+                modal.art.selected_logo = model.art.selected_logo.clone();
+                modal.art.selected_cover = model.art.selected_cover.clone();
+                modal.art.completed_misses.selected_logo = model.art.completed_misses.selected_logo;
+                modal.art.completed_misses.selected_cover = model.art.completed_misses.selected_cover;
+            }
             modal.text.insert(
                 Binding::Title,
                 self.entries
@@ -1893,6 +1896,63 @@ mod perf_fix_tests {
             blurb: "blurb".into(),
         });
     }
+    #[tokio::test]
+    #[cfg(feature = "perf-bench")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn context_menu_inherits_cover_and_logo_misses_and_settles() {
+        use common::theme::{fonts::FontBank, pack::ScreenId, runtime::ThemeSnapshot, ThemeHandle};
+        let root = std::env::temp_dir().join(format!("allium-menu-art-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        common::perf_trace::start_probe(root.join("trace.log").to_str().unwrap());
+        let bank = FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        for name in ["compact-plus", "orbit-hero"] {
+            let snapshot = ThemeSnapshot::load(
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../themes").join(name).canonicalize().unwrap(),
+            ).unwrap();
+            let handle = ThemeHandle::prepare(snapshot, &bank, 993).unwrap();
+            for has_cover in [false, true] {
+                let stem = format!("{name}-{has_cover}");
+                if has_cover {
+                    tiny_skia::Pixmap::new(16, 16).unwrap()
+                        .save_png(root.join(format!("Imgs/{stem}.png"))).unwrap();
+                }
+                common::media::invalidate();
+                let mut list = list();
+                list.res.insert(Some(handle.clone()));
+                list.entries = vec![Entry::Game(Game::new(root.join(format!("{stem}.sfc"))))];
+                list.list.set_items(vec![stem], false);
+                list.enable_orbit();
+                list.open_menu().unwrap();
+                let models = list.theme_models(ScreenId::Library, &handle).unwrap();
+                let modal = models.last().unwrap();
+                assert_eq!(modal.screen, ScreenId::ContextMenu);
+                assert!(!super::super::app::theme_content_complete(modal, &handle));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while list.idle_media_step(&handle, ScreenId::Library) {
+                    assert!(std::time::Instant::now() < deadline, "{name} art timeout");
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                let models = list.theme_models(ScreenId::Library, &handle).unwrap();
+                let source = &models[0].art;
+                let mut modal = models.last().unwrap().clone();
+                assert!(source.completed_misses.selected_logo, "{name} logo miss");
+                assert!(modal.art.selected_logo.is_none());
+                assert!(modal.art.completed_misses.selected_logo);
+                assert_eq!(modal.art.completed_misses.selected_cover, source.completed_misses.selected_cover);
+                assert_eq!(modal.art.completed_misses.selected_cover, !has_cover);
+                assert_eq!(modal.art.selected_cover.is_some(), has_cover);
+                if has_cover {
+                    assert!(std::sync::Arc::ptr_eq(modal.art.selected_cover.as_ref().unwrap(), source.selected_cover.as_ref().unwrap()));
+                }
+                assert!(super::super::app::theme_content_complete(&modal, &handle), "{name} completed menu");
+                modal.art.completed_misses.selected_logo = false;
+                assert_eq!(super::super::app::theme_content_complete(&modal, &handle), name == "orbit-hero" && has_cover);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
     #[test]
     fn review_selected_info_tracks_media_generation() {
         let root =

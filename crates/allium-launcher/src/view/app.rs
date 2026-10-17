@@ -64,7 +64,8 @@ pub(super) fn theme_content_complete(
             if c.layout == Some(Arrangement::Hidden) {
                 return true;
             }
-            if c.logo && input.art.selected_logo.is_none() && !input.art.completed_misses.selected_logo {
+            let logo_suppressed = common::theme::logo_suppressed_by_cover(c, input);
+            if c.logo && !logo_suppressed && input.art.selected_logo.is_none() && !input.art.completed_misses.selected_logo {
                 return false;
             }
             if c.kind == Kind::Image {
@@ -75,7 +76,7 @@ pub(super) fn theme_content_complete(
                     }
                     Some(Binding::SelectedCover) => return input.art.selected_cover.is_some() || input.art.completed_misses.selected_cover,
                     Some(Binding::SelectedHero) => return input.art.selected_hero.is_some() || input.art.completed_misses.selected_hero,
-                    Some(Binding::SelectedLogo) => return input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo,
+                    Some(Binding::SelectedLogo) => return logo_suppressed || input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo,
                     _ => {}
                 }
             }
@@ -1648,6 +1649,40 @@ mod integration_navigation_tests {
 mod content_readiness_tests {
     use super::*;
     use common::theme::{fonts::FontBank, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, runtime::ThemeSnapshot, ThemeHandle};
+    #[test]
+    fn covered_titles_skip_pending_logos_but_hero_titles_still_require_them() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for name in ["compact", "compact-plus", "orbit-hero", "orbit-row", "big-picture"] {
+            let snapshot = if name == "compact" { ThemeSnapshot::builtin(name).unwrap() }
+                else { ThemeSnapshot::load(&root.join("themes").join(name)).unwrap() };
+            let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+            let mut input = FrameInputs::new(ScreenId::Library);
+            input.rows.insert(Binding::Entries, vec![Row {
+                id: "selected".into(), label: "Selected".into(), subtitle: String::new(),
+                value: String::new(), enabled: true,
+            }]);
+            input.selected.insert(Binding::Entries, "selected".into());
+            input.art.completed_misses = common::theme::frame::ArtMisses {
+                selected_cover: true, selected_hero: true,
+                entries: std::collections::BTreeSet::from(["selected".into()]),
+                ..Default::default()
+            };
+            assert!(!theme_content_complete(&input, &theme), "{name} pending logo without cover");
+            let cover = std::sync::Arc::new(tiny_skia::Pixmap::new(16, 16).unwrap());
+            input.art.entries.insert("other".into(), cover.clone());
+            assert!(!theme_content_complete(&input, &theme), "{name} unrelated cover");
+            let suppressed = matches!(name, "compact" | "compact-plus");
+            input.art.selected_cover = Some(cover.clone());
+            assert_eq!(theme_content_complete(&input, &theme), suppressed, "{name} direct cover");
+            input.art.selected_cover = None;
+            input.art.entries.insert("selected".into(), cover.clone());
+            assert_eq!(theme_content_complete(&input, &theme), suppressed, "{name} selected row cover");
+            input.art.selected_logo = Some(cover);
+            assert!(theme_content_complete(&input, &theme), "{name} loaded logo");
+        }
+    }
+
     #[test]
     fn completed_misses_settle_only_their_visible_art_bindings() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();

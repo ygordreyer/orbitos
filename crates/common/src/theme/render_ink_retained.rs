@@ -126,13 +126,8 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
         out.art.selected_logo = input.art.selected_logo.clone();
     }
     if c.logo_when_no_cover {
-        out.art.selected_cover = input.art.selected_cover.clone();
-        if let Some(id) = input.selected.get(&Binding::Entries) {
-            out.selected.insert(Binding::Entries, id.clone());
-            if let Some(cover) = input.art.entries.get(id) {
-                out.art.entries.insert(id.clone(), cover.clone());
-            }
-        }
+        // Only cover presence hides the logo, so a reused bool stands in for it: no ID clone or map insert per op.
+        out.art.next_cover_expected = crate::theme::logo_suppressed_by_cover(c, input);
     }
     match c.kind {
         Kind::Text => {
@@ -285,6 +280,37 @@ mod review_tests {
     use super::*;
     use crate::theme::fonts::FontBank;
     use std::path::Path;
+
+    #[test]
+    fn logo_cover_dependencies_track_presence_without_selected_ids_or_art_maps() {
+        for kind in ["text", "image"] {
+            let c: Component = serde_json::from_value(serde_json::json!({
+                "id": "title", "kind": kind, "rect": [0, 0, 100, 30],
+                "binding": if kind == "text" { "selected_title" } else { "selected_logo" },
+                "logo": kind == "text", "logo_when_no_cover": true
+            })).unwrap();
+            let mut input = FrameInputs::new(ScreenId::Library);
+            input.selected.insert(Binding::Entries, "first".into());
+            let missing = retained::capture(&dependencies(&c, &input));
+            let cover = Arc::new(Pixmap::new(16, 16).unwrap());
+            input.art.entries.insert("other".into(), cover.clone());
+            assert!(retained::matches(&missing, &dependencies(&c, &input)));
+            input.art.entries.insert("first".into(), cover.clone());
+            let deps = dependencies(&c, &input);
+            assert!(deps.selected.is_empty() && deps.art.entries.is_empty());
+            assert!(deps.art.selected_cover.is_none());
+            assert!(!retained::matches(&missing, &deps));
+            let present = retained::capture(&deps);
+            input.selected.insert(Binding::Entries, "other".into());
+            assert!(retained::matches(&present, &dependencies(&c, &input)));
+            input.art.entries.clear();
+            input.art.selected_cover = Some(Arc::new(Pixmap::new(8, 8).unwrap()));
+            assert!(retained::matches(&present, &dependencies(&c, &input)));
+            input.art.selected_cover = None;
+            assert!(!retained::matches(&present, &dependencies(&c, &input)));
+            assert!(retained::matches(&missing, &dependencies(&c, &input)));
+        }
+    }
 
     #[test]
     fn logo_only_selection_change_repaints_retained_titles() {

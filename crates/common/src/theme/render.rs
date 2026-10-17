@@ -781,11 +781,7 @@ impl PreparedFrame {
         );
     }
     fn logo(&mut self, c: &Component, input: &FrameInputs) -> Result<bool> {
-        if c.logo_when_no_cover
-            && (input.art.selected_cover.is_some()
-                || input.selected.get(&Binding::Entries)
-                    .is_some_and(|id| input.art.entries.contains_key(id)))
-        {
+        if super::logo_suppressed_by_cover(c, input) {
             return Ok(false);
         }
         let Some(source) = input.art.selected_logo.as_ref() else {

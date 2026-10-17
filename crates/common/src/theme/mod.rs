@@ -17,6 +17,13 @@ mod parity_b_tests;
 pub use fonts::{FontBank, ThemeHandle};
 pub use pack::{Component, Kind, Pack, Rect, ScreenId};
 
+pub fn logo_suppressed_by_cover(component: &Component, input: &frame::FrameInputs) -> bool {
+    component.logo_when_no_cover
+        && (input.art.selected_cover.is_some()
+            || input.selected.get(&pack::Binding::Entries)
+                .is_some_and(|id| input.art.entries.contains_key(id)))
+}
+
 pub mod choices;
 pub use choices::{ChoiceKind, ThemeChoice, ThemeChoices};
 
