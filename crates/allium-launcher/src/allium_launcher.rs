@@ -424,7 +424,7 @@ impl AlliumLauncher<DefaultPlatform> {
             tokio::select! {
                 event = self.poll_input() => {
                     crate::network_runtime::trace_wake("input");
-                    let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
+                    let _phase = common::perf_trace::input(event);
                     let mut bubble = VecDeque::new();
                     self.view.handle_key_event(event, tx.clone(), &mut bubble).await?;
                 }
@@ -478,7 +478,7 @@ impl AlliumLauncher<DefaultPlatform> {
     ) -> Result<usize> {
         let _phase = (!matches!(first,
             KeyEvent::Released(Key::L | Key::R | Key::Left | Key::Right | Key::Up | Key::Down)
-        )).then(|| common::perf_trace::phase(common::perf_trace::Phase::Input));
+        )).then(|| common::perf_trace::input(first));
         let repeat_key = match first {
             KeyEvent::Autorepeat(_) => navigation_key(first),
             _ => None,
@@ -2630,6 +2630,9 @@ mod integration_measurement_tests {
             .unwrap();
         assert_eq!(feedback["selection_generation"], 1);
         assert_eq!(final_content["selection_generation"], 1);
+        assert_eq!(feedback["measurement"]["input_key"], "Down");
+        assert_eq!(feedback["measurement"]["input_edge"], "press");
+        assert_eq!(feedback["measurement"]["input_generation"], 1);
         assert_eq!(
             final_content["measurement"]["first_feedback_monotonic_us"],
             final_content["measurement"]["final_content_monotonic_us"]
@@ -2652,6 +2655,17 @@ mod integration_measurement_tests {
             common::perf_trace::probe_counts()["measurement"]["input"],
             frozen
         );
+        for (event, edge, generation) in [
+            (KeyEvent::Pressed(Key::B), "press", 2),
+            (KeyEvent::Released(Key::B), "release", 3),
+        ] {
+            app.apply_input_batch(event, &mut PendingInput::default(),
+                &mut EnumMap::default(), &tx, &rx).await.unwrap();
+            let measurement = common::perf_trace::probe_counts()["measurement"].clone();
+            assert_eq!(measurement["input_key"], "B");
+            assert_eq!(measurement["input_edge"], edge);
+            assert_eq!(measurement["input_generation"], generation);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

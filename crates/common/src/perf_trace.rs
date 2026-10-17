@@ -83,12 +83,17 @@ struct Trace {
     input_cpu: [u64; 8],
     generation: u64,
     input_epoch: u64,
+    input_key: Option<crate::platform::Key>,
+    input_edge: Option<&'static str>,
     viewport_shift: bool,
     first_feedback_us: u64,
     final_content_us: u64,
     completed_input: Option<InputTotals>,
     stage_begin: [u64; STAGE_NAMES.len()],
     stage_end: [u64; STAGE_NAMES.len()],
+    frame_stage_begin: [u64; STAGE_NAMES.len()],
+    frame_stage_end: [u64; STAGE_NAMES.len()],
+    presented_us: u64,
     file: File,
     path: String,
     cpu: [u64; 8],
@@ -103,6 +108,7 @@ struct Trace {
     render_reason: &'static str,
     present_reason: &'static str,
     content_pending_reason: &'static str,
+    content_pending_reasons: Vec<(&'static str, usize)>,
     next_cover_expected: bool,
     missing_content_rows: usize,
 }
@@ -140,12 +146,17 @@ fn install(path: &str) -> std::io::Result<()> {
             input_cpu: [0; 8],
             generation: 0,
             input_epoch: 0,
+            input_key: None,
+            input_edge: None,
             viewport_shift: false,
             first_feedback_us: 0,
             final_content_us: 0,
             completed_input: None,
             stage_begin: [0; STAGE_NAMES.len()],
             stage_end: [0; STAGE_NAMES.len()],
+            frame_stage_begin: [0; STAGE_NAMES.len()],
+            frame_stage_end: [0; STAGE_NAMES.len()],
+            presented_us: 0,
             cpu: [0; 8],
             hits: [0; 3],
             started: None,
@@ -158,6 +169,7 @@ fn install(path: &str) -> std::io::Result<()> {
             render_reason: "none",
             present_reason: "none",
             content_pending_reason: "not_evaluated",
+            content_pending_reasons: Vec::new(),
             next_cover_expected: false,
             missing_content_rows: 0,
         })
@@ -211,6 +223,10 @@ pub fn phase(phase: Phase) -> PhaseGuard {
             trace.input_us = monotonic_us();
             trace.generation = trace.generation.wrapping_add(1);
             trace.input_epoch = trace.input_epoch.wrapping_add(1);
+            trace.input_key = None;
+            trace.input_edge = None;
+            trace.content_pending_reason = "not_evaluated";
+            trace.content_pending_reasons.clear();
             trace.viewport_shift = false;
             trace.first_feedback_us = 0;
             trace.final_content_us = 0;
@@ -228,6 +244,24 @@ pub fn phase(phase: Phase) -> PhaseGuard {
         })
     });
     PhaseGuard { phase, timing }
+}
+pub fn input(event: crate::platform::KeyEvent) -> PhaseGuard {
+    use crate::platform::KeyEvent;
+    let guard = phase(Phase::Input);
+    if guard.timing.is_none() { return guard; }
+    TRACE.with(|state| {
+        if let Some(t) = state.borrow_mut().as_mut() {
+            let (key, edge) = match event {
+                KeyEvent::Pressed(key) => (key, "press"),
+                KeyEvent::Released(key) => (key, "release"),
+                KeyEvent::Autorepeat(key) => (key, "autorepeat"),
+            };
+            t.input_key = Some(key);
+            t.input_edge = Some(edge);
+            write_event(t, "input_received", t.generation, None);
+        }
+    });
+    guard
 }
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
@@ -286,6 +320,9 @@ pub fn begin_render() {
         if let Some(t) = t.borrow_mut().as_mut() {
             t.cpu = [0; 8];
             t.frame_stages = [0; STAGE_NAMES.len()];
+            t.frame_stage_begin = [0; STAGE_NAMES.len()];
+            t.frame_stage_end = [0; STAGE_NAMES.len()];
+            t.presented_us = 0;
             t.hits = [0; 3];
             t.counts = [0; COUNT_LEN];
             t.started = Some(Instant::now());
@@ -530,6 +567,11 @@ mod tests {
             let _disabled = phase(Phase::Input);
             hit(ArtHit::Ram);
         }
+        let disabled = input(crate::platform::KeyEvent::Pressed(crate::platform::Key::B));
+        assert!(disabled.timing.is_none());
+        drop(disabled);
+        content_readiness("rows", false, 1);
+        artwork_readiness(&crate::theme::frame::Art::default(), &crate::theme::frame::Art::default());
         assert!(!path.exists());
         install(path.to_str().unwrap()).unwrap();
         {
@@ -903,6 +945,9 @@ pub fn stage(stage: Stage) -> StageGuard {
         if trace.stage_begin[stage as usize] == 0 {
             trace.stage_begin[stage as usize] = now;
         }
+        if trace.started.is_some() && trace.frame_stage_begin[stage as usize] == 0 {
+            trace.frame_stage_begin[stage as usize] = now;
+        }
         (
             Some(now),
             if trace.started.is_some() {
@@ -931,6 +976,7 @@ impl Drop for StageGuard {
                         trace.stage_end[self.stage as usize] = end;
                         if self.frame_attempt != 0 && self.frame_attempt == trace.attempt {
                             trace.frame_stages[self.stage as usize] += end.saturating_sub(start);
+                            trace.frame_stage_end[self.stage as usize] = end;
                         }
                     }
                 }
@@ -1026,15 +1072,22 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
     let input = t.completed_input.unwrap_or_else(|| input_totals(t));
     serde_json::json!({
         "selection_generation": t.generation, "viewport_shift": t.viewport_shift,
+        "input_generation": t.input_epoch, "input_key": t.input_key, "input_edge": t.input_edge,
+        "input_received_monotonic_us": t.input_us,
         "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
         "content_pending_reason": t.content_pending_reason,
+        "content_pending_reasons": t.content_pending_reasons.iter().map(|(reason, missing_rows)|
+            serde_json::json!({"reason":reason,"missing_rows":missing_rows})).collect::<Vec<_>>(),
         "next_cover_expected": t.next_cover_expected,
         "missing_content_rows": t.missing_content_rows,
         "first_feedback_monotonic_us": t.first_feedback_us,
         "final_content_monotonic_us": t.final_content_us,
         "first_feedback_us": (t.first_feedback_us != 0).then(|| t.first_feedback_us.saturating_sub(t.input_us)),
         "final_content_us": (t.final_content_us != 0).then(|| t.final_content_us.saturating_sub(t.input_us)),
-        "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts.as_slice()},
+        "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts.as_slice(),
+            "render_attempt": t.attempt, "render_start_monotonic_us": t.render_us,
+            "presented_monotonic_us": t.presented_us,
+            "stage_begin_monotonic_us": t.frame_stage_begin, "stage_end_monotonic_us": t.frame_stage_end},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts.as_slice()},
         "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish"],
         "stage_names": STAGE_NAMES,
@@ -1047,11 +1100,17 @@ fn input_totals(t: &Trace) -> InputTotals {
 }
 
 pub fn content_readiness(reason: &'static str, next_cover_expected: bool, missing_rows: usize) {
+    if !recording() { return; }
+    content_readiness_reasons(if reason == "ready" { vec![] } else { vec![(reason, missing_rows)] }, next_cover_expected);
+}
+
+pub fn content_readiness_reasons(reasons: Vec<(&'static str, usize)>, next_cover_expected: bool) {
     TRACE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
-            t.content_pending_reason = reason;
+            t.content_pending_reason = reasons.first().map_or("ready", |p| p.0);
             t.next_cover_expected = next_cover_expected;
-            t.missing_content_rows = missing_rows;
+            t.missing_content_rows = reasons.first().map_or(0, |p| p.1);
+            t.content_pending_reasons = reasons;
         }
     });
 }
@@ -1096,14 +1155,51 @@ fn write_event(
     generation: u64,
     task: Option<(&'static str, u64, u64)>,
 ) {
-    let line = serde_json::json!({
+    let line = event_values(t, event, generation, task).to_string() + "\n";
+    let _ = append_bounded(&mut t.file, line.as_bytes());
+}
+
+fn event_values(t: &Trace, event: &'static str, generation: u64, task: Option<(&'static str, u64, u64)>) -> serde_json::Value {
+    serde_json::json!({
         "event": event, "monotonic_us": monotonic_us(), "thread_cpu_ns": thread_cpu_ns(),
         "pid": std::process::id(), "tid": thread_id(),
         "selection_generation": generation, "viewport_shift": t.viewport_shift,
         "task": task.map(|(name, wall_us, cpu_ns)| serde_json::json!({"name":name,"wall_us":wall_us,"cpu_ns":cpu_ns})),
         "measurement": measurement_values(t),
-    }).to_string() + "\n";
-    let _ = append_bounded(&mut t.file, line.as_bytes());
+    })
+}
+
+pub fn artwork_readiness(before: &crate::theme::frame::Art, after: &crate::theme::frame::Art) {
+    TRACE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(t) = state.as_mut() else { return };
+        let mut changes = Vec::new();
+        for (binding, old, new, missed_before, missed_after) in [
+            ("selected_cover", &before.selected_cover, &after.selected_cover, before.completed_misses.selected_cover, after.completed_misses.selected_cover),
+            ("selected_hero", &before.selected_hero, &after.selected_hero, before.completed_misses.selected_hero, after.completed_misses.selected_hero),
+            ("selected_logo", &before.selected_logo, &after.selected_logo, before.completed_misses.selected_logo, after.completed_misses.selected_logo),
+            ("next_cover", &before.next_cover, &after.next_cover, before.completed_misses.next_cover, after.completed_misses.next_cover),
+        ] {
+            let adopted = new.as_ref().is_some_and(|new| old.as_ref().is_none_or(|old| !std::sync::Arc::ptr_eq(old, new)));
+            if adopted || (!missed_before && missed_after) {
+                changes.push(serde_json::json!({"binding":binding,"outcome":if adopted { "adopted" } else { "completed_miss" }}));
+            }
+        }
+        for (id, new) in &after.entries {
+            if before.entries.get(id).is_none_or(|old| !std::sync::Arc::ptr_eq(old, new)) {
+                changes.push(serde_json::json!({"binding":"rows","outcome":"adopted","row_id":id}));
+            }
+        }
+        for id in after.completed_misses.entries.difference(&before.completed_misses.entries) {
+            changes.push(serde_json::json!({"binding":"rows","outcome":"completed_miss","row_id":id}));
+        }
+        if !changes.is_empty() {
+            let mut row = event_values(t, "artwork_readiness", t.generation, None);
+            row["artwork_changes"] = changes.into();
+            let line = row.to_string() + "\n";
+            let _ = append_bounded(&mut t.file, line.as_bytes());
+        }
+    });
 }
 
 fn content_marker(generation: u64, final_content: bool) {
@@ -1149,12 +1245,13 @@ pub fn presented(generation: u64, content_complete: bool) {
         if t.generation != generation {
             return;
         }
+        let now = monotonic_us();
+        t.presented_us = now;
         let first = t.first_feedback_us == 0;
         let final_content = content_complete && t.final_content_us == 0;
         if !first && !final_content {
             return;
         }
-        let now = monotonic_us();
         if first {
             t.first_feedback_us = now;
         }
@@ -1198,12 +1295,13 @@ pub struct TaskGuard {
 /// Worker threads initialize their own trace; pass the scheduled generation explicitly.
 pub fn task(name: &'static str, generation: u64) -> TaskGuard {
     initialize();
-    let started = TRACE.with(|state| {
+    // Idle prewarm can run hundreds of times after final content, evicting that input.
+    let started = (name != "navigation_prewarm").then(|| TRACE.with(|state| {
         state
             .borrow()
             .as_ref()
             .map(|_| (monotonic_us(), thread_cpu_ns()))
-    });
+    })).flatten();
     TaskGuard {
         name,
         generation,
@@ -1244,6 +1342,152 @@ impl Drop for TaskGuard {
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn prewarm_flood_preserves_open_and_completed_input_rows_across_threads() {
+        let path = std::env::temp_dir().join(format!("allium-prewarm-flood-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = input(crate::platform::KeyEvent::Pressed(crate::platform::Key::B)); }
+        begin_render();
+        content_readiness("selected_logo", false, 0);
+        presented(generation(), false);
+        drawn_frame();
+        let flood = || {
+            let worker_path = path.clone();
+            std::thread::spawn(move || {
+                install(worker_path.to_str().unwrap()).unwrap();
+                for _ in 0..1000 { let _task = task("navigation_prewarm", 1); }
+            }).join().unwrap();
+            for _ in 0..1000 { let _task = task("navigation_prewarm", 1); }
+        };
+        let open = std::fs::read(&path).unwrap();
+        flood();
+        assert_eq!(std::fs::read(&path).unwrap(), open);
+        content_readiness("ready", false, 0);
+        presented(generation(), true);
+        let completed = std::fs::read(&path).unwrap();
+        flood();
+        assert_eq!(std::fs::read(&path).unwrap(), completed);
+        let rows: Vec<serde_json::Value> = std::str::from_utf8(&completed).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["input_received", "first_feedback", "frame", "final_content"]);
+        assert!(completed.len() as u64 <= LOG_LIMIT);
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn input_records_identify_key_edge_and_independent_measurement_generation() {
+        use crate::platform::{Key, KeyEvent};
+        let path = std::env::temp_dir().join(format!("allium-input-edge-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        for event in [KeyEvent::Pressed(Key::B), KeyEvent::Released(Key::B), KeyEvent::Autorepeat(Key::Right)] {
+            let _input = input(event);
+            selection(91, false);
+            first_feedback(91);
+        }
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        for (i, (key, edge)) in [("B", "press"), ("B", "release"), ("Right", "autorepeat")].iter().enumerate() {
+            for row in &rows[i * 2..i * 2 + 2] {
+                assert_eq!(row["measurement"]["input_key"], *key);
+                assert_eq!(row["measurement"]["input_edge"], *edge);
+                assert_eq!(row["measurement"]["input_generation"], i + 1);
+                assert!(row["measurement"]["input_received_monotonic_us"].as_u64().unwrap() > 0);
+            }
+            assert_eq!(rows[i * 2]["event"], "input_received");
+            assert_eq!(rows[i * 2 + 1]["selection_generation"], 91);
+        }
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn presented_frames_keep_separate_stage_endpoints_and_all_pending_reasons() {
+        let path = std::env::temp_dir().join(format!("allium-frame-readiness-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = input(crate::platform::KeyEvent::Pressed(crate::platform::Key::B)); }
+        for reasons in [vec![("selected_logo", 0), ("rows", 2)], vec![("rows", 1)], vec![]] {
+            begin_render();
+            content_readiness_reasons(reasons, true);
+            for which in [Stage::Layout, Stage::Raster, Stage::Present] {
+                let _stage = stage(which);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let complete = probe_counts()["measurement"]["content_pending_reasons"].as_array().unwrap().is_empty();
+            presented(generation(), complete);
+            drawn_frame();
+        }
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let frames: Vec<_> = rows.iter().filter(|row| row["event"] == "frame").collect();
+        for (i, row) in frames.iter().enumerate() {
+            let frame = &row["measurement"]["frame"];
+            assert_eq!(frame["render_attempt"], i + 1);
+            let start = frame["render_start_monotonic_us"].as_u64().unwrap();
+            let present = frame["presented_monotonic_us"].as_u64().unwrap();
+            for index in [4, 5, 6] {
+                let begin = frame["stage_begin_monotonic_us"][index].as_u64().unwrap();
+                let end = frame["stage_end_monotonic_us"][index].as_u64().unwrap();
+                assert!(start <= begin && begin <= end && end <= present);
+                assert_eq!(frame["stage_wall_us"][index], end - begin);
+            }
+            assert_eq!(row["measurement"]["content_pending_reasons"].as_array().unwrap().len(), 2 - i);
+        }
+        let final_row = rows.iter().find(|row| row["event"] == "final_content").unwrap();
+        assert_eq!(final_row["measurement"]["frame"]["render_attempt"], 3);
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artwork_readiness_names_adoptions_and_completed_misses_without_duplicates() {
+        use crate::theme::frame::Art;
+        let path = std::env::temp_dir().join(format!("allium-art-readiness-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        let before = Art::default();
+        let mut after = before.clone();
+        after.selected_logo = Some(std::sync::Arc::new(tiny_skia::Pixmap::new(1, 1).unwrap()));
+        after.completed_misses.next_cover = true;
+        after.completed_misses.entries.insert("missing-row".into());
+        artwork_readiness(&before, &after);
+        artwork_readiness(&after, &after);
+        let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["event"], "artwork_readiness");
+        assert_eq!(row["artwork_changes"], serde_json::json!([
+            {"binding":"selected_logo","outcome":"adopted"},
+            {"binding":"next_cover","outcome":"completed_miss"},
+            {"binding":"rows","outcome":"completed_miss","row_id":"missing-row"}
+        ]));
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_frame_projection_and_counter_indices_remain_compatible() {
+        #[derive(serde::Deserialize)]
+        struct LegacyFrame { event: String, measurement: LegacyMeasurement }
+        #[derive(serde::Deserialize)]
+        struct LegacyMeasurement { frame: LegacyCounters, counter_names: Vec<String> }
+        #[derive(serde::Deserialize)]
+        struct LegacyCounters { counters: Vec<u64> }
+        let old = r#"{"event":"frame","measurement":{"frame":{"counters":[0,1]},"counter_names":["text_hit","text_miss"]}}"#;
+        let legacy: LegacyFrame = serde_json::from_str(old).unwrap();
+        assert_eq!(legacy.measurement.frame.counters, [0, 1]);
+        let path = std::env::temp_dir().join(format!("allium-legacy-frame-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        count(Count::HeroHit, 32);
+        count(Count::HeroMiss, 33);
+        count(Count::HeroPrewarmPublish, 34);
+        drawn_frame();
+        let legacy: LegacyFrame = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(legacy.event, "frame");
+        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish"]);
+        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34]);
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn worker_decode_trace_cannot_complete_foreground_selection() {
         let path = std::env::temp_dir().join(format!("allium-worker-isolation-{}.log", std::process::id()));

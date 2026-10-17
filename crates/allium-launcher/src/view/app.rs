@@ -130,6 +130,14 @@ fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
     input: &common::theme::frame::FrameInputs,
     handle: &common::theme::ThemeHandle,
 ) -> Option<(&'static str, usize)> {
+    visit_theme_content_pending::<DIAGNOSE_ROWS>(input, handle, |_, _| true)
+}
+
+fn visit_theme_content_pending<const DIAGNOSE_ROWS: bool>(
+    input: &common::theme::frame::FrameInputs,
+    handle: &common::theme::ThemeHandle,
+    mut stop: impl FnMut(&'static str, usize) -> bool,
+) -> Option<(&'static str, usize)> {
     use common::theme::pack::{Arrangement, Binding, Kind};
     let has_rows = input.rows.values().any(|rows| !rows.is_empty());
     if !has_rows && input.selected.is_empty() {
@@ -144,7 +152,7 @@ fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
             }
             let logo_suppressed = common::theme::logo_suppressed_by_cover(c, input);
             if c.logo && !logo_suppressed && input.art.selected_logo.is_none() && !input.art.completed_misses.selected_logo {
-                return Some(("logo", 0));
+                if stop("logo", 0) { return Some(("logo", 0)); }
             }
             if c.kind == Kind::Image {
                 let (ready, reason) = match c.binding {
@@ -155,7 +163,7 @@ fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
                     Some(Binding::SelectedLogo) => (logo_suppressed || input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo, "selected_logo"),
                     _ => (true, ""),
                 };
-                return (!ready).then_some((reason, 0));
+                return (!ready && stop(reason, 0)).then_some((reason, 0));
             }
             if c.kind == Kind::Entries
                 && c.layout == Some(Arrangement::Shelf)
@@ -164,7 +172,7 @@ fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
                 && input.art.next_cover.is_none()
                 && !input.art.completed_misses.next_cover
             {
-                return Some(("peek", 0));
+                if stop("peek", 0) { return Some(("peek", 0)); }
             }
             if c.kind == Kind::Entries
                 && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
@@ -173,11 +181,25 @@ fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
                     let mut missing = rows.iter().filter(|row| !input.art.entries.contains_key(&row.id)
                         && !input.art.completed_misses.entries.contains(&row.id));
                     let count = if DIAGNOSE_ROWS { missing.count() } else { usize::from(missing.next().is_some()) };
-                    if count != 0 { return Some(("rows", count)); }
+                    if count != 0 && stop("rows", count) { return Some(("rows", count)); }
                 }
             }
             None
         })
+}
+
+fn theme_content_pending_reasons(
+    models: &[common::theme::frame::FrameInputs],
+    handle: &common::theme::ThemeHandle,
+) -> Vec<(&'static str, usize)> {
+    let mut reasons = Vec::new();
+    for input in models {
+        visit_theme_content_pending::<true>(input, handle, |reason, count| {
+            if !reasons.contains(&(reason, count)) { reasons.push((reason, count)); }
+            false
+        });
+    }
+    reasons
 }
 
 pub(crate) struct NavigationWarm {
@@ -960,12 +982,11 @@ where
             models.iter().all(|input| theme_content_complete(input, &handle))
         });
         if common::perf_trace::recording() {
-            let pending = models.as_ref().and_then(|models| models.iter()
-                .find_map(|input| theme_content_pending::<true>(input, &handle)));
+            let pending = models.as_ref().map_or_else(Vec::new,
+                |models| theme_content_pending_reasons(models, &handle));
             let next_cover_expected = models.as_ref().is_some_and(|models| models.iter()
                 .any(|input| input.art.next_cover_expected));
-            common::perf_trace::content_readiness(pending.map_or("ready", |p| p.0),
-                next_cover_expected, pending.map_or(0, |p| p.1));
+            common::perf_trace::content_readiness_reasons(pending, next_cover_expected);
         }
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
@@ -2141,6 +2162,40 @@ mod integration_navigation_tests {
 mod content_readiness_tests {
     use super::*;
     use common::theme::{fonts::FontBank, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, runtime::ThemeSnapshot, ThemeHandle};
+    #[test]
+    fn diagnostics_include_every_blocker_and_keep_the_original_first_reason() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for name in ["orbit-hero", "orbit-row", "big-picture", "compact-plus"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(name)).unwrap(), &bank, 1).unwrap();
+            let demand = super::super::art_queue::Demand::from_components(
+                &theme.pack().screens[&ScreenId::Library].components, theme.pack().ink(),
+            );
+            let mut input = FrameInputs::new(ScreenId::Library);
+            input.rows.insert(Binding::Entries, vec![Row {
+                id: "missing".into(), label: "Missing".into(), subtitle: String::new(),
+                value: String::new(), enabled: true,
+            }]);
+            input.art.next_cover_expected = true;
+            let reasons = theme_content_pending_reasons(&[input.clone()], &theme);
+            assert_eq!(reasons.first().copied(), theme_content_pending::<true>(&input, &theme));
+            for (required, names) in [
+                (demand.cover, &["selected_cover"][..]),
+                (demand.hero, &["selected_hero"][..]),
+                (demand.logo, &["selected_logo", "logo"][..]),
+                (demand.next, &["next_cover", "peek"][..]),
+                (demand.rows, &["rows"][..]),
+            ] {
+                assert_eq!(reasons.iter().any(|(reason, _)| names.contains(reason)), required, "{name}: {reasons:?}");
+            }
+            input.art.completed_misses = common::theme::frame::ArtMisses {
+                selected_cover: true, selected_hero: true, selected_logo: true, next_cover: true,
+                entries: std::collections::BTreeSet::from(["missing".into()]),
+            };
+            assert!(theme_content_pending_reasons(&[input], &theme).is_empty());
+        }
+    }
+
     #[test]
     fn covered_titles_skip_pending_logos_but_hero_titles_still_require_them() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();

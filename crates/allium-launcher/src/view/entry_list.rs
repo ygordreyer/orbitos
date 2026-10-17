@@ -416,6 +416,9 @@ where
             return pending;
         }
         let after = visible_art(orbit.theme_art(&self.entries, selected, first, count));
+        if common::perf_trace::recording() {
+            common::perf_trace::artwork_readiness(&before, &after);
+        }
         let art_changed = before != after;
         let readiness_changed = before.completed_misses != after.completed_misses;
         let mut metadata_changed = false;
