@@ -48,12 +48,16 @@ pub struct Game {
 }
 
 impl Game {
-    pub(crate) fn hydrate_name(&mut self) {
+    pub(crate) fn hydrate_name(&mut self) -> bool {
         if let Some(name) =
             common::media::cached_name(&self.path).filter(|name| !name.trim().is_empty())
+            && (self.name != name || self.full_name != name)
         {
             self.name = name.clone();
             self.full_name = name;
+            true
+        } else {
+            false
         }
     }
 
@@ -88,9 +92,16 @@ impl Game {
     }
 
     pub fn from_db(game: DbGame) -> Option<Game> {
+        #[cfg(test)]
+        super::load_work::record(|work| work.metadata += 1);
         if !game.path.exists() && !crate::network_runtime::registered(&game.path) {
             return None;
         }
+        Some(Self::from_db_present(game))
+    }
+
+    /// The caller has already established existence from its directory inventory.
+    pub(crate) fn from_db_present(game: DbGame) -> Game {
         let full_name = game
             .path
             .file_stem()
@@ -108,7 +119,7 @@ impl Game {
             .unwrap_or("")
             .to_string();
 
-        Some(Game {
+        Game {
             name: game.name,
             full_name,
             path: game.path,
@@ -122,7 +133,7 @@ impl Game {
             genres: game.genres,
             favorite: game.favorite,
             screenshot_path: game.screenshot_path,
-        })
+        }
     }
 
     pub fn image(&mut self) -> Option<&Path> {
@@ -152,6 +163,7 @@ impl Ord for Game {
 
         if cmp == Ordering::Equal {
             match (self.extension.as_str(), other.extension.as_str()) {
+                ("cue", "cue") => Ordering::Equal,
                 ("cue", _) => Ordering::Less,
                 (_, "cue") => Ordering::Greater,
                 (a, b) => a.cmp(b),
@@ -202,4 +214,23 @@ fn find(path: &Path, name: &OsStr) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    #[test]
+    fn equal_cue_names_are_reflexive_and_keep_stable_order() {
+        let mut games: Vec<_> = (0..128)
+            .map(|i| Game::new(format!("/{i}/Same.cue").into()))
+            .collect();
+        let original = games.clone();
+        assert_eq!(games[0].cmp(&games[0]), Ordering::Equal);
+        games.sort();
+        assert_eq!(games, original);
+        let chd = Game::new("/Same.chd".into());
+        assert_eq!(games[0].cmp(&chd), Ordering::Less);
+        assert_eq!(chd.cmp(&games[0]), Ordering::Greater);
+    }
 }

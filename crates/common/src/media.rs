@@ -73,6 +73,7 @@ struct Cache {
     defer_cold: bool,
     local_containers: BTreeMap<PathBuf, Option<PathBuf>>,
     paths: BTreeMap<(PathBuf, Kind), Option<PathBuf>>,
+    path_order: std::collections::VecDeque<(PathBuf, Kind)>,
     logos: BTreeMap<PathBuf, Option<std::sync::Arc<tiny_skia::Pixmap>>>,
 }
 const PATH_CACHE_LIMIT: usize = 512;
@@ -228,12 +229,18 @@ impl Cache {
         while self.evict_record() {}
         self.local_containers.clear();
         self.paths.clear();
+        self.path_order.clear();
         self.logos.clear();
     }
 
     fn insert_path(&mut self, key: (PathBuf, Kind), path: Option<PathBuf>) {
-        if self.paths.len() >= PATH_CACHE_LIMIT {
-            self.paths.clear();
+        if !self.paths.contains_key(&key) {
+            if self.paths.len() >= PATH_CACHE_LIMIT {
+                if let Some(old) = self.path_order.pop_front() {
+                    self.paths.remove(&old);
+                }
+            }
+            self.path_order.push_back(key.clone());
         }
         self.paths.insert(key, path);
     }
@@ -720,7 +727,15 @@ pub fn cached_name(path: &Path) -> Option<String> {
     if !record.name.is_empty() {
         return Some(record.name.clone());
     }
-    name(path)
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let (source, identity) = identity_source_policy(path, &mut cache, false)?;
+        cache
+            .names
+            .get(&source)?
+            .get(&identity)
+            .map(|entry| entry.name.clone())
+    })
 }
 /// Fingerprints are checked at directory load or explicit refresh, never at frame preparation.
 pub fn check_directory(parent: &Path) {
@@ -777,6 +792,13 @@ fn local_container(path: &Path, cache: &mut Cache) -> Option<PathBuf> {
     found
 }
 fn identity_source(path: &Path, cache: &mut Cache) -> Option<(PathBuf, PathBuf)> {
+    identity_source_policy(path, cache, true)
+}
+fn identity_source_policy(
+    path: &Path,
+    cache: &mut Cache,
+    discover_container: bool,
+) -> Option<(PathBuf, PathBuf)> {
     let mut parents = Vec::new();
     for parent in path.ancestors().skip(1).take(8) {
         parents.push(parent);
@@ -824,7 +846,17 @@ fn identity_source(path: &Path, cache: &mut Cache) -> Option<(PathBuf, PathBuf)>
         if unresolved.get() {
             return None;
         }
-        let container = game_container(path).or_else(|| local_container(path, cache))?;
+        let container = game_container(path).or_else(|| {
+            if discover_container {
+                local_container(path, cache)
+            } else {
+                cache
+                    .local_containers
+                    .get(&normalize(path))
+                    .cloned()
+                    .flatten()
+            }
+        })?;
         find(&container, cache)
     })
 }
@@ -1933,6 +1965,68 @@ mod tests {
     }
 
     #[test]
+    fn resolving_logo_at_path_cache_limit_keeps_visible_cover() {
+        invalidate();
+        let game = PathBuf::from("/fixture/selected.sfc");
+        let cover = PathBuf::from("/fixture/cover.png");
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            for i in 0..PATH_CACHE_LIMIT - 1 {
+                cache.insert_path(
+                    (PathBuf::from(format!("/fixture/{i}.sfc")), Kind::Cover),
+                    None,
+                );
+            }
+            cache.insert_path((game.clone(), Kind::Cover), Some(cover.clone()));
+            cache.insert_path((game.clone(), Kind::Logo), Some("/fixture/logo.png".into()));
+            assert_eq!(cache.paths.len(), PATH_CACHE_LIMIT);
+        });
+        assert_eq!(cached_resolve(&game, Kind::Cover), Some(cover));
+        invalidate();
+    }
+
+    #[test]
+    fn cached_name_never_probes_unregistered_launch_containers() {
+        invalidate();
+        let root = std::env::temp_dir().join(format!("allium-cached-name-{}", std::process::id()));
+        let dir = root.join("Roms/PS/Game");
+        fs::create_dir_all(&dir).unwrap();
+        let launch = dir.join("Launch.cue");
+        fs::write(&launch, b"fixture").unwrap();
+        fs::write(
+            root.join("Roms/PS/gamelist.xml"),
+            "<gameList><game><path>Game</path><name>Container</name></game></gameList>",
+        )
+        .unwrap();
+        check_directory(&dir);
+        let io = crate::perf_trace::frontend_io_ops();
+        assert_eq!(cached_name(&launch), None);
+        assert_eq!(crate::perf_trace::frontend_io_ops() - io, 0);
+        set_game_containers([(launch.clone(), dir)]);
+        let io = crate::perf_trace::frontend_io_ops();
+        assert_eq!(cached_name(&launch).as_deref(), Some("Container"));
+        assert_eq!(crate::perf_trace::frontend_io_ops() - io, 0);
+        set_game_containers(std::iter::empty());
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+    }
+
+    #[test]
+    fn metadata_only_snapshot_does_not_prepare_art_paths() {
+        invalidate();
+        let path = fixture().join("Complete.sfc");
+        let prepared = prepare_game_kinds(&path, &[]);
+        assert!(!prepared.metadata.name.is_empty());
+        assert!(prepared.paths.is_empty());
+        assert!(CACHE.with(|c| c.borrow().paths.is_empty()));
+        let prepared = prepare_game_kinds(&path, &[Kind::Logo]);
+        assert_eq!(prepared.paths.len(), 1);
+        assert_eq!(prepared.paths[0].0, Kind::Logo);
+        assert!(prepared.paths[0].1.is_some());
+        invalidate();
+    }
+
+    #[test]
     fn cold_ui_names_defer_xml_and_refresh_from_worker_indexes() {
         invalidate();
         PARSES.with(|p| p.borrow_mut().clear());
@@ -2311,17 +2405,23 @@ pub struct PreparedGame {
     paths: Vec<(Kind, Option<PathBuf>)>,
 }
 pub fn prepare_game(path: &Path) -> PreparedGame {
+    prepare_game_kinds(
+        path,
+        &[
+            Kind::Cover,
+            Kind::TallCover,
+            Kind::Logo,
+            Kind::Background,
+            Kind::PreparedCover,
+        ],
+    )
+}
+pub fn prepare_game_kinds(path: &Path, kinds: &[Kind]) -> PreparedGame {
     let (parent, metadata, _) = CACHE.with(|c| metadata_with_parent(path, &mut c.borrow_mut()));
-    let paths = [
-        Kind::Cover,
-        Kind::TallCover,
-        Kind::Logo,
-        Kind::Background,
-        Kind::PreparedCover,
-    ]
-    .into_iter()
-    .map(|kind| (kind, resolve(path, kind)))
-    .collect();
+    let paths = kinds
+        .iter()
+        .map(|&kind| (kind, resolve(path, kind)))
+        .collect();
     PreparedGame {
         path: path.into(),
         parent,
@@ -2369,6 +2469,7 @@ pub fn clear_prepared_paths() {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.paths.clear();
+        cache.path_order.clear();
         cache.local_containers.clear();
     });
 }

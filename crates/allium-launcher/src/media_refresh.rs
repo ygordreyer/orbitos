@@ -30,6 +30,7 @@ fn start(root: &Path) -> Refresh {
     let root = root.to_owned();
     let worker_root = root.clone();
     std::thread::spawn(move || {
+        background_priority();
         let run = || -> Result<()> {
             let mut directories = vec![worker_root.join("Roms")];
             while let Some(path) = directories.pop() {
@@ -308,9 +309,19 @@ mod tests {
     }
 }
 
+fn background_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+            log::warn!("Cannot lower media worker priority: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 struct MarkerProbe {
-    root: PathBuf,
-    result: Receiver<std::io::Result<bool>>,
+    send: mpsc::SyncSender<PathBuf>,
+    result: Receiver<(PathBuf, std::io::Result<bool>)>,
+    pending: bool,
 }
 thread_local! {
     static MARKER_PROBE: std::cell::RefCell<Option<MarkerProbe>> = const { std::cell::RefCell::new(None) };
@@ -319,35 +330,38 @@ thread_local! {
 pub(crate) fn marker_ready(root: &Path) -> Result<Option<bool>> {
     MARKER_PROBE.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_some_and(|probe| probe.root != root) {
-            *slot = None;
-        }
         if slot.is_none() {
-            let marker = root.join(".allium/state/media-refresh");
-            let (send, result) = mpsc::sync_channel(1);
+            let (send, jobs) = mpsc::sync_channel::<PathBuf>(1);
+            let (done, result) = mpsc::sync_channel(1);
             std::thread::Builder::new()
                 .name("allium-media-marker".into())
                 .stack_size(64 * 1024)
                 .spawn(move || {
-                    let _ = send.send(marker.try_exists());
+                    background_priority();
+                    while let Ok(root) = jobs.recv() {
+                        let found = root.join(".allium/state/media-refresh").try_exists();
+                        if done.send((root, found)).is_err() { break; }
+                    }
                 })?;
-            *slot = Some(MarkerProbe {
-                root: root.into(),
-                result,
-            });
-            return Ok(None);
+            *slot = Some(MarkerProbe { send, result, pending: false });
         }
-        match slot.as_ref().unwrap().result.try_recv() {
-            Ok(found) => {
-                *slot = None;
-                Ok(Some(found?))
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                *slot = None;
-                anyhow::bail!("Media marker worker disconnected")
+        let probe = slot.as_mut().unwrap();
+        if probe.pending {
+            match probe.result.try_recv() {
+                Ok((completed_root, found)) => {
+                    probe.pending = false;
+                    if completed_root == root { return Ok(Some(found?)); }
+                }
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    *slot = None;
+                    anyhow::bail!("Media marker worker disconnected")
+                }
             }
         }
+        probe.send.try_send(root.into())?;
+        probe.pending = true;
+        Ok(None)
     })
 }
 
@@ -371,6 +385,19 @@ mod marker_probe_tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(marker.exists(), "probe must not claim the marker");
+        MARKER_PROBE.with(|slot| assert!(slot.borrow().is_some(), "reuse the worker after completion"));
+        fs::remove_file(&marker).unwrap();
+        assert_eq!(marker_ready(&root).unwrap(), None);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(found) = marker_ready(&root).unwrap() {
+                assert!(!found);
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        MARKER_PROBE.with(|slot| assert!(slot.borrow().is_some()));
         fs::remove_dir_all(root).unwrap();
     }
 }

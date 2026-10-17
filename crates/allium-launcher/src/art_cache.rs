@@ -262,52 +262,43 @@ fn admitted(available: u64, incoming: u64, block: u64) -> bool {
         .and_then(|n| available.checked_sub(n))
         .is_some_and(|remaining| remaining >= RESERVE_BYTES)
 }
+#[cfg(test)]
+thread_local! { static INVENTORY_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 fn prepare_write(
     dir: &Path,
     incoming: u64,
     mut space: impl FnMut() -> Option<(u64, u64)>,
 ) -> std::io::Result<bool> {
     let now = SystemTime::now();
+    let mut total = 0u64;
+    let mut candidates = Vec::new();
+    #[cfg(test)]
+    INVENTORY_PASSES.with(|n| n.set(n.get() + 1));
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_file()
-            && temp_file(&entry.path())
-            && now
-                .duration_since(entry.metadata()?.modified()?)
-                .is_ok_and(|age| age > Duration::from_secs(60))
-        {
-            fs::remove_file(entry.path())?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() || !(cache_file(&path) || temp_file(&path)) {
+            continue;
         }
+        let metadata = entry.metadata()?;
+        let modified = metadata.modified()?;
+        if temp_file(&path) && now.duration_since(modified).is_ok_and(|age| age > Duration::from_secs(60)) {
+            fs::remove_file(path)?;
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        if cache_file(&path) { candidates.push((modified, path, metadata.len())); }
     }
+    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut candidates = candidates.into_iter();
     loop {
-        let Some((available, block)) = space() else {
-            return Ok(false);
-        };
-        let mut total = 0u64;
-        let mut oldest = None;
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_file() || !(cache_file(&path) || temp_file(&path)) {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            total = total.saturating_add(metadata.len());
-            if cache_file(&path) {
-                let modified = metadata.modified()?;
-                if oldest.as_ref().is_none_or(|(time, _)| modified < *time) {
-                    oldest = Some((modified, path));
-                }
-            }
-        }
+        let Some((available, block)) = space() else { return Ok(false); };
         if total.saturating_add(incoming) <= DISK_BYTES && admitted(available, incoming, block) {
             return Ok(true);
         }
-        if let Some((_, path)) = oldest {
-            fs::remove_file(path)?;
-        } else {
-            return Ok(false);
-        }
+        let Some((_, path, bytes)) = candidates.next() else { return Ok(false); };
+        fs::remove_file(path)?;
+        total = total.saturating_sub(bytes);
     }
 }
 
@@ -842,5 +833,31 @@ mod dl8_tests {
         assert!(!admitted(floor, 1, 4096));
         assert!(!admitted(floor + cost - 1, 1, 4096));
         assert!(admitted(floor + cost, 1, 4096));
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn multi_eviction_uses_one_inventory_and_preserves_unrelated_files() {
+        let root = std::env::temp_dir().join(format!("allium-art-inventory-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let _writer = CacheWriter::acquire(&root).unwrap();
+        for i in 0..5 {
+            File::create(root.join(format!("{i:064x}.rgba"))).unwrap().set_len(4 * 1024 * 1024).unwrap();
+        }
+        fs::write(root.join("keep.txt"), b"not cache").unwrap();
+        INVENTORY_PASSES.with(|n| n.set(0));
+        assert!(prepare_write(&root, 2 * 1024 * 1024, || Some((u64::MAX, 4096))).unwrap());
+        INVENTORY_PASSES.with(|n| assert_eq!(n.get(), 1));
+        let remaining: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).filter(|p| cache_file(p)).collect();
+        assert_eq!(remaining.len(), 3);
+        assert!(root.join("keep.txt").exists());
+        assert_eq!(remaining.iter().map(|p| fs::metadata(p).unwrap().len()).sum::<u64>(), 12 * 1024 * 1024);
+        drop(_writer);
+        fs::remove_dir_all(root).unwrap();
     }
 }

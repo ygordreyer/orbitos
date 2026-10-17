@@ -351,16 +351,20 @@ async fn spawn_main() -> Result<Child> {
             debug!("no game info found, launching launcher");
             common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Frontend);
             use common::constants::ALLIUM_LAUNCHER;
+            common::perf_trace::lifecycle(common::perf_trace::LAUNCHER_SPAWN);
             Command::new(ALLIUM_LAUNCHER.as_path())
         }
     }
     .spawn()?);
 
     #[cfg(not(feature = "miyoo"))]
-    return Ok(Command::new("/bin/sh")
-        .arg("-c")
-        .arg("make simulator-launcher")
-        .spawn()?);
+    {
+        common::perf_trace::lifecycle(common::perf_trace::LAUNCHER_SPAWN);
+        return Ok(Command::new("/bin/sh")
+            .arg("-c")
+            .arg("make simulator-launcher")
+            .spawn()?);
+    }
 }
 
 impl AlliumD<DefaultPlatform> {
@@ -543,6 +547,9 @@ impl AlliumD<DefaultPlatform> {
                         }
                     }
                     _ = self.main.wait() => {
+                        common::perf_trace::lifecycle(common::perf_trace::CHILD_EXIT);
+                        #[cfg(feature = "miyoo")]
+                        restore_launcher_boost();
                         idle_since = Instant::now();
                         if !self.is_terminating {
                             info!("main process terminated, recording play time");
@@ -798,6 +805,10 @@ impl AlliumD<DefaultPlatform> {
 
         self.hide_osd();
 
+        #[cfg(feature = "miyoo")]
+        restore_launcher_boost();
+        #[cfg(feature = "miyoo")]
+        let _boost_pause = pause_launcher_boost();
         signal(&self.main, Signal::SIGSTOP)?;
 
         Command::new("say")
@@ -840,6 +851,10 @@ impl AlliumD<DefaultPlatform> {
     async fn handle_suspend(&mut self) -> Result<()> {
         info!("suspending...");
         self.hide_osd();
+        #[cfg(feature = "miyoo")]
+        restore_launcher_boost();
+        #[cfg(feature = "miyoo")]
+        let _boost_pause = pause_launcher_boost();
         #[allow(clippy::let_unit_value)]
         let ctx = self.platform.suspend()?;
         signal(&self.main, Signal::SIGSTOP)?;
@@ -921,17 +936,15 @@ impl AlliumD<DefaultPlatform> {
         }
 
         let database = Database::new()?;
-        database.add_play_time(game_info.path.as_path(), duration)?;
-
-        // Record game session
         let start_time = game_info.start_time.timestamp();
         let end_time = Utc::now().timestamp();
-        database.insert_game_session(
+        database.record_game_session(
             game_info.path.as_path(),
             start_time,
             end_time,
             duration.num_seconds(),
         )?;
+        common::perf_trace::lifecycle(common::perf_trace::SESSION_RECORD);
 
         Ok(())
     }
@@ -1032,6 +1045,8 @@ async fn terminate(child: &mut Child) -> Result<()> {
     if let Err(_e) = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
         signal(child, Signal::SIGKILL)?;
     }
+    #[cfg(feature = "miyoo")]
+    restore_launcher_boost();
     Ok(())
 }
 
@@ -1303,5 +1318,23 @@ mod theme_settings_tests {
             }
         }
         std::fs::remove_dir_all(state).unwrap();
+    }
+}
+
+#[cfg(feature = "miyoo")]
+fn pause_launcher_boost() -> Option<common::platform::cpu_tuning::InputBoostPause> {
+    match common::platform::cpu_tuning::pause_input_boost() {
+        Ok(pause) => Some(pause),
+        Err(error) => {
+            warn!("Cannot inhibit launcher CPU boost: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "miyoo")]
+fn restore_launcher_boost() {
+    if let Err(error) = common::platform::cpu_tuning::restore_boost_lease() {
+        warn!("Cannot recover launcher CPU boost: {error}");
     }
 }

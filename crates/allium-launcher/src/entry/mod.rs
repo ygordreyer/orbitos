@@ -29,6 +29,30 @@ pub enum Entry {
 
 impl Entry {
     pub fn new(path: PathBuf, console_mapper: &ConsoleMapper) -> Result<Option<Entry>> {
+        Self::from_path_type(
+            path,
+            |path| {
+                #[cfg(test)]
+                load_work::record(|work| work.metadata += 1);
+                path.is_dir()
+            },
+            console_mapper,
+        )
+    }
+
+    pub(crate) fn from_scanned_path(
+        path: PathBuf,
+        is_dir: bool,
+        console_mapper: &ConsoleMapper,
+    ) -> Result<Option<Entry>> {
+        Self::from_path_type(path, |_| is_dir, console_mapper)
+    }
+
+    fn from_path_type(
+        path: PathBuf,
+        is_dir: impl FnOnce(&Path) -> bool,
+        console_mapper: &ConsoleMapper,
+    ) -> Result<Option<Entry>> {
         // Don't add hidden files starting with . or _
         let file_name = match path.file_name().and_then(OsStr::to_str) {
             Some(file_name) => file_name,
@@ -66,7 +90,7 @@ impl Entry {
             return Ok(None);
         }
 
-        if path.is_dir() {
+        if is_dir(&path) {
             // Playlist folders retain game/save identity; app packages keep their rules.
             // Other directories may contain periods, such as a version suffix.
             if !extension.eq_ignore_ascii_case("m3u") && !extension.eq_ignore_ascii_case("pak") {
@@ -150,7 +174,23 @@ pub trait Sort: Debug + Clone {
         console_mapper: &ConsoleMapper,
         locale: &Locale,
     ) -> Result<Vec<Entry>>;
+    /// Refresh titles without reopening the directory or replacing loaded images.
+    /// The list owner restores selection by path if this changes the order.
+    fn refresh_names(&self, entries: &mut [Entry]) -> bool {
+        hydrate_names(entries)
+    }
+
     fn preserve_selection(&self) -> bool;
+}
+
+pub(crate) fn hydrate_names(entries: &mut [Entry]) -> bool {
+    let mut changed = false;
+    for entry in entries {
+        if let Entry::Game(game) = entry {
+            changed |= game.hydrate_name();
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -246,5 +286,32 @@ mod dotted_directory_tests {
             fs::create_dir(&path).unwrap();
             assert!(Entry::new(path, &ConsoleMapper::new()).unwrap().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod load_work {
+    use std::cell::Cell;
+
+    // Explicit operations in the list pipeline, excluding media indexing and app parsing.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct Counts {
+        pub directory_reads: usize,
+        pub metadata: usize,
+        pub file_types: usize,
+        pub sql: usize,
+    }
+    thread_local! {
+        static WORK: Cell<Counts> = Cell::new(Counts::default());
+    }
+    pub fn record(update: impl FnOnce(&mut Counts)) {
+        WORK.with(|work| {
+            let mut counts = work.get();
+            update(&mut counts);
+            work.set(counts);
+        });
+    }
+    pub fn take() -> Counts {
+        WORK.with(|work| work.replace(Counts::default()))
     }
 }

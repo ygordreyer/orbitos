@@ -11,6 +11,7 @@ use common::locale::Locale;
 use common::platform::{DefaultPlatform, KeyEvent, Platform};
 use common::resources::Resources;
 use common::stylesheet::Stylesheet;
+use common::view::menu_status::MenuStatusCache;
 use common::view::{Label, StatusBar, View};
 use tokio::sync::mpsc::Sender;
 
@@ -33,15 +34,15 @@ impl<B> App<B>
 where
     B: Battery + 'static,
 {
-    pub fn new(rect: Rect, res: Resources, battery: B) -> Result<Self> {
+    pub fn new(rect: Rect, res: Resources, status: MenuStatusCache) -> Result<Self> {
         let Rect { x, y, w, h } = rect;
         let styles = res.get::<Stylesheet>();
         let locale = res.get::<Locale>();
 
-        let status_bar = StatusBar::new(
+        let status_bar = StatusBar::new_cached(
             res.clone(),
             Point::new(w as i32 - styles.ui.margin_y, y + styles.ui.margin_y),
-            battery,
+            status,
         );
 
         let label = Label::new(
