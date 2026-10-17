@@ -394,3 +394,39 @@ async fn fpdiag_page_repair_preserves_neighbors_but_remap_rejects_them() {
     common::perf_trace::stop_probe();
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn compose_prepared_recents_skips_styles_until_a_toast_consumes_them() {
+    let (_reset, mut app) = recents_fixture();
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await.unwrap();
+    let mut work = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.view.prewarm_navigation_step(&mut work, 1).unwrap() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let (tx, _rx) = mpsc::channel(100);
+    app.view.handle_key_event(KeyEvent::Pressed(Key::Down), tx, &mut VecDeque::new()).await.unwrap();
+    let builds = crate::theme_adapter::DRAWING_STYLE_BUILDS.with(std::cell::Cell::get);
+    app.present_frame(false, &mut overlay).await.unwrap();
+    assert!(app.view.proof_retired_neighbors(), "the press must adopt a neighbor");
+    assert_eq!(crate::theme_adapter::DRAWING_STYLE_BUILDS.with(std::cell::Cell::get), builds,
+        "prepared adoption must not construct a drawing stylesheet");
+    assert!(!overlay);
+    #[cfg(feature = "perf-bench")]
+    assert_eq!(app.proof_frame().data(), app.view.proof_fresh_navigation_pixels());
+
+    app.toast = Some(Toast::new("compose style consumer".into(), None));
+    app.present_frame(false, &mut overlay).await.unwrap();
+    assert_eq!(crate::theme_adapter::DRAWING_STYLE_BUILDS.with(std::cell::Cell::get), builds + 1);
+    assert!(overlay);
+
+    app.toast = None;
+    app.res.insert(None::<common::theme::ThemeHandle>);
+    app.view.set_should_draw();
+    app.present_frame(false, &mut overlay).await.unwrap();
+    assert_eq!(crate::theme_adapter::DRAWING_STYLE_BUILDS.with(std::cell::Cell::get), builds + 2,
+        "legacy drawing must still construct its stylesheet");
+}

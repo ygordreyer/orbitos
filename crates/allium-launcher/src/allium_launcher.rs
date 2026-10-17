@@ -590,19 +590,27 @@ impl AlliumLauncher<DefaultPlatform> {
         drop(component_phase);
         let compose_phase = (self.view.should_draw() || self.toast.is_some() || network_dirty)
             .then(|| common::perf_trace::phase(common::perf_trace::Phase::Compose));
-        let drawing_style = crate::theme_adapter::drawing_style(
+        let drawing_style = std::cell::OnceCell::new();
+        let styles = || drawing_style.get_or_init(|| crate::theme_adapter::drawing_style(
             &self.res.get::<Stylesheet>(),
             crate::theme_adapter::snapshot(&self.res).as_ref(),
-        );
-        let mut drawn =
-            self.view.should_draw() && self.view.draw(&mut self.display, &drawing_style)?;
+        ));
+        let mut drawn = if self.view.should_draw() {
+            let _stage = common::perf_trace::stage(common::perf_trace::Stage::ComposeDraw);
+            match self.view.draw_prepared_theme(&mut self.display)? {
+                Some(drawn) => drawn,
+                None => self.view.draw(&mut self.display, styles())?,
+            }
+        } else { false };
 
         if let Some(toast) = self.toast.as_mut() {
-            drawn |= toast.draw(&mut self.display, &drawing_style)?;
+            drawn |= toast.draw(&mut self.display, styles())?;
         }
 
-        let network_drawn = (network_dirty || drawn)
-            && crate::network_runtime::draw(&mut self.display, &drawing_style);
+        let network_drawn = if network_dirty || drawn {
+            let _stage = common::perf_trace::stage(common::perf_trace::Stage::NetworkOverlay);
+            crate::network_runtime::draw_with_style(&mut self.display, styles)
+        } else { false };
         drawn |= network_drawn;
         *overlay_was_drawn = network_drawn || self.toast.is_some();
         let present_damage = self.view.take_present_damage();

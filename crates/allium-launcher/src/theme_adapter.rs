@@ -194,7 +194,13 @@ fn color(handle: &ThemeHandle, role: ColorRole) -> common::display::color::Color
         u8::from_str_radix(&s[7..9], 16).unwrap(),
     )
 }
+#[cfg(test)]
+thread_local! { pub(crate) static DRAWING_STYLE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub fn drawing_style(raw: &Stylesheet, handle: Option<&ThemeHandle>) -> Stylesheet {
+    let _stage = common::perf_trace::stage(common::perf_trace::Stage::DrawingStyle);
+    #[cfg(test)]
+    DRAWING_STYLE_BUILDS.with(|count| count.set(count.get() + 1));
     let Some(handle) = handle else {
         return raw.clone();
     };

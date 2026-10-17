@@ -938,7 +938,7 @@ where
         Ok(())
     }
 
-    fn draw_prepared_theme(&mut self, display: &mut impl Display) -> Result<Option<bool>> {
+    pub(crate) fn draw_prepared_theme(&mut self, display: &mut impl Display) -> Result<Option<bool>> {
         self.present_damage = None;
         self.present_packed = None;
         self.present_pack_diagnostic = common::display::packed::PackDiagnostic::new(self.neighbor_graveyard.packed_reason.unwrap_or("not_adopted"));

@@ -1127,34 +1127,47 @@ pub fn search(query: &str, entries: &mut Vec<Entry>) {
         }
     });
 }
+#[cfg(test)]
+thread_local! { static TITLE_MAP_BUILDS: Cell<usize> = const { Cell::new(0) }; }
+
 pub fn draw(display: &mut <DefaultPlatform as Platform>::Display, styles: &Stylesheet) -> bool {
-    if draw_startup_block(display, styles) {
+    draw_with_style(display, || styles)
+}
+pub(crate) fn draw_with_style<'a>(
+    display: &mut <DefaultPlatform as Platform>::Display,
+    mut styles: impl FnMut() -> &'a Stylesheet,
+) -> bool {
+    if draw_startup_block(display, &mut styles) {
         return true;
     }
     with(false, |r| {
-        let titles = r
-            .catalog
-            .games
-            .iter()
-            .map(|g| {
-                (
-                    g.id.clone(),
-                    format!(
-                        "{}  ({} MiB)",
-                        g.display_title,
-                        g.files.iter().map(|f| f.bytes).sum::<u64>() / 1048576
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
         let Some(modal) = r.modal.as_mut() else {
             return false;
         };
+        let styles = styles();
         if let Modal::Discs { picker, .. } = modal {
             picker.draw(display, styles);
             footer(display, styles, "A Start disc    B Cancel");
             return true;
         }
+        let titles = if matches!(modal, Modal::ConfirmImport(_) | Modal::ConfirmUnload(_) | Modal::Storage { .. }) {
+            #[cfg(test)]
+            TITLE_MAP_BUILDS.with(|count| count.set(count.get() + 1));
+            r.catalog
+                .games
+                .iter()
+                .map(|g| {
+                    (
+                        g.id.clone(),
+                        format!(
+                            "{}  ({} MiB)",
+                            g.display_title,
+                            g.files.iter().map(|f| f.bytes).sum::<u64>() / 1048576
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        } else { HashMap::new() };
         fill_rect(
             &mut display.pixmap_mut(),
             Rect::new(
@@ -1266,15 +1279,16 @@ pub fn draw(display: &mut <DefaultPlatform as Platform>::Display, styles: &Style
         true
     })
 }
-fn draw_startup_block(
+fn draw_startup_block<'a>(
     display: &mut <DefaultPlatform as Platform>::Display,
-    styles: &Stylesheet,
+    styles: impl FnOnce() -> &'a Stylesheet,
 ) -> bool {
     let visible =
         STARTUP.with(|cell| matches!(&*cell.borrow(), Startup::Blocked { modal: true, .. }));
     if !visible {
         return false;
     }
+    let styles = styles();
     fill_rect(
         &mut display.pixmap_mut(),
         Rect::new(
