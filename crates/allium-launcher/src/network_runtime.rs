@@ -1326,13 +1326,21 @@ pub fn footer(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     include!("network_runtime_dl11_tests.rs");
     include!("network_runtime_dl12_bench.rs");
     include!("network_runtime_dl17b_tests.rs");
     use super::*;
     use crate::network_library::Payload;
     use sha2::{Digest, Sha256};
+    pub(crate) fn details_slot_fixture() -> (impl Drop, Game) {
+        let fixture = StartupFixture::new("details-slot");
+        fixture.configured();
+        initialize(fixture.root.clone()).unwrap();
+        settle();
+        let game = Game::new(fixture.root.join(&fixture.game.game_path));
+        (fixture, game)
+    }
     fn settle() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while active() {

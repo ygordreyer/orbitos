@@ -48,16 +48,54 @@ fn prepare_theme_inputs(
     }
 }
 
+struct ParkedDetails {
+    lower: common::theme::pack::ScreenId,
+    frame: common::theme::render::PreparedFrame,
+}
+impl std::fmt::Debug for ParkedDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkedDetails").field("lower", &self.lower).finish_non_exhaustive()
+    }
+}
+
 fn prepare_theme_frames(
     handle: &common::theme::ThemeHandle,
     models: &[common::theme::frame::FrameInputs],
     previous: Vec<common::theme::render::PreparedFrame>,
+    parked: &mut Option<ParkedDetails>,
 ) -> Result<Vec<common::theme::render::PreparedFrame>> {
+    use common::theme::pack::ScreenId;
     use common::theme::render::PreparedFrame;
     let Some((top, lower)) = models.split_last() else {
+        *parked = None;
         return Ok(vec![]);
     };
+    // Reuse only across the same single lower screen; other stacks retire the slot.
+    let can_park = !crate::network_runtime::blocks_navigation_warm();
+    let compatible_stack = can_park && (models.len() == 1
+        || (models.len() == 2 && top.screen == ScreenId::GameDetail));
+    if parked.as_ref().is_some_and(|saved| !compatible_stack
+        || saved.lower != models[0].screen || !saved.frame.navigation_theme_matches(handle))
+    {
+        *parked = None;
+    }
     let mut previous: Vec<_> = previous.into_iter().map(Some).collect();
+    if can_park && models.len() == 1 && previous.len() == 2
+        && previous[0].as_ref().is_some_and(|frame| frame.screen() == top.screen)
+        && previous[1].as_ref().is_some_and(|frame| {
+            frame.screen() == ScreenId::GameDetail && frame.navigation_theme_matches(handle)
+        })
+    {
+        *parked = Some(ParkedDetails { lower: top.screen, frame: previous[1].take().unwrap() });
+    }
+    if models.len() == 2 && top.screen == ScreenId::GameDetail {
+        if let Some(saved) = parked.take() {
+            previous.resize_with(models.len().max(previous.len()), || None);
+            if previous[1].as_ref().is_none_or(|frame| frame.screen() != ScreenId::GameDetail) {
+                previous[1] = Some(saved.frame);
+            }
+        }
+    }
     let top = PreparedFrame::prepare_reusing(
         handle.clone(), top, previous.get_mut(lower.len()).and_then(Option::take),
     )?;
@@ -196,6 +234,8 @@ where
     detail_shadows: Option<common::theme::render::DetailShadowWarm>,
     content_complete: bool,
     theme_scene: Option<crate::theme_adapter::ThemeScene>,
+    // At most one closed Details frame: ~3.56 MB of framebuffer and operation underlays.
+    parked_details: Option<ParkedDetails>,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
     theme_presented_screen: Option<common::theme::pack::ScreenId>,
@@ -312,6 +352,7 @@ where
             detail_shadows: None,
             content_complete: true,
             theme_scene: None,
+            parked_details: None,
             present_damage: None,
             theme_was_layered: false,
             theme_presented_screen: None,
@@ -589,6 +630,7 @@ where
     pub(crate) fn theme_fallback(&mut self) -> Result<()> {
         self.content_complete = true;
         self.theme_scene = None;
+        self.release_details_frame();
         self.theme_dirty = false;
         self.dirty = true;
         self.views.0.clear_theme()?;
@@ -599,6 +641,14 @@ where
             search.clear_theme()?;
         }
         Ok(())
+    }
+    pub(crate) fn release_details_frame(&mut self) {
+        self.parked_details = None;
+    }
+    pub(crate) fn prepare_command(&mut self, command: &Command) {
+        if matches!(command, Command::Exec(_) | Command::ReloadStylesheet(..)) {
+            self.release_details_frame();
+        }
     }
     pub(crate) fn force_full_present(&mut self) {
         self.dirty = true;
@@ -885,6 +935,7 @@ where
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
+            self.release_details_frame();
             self.content_complete = true;
             if common::perf_trace::recording() {
                 common::perf_trace::content_readiness("ready", false, 0);
@@ -919,9 +970,10 @@ where
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
             let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
-            let frames = prepare_theme_frames(&handle, &models, previous)?;
+            let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details)?;
             Some(crate::theme_adapter::ThemeScene { frames })
         } else {
+            self.release_details_frame();
             None
         };
         Ok(())
@@ -1421,6 +1473,9 @@ where
         let selected = self.selected;
         let dirty = (self.dirty, self.theme_dirty);
         let handled = self.dispatch_key_event(event, commands, bubble).await?;
+        if crate::network_runtime::blocks_navigation_warm() {
+            self.release_details_frame();
+        }
         if let Some(handle) = handle {
             let same_theme = crate::theme_adapter::snapshot(&self.res).is_some_and(|current| {
                 current.generation() == handle.generation() && current.digest() == handle.digest()
@@ -1501,6 +1556,9 @@ where
 //         _ => unreachable!(),
 //     }
 // }
+
+#[cfg(test)]
+mod details_frame_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1623,6 +1681,7 @@ mod tests {
         lower.text.insert(Binding::SelectedTitle, "AV To é 日本語".into());
         lower.status.clock = Some("12:34".into());
         let mut optimized = vec![];
+        let mut parked = None;
         let mut reference = vec![];
         for top_screen in [None, Some(ScreenId::GameDetail), None, Some(ScreenId::ContextMenu), None] {
             let mut models = vec![lower.clone()];
@@ -1634,7 +1693,7 @@ mod tests {
                 models.push(top);
             }
             let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
-            optimized = super::prepare_theme_frames(&theme, &models, optimized).unwrap();
+            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked).unwrap();
             let mut old = reference.into_iter();
             reference = models.iter().map(|input| PreparedFrame::prepare_reusing(theme.clone(), input, old.next()).unwrap()).collect::<Vec<_>>();
             let mut actual = <DefaultPlatform as Platform>::Display::default();
@@ -1808,6 +1867,34 @@ mod integration_navigation_tests {
         let cold_theme = ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 902).unwrap();
         let cold = common::theme::render::PreparedFrame::prepare(cold_theme, details).unwrap();
         assert_eq!(hot.pixels().data(), cold.pixels().data());
+        let initial = details.clone();
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        for key in [Key::Down, Key::Right] {
+            app.handle_key_event(KeyEvent::Pressed(key), tx.clone(), &mut VecDeque::new()).await.unwrap();
+            app.prepare_theme().unwrap();
+            app.draw(&mut display, &style).unwrap();
+        }
+        let changed = app.theme_models(&handle).unwrap().unwrap();
+        assert_ne!(changed.last().unwrap().pagination, initial.pagination);
+        assert_ne!(changed.last().unwrap().focus, initial.focus);
+        app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        assert!(app.parked_details.is_some());
+        app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        assert!(app.parked_details.is_none());
+        let mut reopened = app.theme_models(&handle).unwrap().unwrap();
+        app.normalize_theme_inputs(&handle, &mut reopened);
+        let reopened = reopened.last().unwrap();
+        assert_eq!(reopened.pagination, initial.pagination);
+        assert_eq!(reopened.focus, initial.focus);
+        let fresh = common::theme::render::PreparedFrame::prepare(
+            ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 903).unwrap(), reopened,
+        ).unwrap();
+        assert_eq!(display.pixmap().data(), fresh.pixels().data());
         app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
         app.prepare_theme().unwrap();
         app.draw(&mut display, &style).unwrap();
@@ -1835,9 +1922,41 @@ mod integration_navigation_tests {
         // A new plan still expires when the selected game changes.
         app.prewarm_navigation_step(&mut work, 1).unwrap();
         assert!(work.is_some());
-        app.handle_key_event(KeyEvent::Pressed(Key::Down), tx, &mut VecDeque::new()).await.unwrap();
+        app.handle_key_event(KeyEvent::Pressed(Key::Down), tx.clone(), &mut VecDeque::new()).await.unwrap();
         app.prewarm_navigation_step(&mut work, 1).unwrap();
         assert!(work.is_none(), "selection change retained speculative Details work");
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        assert!(app.parked_details.is_some(), "selection changes must preserve reusable Details");
+        app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        app.prepare_theme().unwrap();
+        let mut selected = app.theme_models(&handle).unwrap().unwrap();
+        app.normalize_theme_inputs(&handle, &mut selected);
+        let selected = selected.last().unwrap();
+        assert_ne!(selected.text, initial.text);
+        let fresh = common::theme::render::PreparedFrame::prepare(
+            ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 904).unwrap(), selected,
+        ).unwrap();
+        assert_eq!(app.theme_scene.as_ref().unwrap().frames.last().unwrap().pixels().data(), fresh.pixels().data());
+        for command in [Command::Exec(std::process::Command::new("unused-game-launch")),
+            Command::Exec(std::process::Command::new("unused-app-launch")),
+            Command::ReloadStylesheet(Box::new(style.clone()), false)]
+        {
+            app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
+            app.prepare_theme().unwrap();
+            assert!(app.parked_details.is_some());
+            app.prepare_command(&Command::Redraw);
+            assert!(app.parked_details.is_some());
+            app.prepare_command(&command);
+            assert!(app.parked_details.is_none(), "{command:?} retained closed Details");
+            app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
+            app.prepare_theme().unwrap();
+        }
+        app.handle_key_event(KeyEvent::Pressed(Key::B), tx, &mut VecDeque::new()).await.unwrap();
+        app.prepare_theme().unwrap();
+        assert!(app.parked_details.is_some());
+        app.theme_fallback().unwrap();
+        assert!(app.parked_details.is_none());
         std::fs::remove_dir_all(root).unwrap();
         common::media::set_game_containers(std::iter::empty());
         common::media::invalidate();

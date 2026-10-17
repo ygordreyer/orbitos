@@ -639,6 +639,7 @@ impl AlliumLauncher<DefaultPlatform> {
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<()> {
+        self.view.prepare_command(&command);
         #[cfg(test)]
         if matches!(&command, Command::Exec(_))
             && crate::network_runtime::test_loop_event("dispatch")
