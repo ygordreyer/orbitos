@@ -146,7 +146,7 @@ where
     disc_picker: Option<DiscPicker>,
     details: Option<crate::view::details::Details>,
     semantic_info: Option<SelectedInfo>,
-    idle_media_key: Option<(usize, usize, usize, u64, bool, bool, super::art_queue::Demand, common::theme::art::Targets)>,
+    idle_media_key: Option<(usize, usize, usize, u64, bool, bool, bool, super::art_queue::Demand, common::theme::art::Targets)>,
     idle_media_work: VecDeque<super::orbit::WarmArt>,
     idle_lower_work: VecDeque<super::orbit::WarmArt>,
     detail_action: usize,
@@ -383,6 +383,7 @@ where
             self.idle_media_work.clear();
             self.idle_lower_work.clear();
         }
+        let neighbours = composed_screens[0] != common::theme::pack::ScreenId::GameDetail;
         let key = (
             selected,
             first,
@@ -390,6 +391,7 @@ where
             common::media::generation(),
             ink,
             tall,
+            neighbours,
             demand,
             targets,
         );
@@ -405,16 +407,13 @@ where
             });
             self.idle_media_key = Some(key);
             self.idle_media_work =
-                super::art_queue::plan(&self.entries, selected, first, count, direction, demand);
-            if composed_screens[0] == common::theme::pack::ScreenId::GameDetail {
-                self.idle_media_work.retain(|task| task.entry().path() == self.entries[selected].path());
-            }
+                super::art_queue::plan(&self.entries, selected, first, count, direction, demand, neighbours);
             self.idle_lower_work.clear();
             if self.details.is_some() {
                 let lower = super::art_queue::Demand::from_components(
                     &handle.pack().screens[&screen].components, ink);
                 self.idle_lower_work = super::art_queue::plan(
-                    &self.entries, selected, first, count, direction, lower);
+                    &self.entries, selected, first, count, direction, lower, true);
                 self.idle_lower_work.retain(|task| {
                     let path = task.entry().path();
                     path == self.entries[selected].path()
@@ -598,7 +597,7 @@ where
         let components = &handle.pack().screens.get(&ScreenId::GameDetail)?.components;
         let mut demand = super::art_queue::Demand::from_components(components, true);
         demand.metadata = false;
-        let mut artwork = super::art_queue::plan(&self.entries, selected, selected, 1, 1, demand);
+        let mut artwork = super::art_queue::plan(&self.entries, selected, selected, 1, 1, demand, true);
         artwork.retain(|task| task.entry().path() == self.entries[selected].path());
         let details_text = components.iter().any(|c| c.binding == Some(common::theme::pack::Binding::SelectedBlurb)
             && c.paint.as_ref().is_some_and(|p| p.section_style.is_some())).then(||
@@ -716,7 +715,7 @@ where
             handle.pack().ink(),
         );
         let mut artwork =
-            super::art_queue::plan(&self.entries, selected, first, count, direction, demand);
+            super::art_queue::plan(&self.entries, selected, first, count, direction, demand, true);
         // Warm only art used by the predicted frame; App prepares one raster neighbor.
         artwork.retain(|task| {
             let path = task.entry().path();
@@ -2394,6 +2393,87 @@ pub(crate) mod ux4_tests {
             .iter()
             .any(|entry| matches!(entry, MenuEntry::Download(_)))
     }
+    fn idle_queue_fixture(next_cover: bool) -> (EntryList<PathsSort>, common::theme::ThemeHandle) {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let source = repo.join("themes/compact-plus");
+        let root = std::env::temp_dir().join(format!("allium-idle-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut pack: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(source.join("theme.json")).unwrap()).unwrap();
+        let details = pack["screens"]["game_detail"]["components"].as_array().unwrap().clone();
+        let recents = pack["screens"]["recents"]["components"].as_array_mut().unwrap();
+        for image in recents.iter_mut().filter(|c| c["kind"] == "image") {
+            let detail = details.iter().find(|c| c["binding"] == image["binding"]).unwrap();
+            image["rect"] = detail["rect"].clone();
+        }
+        recents.iter_mut().find(|c| c["binding"] == "entries").unwrap()["visible_count"] = 2.into();
+        if next_cover {
+            let mut next = details.iter().find(|c| c["binding"] == "selected_cover").unwrap().clone();
+            next["id"] = "next-cover".into();
+            next["binding"] = "next_cover".into();
+            pack["screens"]["game_detail"]["components"].as_array_mut().unwrap().push(next);
+        }
+        for asset in pack["assets"].as_object().unwrap().values() {
+            let path = asset["path"].as_str().unwrap();
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::copy(source.join(path), root.join(path)).unwrap();
+        }
+        std::fs::write(root.join("theme.json"), serde_json::to_vec(&pack).unwrap()).unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root).unwrap(), &bank, 604).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let res = resources();
+        res.insert(Some(theme.clone()));
+        let paths = (0..4).map(|i| root.join(format!("Game {i}.chd"))).collect();
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, PathsSort { paths }).unwrap();
+        list.select(1);
+        (list, theme)
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn idle_details_preserves_demanded_next_cover_without_speculative_neighbors() {
+        use common::theme::pack::ScreenId;
+        use super::super::orbit::WarmArt;
+        let (mut list, theme) = idle_queue_fixture(true);
+        let Entry::Game(game) = &list.entries[1] else { unreachable!() };
+        list.details = Some(crate::view::details::Details::cached(game, ""));
+        list.idle_media_step(&theme, ScreenId::Recents);
+        assert!(list.idle_media_work.iter().any(|task| matches!(task, WarmArt::Cover(_))
+            && task.entry().path() == list.entries[2].path()), "explicit next cover was dropped");
+        assert!(!list.idle_media_work.iter().any(|task|
+            matches!(task, WarmArt::Hero(_) | WarmArt::Logo(_))
+                && task.entry().path() != list.entries[1].path()), "queued speculative neighbour art");
+        assert!(!list.idle_media_work.iter().any(|task|
+            task.entry().path() == list.entries[0].path()), "queued speculative neighbour cover");
+        list.release_theme_art();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn idle_details_close_rebuilds_equal_demand_and_targets_for_neighbors() {
+        use common::theme::{art::Targets, pack::ScreenId};
+        use super::super::{art_queue::Demand, orbit::WarmArt};
+        let (mut list, theme) = idle_queue_fixture(false);
+        let demand = |screen| Demand::from_components(&theme.pack().screens[&screen].components, true);
+        assert_eq!(demand(ScreenId::Recents), demand(ScreenId::GameDetail));
+        assert_eq!(Targets::for_screens(theme.pack(), &[ScreenId::Recents]),
+            Targets::for_screens(theme.pack(), &[ScreenId::GameDetail]));
+        let Entry::Game(game) = &list.entries[1] else { unreachable!() };
+        list.details = Some(crate::view::details::Details::cached(game, ""));
+        list.idle_media_step(&theme, ScreenId::Recents);
+        assert!(list.idle_media_work.iter().all(|task|
+            task.entry().path() == list.entries[1].path()));
+        let detail_key = list.idle_media_key;
+        list.details = None;
+        list.idle_media_step(&theme, ScreenId::Recents);
+        assert!(list.idle_media_work.iter().any(|task| matches!(task, WarmArt::Hero(_))
+            && task.entry().path() == list.entries[0].path()), "closing Details did not resume neighbour prefetch");
+        assert_ne!(list.idle_media_key, detail_key);
+        list.release_theme_art();
+    }
+
     #[test]
     #[serial_test::serial(orbit_fixture)]
     fn idle_details_only_selected_work_keeps_recents_neighbors_resident() {

@@ -3369,7 +3369,7 @@ mod demand_queue_tests {
                 pack.ink(),
             );
             let mut work =
-                super::super::art_queue::plan(&entries, selected, first, count, 1, demand);
+                super::super::art_queue::plan(&entries, selected, first, count, 1, demand, true);
             let after_tasks = work.len();
             MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
             let mut orbit = Orbit::new();

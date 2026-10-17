@@ -97,6 +97,7 @@ pub(super) fn plan(
     count: usize,
     direction: isize,
     demand: Demand,
+    neighbours: bool,
 ) -> VecDeque<WarmArt> {
     let mut work = VecDeque::new();
     let mut seen = HashSet::new();
@@ -157,7 +158,7 @@ pub(super) fn plan(
             push(WarmArt::Cover(entry.clone()));
         }
     }
-    if entries.len() > 1 {
+    if neighbours && entries.len() > 1 {
         let forward = if direction < 0 { entries.len() - 1 } else { 1 };
         for index in [
             (selected + forward) % entries.len(),
@@ -208,7 +209,7 @@ mod tests {
         { let _input = common::perf_trace::phase(common::perf_trace::Phase::Input); }
         let pack = load_pack("orbit-hero");
         let demand = Demand::from_components(&pack.screens[&ScreenId::Library].components, pack.ink());
-        plan(&games(), 1, 0, 3, 1, demand);
+        plan(&games(), 1, 0, 3, 1, demand, true);
         let measurement = common::perf_trace::probe_counts()["measurement"].clone();
         let names = measurement["counter_names"].as_array().unwrap();
         for (name, expected) in [("art_request_hero", 3), ("art_request_logo", 3),
@@ -228,14 +229,14 @@ mod tests {
             let pack = load_pack(id);
             let demand =
                 Demand::from_components(&pack.screens[&ScreenId::Recents].components, pack.ink());
-            let work = plan(&entries, 1, 0, 3, 1, demand);
+            let work = plan(&entries, 1, 0, 3, 1, demand, true);
             assert!(work.is_empty(), "{id} recents: {work:?}");
         }
         let pack = load_pack("compact-plus");
         for screen in [ScreenId::Library, ScreenId::Recents] {
             let demand = Demand::from_components(&pack.screens[&screen].components, pack.ink());
             assert!(!demand.rows && !demand.next);
-            let work = plan(&entries, 4, 0, 9, 1, demand);
+            let work = plan(&entries, 4, 0, 9, 1, demand, true);
             assert!(work.iter().all(|t| {
                 [3, 4, 5]
                     .iter()
@@ -247,7 +248,7 @@ mod tests {
             Demand::from_components(&pack.screens[&ScreenId::Recents].components, pack.ink());
         assert!(!demand.hero);
         assert!(
-            plan(&entries, 1, 0, 5, 1, demand)
+            plan(&entries, 1, 0, 5, 1, demand, true)
                 .iter()
                 .all(|t| !matches!(t, WarmArt::Hero(_)))
         );
@@ -266,6 +267,7 @@ mod tests {
                 rows: true,
                 ..Demand::default()
             },
+            true,
         );
         let actual: Vec<_> = work
             .iter()
@@ -287,6 +289,7 @@ mod tests {
                 rows: true,
                 ..Demand::default()
             },
+            true,
         );
         let heroes: Vec<_> = reverse
             .iter()
@@ -316,6 +319,7 @@ mod tests {
                     next: true,
                     metadata: true,
                 },
+                true,
             );
             assert_eq!(
                 work.len(),
@@ -327,9 +331,9 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(plan(entries, 0, 0, 3, 1, Demand::default()).is_empty());
+            assert!(plan(entries, 0, 0, 3, 1, Demand::default(), true).is_empty());
         }
-        assert!(plan(&[], 0, 0, 3, 1, Demand::default()).is_empty());
+        assert!(plan(&[], 0, 0, 3, 1, Demand::default(), true).is_empty());
     }
     #[test]
     fn tasks_resolve_only_their_requested_kinds() {
