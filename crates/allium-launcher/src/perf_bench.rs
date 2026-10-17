@@ -1129,6 +1129,53 @@ async fn held_completion_release_and_settled_media_event_loop() -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "explicit disposable event loop fixture"]
+async fn medianoop_continuous_repeats_adopt_current_selection_before_release() -> Result<()> {
+    let _cleanup = fixture()?;
+    let root = ALLIUM_GAMES_DIR.join("held-current");
+    fs::create_dir_all(root.join("Imgs"))?;
+    fs::write(root.join("Current.chd"), [])?;
+    art(&root.join("Imgs/Current.png"), 240, 240, 91)?;
+    art(&root.join("Imgs/Current.hero.png"), 360, 210, 91)?;
+    let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
+    app.view.proof_games_directory(root);
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await?;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    LOOP_INPUT.with(|input| *input.borrow_mut() = Some(receiver));
+    let state = std::rc::Rc::new(LoopState::default());
+    state.completion_generation.set(crate::view::orbit::completion_generation());
+    LOOP_STATE.with(|slot| *slot.borrow_mut() = Some(state.clone()));
+    let _reset = LoopReset;
+    sender.send(KeyEvent::Pressed(Key::Right))?;
+    for _ in 0..130 { sender.send(KeyEvent::Autorepeat(Key::Right))?; }
+    let checks = async {
+        state.input.notified().await;
+        loop {
+            tokio::select! {
+                _ = state.presented_held.notified() => break,
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {
+                    sender.send(KeyEvent::Autorepeat(Key::Right))?;
+                }
+            }
+        }
+        ensure!(state.inputs.get() >= 65, "did not exercise the bounded repeat batch");
+        ensure!(state.held.get() && state.adopted_held.get(), "completion waited for release");
+        println!("MEDIANOOP_REPEAT inputs={} polls={} completion_adopted_and_presented_while_held=true repeat_batch_bound=64",
+            state.inputs.get(), state.polls.get());
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = app.run_event_loop() => anyhow::bail!("event loop stopped: {result:?}"),
+            result = checks => result,
+        }
+    }).await??;
+    app.view.stop_workers();
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(orbit_fixture)]
 async fn perf_name_index_consumed_by_view_rearms_settled_media() -> Result<()> {
     use crate::view::orbit::proof_art_completion;

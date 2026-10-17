@@ -1954,6 +1954,11 @@ pub(crate) async fn art_ready() {
     if let Some(ready) = ready { ready.notified().await; }
     else { std::future::pending::<()>().await; }
 }
+pub(crate) fn art_result_queued() -> bool {
+    ART_WORKER.with(|state| state.borrow().as_ref().is_some_and(|worker|
+        worker.queued_results.load(std::sync::atomic::Ordering::Acquire) != 0))
+}
+
 struct ArtResult {
     targets: ArtTargets,
     owner: u64,
@@ -1976,6 +1981,7 @@ struct ArtResult {
 struct ArtWorker {
     send: std::sync::mpsc::SyncSender<ArtJob>,
     recv: std::sync::mpsc::Receiver<ArtResult>,
+    queued_results: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     busy: Option<(u64, u64)>,
     in_flight: usize,
     ready: std::sync::Arc<tokio::sync::Notify>,
@@ -1991,6 +1997,8 @@ fn worker() -> ArtWorker {
     let (done, recv) = std::sync::mpsc::sync_channel(1);
     let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let result_account = queued_bytes.clone();
+    let queued_results = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result_count = queued_results.clone();
     let ready = std::sync::Arc::new(tokio::sync::Notify::new());
     let completion = ready.clone();
     std::thread::Builder::new()
@@ -2096,7 +2104,11 @@ fn worker() -> ArtWorker {
                 };
                 ART_CANCELLATION.with(|slot| slot.replace(None));
                 task.finish();
+                // Publish before send: a completed result blocked on the bounded channel
+                // must also prevent the pre-render no-result shortcut. Only receive decrements.
+                result_count.fetch_add(1, std::sync::atomic::Ordering::Release);
                 if done.send(result).is_err() {
+                    result_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     break;
                 }
                 completion.notify_one();
@@ -2107,6 +2119,7 @@ fn worker() -> ArtWorker {
     ArtWorker {
         send,
         recv,
+        queued_results,
         busy: None,
         in_flight: 0,
         ready,
@@ -2134,12 +2147,18 @@ impl Orbit {
         self.warm_art_step_for_targets(work, self.targets)
     }
     pub(crate) fn warm_art_step_for_targets(&mut self, work: &mut VecDeque<WarmArt>, targets: ArtTargets) -> bool {
+        let completed = self.adopt_art_result();
+        self.submit_art_step_for_targets(work, targets);
+        completed
+    }
+    pub(crate) fn adopt_art_result(&mut self) -> bool {
         self.refresh_art();
         ART_WORKER.with(|state| {
             let mut state = state.borrow_mut();
-            let worker = state.get_or_insert_with(worker);
+            let Some(worker) = state.as_mut() else { return false; };
             let mut completed = false;
             if let Ok(mut result) = worker.recv.try_recv() {
+                worker.queued_results.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 result.queued_pixels.take();
                 worker.in_flight -= 1;
                 #[cfg(test)]
@@ -2208,12 +2227,20 @@ impl Orbit {
                     completed = true;
                 }
             }
+            completed
+        })
+    }
+    pub(crate) fn submit_art_step_for_targets(&mut self, work: &mut VecDeque<WarmArt>, targets: ArtTargets) {
+        self.refresh_art();
+        ART_WORKER.with(|state| {
+            let mut state = state.borrow_mut();
+            let worker = state.get_or_insert_with(worker);
             let owner = (self.worker_id, self.worker_epoch);
             if worker.busy != Some(owner) {
                 while let Some(task) = self.pending_tasks.pop_back() { work.push_front(task); }
             }
             if worker.busy.is_some_and(|busy| busy != owner) || worker.in_flight >= IN_FLIGHT_JOBS {
-                return completed;
+                return;
             }
             while let Some(task) = work.pop_front() {
                 if worker.in_flight > 0 && !(self.task_visible(&task)
@@ -2319,7 +2346,6 @@ impl Orbit {
                 // visible successor can run before the previous result is adopted.
                 break;
             }
-            completed
         })
     }
 }
@@ -3453,6 +3479,38 @@ mod demand_queue_tests {
 mod pipeline_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn medianoop_queue_probe_is_nonconsuming_and_submission_does_not_adopt() {
+        common::media::invalidate();
+        let entry = Entry::Game(crate::entry::game::Game::new("/missing-medianoop/Game.sfc".into()));
+        let mut orbit = Orbit::new();
+        orbit.protect_selected(&entry);
+        assert!(!art_result_queued());
+        let generation = completion_generation();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        proof_art_gate(Some(gate.clone()));
+        let mut work = VecDeque::from([WarmArt::Hero(entry.clone())]);
+        orbit.submit_art_step_for_targets(&mut work, orbit.targets);
+        assert!(!art_result_queued(), "in-flight decode is not a queued result");
+        gate.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !art_result_queued() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for _ in 0..64 {
+            assert!(art_result_queued());
+            orbit.submit_art_step_for_targets(&mut work, orbit.targets);
+            assert!(orbit.completed_tasks.is_empty(), "selection planning consumed a result");
+        }
+        assert_eq!(completion_generation(), generation);
+        assert!(orbit.adopt_art_result());
+        assert!(!art_result_queued());
+        assert!(orbit.completed_tasks.iter().any(|task| task.key == WarmArt::Hero(entry.clone()).key() && task.missing));
+        assert!(!orbit.adopt_art_result());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(orbit_fixture)]

@@ -399,6 +399,7 @@ where
     neighbor_graveyard: NeighborGraveyard,
     neighbor_base: Option<common::theme::render::NavigationStamp>,
     neighbor_adopted: bool,
+    media_deferred: bool,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
     theme_presented_screen: Option<common::theme::pack::ScreenId>,
@@ -520,6 +521,7 @@ where
             neighbor_graveyard: NeighborGraveyard { base: None, siblings: Vec::with_capacity(2) },
             neighbor_base: None,
             neighbor_adopted: false,
+            media_deferred: false,
             present_damage: None,
             theme_was_layered: false,
             theme_presented_screen: None,
@@ -888,7 +890,19 @@ where
         self.neighbor_graveyard.clear();
     }
 
+    pub(crate) fn defer_media_step(&mut self) -> bool {
+        self.media_deferred = !super::orbit::art_result_queued() && !self.dirty
+            && self.selected == 0 && self.search_results.is_none() && !self.search_view.is_active()
+            && self.rect.w == 640 && self.rect.h == 480 && self.views.0.navigation_warm_ready()
+            && !crate::network_runtime::blocks_navigation_warm() && !self.neighbors.is_empty();
+        if self.media_deferred && common::perf_trace::recording() {
+            common::perf_trace::neighbor_warm("media_no_result");
+        }
+        self.media_deferred
+    }
+
     pub(crate) fn idle_media_step(&mut self) -> bool {
+        self.media_deferred = false;
         let _task = common::perf_trace::task("media_adopt", common::perf_trace::generation());
         let completion = super::orbit::completion_generation();
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
@@ -1198,6 +1212,10 @@ where
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
+        // Recheck after input/update/layout work, later than the ordinary media poll.
+        if super::orbit::art_result_queued() {
+            self.idle_media_step();
+        }
         self.neighbor_adopted = false;
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             self.release_details_frame();
@@ -1229,7 +1247,6 @@ where
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameNormalize);
                 self.normalize_theme_inputs(&handle, &mut models);
             }
-            let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
             let locale = self.res.get::<Locale>();
             let generation = {
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::NeighborGeneration);
@@ -1247,6 +1264,20 @@ where
             if self.dirty || self.selected != 0 || self.search_results.is_some() || self.search_view.is_active()
                 || self.rect.w != 640 || self.rect.h != 480 || !self.views.0.navigation_warm_ready()
             { self.invalidate_neighbors(); }
+            if self.media_deferred {
+                let eligible = models.len() == 1 && self.theme_scene.as_ref().is_some_and(|scene| {
+                    scene.frames.len() == 1 && self.neighbor_base.as_ref().is_some_and(|stamp|
+                        scene.frames[0].navigation_is_current(stamp))
+                        && self.neighbors.iter().any(|candidate|
+                            scene.frames[0].navigation_is_current(&candidate.base)
+                                && candidate.frame.neighbor_matches(&handle, &models[0]))
+                });
+                if !eligible {
+                    self.idle_media_step();
+                    return self.prepare_theme();
+                }
+            }
+            let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
             let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details,
                 &mut self.neighbors, &mut self.neighbor_graveyard, self.neighbor_base.as_ref(), &mut self.neighbor_adopted)?;
             let _readiness = common::perf_trace::stage(common::perf_trace::Stage::FrameReadiness);
@@ -2537,8 +2568,13 @@ mod integration_navigation_tests {
                 )
                 .await
                 .unwrap();
+                let plans = super::super::entry_list::MEDIA_PLANS.with(std::cell::Cell::get);
+                if *id == "compact-plus" { assert!(app.defer_media_step()); }
                 app.prepare_theme().unwrap();
                 if *id == "compact-plus" {
+                    assert!(app.media_deferred, "no-result prepared hit must defer media planning");
+                    assert_eq!(super::super::entry_list::MEDIA_PLANS.with(std::cell::Cell::get), plans,
+                        "no-result press ran selection planning before presentation");
                     assert!(app.theme_scene.as_ref().unwrap().frames[0].navigation_is_current(predicted.as_ref().unwrap()),
                         "matching press must adopt the full frame");
                     assert!(app.neighbor_graveyard.base.is_some());
@@ -2553,8 +2589,48 @@ mod integration_navigation_tests {
                 assert!(warmed.0 == fresh.pixels().data(), "{id} pixels");
                 assert_eq!(warmed.1, fresh.targets, "{id} targets");
                 app.draw(&mut display, &style).unwrap();
+                if app.media_deferred {
+                    app.idle_media_step();
+                    assert!(!app.media_deferred);
+                    assert!(super::super::entry_list::MEDIA_PLANS.with(std::cell::Cell::get) > plans,
+                        "deferred selection planning must run after presentation");
+                }
             }
             if *id == "compact-plus" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app.idle_media_step() {
+                    assert!(std::time::Instant::now() < deadline);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                app.handle_key_event(KeyEvent::Pressed(Key::Down), tx.clone(), &mut VecDeque::new()).await.unwrap();
+                app.views.0.release_theme_art();
+                app.invalidate_neighbors();
+                let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+                super::super::orbit::proof_art_gate(Some(gate.clone()));
+                app.idle_media_step();
+                assert!(!super::super::orbit::art_result_queued());
+                let completion = super::super::orbit::completion_generation();
+                gate.wait();
+                while !super::super::orbit::art_result_queued() {
+                    assert!(std::time::Instant::now() < deadline);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                app.prepare_theme().unwrap();
+                assert_ne!(super::super::orbit::completion_generation(), completion,
+                    "result arriving after input and the media poll must be adopted before render");
+                let mut models = app.theme_models(&handle).unwrap().unwrap();
+                app.normalize_theme_inputs(&handle, &mut models);
+                assert!(app.proof_navigation_scene().0
+                    == common::theme::render::PreparedFrame::prepare(handle.clone(), &models[0]).unwrap().pixels().data());
+                assert_eq!(app.content_complete(), models.iter().all(|input| theme_content_complete(input, &handle)));
+                app.draw(&mut display, &style).unwrap();
+                while app.idle_media_step() {
+                    assert!(std::time::Instant::now() < deadline);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                app.prepare_theme().unwrap();
+                app.draw(&mut display, &style).unwrap();
+                println!("MEDIANOOP prepared_hit_pre_present_plans=0 post_present_planning=true racing_completion_before_render=true pixels_and_readiness=identical");
                 for cycle in 0..3 {
                     for key in [Key::Start, Key::B] {
                         let builds = THEME_MODEL_BUILDS.with(|n| n.get());

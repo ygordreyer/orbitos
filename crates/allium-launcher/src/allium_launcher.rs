@@ -226,14 +226,19 @@ impl AlliumLauncher<DefaultPlatform> {
             }
             // Rendering can be slower than autorepeat: waiting for an input gap would
             // starve completion adoption for the entire hold. Poll once per bounded batch.
+            let mut media_deferred = false;
             if input_handled
                 && media_pending
                 && rx.is_empty()
                 && keys.values().any(|pressed| *pressed)
                 && last_media_step.elapsed() >= Duration::from_millis(10)
             {
-                self.poll_media_step(&mut media_pending);
-                last_media_step = Instant::now();
+                media_deferred = self.toast.is_none() && !network_dirty && !overlay_was_drawn
+                    && self.view.defer_media_step();
+                if !media_deferred {
+                    self.poll_media_step(&mut media_pending);
+                    last_media_step = Instant::now();
+                }
             }
             let dt = last_frame.elapsed();
             let update_due = Instant::now() >= update_deadline;
@@ -255,6 +260,10 @@ impl AlliumLauncher<DefaultPlatform> {
 
             self.present_frame(network_dirty, &mut overlay_was_drawn)
                 .await?;
+            if media_deferred {
+                self.poll_media_step(&mut media_pending);
+                last_media_step = Instant::now();
+            }
             let mut handled_action = false;
             while let Some(action) = crate::network_runtime::action() {
                 handled_action = true;

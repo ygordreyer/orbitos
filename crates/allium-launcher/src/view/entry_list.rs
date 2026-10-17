@@ -138,7 +138,59 @@ impl std::fmt::Debug for RecentsSemantic {
 #[cfg(test)]
 thread_local! {
     pub(crate) static RECENTS_SEMANTIC_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static MEDIA_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEDIA_CONFIG_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEMANTIC_ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Debug)]
+struct MediaConfig {
+    generation: u64,
+    digest: String,
+    screen: common::theme::pack::ScreenId,
+    stack: [Option<common::theme::pack::ScreenId>; 3],
+    count: usize,
+    ink: bool,
+    tall: bool,
+    demand: super::art_queue::Demand,
+    lower: super::art_queue::Demand,
+    targets: common::theme::art::Targets,
+    lower_targets: common::theme::art::Targets,
+    visible: super::art_queue::Demand,
+    metadata: bool,
+    blurb: bool,
+}
+impl MediaConfig {
+    fn new(handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId,
+        stack: [Option<common::theme::pack::ScreenId>; 3]) -> Self {
+        use common::theme::pack::{Arrangement, Binding, Kind};
+        #[cfg(test)]
+        MEDIA_CONFIG_BUILDS.with(|n| n.set(n.get() + 1));
+        let ink = handle.pack().ink();
+        let components: Vec<_> = stack.iter().flatten()
+            .flat_map(|screen| &handle.pack().screens[screen].components).collect();
+        let image = |binding| components.iter().any(|c| c.kind == Kind::Image && c.binding == Some(binding));
+        Self {
+            generation: handle.generation(), digest: handle.digest().to_owned(), screen, stack,
+            count: crate::theme_adapter::capacity(handle, screen, Binding::Entries), ink,
+            tall: handle.pack().alignment.as_ref().is_some_and(|a| a.cover_shape == "tall"),
+            demand: super::art_queue::Demand::from_components(components.iter().copied(), ink),
+            lower: super::art_queue::Demand::from_components(&handle.pack().screens[&screen].components, ink),
+            targets: common::theme::art::Targets::from_components(handle.pack(), components.iter().copied()),
+            lower_targets: common::theme::art::Targets::for_screens(handle.pack(), &[screen]),
+            visible: super::art_queue::Demand {
+                hero: image(Binding::SelectedHero), cover: image(Binding::SelectedCover),
+                logo: image(Binding::SelectedLogo) || components.iter().any(|c| c.logo),
+                next: image(Binding::NextCover) || components.iter().any(|c| c.layout == Some(Arrangement::Shelf)
+                    && (!ink || c.paint.as_ref().is_some_and(|p| p.peek.is_some()))),
+                rows: components.iter().any(|c| c.kind == Kind::Entries
+                    && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)),
+                metadata: false,
+            },
+            metadata: components.iter().any(|c| c.binding == Some(Binding::SelectedMetadata)),
+            blurb: components.iter().any(|c| c.binding == Some(Binding::SelectedBlurb)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -165,6 +217,7 @@ where
     disc_picker: Option<DiscPicker>,
     details: Option<crate::view::details::Details>,
     semantic_info: Option<SelectedInfo>,
+    media_config: Option<MediaConfig>,
     idle_media_key: Option<(usize, usize, usize, u64, bool, bool, bool, super::art_queue::Demand, common::theme::art::Targets)>,
     idle_media_work: VecDeque<super::orbit::WarmArt>,
     idle_lower_work: VecDeque<super::orbit::WarmArt>,
@@ -283,6 +336,7 @@ where
             disc_picker: None,
             details: None,
             semantic_info: None,
+            media_config: None,
             idle_media_key: None,
             idle_media_work: VecDeque::new(),
             idle_lower_work: VecDeque::new(),
@@ -361,6 +415,20 @@ where
         }
     }
 
+    fn media_configuration(&mut self, handle: &common::theme::ThemeHandle,
+        screen: common::theme::pack::ScreenId) -> &MediaConfig {
+        use common::theme::pack::ScreenId;
+        let stack = [Some(if self.details.is_some() { ScreenId::GameDetail } else { screen }),
+            self.menu.as_ref().map(|_| ScreenId::ContextMenu),
+            self.disc_picker.as_ref().map(|_| ScreenId::DiscPicker)];
+        if self.media_config.as_ref().is_none_or(|config| config.generation != handle.generation()
+            || config.digest != handle.digest() || config.screen != screen || config.stack != stack)
+        {
+            self.media_config = Some(MediaConfig::new(handle, screen, stack));
+        }
+        self.media_config.as_ref().unwrap()
+    }
+
     pub(crate) fn idle_media_step(
         &mut self,
         handle: &common::theme::ThemeHandle,
@@ -374,36 +442,16 @@ where
         }
         let selected = self.list.selected();
         let first = self.list.window_start();
-        let count =
-            crate::theme_adapter::capacity(handle, screen, common::theme::pack::Binding::Entries);
-        let ink = handle.pack().ink();
-        let tall = handle
-            .pack()
-            .alignment
-            .as_ref()
-            .is_some_and(|a| a.cover_shape == "tall");
-        let mut composed_screens = vec![if self.details.is_some() {
-            common::theme::pack::ScreenId::GameDetail
-        } else { screen }];
-        if self.menu.is_some() {
-            composed_screens.push(common::theme::pack::ScreenId::ContextMenu);
-        }
-        if self.disc_picker.is_some() {
-            composed_screens.push(common::theme::pack::ScreenId::DiscPicker);
-        }
-        let components: Vec<_> = composed_screens
-            .iter()
-            .flat_map(|screen| &handle.pack().screens[screen].components)
-            .collect();
-        let demand = super::art_queue::Demand::from_components(components.iter().copied(), ink);
-        let targets = common::theme::art::Targets::from_components(handle.pack(), components.iter().copied());
-        let lower_targets = common::theme::art::Targets::for_screens(handle.pack(), &[screen]);
+        let config = self.media_configuration(handle, screen);
+        let neighbours = config.stack[0] != Some(common::theme::pack::ScreenId::GameDetail);
+        let (count, ink, tall, demand, targets, lower_targets, lower, visible, metadata, blurb) =
+            (config.count, config.ink, config.tall, config.demand, config.targets, config.lower_targets,
+                config.lower, config.visible, config.metadata, config.blurb);
         if self.orbit.get_or_insert_with(Orbit::new).set_art_theme(handle) {
             self.idle_media_key = None;
             self.idle_media_work.clear();
             self.idle_lower_work.clear();
         }
-        let neighbours = composed_screens[0] != common::theme::pack::ScreenId::GameDetail;
         let key = (
             selected,
             first,
@@ -416,6 +464,8 @@ where
             targets,
         );
         if self.idle_media_key != Some(key) {
+            #[cfg(test)]
+            MEDIA_PLANS.with(|n| n.set(n.get() + 1));
             let direction = self.idle_media_key.map_or(1, |old| {
                 let forward = (selected + self.entries.len() - old.0.min(self.entries.len() - 1))
                     % self.entries.len();
@@ -430,8 +480,6 @@ where
                 super::art_queue::plan(&self.entries, selected, first, count, direction, demand, neighbours);
             self.idle_lower_work.clear();
             if self.details.is_some() {
-                let lower = super::art_queue::Demand::from_components(
-                    &handle.pack().screens[&screen].components, ink);
                 self.idle_lower_work = super::art_queue::plan(
                     &self.entries, selected, first, count, direction, lower, true);
                 self.idle_lower_work.retain(|task| {
@@ -459,55 +507,47 @@ where
             demand.next,
         );
         let visible_art = |mut art: common::theme::frame::Art| {
-            use common::theme::pack::{Arrangement, Binding, Kind};
-            let image = |binding| {
-                components
-                    .iter()
-                    .any(|c| c.kind == Kind::Image && c.binding == Some(binding))
-            };
-            if !image(Binding::SelectedHero) {
+            if !visible.hero {
                 art.selected_hero = None;
                 art.completed_misses.selected_hero = false;
             }
-            if !image(Binding::SelectedCover) {
+            if !visible.cover {
                 art.selected_cover = None;
                 art.completed_misses.selected_cover = false;
             }
-            if !image(Binding::SelectedLogo) && !components.iter().any(|c| c.logo) {
+            if !visible.logo {
                 art.selected_logo = None;
                 art.completed_misses.selected_logo = false;
             }
-            if !image(Binding::NextCover)
-                && !components.iter().any(|c| {
-                    c.layout == Some(Arrangement::Shelf)
-                        && (!ink || c.paint.as_ref().is_some_and(|p| p.peek.is_some()))
-                })
-            {
+            if !visible.next {
                 art.next_cover = None;
                 art.completed_misses.next_cover = false;
             }
-            if !components.iter().any(|c| {
-                c.kind == Kind::Entries
-                    && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
-            }) {
+            if !visible.rows {
                 art.entries.clear();
                 art.completed_misses.entries.clear();
             }
             art
         };
-        let before = visible_art(orbit.theme_art(&self.entries, selected, first, count));
-        let lower_before = self.details.as_ref().map(|_| {
+        let has_result = super::orbit::art_result_queued();
+        let before = has_result.then(|| visible_art(orbit.theme_art(&self.entries, selected, first, count)));
+        let lower_before = self.details.as_ref().filter(|_| has_result).map(|_| {
             orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets)
         });
-        let mut completed = orbit.warm_art_step(&mut self.idle_media_work);
+        // A result arriving after the probe stays queued for the next adoption pass.
+        // Submission must not consume it without the corresponding before snapshot.
+        let mut completed = has_result && orbit.adopt_art_result();
+        orbit.submit_art_step_for_targets(&mut self.idle_media_work, targets);
         // Visible Details work takes priority; lower variants also serve transparent Details packs.
         if self.idle_media_work.is_empty() && !orbit.art_pending() && !self.idle_lower_work.is_empty() {
-            completed |= orbit.warm_art_step_for_targets(&mut self.idle_lower_work, lower_targets);
+            completed |= has_result && orbit.adopt_art_result();
+            orbit.submit_art_step_for_targets(&mut self.idle_lower_work, lower_targets);
         }
         let pending = !self.idle_media_work.is_empty() || !self.idle_lower_work.is_empty() || orbit.art_pending();
         if !completed {
             return pending;
         }
+        let before = before.unwrap();
         let after = visible_art(orbit.theme_art(&self.entries, selected, first, count));
         if common::perf_trace::recording() {
             common::perf_trace::artwork_readiness(&before, &after);
@@ -521,13 +561,6 @@ where
                 != lower_after.as_ref().map(|art| &art.completed_misses);
         let mut metadata_changed = false;
         if let Some(Entry::Game(game)) = self.entries.get(selected) {
-            use common::theme::pack::Binding;
-            let metadata = components
-                .iter()
-                .any(|c| c.binding == Some(Binding::SelectedMetadata));
-            let blurb = components
-                .iter()
-                .any(|c| c.binding == Some(Binding::SelectedBlurb));
             if metadata || blurb {
                 let before = self.semantic_info.take();
                 let platform = self
@@ -957,7 +990,9 @@ where
             }
             return child.theme_models(screen, handle);
         }
-        let count = crate::theme_adapter::capacity(handle, screen, Binding::Entries);
+        let config = self.media_configuration(handle, screen);
+        let (count, ink, tall, targets, lower_targets) = (config.count, config.ink, config.tall,
+            config.targets, if config.stack[0] == Some(ScreenId::GameDetail) { config.lower_targets } else { config.targets });
         self.list.set_visible_count_override(Some(count))?;
         let first = self.list.window_start();
         let selected = self.list.selected();
@@ -975,21 +1010,9 @@ where
             self.idle_media_work.clear();
             self.idle_lower_work.clear();
         }
-        orbit.set_ink_art(handle.pack().ink());
-        orbit.set_cover_shape(
-            handle
-                .pack()
-                .alignment
-                .as_ref()
-                .is_some_and(|a| a.cover_shape == "tall"),
-        );
-        let mut art_screens = vec![if self.details.is_some() { ScreenId::GameDetail } else { screen }];
-        if self.menu.is_some() { art_screens.push(ScreenId::ContextMenu); }
-        if self.disc_picker.is_some() { art_screens.push(ScreenId::DiscPicker); }
-        orbit.set_art_targets(common::theme::art::Targets::for_screens(handle.pack(), &art_screens));
-        let lower_targets = if self.details.is_some() {
-            common::theme::art::Targets::for_screens(handle.pack(), &[screen])
-        } else { common::theme::art::Targets::for_screens(handle.pack(), &art_screens) };
+        orbit.set_ink_art(ink);
+        orbit.set_cover_shape(tall);
+        orbit.set_art_targets(targets);
         orbit.protect_covered(self.entries.get(selected).filter(|_| self.details.is_some()), lower_targets);
         if let Some(entry) = self.entries.get(selected) {
             orbit.protect_selected(entry);
@@ -2465,6 +2488,119 @@ pub(crate) mod ux4_tests {
         let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, PathsSort { paths }).unwrap();
         list.select(1);
         (list, theme)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "perf-bench")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn medianoop_configuration_reuse_racing_completion_misses_and_eviction() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle,
+            pack::ScreenId, render::PreparedFrame};
+        use super::super::orbit::{art_result_queued, completion_generation, proof_art_gate};
+        let (mut list, theme) = idle_queue_fixture(false);
+        let root = list.entries[0].path().parent().unwrap().to_owned();
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        common::perf_trace::start_probe(root.join("medianoop.jsonl").to_str().unwrap());
+        for i in 0..4 {
+            std::fs::write(root.join(format!("Game {i}.chd")), []).unwrap();
+            let mut pixels = tiny_skia::Pixmap::new(32, 32).unwrap();
+            pixels.fill(tiny_skia::Color::from_rgba8(i * 50, 90, 120, 255));
+            pixels.save_png(root.join(format!("Imgs/Game {i}.png"))).unwrap();
+        }
+        common::media::invalidate();
+        let builds = MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get);
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 1);
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        proof_art_gate(Some(gate.clone()));
+        list.idle_media_step(&theme, ScreenId::Recents);
+        assert!(!art_result_queued());
+        let generation = completion_generation();
+        gate.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !art_result_queued() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(completion_generation(), generation, "queue signal must precede visible adoption");
+        assert!(art_result_queued(), "probing must not consume the racing result");
+        list.idle_media_step(&theme, ScreenId::Recents);
+        assert_ne!(completion_generation(), generation, "racing missing hero must settle before render");
+        let drain = |list: &mut EntryList<PathsSort>, theme: &ThemeHandle| {
+            while list.idle_media_step(theme, ScreenId::Recents) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        drain(&mut list, &theme);
+        let settled = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+        assert!(settled.art.selected_cover.is_some());
+        assert!(settled.art.completed_misses.selected_hero && settled.art.completed_misses.selected_logo);
+        assert!(super::super::app::theme_content_complete(&settled, &theme));
+        for selected in [2, 1] {
+            list.select(selected);
+            list.theme_models(ScreenId::Recents, &theme).unwrap();
+            drain(&mut list, &theme);
+        }
+        let requests = super::super::orbit::test_art_requests();
+        for selected in [2, 1, 2, 1] {
+            list.select(selected);
+            list.theme_models(ScreenId::Recents, &theme).unwrap();
+            drain(&mut list, &theme);
+        }
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 1,
+            "selection and completion must reuse immutable configuration");
+        assert_eq!(super::super::orbit::test_art_requests(), requests, "completed misses were resubmitted");
+        let before_eviction = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+        list.release_theme_art();
+        let evicted = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+        assert!(evicted.art.selected_cover.is_none());
+        assert!(!super::super::app::theme_content_complete(&evicted, &theme));
+        drain(&mut list, &theme);
+        let restored = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+        assert!(super::super::app::theme_content_complete(&restored, &theme));
+        assert!(PreparedFrame::prepare(theme.clone(), &before_eviction).unwrap().pixels().data()
+            == PreparedFrame::prepare(theme.clone(), &restored).unwrap().pixels().data());
+        common::media::invalidate();
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        drain(&mut list, &theme);
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 1,
+            "media library change must replan without rebuilding theme configuration");
+        list.details = match &list.entries[1] {
+            Entry::Game(game) => Some(crate::view::details::Details::cached(game, "")), _ => unreachable!(),
+        };
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 2);
+        list.open_menu().unwrap();
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 3);
+        list.menu = None;
+        list.disc_picker = Some(DiscPicker::new(crate::discs::Playlist {
+            path: root.join("Game.m3u"), discs: vec![crate::discs::Disc { path: root.join("Game 1.chd"), available: true }], core_compatible: true,
+        }));
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), builds + 4);
+        list.disc_picker = None;
+        list.details = None;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        for name in ["compact-plus", "big-picture"] {
+            let changed = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes").join(name)).unwrap(), &bank, 605).unwrap();
+            let before = MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get);
+            list.theme_models(ScreenId::Recents, &changed).unwrap();
+            drain(&mut list, &changed);
+            assert_eq!(MEDIA_CONFIG_BUILDS.with(std::cell::Cell::get), before + 1);
+            let cached = list.theme_models(ScreenId::Recents, &changed).unwrap().remove(0);
+            list.media_config = None;
+            let fresh = list.theme_models(ScreenId::Recents, &changed).unwrap().remove(0);
+            assert!(cached == fresh, "cached configuration changed readiness or inputs: {name}");
+            assert!(PreparedFrame::prepare(changed.clone(), &cached).unwrap().pixels().data()
+                == PreparedFrame::prepare(changed, &fresh).unwrap().pixels().data());
+        }
+        common::perf_trace::stop_probe();
+        list.release_theme_art();
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
 
     #[test]
