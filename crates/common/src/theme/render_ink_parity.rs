@@ -6,15 +6,21 @@ pub(super) fn symbol(text: &str) -> bool {
 }
 impl InkTextLayout {
     fn detail_lines(&self, text: &str, width: u32) -> Vec<String> {
+        #[cfg(test)]
+        if REFERENCE_WIDTHS.with(|r| r.get()) {
+            return tests::reference_lines(self, text, width);
+        }
         let mut lines = Vec::new();
         let mut line = String::new();
-        let measured = |s: &str| self.metrics(&self.value(s)).0.ceil();
+        let mut measure = self.prefix_measure();
         for ch in text.chars() {
             if ch == '\n' {
                 lines.push(std::mem::take(&mut line));
+                measure.reset("");
                 continue;
             }
-            if !line.is_empty() && measured(&format!("{line}{ch}")) > width as f32 {
+            let candidate_width = measure.push(ch).ceil();
+            if !line.is_empty() && candidate_width > width as f32 {
                 if let Some(space) = line
                     .char_indices()
                     .filter(|(_, c)| c.is_whitespace())
@@ -27,8 +33,12 @@ impl InkTextLayout {
                 } else {
                     lines.push(std::mem::take(&mut line));
                 }
-                if !line.is_empty() && measured(&format!("{line}{ch}")) > width as f32 {
+                measure.reset(&line);
+                let candidate_width = measure.push(ch).ceil();
+                if !line.is_empty() && candidate_width > width as f32 {
                     lines.push(std::mem::take(&mut line));
+                    measure.reset("");
+                    measure.push(ch);
                 }
             }
             line.push(ch);
@@ -342,3 +352,7 @@ impl PreparedFrame {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "render_ink_details_tests.rs"]
+mod tests;

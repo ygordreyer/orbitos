@@ -19,6 +19,46 @@ pub struct InkTextLayout {
     family: FontId,
 }
 type Type = InkTextLayout;
+struct InkPrefixMeasure<'a> {
+    layout: &'a InkTextLayout,
+    x: f32,
+    previous: Option<rusttype::GlyphId>,
+}
+impl InkPrefixMeasure<'_> {
+    fn push_glyph(&mut self, ch: char) {
+        #[cfg(test)]
+        DETAIL_GLYPH_VISITS.with(|n| n.set(n.get() + 1));
+        let font = self.layout.face(ch);
+        let scale = Scale::uniform(self.layout.size);
+        let glyph = font.glyph(ch).scaled(scale);
+        if let Some(previous) = self.previous {
+            self.x += font.pair_kerning(scale, previous, glyph.id());
+        }
+        self.previous = Some(glyph.id());
+        // Match metrics' addition order and retain tracking after the last glyph.
+        self.x += glyph.h_metrics().advance_width + self.layout.tracking;
+    }
+    fn push(&mut self, ch: char) -> f32 {
+        if self.layout.upper {
+            for ch in ch.to_uppercase() {
+                self.push_glyph(ch);
+            }
+        } else {
+            self.push_glyph(ch);
+        }
+        self.x
+    }
+    fn reset(&mut self, value: &str) {
+        self.x = 0.0;
+        self.previous = None;
+        for ch in value.chars() {
+            self.push(ch);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! { static DETAIL_GLYPH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; static REFERENCE_WIDTHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[path = "render_ink_effects.rs"]
 mod effects;
 #[path = "render_ink_parity.rs"]
@@ -28,6 +68,22 @@ use parity::symbol;
 #[path = "render_ink_retained.rs"]
 pub(super) mod retained;
 impl InkTextLayout {
+    fn prefix_measure(&self) -> InkPrefixMeasure<'_> {
+        InkPrefixMeasure { layout: self, x: 0.0, previous: None }
+    }
+    // The caller has already applied value's uppercase transform.
+    fn advance_width(&self, value: &str) -> f32 {
+        #[cfg(test)]
+        if REFERENCE_WIDTHS.with(|r| r.get()) {
+            return self.metrics(value).0;
+        }
+        let mut measure = self.prefix_measure();
+        for ch in value.chars() {
+            measure.push_glyph(ch);
+        }
+        measure.x
+    }
+
     // Sixteen lines fit the frame model's 8,192 source-character limit.
     pub const GUIDE_LINE_SOURCE_CHAR_LIMIT: usize = 512;
 
@@ -163,8 +219,8 @@ impl InkTextLayout {
         let count = count.max(1) as usize;
         if overflow == Overflow::Ellipsis || count == 1 {
             let mut value = value.replace('\n', " ");
-            if self.metrics(&value).0 > width as f32 {
-                while !value.is_empty() && self.metrics(&(value.clone() + "…")).0 > width as f32 {
+            if self.advance_width(&value) > width as f32 {
+                while !value.is_empty() && self.advance_width(&(value.clone() + "…")) > width as f32 {
                     value.pop();
                 }
                 value = value.trim_end().to_owned() + "…";
@@ -180,7 +236,7 @@ impl InkTextLayout {
             } else {
                 let mut next = line.clone();
                 next.push(ch);
-                if !line.is_empty() && self.metrics(&next).0 > width as f32 {
+                if !line.is_empty() && self.advance_width(&next) > width as f32 {
                     if let Some(at) = line.rfind(char::is_whitespace).filter(|n| *n > 0) {
                         let rest = line[at..].trim_start().to_owned();
                         lines.push(line[..at].trim_end().into());
@@ -201,7 +257,7 @@ impl InkTextLayout {
         }
         if truncated {
             if let Some(last) = lines.last_mut() {
-                while !last.is_empty() && self.metrics(&(last.clone() + "…")).0 > width as f32 {
+                while !last.is_empty() && self.advance_width(&(last.clone() + "…")) > width as f32 {
                     last.pop();
                 }
                 *last = last.trim_end().to_owned() + "…";
@@ -1675,7 +1731,7 @@ impl PreparedFrame {
                 let ty = self.ink_type(c, focused);
                 let full = p.caption_mode.as_deref() == Some("focused") && focused;
                 let width = if full {
-                    (ty.metrics(&ty.value(&row.label)).0.ceil() as u32 + 2)
+                    (ty.advance_width(&ty.value(&row.label)).ceil() as u32 + 2)
                         .max(aw)
                         .min(c.rect.2)
                 } else {
@@ -1788,7 +1844,7 @@ impl PreparedFrame {
             let base_width = aw;
             let full = p.caption_mode.as_deref() == Some("focused") && focused;
             let width = if full {
-                (ty.metrics(&ty.value(&row.label)).0.ceil() as u32 + 2)
+                (ty.advance_width(&ty.value(&row.label)).ceil() as u32 + 2)
                     .max(base_width)
                     .min(c.rect.2)
             } else {
@@ -2128,7 +2184,7 @@ impl PreparedFrame {
         let clock_w = if clock.is_empty() {
             0
         } else {
-            ty.metrics(&ty.value(clock)).0.ceil().max(0.0) as u32 + 2
+            ty.advance_width(&ty.value(clock)).ceil().max(0.0) as u32 + 2
         };
         if c.layout == Some(Arrangement::Horizontal) {
             let wifi = u32::from(input.status.network.is_some()) * 24;
@@ -2142,7 +2198,7 @@ impl PreparedFrame {
                     .map(|v| format!("{}{v}%", if input.status.charging { "+" } else { "" }))
                     .unwrap_or_default()
             };
-            let pw = ty.metrics(&percentage).0.ceil() as u32;
+            let pw = ty.advance_width(&percentage).ceil() as u32;
             let widths = [wifi, bat, pw, clock_w];
             let count = widths.iter().filter(|w| **w > 0).count() as u32;
             let used = widths.iter().sum::<u32>() + count.saturating_sub(1) * gap;
@@ -2320,7 +2376,7 @@ impl PreparedFrame {
         if hints.is_empty() {
             return Ok(());
         }
-        let measure = |text: &str| ty.metrics(&ty.value(text)).0.ceil() as u32;
+        let measure = |text: &str| ty.advance_width(&ty.value(text)).ceil() as u32;
         let badges: Vec<u32> = hints
             .iter()
             .map(|h| {
@@ -2441,7 +2497,7 @@ impl PreparedFrame {
         let stacked = c.layout == Some(Arrangement::Stacked);
         let reserve = records
             .iter()
-            .map(|(l, _)| label.metrics(&label.value(l)).0.ceil() as u32)
+            .map(|(l, _)| label.advance_width(&label.value(l)).ceil() as u32)
             .max()
             .unwrap_or(0)
             + p.value_gap.unwrap_or(if gap > 0 { gap } else { 12 });

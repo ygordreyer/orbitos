@@ -863,6 +863,7 @@ mod tests {
         assert!(parse_sidecar(&serde_json::to_vec(&changed).unwrap(), r4).is_none());
     }
     #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn verified_full_info_paginates_inside_actual_native_text_boxes() {
         use common::theme::{
             ThemeRuntime,

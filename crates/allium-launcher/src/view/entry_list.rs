@@ -1700,15 +1700,25 @@ where
                             .get_console(&game.path)
                             .map(|c| c.name.clone())
                             .unwrap_or_default();
-                        let mut details = crate::view::details::Details::new(game, &platform);
-                        if let Ok(Some(record)) = self.res.get::<Database>().select_game(&game.path)
-                        {
+                        let mut details = {
+                            let _trace = common::perf_trace::recording()
+                                .then(|| common::perf_trace::stage(common::perf_trace::Stage::DetailsMetadata));
+                            crate::view::details::Details::new(game, &platform)
+                        };
+                        let record = {
+                            let _trace = common::perf_trace::recording()
+                                .then(|| common::perf_trace::stage(common::perf_trace::Stage::DetailsDatabase));
+                            self.res.get::<Database>().select_game(&game.path)
+                        };
+                        if let Ok(Some(record)) = record {
                             details.add_history(
                                 record.play_count,
                                 record.play_time.num_minutes().max(0) as u64,
                             );
                         }
                         if let Some(handle) = crate::theme_adapter::snapshot(&self.res) {
+                            let _trace = common::perf_trace::recording()
+                                .then(|| common::perf_trace::stage(common::perf_trace::Stage::DetailsReflow));
                             details.reflow(&handle);
                         }
                         self.detail_action = 0;

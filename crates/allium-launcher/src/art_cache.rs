@@ -274,6 +274,7 @@ fn prepare_write(
     let mut total = 0u64;
     let mut candidates = Vec::new();
     let mut evictable = 0u64;
+    let mut evictable_bytes = 0u64;
     #[cfg(test)]
     INVENTORY_PASSES.with(|n| n.set(n.get() + 1));
     for entry in fs::read_dir(dir)? {
@@ -290,6 +291,7 @@ fn prepare_write(
             use std::os::unix::fs::MetadataExt;
             let allocated = metadata.blocks().saturating_mul(512);
             evictable = evictable.saturating_add(allocated);
+            evictable_bytes = evictable_bytes.saturating_add(metadata.len());
             candidates.push((!stale, modified, path, metadata.len(), allocated));
         }
     }
@@ -297,7 +299,8 @@ fn prepare_write(
     let mut candidates = candidates.into_iter();
     loop {
         let Some((available, block)) = space() else { return Ok(false); };
-        if !admitted(available.saturating_add(evictable), incoming, block) {
+        if total.saturating_sub(evictable_bytes).saturating_add(incoming) > DISK_BYTES
+            || !admitted(available.saturating_add(evictable), incoming, block) {
             return Ok(false);
         }
         if total.saturating_add(incoming) <= DISK_BYTES && admitted(available, incoming, block)
@@ -308,6 +311,7 @@ fn prepare_write(
         fs::remove_file(path)?;
         total = total.saturating_sub(bytes);
         evictable = evictable.saturating_sub(allocated);
+        evictable_bytes = evictable_bytes.saturating_sub(bytes);
     }
 }
 
@@ -377,7 +381,7 @@ mod tests {
         .unwrap();
         assert_ne!(different.hash, changed.hash);
         assert!(!prepare_write(&dir, DISK_BYTES + 1, || Some((u64::MAX, 4096))).unwrap());
-        assert!(!path.exists());
+        assert!(path.exists());
         assert!(source.exists());
         assert!(key.load(&source).is_none());
         key.store(&source, &pixels);
@@ -578,6 +582,14 @@ mod tests {
         File::create(&young).unwrap().set_len(DISK_BYTES).unwrap();
         assert!(!prepare_write(&dir.0, 1, || Some((u64::MAX, 4096))).unwrap());
         assert!(young.exists());
+        File::options().write(true).open(&young).unwrap().set_len(15 * 1024 * 1024).unwrap();
+        let valid = dir.key(b"valid").path(&dir.0);
+        fs::write(&valid, vec![1; 1024 * 1024]).unwrap();
+        let before: Vec<_> = fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().path()).collect();
+        assert!(!prepare_write(&dir.0, 2 * 1024 * 1024, || Some((512 * 1024 * 1024, 4096))).unwrap());
+        assert_eq!(fs::metadata(&young).unwrap().len(), 15 * 1024 * 1024);
+        assert_eq!(fs::read(&valid).unwrap(), vec![1; 1024 * 1024]);
+        assert!(before.iter().all(|p| p.exists()));
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]

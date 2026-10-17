@@ -7,6 +7,10 @@ use std::{
 };
 
 const COUNT_LEN: usize = 23;
+const STAGE_NAMES: [&str; 11] = [
+    "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
+    "disk_cache", "details_metadata", "details_database", "details_reflow",
+];
 const LOG_LIMIT: u64 = 256 * 1024;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy)]
@@ -55,14 +59,14 @@ pub enum Count {
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
-    stages: [u64; 8],
+    stages: [u64; STAGE_NAMES.len()],
     cpu: [u64; 8],
     counts: [u64; COUNT_LEN],
 }
 struct Trace {
     counts: [u64; COUNT_LEN],
-    stages: [u64; 8],
-    frame_stages: [u64; 8],
+    stages: [u64; STAGE_NAMES.len()],
+    frame_stages: [u64; STAGE_NAMES.len()],
     input_counts: [u64; COUNT_LEN],
     input_cpu: [u64; 8],
     generation: u64,
@@ -71,8 +75,8 @@ struct Trace {
     first_feedback_us: u64,
     final_content_us: u64,
     completed_input: Option<InputTotals>,
-    stage_begin: [u64; 8],
-    stage_end: [u64; 8],
+    stage_begin: [u64; STAGE_NAMES.len()],
+    stage_end: [u64; STAGE_NAMES.len()],
     file: File,
     path: String,
     cpu: [u64; 8],
@@ -118,8 +122,8 @@ fn install(path: &str) -> std::io::Result<()> {
             file,
             path: path.into(),
             counts: [0; COUNT_LEN],
-            stages: [0; 8],
-            frame_stages: [0; 8],
+            stages: [0; STAGE_NAMES.len()],
+            frame_stages: [0; STAGE_NAMES.len()],
             input_counts: [0; COUNT_LEN],
             input_cpu: [0; 8],
             generation: 0,
@@ -128,8 +132,8 @@ fn install(path: &str) -> std::io::Result<()> {
             first_feedback_us: 0,
             final_content_us: 0,
             completed_input: None,
-            stage_begin: [0; 8],
-            stage_end: [0; 8],
+            stage_begin: [0; STAGE_NAMES.len()],
+            stage_end: [0; STAGE_NAMES.len()],
             cpu: [0; 8],
             hits: [0; 3],
             started: None,
@@ -202,9 +206,9 @@ pub fn phase(phase: Phase) -> PhaseGuard {
             trace.input_counts = [0; COUNT_LEN];
             trace.input_cpu = [0; 8];
             trace.cpu = [0; 8];
-            trace.stages = [0; 8];
-            trace.stage_begin = [0; 8];
-            trace.stage_end = [0; 8];
+            trace.stages = [0; STAGE_NAMES.len()];
+            trace.stage_begin = [0; STAGE_NAMES.len()];
+            trace.stage_end = [0; STAGE_NAMES.len()];
         }
         Some(Timing {
             start: thread_cpu_ns(),
@@ -269,7 +273,7 @@ pub fn begin_render() {
     TRACE.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
             t.cpu = [0; 8];
-            t.frame_stages = [0; 8];
+            t.frame_stages = [0; STAGE_NAMES.len()];
             t.hits = [0; 3];
             t.counts = [0; COUNT_LEN];
             t.started = Some(Instant::now());
@@ -402,26 +406,31 @@ mod tests {
         let before = probe_counts()["measurement"]["dropped_trace_lines"].as_u64().unwrap_or(0);
         let holder = OpenOptions::new().append(true).open(&path).unwrap();
         assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
-        let (ready, wait) = std::sync::mpsc::channel();
+        let (done, wait) = std::sync::mpsc::channel();
         let target = path.clone();
         let worker = std::thread::spawn(move || {
             let mut file = OpenOptions::new().append(true).open(target).unwrap();
-            ready.send(()).unwrap();
             let start = Instant::now();
             append_line(&mut file, b"{\"event\":\"must_drop\"}\n", true).unwrap();
-            start.elapsed()
+            done.send(start.elapsed()).unwrap();
         });
-        wait.recv().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let elapsed = match wait.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(elapsed) => elapsed,
+            Err(error) => {
+                assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+                worker.join().unwrap();
+                panic!("contended append must complete while the lock is held: {error}");
+            }
+        };
+        assert!(elapsed < std::time::Duration::from_millis(100), "contended append waited {elapsed:?}");
         let while_locked = std::fs::read_to_string(&path).unwrap();
         assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
-        let elapsed = worker.join().unwrap();
+        worker.join().unwrap();
         let after_append = std::fs::read_to_string(&path).unwrap();
         drawn_frame();
         let data = std::fs::read_to_string(&path).unwrap();
         TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
-        assert!(elapsed < std::time::Duration::from_millis(100), "contended append waited {elapsed:?}");
         assert!(while_locked.is_empty());
         assert!(after_append.is_empty(), "a dropped record must not publish any bytes");
         let row: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
@@ -851,6 +860,9 @@ pub enum Stage {
     Raster,
     Present,
     DiskCache,
+    DetailsMetadata,
+    DetailsDatabase,
+    DetailsReflow,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -905,18 +917,7 @@ impl Drop for StageGuard {
 }
 fn stage_values(trace: &Trace) -> serde_json::Value {
     let mut stages = serde_json::Map::new();
-    for (i, name) in [
-        "selection",
-        "selected_info",
-        "artwork_lookup",
-        "decode",
-        "layout",
-        "raster",
-        "present",
-        "disk_cache",
-    ]
-    .iter()
-    .enumerate()
+    for (i, name) in STAGE_NAMES.iter().enumerate()
     {
         stages.insert((*name).into(), serde_json::json!({"wall_us":trace.stages[i],"begin_monotonic_us":trace.stage_begin[i],"end_monotonic_us":trace.stage_end[i]}));
     }
@@ -948,6 +949,9 @@ mod latency_stage_tests {
         {
             let _input = phase(Phase::Input);
             let _selection = stage(Stage::Selection);
+            for which in [Stage::DetailsMetadata, Stage::DetailsDatabase, Stage::DetailsReflow] {
+                let _stage = stage(which);
+            }
         }
         begin_render();
         for which in [
@@ -969,6 +973,9 @@ mod latency_stage_tests {
         assert!(input > 0);
         for name in [
             "selection",
+            "details_metadata",
+            "details_database",
+            "details_reflow",
             "selected_info",
             "artwork_lookup",
             "layout",
@@ -1001,7 +1008,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
         "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts},
         "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes"],
-        "stage_names": ["selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present", "disk_cache"],
+        "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })
 }
