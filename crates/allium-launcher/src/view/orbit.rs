@@ -100,6 +100,8 @@ pub(crate) enum WarmArt {
 #[derive(Debug)]
 struct CompletedTask {
     key: super::art_queue::AssetKey,
+    admission_rejected: bool,
+    missing: bool,
     // Dedupe must not retain metadata after the common cache evicts its record.
     metadata: Option<std::sync::Weak<common::media::Metadata>>,
 }
@@ -408,7 +410,7 @@ impl Orbit {
         if common::perf_trace::recording() {
             let missed = |task: WarmArt| {
                 let key = task.key();
-                self.completed_tasks.iter().any(|completed| completed.key == key)
+                self.completed_tasks.iter().any(|completed| completed.key == key && completed.missing)
             };
             if let Some(entry) = entries.get(selected) {
                 art.completed_misses.selected_cover = art.selected_cover.is_none()
@@ -507,7 +509,7 @@ impl Orbit {
         }
     }
 
-    fn insert_cached(&mut self, item: CachedArt) {
+    fn insert_cached(&mut self, item: CachedArt) -> bool {
         let bytes = item.image.as_ref().map_or(0, |image| image.data().len());
         while self.cache.len() >= CACHE_ENTRIES
             || self.source_bytes() + bytes > self.source_budget()
@@ -517,13 +519,23 @@ impl Orbit {
                 .iter()
                 .rposition(|item| !self.protected_paths.contains(&item.path))
             else {
-                return;
+                // The soft allowance is shared with inactive lists and retained frame sources.
+                // Visible sources must survive until the next frame releases those references.
+                let resident_bytes: usize = self.cache.iter().filter_map(|item| item.image.as_ref())
+                    .map(|image| image.data().len()).sum();
+                if self.protected_paths.contains(&item.path) && resident_bytes + bytes <= CACHE_PIXEL_BYTES {
+                    break;
+                }
+                common::perf_trace::count(common::perf_trace::Count::ArtAdmissionRejected, 1);
+                common::perf_trace::count(common::perf_trace::Count::ArtAdmissionRejectedBytes, bytes as u64);
+                return false;
             };
             let old = self.cache.remove(index).unwrap();
             self.retire(old);
         }
         self.cache.push_front(item);
         self.source_bytes();
+        true
     }
 
     fn source_budget(&self) -> usize {
@@ -617,6 +629,7 @@ impl Orbit {
     }
 
     pub(crate) fn cancel_selection(&mut self) {
+        self.completed_tasks.retain(|task| !task.admission_rejected);
         self.worker_epoch = self.worker_epoch.wrapping_add(1);
         self.cancellation
             .store(self.worker_epoch, std::sync::atomic::Ordering::Release);
@@ -638,6 +651,20 @@ impl Orbit {
     #[cfg(test)]
     pub(crate) fn cache_entries(&self) -> usize {
         self.cache.len()
+    }
+
+    #[cfg(all(test, feature = "perf-bench"))]
+    pub(crate) fn proof_source_cache(images: &[std::sync::Arc<Pixmap>]) -> Self {
+        let mut orbit = Self::new();
+        for (i, image) in images.iter().enumerate() {
+            let path = PathBuf::from(format!("inactive-{i}"));
+            orbit.protected_paths.push(path.clone());
+            orbit.insert_cached(CachedArt {
+                path,
+                image: Some(std::sync::Arc::new((**image).clone())),
+            });
+        }
+        orbit
     }
 
     pub fn should_draw(&self) -> bool {
@@ -1975,9 +2002,18 @@ impl Orbit {
                         METADATA_COMPLETIONS
                             .with(|generation| generation.set(generation.get().wrapping_add(1)));
                     }
+                    let missed = result.art.iter().all(|art| art.image.is_none());
+                    let visible = self.selected_path.as_ref() == Some(&result.path) || visible_cover;
+                    if visible {
+                        self.protected_paths
+                            .extend(result.art.iter().map(|item| item.path.clone()));
+                    }
+                    let mut rejected = false;
+                    for item in result.art {
+                        rejected |= !self.insert_cached(item);
+                    }
                     if let Some(task) = task.filter(|task| {
-                        matches!(task, WarmArt::Metadata(_))
-                            || result.art.iter().all(|art| art.image.is_none())
+                        matches!(task, WarmArt::Metadata(_)) || missed || rejected
                     }) {
                         let key = task.key();
                         let metadata = matches!(task, WarmArt::Metadata(_)).then(|| {
@@ -1991,14 +2027,10 @@ impl Orbit {
                             self.completed_tasks.pop_back();
                         }
                         self.completed_tasks
-                            .push_front(CompletedTask { key, metadata });
-                    }
-                    if self.selected_path.as_ref() == Some(&result.path) || visible_cover {
-                        self.protected_paths
-                            .extend(result.art.iter().map(|item| item.path.clone()));
-                    }
-                    for item in result.art {
-                        self.insert_cached(item);
+                            .push_front(CompletedTask {
+                                key, metadata, admission_rejected: rejected,
+                                missing: missed || (rejected && visible),
+                            });
                     }
                     #[cfg(feature = "perf-bench")]
                     {
@@ -2423,6 +2455,68 @@ mod network_media_tests {
 mod latency_tests {
     use super::*;
     #[test]
+    fn hero_visible_sources_survive_shared_budget_and_retained_frame() {
+        let theme: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../themes/orbit-hero/theme.json"
+        )).unwrap();
+        assert_eq!(theme["alignment"]["cover_shape"], "square");
+        let components = theme["screens"]["library"]["components"].as_array().unwrap();
+        let shelf = components.iter().find(|c| c["kind"] == "entries").unwrap();
+        let count = shelf["visible_count"].as_u64().unwrap() as usize;
+        assert_eq!(count, 3);
+        assert_eq!(shelf["paint"]["art"]["width"], 160);
+        assert!(shelf["paint"]["peek"].is_object());
+        let hero = components.iter().find(|c| c["binding"] == "selected_hero").unwrap();
+        let logo = components.iter().find(|c| c["binding"] == "selected_logo").unwrap();
+        assert_eq!(hero["rect"], serde_json::json!([24, 56, 592, 176]));
+        assert_eq!(logo["rect"], serde_json::json!([104, 96, 432, 80]));
+        // Ink keeps MEDIA.md sources, not component-sized rasters. Selected cover aliases a row.
+        let sizes: Vec<_> = [(640, 480), (480, 200)].into_iter()
+            .chain(std::iter::repeat_n((480, 480), count + 1)).collect();
+        let visible_bytes: usize = sizes.iter().map(|(w, h)| w * h * 4).sum();
+        assert_eq!(visible_bytes, 5_299_200);
+        let mut other = Orbit::new();
+        for (i, &(w, h)) in sizes.iter().enumerate() {
+            other.insert_cached(CachedArt {
+                path: format!("other-{i}").into(),
+                image: Some(std::sync::Arc::new(Pixmap::new(w as u32, h as u32).unwrap())),
+            });
+        }
+        let mut orbit = Orbit::new();
+        assert_eq!(orbit.source_budget(), 5_186_560);
+        assert_eq!(visible_bytes - orbit.source_budget(), 112_640);
+        let previous = std::sync::Arc::new(Pixmap::new(640, 480).unwrap());
+        orbit.insert_cached(CachedArt { path: "previous-hero".into(), image: Some(previous.clone()) });
+        for (i, &(w, h)) in sizes.iter().enumerate() {
+            let path = PathBuf::from(format!("visible-{i}"));
+            orbit.protected_paths.push(path.clone());
+            orbit.insert_cached(CachedArt {
+                path,
+                image: Some(std::sync::Arc::new(Pixmap::new(w as u32, h as u32).unwrap())),
+            });
+        }
+        println!("HERO_BYTES visible={visible_bytes} budget={} retired={} total={}",
+            orbit.source_budget(), previous.data().len(), orbit.source_bytes());
+        assert_eq!(orbit.cache.len(), sizes.len(), "visible source silently dropped");
+        assert_eq!(orbit.source_bytes(), visible_bytes + previous.data().len());
+        drop(previous);
+        assert_eq!(orbit.source_bytes(), visible_bytes);
+    }
+    #[test]
+    fn protected_source_admission_still_has_a_hard_pixel_limit() {
+        let mut orbit = Orbit::new();
+        for i in 0..10 {
+            let path = PathBuf::from(format!("visible-{i}"));
+            orbit.protected_paths.push(path.clone());
+            assert_eq!(orbit.insert_cached(CachedArt {
+                path,
+                image: Some(std::sync::Arc::new(Pixmap::new(480, 480).unwrap())),
+            }), i < 7);
+            assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
+        }
+        assert_eq!(orbit.cache.len(), 7);
+    }
+    #[test]
     #[cfg(feature = "perf-bench")]
     fn pack_sized_media_decode_once_without_resize_or_disk_cache() {
         let root = std::env::temp_dir().join(format!("allium-packed-art-{}", std::process::id()));
@@ -2563,6 +2657,53 @@ mod demand_queue_tests {
             assert!(std::time::Instant::now() < deadline, "worker timeout");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+    #[test]
+    #[cfg(feature = "perf-bench")]
+    #[serial_test::serial(orbit_fixture)]
+    fn admission_rejection_is_deduplicated_until_selection_changes() {
+        let root = std::env::temp_dir().join(format!("allium-admission-retry-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        Pixmap::new(640, 480).unwrap().save_png(root.join("Imgs/Next.hero.png")).unwrap();
+        let entry = Entry::Game(crate::entry::game::Game::new(root.join("Next.sfc")));
+        common::media::invalidate();
+        let mut orbit = Orbit::new();
+        orbit.set_ink_art(true);
+        for i in 0..7 {
+            let path = PathBuf::from(format!("protected-{i}"));
+            orbit.protected_paths.push(path.clone());
+            assert!(orbit.insert_cached(CachedArt {
+                path,
+                image: Some(Arc::new(Pixmap::new(480, 480).unwrap())),
+            }));
+        }
+        common::perf_trace::start_probe(root.join("trace.log").to_str().unwrap());
+        { let _input = common::perf_trace::phase(common::perf_trace::Phase::Input); }
+        let tasks = VecDeque::from([WarmArt::Hero(entry.clone())]);
+        drain(&mut orbit, &mut tasks.clone());
+        assert!(orbit.image(&entry, "heroes").is_none());
+        assert!(orbit.completed_tasks[0].admission_rejected);
+        assert!(!orbit.theme_art(&[entry.clone()], 0, 0, 1).completed_misses.selected_hero,
+            "a rejected prediction must not mark the future selection ready");
+        for _ in 0..8 {
+            let mut repeated = tasks.clone();
+            assert!(!orbit.warm_art_step(&mut repeated));
+            assert!(repeated.is_empty());
+            assert!(!orbit.art_pending());
+        }
+        let measurement = common::perf_trace::probe_counts()["measurement"].clone();
+        let names = measurement["counter_names"].as_array().unwrap();
+        for (name, expected) in [("art_admission_rejected", 1), ("art_admission_rejected_bytes", 1_228_800)] {
+            let index = names.iter().position(|n| n == name).unwrap();
+            assert_eq!(measurement["input"]["counters"][index], expected);
+        }
+        orbit.protect_selected(&entry);
+        drain(&mut orbit, &mut tasks.clone());
+        assert!(orbit.image(&entry, "heroes").is_some());
+        assert!(orbit.completed_tasks.is_empty());
+        assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]

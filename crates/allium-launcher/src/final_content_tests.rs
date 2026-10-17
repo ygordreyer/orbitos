@@ -119,6 +119,71 @@ async fn pending_cover_and_logo_do_not_record_final_content() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(orbit_fixture)]
+async fn hero_over_soft_budget_completes_without_repeated_visible_artwork() {
+    let (dir, mut app) = missing_art_launcher();
+    for (kind, w, h) in [("covers", 480, 480), ("backgrounds", 640, 480), ("logos", 480, 200)] {
+        std::fs::create_dir_all(dir.0.join("media").join(kind)).unwrap();
+        for (i, name) in ["Alpha", "Beta", "Delta", "Gamma"].into_iter().enumerate() {
+            let mut pixels = tiny_skia::Pixmap::new(w, h).unwrap();
+            pixels.fill(tiny_skia::Color::from_rgba8(40 + i as u8 * 30, 90, 120, 255));
+            pixels.save_png(dir.0.join(format!("media/{kind}/{name}.png"))).unwrap();
+        }
+    }
+    common::media::invalidate();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    app.present_frame(false, &mut false).await.unwrap();
+    while app.view.idle_media_step() {
+        app.present_frame(false, &mut false).await.unwrap();
+        assert!(Instant::now() < deadline, "initial artwork timeout");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    app.present_frame(false, &mut false).await.unwrap();
+    assert!(app.view.content_complete());
+    let previous = app.view.proof_game_theme_inputs();
+    let art = &previous[0].art;
+    assert!(art.next_cover_expected);
+    let mut sources: Vec<_> = art.entries.values().cloned().collect();
+    sources.extend([art.next_cover.clone().unwrap(), art.selected_logo.clone().unwrap(),
+        art.selected_hero.clone().unwrap(), art.selected_hero.clone().unwrap()]);
+    // An inactive list with its speculative hero consumes the shared allowance.
+    let inactive = crate::view::orbit::Orbit::proof_source_cache(&sources);
+    assert_eq!(inactive.cache_entries(), 7);
+    let path = dir.0.join("hero-pressure.trace");
+    common::perf_trace::start_probe(path.to_str().unwrap());
+    { let _input = common::perf_trace::phase(common::perf_trace::Phase::Input); }
+    common::perf_trace::selection(42, false);
+    let (tx, _rx) = tokio::sync::mpsc::channel(10);
+    app.view.handle_key_event(KeyEvent::Pressed(Key::Right), tx, &mut VecDeque::new()).await.unwrap();
+    app.present_frame(false, &mut false).await.unwrap();
+    crate::view::orbit::proof_art_completion();
+    let mut completions = std::collections::HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pending = app.view.idle_media_step();
+        if let Some(task) = crate::view::orbit::proof_art_completion() {
+            assert!(completions.insert(format!("{task:?}")), "repeated artwork: {task:?}");
+        }
+        app.present_frame(false, &mut false).await.unwrap();
+        assert!(Instant::now() < deadline, "Hero selection did not settle");
+        if !pending { break; }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let inputs = app.view.proof_game_theme_inputs();
+    assert!(inputs[0].art.selected_hero.is_some());
+    assert!(inputs[0].art.selected_logo.is_some());
+    assert_eq!(inputs[0].art.entries.len(), 3);
+    assert!(app.view.content_complete(), "{}", common::perf_trace::probe_counts()["measurement"]);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(rows.iter().filter(|r| r["event"] == "final_content" && r["selection_generation"] == 42).count(), 1);
+    for _ in 0..8 {
+        assert!(!app.view.idle_media_step());
+        assert!(crate::view::orbit::proof_art_completion().is_none());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
 async fn compact_plus_three_warm_games_present_once_per_down_press() {
     let dir = ALLIUM_GAMES_DIR.join("compact-plus-settled-fixture");
     assert!(!dir.exists());

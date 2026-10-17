@@ -102,6 +102,26 @@ pub(super) fn plan(
     let mut seen = HashSet::new();
     let mut push = |task: WarmArt| {
         if seen.insert(task.key()) {
+            if common::perf_trace::recording() {
+                use common::perf_trace::Count;
+                let kind = match &task {
+                    WarmArt::Hero(_) => Some(Count::ArtRequestHero),
+                    WarmArt::Logo(_) => Some(Count::ArtRequestLogo),
+                    WarmArt::Cover(entry) => Some(if entries.get(selected).is_some_and(|e| e.path() == entry.path()) {
+                        Count::ArtRequestCover
+                    } else if entries.get(first.saturating_add(count)).is_some_and(|e| e.path() == entry.path()) {
+                        Count::ArtRequestNext
+                    } else if entries.iter().skip(first).take(count).any(|e| e.path() == entry.path()) {
+                        Count::ArtRequestEntries
+                    } else {
+                        Count::ArtRequestCover
+                    }),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    common::perf_trace::count(kind, 1);
+                }
+            }
             work.push_back(task);
         }
     };
@@ -179,6 +199,27 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../themes/{id}/theme.json"));
         Pack::parse(&std::fs::read(path).unwrap()).unwrap()
+    }
+    #[test]
+    #[cfg(feature = "perf-bench")]
+    fn hero_request_counters_follow_deduplicated_plan_and_reset_per_input() {
+        let path = std::env::temp_dir().join(format!("allium-art-requests-{}.log", std::process::id()));
+        common::perf_trace::start_probe(path.to_str().unwrap());
+        { let _input = common::perf_trace::phase(common::perf_trace::Phase::Input); }
+        let pack = load_pack("orbit-hero");
+        let demand = Demand::from_components(&pack.screens[&ScreenId::Library].components, pack.ink());
+        plan(&games(), 1, 0, 3, 1, demand);
+        let measurement = common::perf_trace::probe_counts()["measurement"].clone();
+        let names = measurement["counter_names"].as_array().unwrap();
+        for (name, expected) in [("art_request_hero", 3), ("art_request_logo", 3),
+            ("art_request_cover", 1), ("art_request_next", 1), ("art_request_entries", 2)] {
+            let index = names.iter().position(|n| n == name).unwrap();
+            assert_eq!(measurement["input"]["counters"][index], expected, "{name}");
+        }
+        { let _input = common::perf_trace::phase(common::perf_trace::Phase::Input); }
+        assert!(common::perf_trace::probe_counts()["measurement"]["input"]["counters"]
+            .as_array().unwrap().iter().all(|n| n == 0));
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn actual_screens_request_only_drawn_asset_kinds() {

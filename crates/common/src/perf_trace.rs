@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-const COUNT_LEN: usize = 23;
+const COUNT_LEN: usize = 30;
 const STAGE_NAMES: [&str; 11] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow",
@@ -56,6 +56,13 @@ pub enum Count {
     RestoreBytes,
     OpacityPixels,
     PreviewMaskBytes,
+    ArtAdmissionRejected,
+    ArtAdmissionRejectedBytes,
+    ArtRequestHero,
+    ArtRequestLogo,
+    ArtRequestCover,
+    ArtRequestNext,
+    ArtRequestEntries,
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
@@ -145,7 +152,7 @@ fn install(path: &str) -> std::io::Result<()> {
             damage_pixels: 0,
             render_reason: "none",
             present_reason: "none",
-            content_pending_reason: "ready",
+            content_pending_reason: "not_evaluated",
             next_cover_expected: false,
             missing_content_rows: 0,
         })
@@ -1007,7 +1014,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
         "final_content_us": (t.final_content_us != 0).then(|| t.final_content_us.saturating_sub(t.input_us)),
         "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes"],
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries"],
         "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })
@@ -1215,6 +1222,46 @@ impl Drop for TaskGuard {
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn worker_decode_trace_cannot_complete_foreground_selection() {
+        let path = std::env::temp_dir().join(format!("allium-worker-isolation-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = phase(Phase::Input); }
+        selection(26, false);
+        content_readiness("selected_logo", true, 0);
+        presented(26, false);
+        let worker_path = path.clone();
+        std::thread::Builder::new().name("allium-art".into()).spawn(move || {
+            install(worker_path.to_str().unwrap()).unwrap();
+            {
+                let _task = task("artwork", 26);
+                begin_render();
+                hit(ArtHit::Decode);
+                drawn_frame();
+            }
+            let values = probe_counts();
+            assert_eq!(values["measurement"]["selection_generation"], 0);
+            assert_eq!(values["measurement"]["content_pending_reason"], "not_evaluated");
+            assert_eq!(values["measurement"]["final_content_monotonic_us"], 0);
+        }).unwrap().join().unwrap();
+        assert_eq!(probe_counts()["measurement"]["content_pending_reason"], "selected_logo");
+        assert_eq!(probe_counts()["measurement"]["final_content_monotonic_us"], 0);
+        content_readiness("ready", true, 0);
+        presented(26, true);
+        presented(26, true);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let worker_frame = rows.iter().find(|r| r["event"] == "frame").unwrap();
+        assert_eq!(worker_frame["thread"], "allium-art");
+        assert_eq!(worker_frame["input_monotonic_us"], 0);
+        assert_eq!(worker_frame["flushed_pixels"], 0);
+        let task = rows.iter().find(|r| r["event"] == "task_completed").unwrap();
+        assert_eq!(task["selection_generation"], 26);
+        assert_eq!(task["measurement"]["selection_generation"], 0);
+        assert_eq!(rows.iter().filter(|r| r["event"] == "final_content").count(), 1);
+        TRACE.with(|state| *state.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn settlement_requires_presented_current_selection_and_is_deduplicated() {
         let path = std::env::temp_dir().join(format!("allium-settlement-{}.log", std::process::id()));
