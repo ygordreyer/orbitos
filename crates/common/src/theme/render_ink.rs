@@ -416,13 +416,19 @@ pub(super) struct TextRaster {
     overflow: Overflow,
     center: bool,
     guide: bool,
+    baseline: Option<(f32, f32)>,
     color: Color,
     synopsis: bool,
 }
 impl TextRaster {
     pub(super) fn bytes(&self) -> usize { self.rect.2 as usize * self.rect.3 as usize * 4 + self.key.len() }
     pub(super) fn pixels(&self) -> Result<Arc<Pixmap>> {
-        let Self { ty, value, rect, count, align, overflow, center, guide, color, .. } = self;
+        let Self { ty, value, rect, count, align, overflow, center, guide, baseline, color, .. } = self;
+        if let Some((x, baseline)) = baseline {
+            let mut pix = ink_pixmap(rect.2, rect.3)?;
+            raster(&mut pix, ty, value, *x, *baseline, *color);
+            return Ok(Arc::new(pix));
+        }
         let lines = if *guide {
             ty.guide_lines(value, rect.2, ty.guide_line_count(rect.3, *count))
         } else {
@@ -539,7 +545,7 @@ impl PreparedFrame {
         let key = format!("{key}:{:?}", ty.literal_color);
         let key = if guide { key + ":guide" } else { key };
         let request = || TextRaster {
-            key: key.clone(), ty: ty.clone(), value: value.clone(), rect, count, align, overflow, center, guide,
+            key: key.clone(), ty: ty.clone(), value: value.clone(), rect, count, align, overflow, center, guide, baseline: None,
             color: ty.literal_color.unwrap_or_else(|| self.color(ty.color)),
             synopsis: self.theme.pack().screens[&self.screen].components.iter()
                 .any(|c| c.id == id && c.binding == Some(Binding::SelectedBlurb)),
@@ -3236,3 +3242,7 @@ mod counter_wiring_tests {
 #[cfg(test)]
 #[path = "render_ink_warm_tests.rs"]
 mod warm_tests;
+
+#[cfg(test)]
+#[path = "render_ink_baseline_tests.rs"]
+mod baseline_tests;

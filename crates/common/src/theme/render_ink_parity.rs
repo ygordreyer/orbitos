@@ -180,32 +180,80 @@ impl PreparedFrame {
         align: Align,
         baseline: f32,
     ) -> Result<()> {
-        let _text = crate::perf_trace::recording()
-            .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
-        let value = ty
-            .lines(&ty.value(text), rect.2, 1, Overflow::Ellipsis)
-            .pop()
-            .unwrap_or_default();
-        let (_, left, right) = ty.metrics(&value);
-        let x = match align {
-            Align::Left => -left,
-            Align::Center => (rect.2 as f32 - left - right) / 2.0,
-            Align::Right => rect.2 as f32 - right,
-        };
-        let mut pixels = ink_pixmap(rect.2, rect.3)?;
-        raster(
-            &mut pixels,
-            ty,
-            &value,
-            x,
-            baseline - rect.1 as f32,
-            self.color(ty.color),
+        let color = self.color(ty.color);
+        let baseline = baseline - rect.1 as f32;
+        let input_key = format!(
+            "baseline:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{}:{}:{}:{:?}:{:?}:{:?}",
+            ty.family, ty.color, ty.size.to_bits(), ty.line, ty.weight,
+            ty.tracking.to_bits(), ty.upper, align, rect.2, rect.3,
+            baseline.to_bits(), color, ty.literal_color, text,
         );
+        let weak = self.theme.weak();
+        let collecting = collecting_text();
+        // The input key determines ellipsis and x; the suffix records x's exact bits without remeasuring hits.
+        let cached = if collecting { None } else { TEXT.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let index = cache.iter().position(|e| {
+                e.theme.ptr_eq(&weak) && e.theme.strong_count() > 0
+                    && e.key.rsplit_once(":x=").is_some_and(|(key, _)| key == input_key)
+            })?;
+            let e = cache.remove(index).unwrap();
+            let pixels = e.pixels.clone();
+            cache.push_front(e);
+            Some(pixels)
+        }) };
+        let pixels = if let Some(pixels) = cached {
+            crate::perf_trace::count(crate::perf_trace::Count::TextHit, 1);
+            pixels
+        } else {
+            if !collecting { crate::perf_trace::count(crate::perf_trace::Count::TextMiss, 1); }
+            let _text = crate::perf_trace::recording()
+                .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
+            let value = ty
+                .lines(&ty.value(text), rect.2, 1, Overflow::Ellipsis)
+                .pop()
+                .unwrap_or_default();
+            let (_, left, right) = ty.metrics(&value);
+            let x = match align {
+                Align::Left => -left,
+                Align::Center => (rect.2 as f32 - left - right) / 2.0,
+                Align::Right => rect.2 as f32 - right,
+            };
+            let mut pixels = ink_pixmap(rect.2, rect.3)?;
+            raster(&mut pixels, ty, &value, x, baseline, color);
+            let pixels = Arc::new(pixels);
+            let key = format!("{input_key}:x={}", x.to_bits());
+            let bytes = pixels.data().len() + key.len();
+            // Keep collection's immediate painting, and let the worker warm these same baseline keys.
+            if collecting {
+                TEXT_PLAN.with(|plan| plan.borrow_mut().as_mut().unwrap().push(TextRaster {
+                    key: key.clone(), ty: ty.clone(), value, rect, count: 1, align,
+                    overflow: Overflow::Ellipsis, center: false, guide: false,
+                    baseline: Some((x, baseline)), color, synopsis: false,
+                }));
+            }
+            if !collecting && bytes <= TEXT_LIMIT && !HERO_SCRATCH.get() {
+                TEXT.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let mut total = cache.iter()
+                        .map(|e| e.pixels.data().len() + e.key.len()).sum::<usize>();
+                    while !cache.is_empty() && total + bytes > TEXT_LIMIT {
+                        let entry = cache.pop_back().unwrap();
+                        total -= entry.pixels.data().len() + entry.key.len();
+                        if crate::perf_trace::recording() {
+                            crate::perf_trace::count(crate::perf_trace::Count::TextEviction, 1);
+                        }
+                    }
+                    cache.push_front(CachedText { theme: weak, key, pixels: pixels.clone() });
+                });
+            }
+            pixels
+        };
         crate::theme::render::ink_blit::bitmap(
             &mut self.pixels,
             rect.0 as i32,
             rect.1 as i32,
-            pixels.as_ref(),
+            pixels.as_ref().as_ref(),
         );
         self.text_boxes.push((id.into(), rect));
         Ok(())
