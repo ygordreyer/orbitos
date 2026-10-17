@@ -406,6 +406,9 @@ where
             self.idle_media_key = Some(key);
             self.idle_media_work =
                 super::art_queue::plan(&self.entries, selected, first, count, direction, demand);
+            if composed_screens[0] == common::theme::pack::ScreenId::GameDetail {
+                self.idle_media_work.retain(|task| task.entry().path() == self.entries[selected].path());
+            }
             self.idle_lower_work.clear();
             if self.details.is_some() {
                 let lower = super::art_queue::Demand::from_components(
@@ -2391,6 +2394,87 @@ pub(crate) mod ux4_tests {
             .iter()
             .any(|entry| matches!(entry, MenuEntry::Download(_)))
     }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn idle_details_only_selected_work_keeps_recents_neighbors_resident() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::ScreenId};
+        use super::super::orbit::{test_art_requests, WarmArt};
+        let root = common::constants::ALLIUM_GAMES_DIR.join("idle-details-selected");
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        std::fs::create_dir_all(root.join("media/logos")).unwrap();
+        let paths = (0..3).map(|i| {
+            let path = root.join(format!("Game {i}.chd"));
+            std::fs::write(&path, []).unwrap();
+            for file in [format!("Imgs/Game {i}.png"), format!("Imgs/Game {i}.hero.png"),
+                format!("media/logos/Game {i}.png")] {
+                let mut image = tiny_skia::Pixmap::new(64, 64).unwrap();
+                image.fill(tiny_skia::Color::from_rgba8(i * 100, 90, 120, 255));
+                image.save_png(root.join(file)).unwrap();
+            }
+            path
+        }).collect();
+        common::media::invalidate();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(
+            ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 603).unwrap();
+        let res = resources();
+        res.insert(Some(theme.clone()));
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, PathsSort { paths }).unwrap();
+        list.select(1);
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        let drain = |list: &mut EntryList<PathsSort>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while list.idle_media_step(&theme, ScreenId::Recents) {
+                if list.details.is_some() {
+                    assert!(list.idle_media_work.iter().all(|task|
+                        task.entry().path() == list.entries[1].path()), "queued a Details neighbour");
+                }
+                assert!(std::time::Instant::now() < deadline, "idle Details artwork timeout");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        drain(&mut list);
+        assert_eq!(list.orbit_cache_counts(), (9, 0));
+        let recents_targets = common::theme::art::Targets::for_screens(theme.pack(), &[ScreenId::Recents]);
+        let recents: Vec<_> = (0..3).map(|i| list.orbit.as_ref().unwrap()
+            .theme_art_for_targets(&list.entries, i, 0, 3, recents_targets)).collect();
+        assert!(recents.iter().all(|art| art.selected_hero.is_some()
+            && art.selected_logo.is_some() && art.selected_cover.is_some()));
+        let Entry::Game(game) = &list.entries[1] else { unreachable!() };
+        list.details = Some(crate::view::details::Details::cached(game, ""));
+        let requests = test_art_requests();
+        assert!(list.idle_media_step(&theme, ScreenId::Recents));
+        assert!(list.idle_media_work.iter().all(|task| task.entry().path() == list.entries[1].path()));
+        assert_eq!(list.idle_media_work.len(), 3);
+        assert!(matches!(&list.idle_media_work[0], WarmArt::Logo(_)));
+        assert!(matches!(&list.idle_media_work[1], WarmArt::Cover(_)));
+        assert!(matches!(&list.idle_media_work[2], WarmArt::Metadata(_)));
+        assert!(list.idle_lower_work.iter().all(|task| task.entry().path() == list.entries[1].path()));
+        assert_eq!(list.idle_lower_work.len(), 4);
+        drain(&mut list);
+        assert_eq!(test_art_requests() - requests, 3, "only selected Details images need loading");
+        let detail = list.theme_models(ScreenId::Recents, &theme).unwrap().pop().unwrap().art;
+        assert!(detail.selected_hero.is_some() && detail.selected_logo.is_some() && detail.selected_cover.is_some());
+        assert_eq!(list.orbit_cache_counts(), (12, 0));
+        list.details = None;
+        let requests = test_art_requests();
+        drain(&mut list);
+        assert_eq!(test_art_requests(), requests, "closing Details submitted a disk reload");
+        for (i, before) in recents.iter().enumerate() {
+            let after = list.orbit.as_ref().unwrap()
+                .theme_art_for_targets(&list.entries, i, 0, 3, recents_targets);
+            for (before, after) in [(&before.selected_hero, &after.selected_hero),
+                (&before.selected_logo, &after.selected_logo), (&before.selected_cover, &after.selected_cover)] {
+                assert!(std::sync::Arc::ptr_eq(before.as_ref().unwrap(), after.as_ref().unwrap()),
+                    "Recents artwork for game {i} left RAM");
+            }
+        }
+        list.release_theme_art();
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
     #[test]
     #[serial_test::serial(orbit_fixture)]
     fn artkeep_selection_while_details_open_and_generations_invalidate_both_screens() {
