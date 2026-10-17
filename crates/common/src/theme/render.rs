@@ -26,6 +26,9 @@ mod ink_blit;
 mod retained;
 #[path = "render_tiles.rs"]
 mod tiles;
+#[path = "render_details.rs"]
+mod details;
+pub use details::DetailImageWarm;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -620,31 +623,24 @@ impl PreparedFrame {
         self.text_boxes.push((id.into(), rect));
         Ok(())
     }
-    fn image_pixels_with_radius(
-        &self,
-        rect: Rect,
-        source: &std::sync::Arc<Pixmap>,
-        c: &Component,
-        radius: u32,
-    ) -> Result<std::sync::Arc<Pixmap>> {
-        let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::ComponentPrep);
+    fn image_key(&self, screen: ScreenId, rect: Rect, c: &Component, radius: u32) -> super::image_cache::ImageKey {
         let mask = self
             .theme
             .base()
             .0
             .image_masks
-            .get(&self.screen)
+            .get(&screen)
             .and_then(|m| m.get(&c.id));
         let background = (self.retained_layout
-            && self.screen == ScreenId::Library
+            && screen == ScreenId::Library
             && c.id == "hero")
             .then(|| {
                 let color = self.color(ColorRole::Background);
                 [color.r(), color.g(), color.b(), color.a()]
             });
-        let key = super::image_cache::ImageKey {
+        super::image_cache::ImageKey {
             generation: self.theme.generation(),
-            screen: self.screen,
+            screen,
             component: c.id.clone(),
             width: rect.2,
             height: rect.3,
@@ -655,7 +651,68 @@ impl PreparedFrame {
             fade_width: c.fade_width,
             mask: mask.map_or(0, |pixels| pixels as *const Pixmap as usize),
             background,
-        };
+        }
+    }
+    fn transform_image(theme: &ThemeHandle, key: &super::image_cache::ImageKey, source: &std::sync::Arc<Pixmap>) -> Result<std::sync::Arc<Pixmap>> {
+        let mut image = super::runtime::fit_image(
+            source,
+            key.width,
+            key.height,
+            key.fit,
+        )?;
+        super::runtime::blur(&mut image, key.blur)?;
+        super::runtime::rounded(&mut image, key.radius);
+        if key.fade_edge == Some(FadeEdge::Left) {
+            let width = key.fade_width.unwrap();
+            for y in 0..key.height {
+                for x in 0..width {
+                    let at = ((y * key.width + x) * 4) as usize;
+                    let fraction = x as f32 / width as f32;
+                    for channel in &mut image.data_mut()[at..at + 4] {
+                        *channel = (*channel as f32 * fraction).round() as u8;
+                    }
+                }
+            }
+        }
+        if let Some(mask) = theme
+            .base()
+            .0
+            .image_masks
+            .get(&key.screen)
+            .and_then(|m| m.get(&key.component))
+        {
+            super::runtime::alpha_mask(&mut image, mask)?;
+        }
+        if let Some(background) = key.background {
+            crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+            let mut opaque = Pixmap::new(key.width, key.height).unwrap();
+            opaque.fill(tiny_skia::Color::from_rgba8(
+                background[0],
+                background[1],
+                background[2],
+                background[3],
+            ));
+            super::blit::BlitMap::new(image.as_ref()).draw(
+                &mut opaque.as_mut(),
+                0,
+                0,
+                image.as_ref(),
+                1.0,
+                None,
+            );
+            image = opaque;
+        }
+        Ok(std::sync::Arc::new(image))
+    }
+    fn image_pixels_with_radius(
+        &self,
+        rect: Rect,
+        source: &std::sync::Arc<Pixmap>,
+        c: &Component,
+        radius: u32,
+    ) -> Result<std::sync::Arc<Pixmap>> {
+        let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::ComponentPrep);
+        let key = self.image_key(self.screen, rect, c, radius);
         if let Some(pixels) = self
             .theme
             .base()
@@ -676,58 +733,9 @@ impl PreparedFrame {
             .lock()
             .map_err(|_| anyhow::anyhow!("Image cache unavailable"))?
             .reserve(
-                rect.2 as usize * rect.3 as usize * 4 * if background.is_some() { 2 } else { 1 },
+                rect.2 as usize * rect.3 as usize * 4 * if key.background.is_some() { 2 } else { 1 },
             );
-        let mut image = super::runtime::fit_image(
-            source,
-            rect.2,
-            rect.3,
-            c.fit.unwrap_or(super::pack::Fit::Contain),
-        )?;
-        super::runtime::blur(&mut image, c.blur_radius.unwrap_or(0))?;
-        super::runtime::rounded(&mut image, radius);
-        if c.fade_edge == Some(FadeEdge::Left) {
-            let width = c.fade_width.unwrap();
-            for y in 0..rect.3 {
-                for x in 0..width {
-                    let at = ((y * rect.2 + x) * 4) as usize;
-                    let fraction = x as f32 / width as f32;
-                    for channel in &mut image.data_mut()[at..at + 4] {
-                        *channel = (*channel as f32 * fraction).round() as u8;
-                    }
-                }
-            }
-        }
-        if let Some(mask) = self
-            .theme
-            .base()
-            .0
-            .image_masks
-            .get(&self.screen)
-            .and_then(|m| m.get(&c.id))
-        {
-            super::runtime::alpha_mask(&mut image, mask)?;
-        }
-        if let Some(background) = background {
-            crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
-            let mut opaque = Pixmap::new(rect.2, rect.3).unwrap();
-            opaque.fill(tiny_skia::Color::from_rgba8(
-                background[0],
-                background[1],
-                background[2],
-                background[3],
-            ));
-            super::blit::BlitMap::new(image.as_ref()).draw(
-                &mut opaque.as_mut(),
-                0,
-                0,
-                image.as_ref(),
-                1.0,
-                None,
-            );
-            image = opaque;
-        }
-        let image = std::sync::Arc::new(image);
+        let image = Self::transform_image(&self.theme, &key, source)?;
         self.theme
             .base()
             .0
@@ -781,6 +789,27 @@ impl PreparedFrame {
             1.0,
         );
     }
+    fn logo_rect(c: &Component, source: &Pixmap) -> Rect {
+        let target = super::art::Target { width: c.rect.2, height: c.rect.3, fit: super::pack::Fit::Contain, logo_box: true }
+            .logo(source.width(), source.height());
+        let (width, height) = (target.width, target.height);
+        let align = c.align.or_else(|| c.paint.as_ref().and_then(|p| p.anchor)).unwrap_or(Align::Left);
+        let x = c.rect.0 + match align {
+            Align::Left => 0,
+            Align::Center => (c.rect.2 - width) / 2,
+            Align::Right => c.rect.2 - width,
+        };
+        Rect(x, c.rect.1 + (c.rect.3 - height) / 2, width, height)
+    }
+    fn ink_image_component(&self, c: &Component) -> Component {
+        let mut image = c.clone();
+        if c.binding != Some(Binding::SelectedHero) {
+            image.fit = Some(if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {
+                super::pack::Fit::Cover
+            } else { super::pack::Fit::Contain });
+        }
+        image
+    }
     fn logo(&mut self, c: &Component, input: &FrameInputs) -> Result<bool> {
         if super::logo_suppressed_by_cover(c, input) {
             return Ok(false);
@@ -788,20 +817,7 @@ impl PreparedFrame {
         let Some(source) = input.art.selected_logo.as_ref() else {
             return Ok(false);
         };
-        let target = super::art::Target { width: c.rect.2, height: c.rect.3, fit: super::pack::Fit::Contain, logo_box: true }
-            .logo(source.width(), source.height());
-        let (width, height) = (target.width, target.height);
-        let align = c
-            .align
-            .or_else(|| c.paint.as_ref().and_then(|p| p.anchor))
-            .unwrap_or(Align::Left);
-        let x = c.rect.0
-            + match align {
-                Align::Left => 0,
-                Align::Center => (c.rect.2 - width) / 2,
-                Align::Right => c.rect.2 - width,
-            };
-        let rect = Rect(x, c.rect.1 + (c.rect.3 - height) / 2, width, height);
+        let rect = Self::logo_rect(c, source);
         let mut slot = c.clone();
         slot.fit = Some(super::pack::Fit::Contain);
         slot.radius = Some(0);

@@ -1069,18 +1069,7 @@ impl PreparedFrame {
                         if let Some(shadow) = &p.shadow {
                             self.ink_shadow(c.rect, c.radius.unwrap_or(0), shadow);
                         }
-                        let mut image_c = c.clone();
-                        if c.binding != Some(Binding::SelectedHero) {
-                            image_c.fit = Some(
-                                if self.theme.pack().alignment.as_ref().unwrap().cover_shape
-                                    == "square"
-                                {
-                                    crate::theme::pack::Fit::Cover
-                                } else {
-                                    crate::theme::pack::Fit::Contain
-                                },
-                            );
-                        }
+                        let image_c = self.ink_image_component(c);
                         let image = self.image_pixels(c.rect, source, &image_c)?;
                         self.draw_image(c.rect, &image);
                         if let Some(b) = &p.border {

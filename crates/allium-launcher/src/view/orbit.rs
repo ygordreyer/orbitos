@@ -101,6 +101,7 @@ pub(crate) enum WarmArt {
 
 #[derive(Debug)]
 struct CompletedTask {
+    targets: ArtTargets,
     key: super::art_queue::AssetKey,
     admission_rejected: bool,
     missing: bool,
@@ -237,11 +238,11 @@ impl Orbit {
             self.targets = targets;
         }
     }
-    fn task_target(&self, task: &WarmArt) -> Option<ArtTarget> {
+    fn task_target(task: &WarmArt, targets: ArtTargets) -> Option<ArtTarget> {
         match task {
-            WarmArt::Hero(_) => self.targets.hero,
-            WarmArt::Logo(_) => self.targets.logo,
-            WarmArt::Cover(_) | WarmArt::CoverFallback(_) | WarmArt::OtherCover(_) => self.targets.cover,
+            WarmArt::Hero(_) => targets.hero,
+            WarmArt::Logo(_) => targets.logo,
+            WarmArt::Cover(_) | WarmArt::CoverFallback(_) | WarmArt::OtherCover(_) => targets.cover,
             WarmArt::Metadata(_) => None,
         }
     }
@@ -413,19 +414,22 @@ impl Orbit {
         first: usize,
         count: usize,
     ) -> common::theme::frame::Art {
+        self.theme_art_for_targets(entries, selected, first, count, self.targets)
+    }
+    pub(crate) fn theme_art_for_targets(&self, entries: &[Entry], selected: usize, first: usize, count: usize, targets: ArtTargets) -> common::theme::frame::Art {
         let _stage = common::perf_trace::stage(common::perf_trace::Stage::ArtworkLookup);
         let mut art = common::theme::frame::Art::default();
         if let Some(entry) = entries.get(selected) {
-            art.selected_logo = self.cached_variant(&art_path(entry, "logos"), self.targets.logo).cloned();
-            art.selected_hero = self.image(entry, "heroes").cloned();
-            art.selected_cover = self.theme_cover_image(entry).cloned();
+            art.selected_logo = self.cached_variant(&art_path(entry, "logos"), targets.logo).cloned();
+            art.selected_hero = self.cached_variant(&art_path(entry, "heroes"), if self.ink_art { targets.hero } else { None }).cloned();
+            art.selected_cover = self.cached_variant(&self.cover_path(entry), targets.cover).cloned();
         }
         if let Some(next) = peek_game(entries, first, count) {
             art.next_cover_expected = true;
-            art.next_cover = self.theme_cover_image(&entries[next]).cloned();
+            art.next_cover = self.cached_variant(&self.cover_path(&entries[next]), targets.cover).cloned();
         }
         for entry in entries.iter().skip(first).take(count) {
-            if let Some(image) = self.theme_cover_image(entry) {
+            if let Some(image) = self.cached_variant(&self.cover_path(entry), targets.cover) {
                 art.entries
                     .insert(crate::theme_adapter::entry_id(entry.path()), image.clone());
             }
@@ -433,7 +437,7 @@ impl Orbit {
         if common::perf_trace::recording() {
             let missed = |task: WarmArt| {
                 let key = task.key();
-                self.completed_tasks.iter().any(|completed| completed.key == key && completed.missing)
+                self.completed_tasks.iter().any(|completed| completed.key == key && completed.targets == targets && completed.missing)
             };
             if let Some(entry) = entries.get(selected) {
                 art.completed_misses.selected_cover = art.selected_cover.is_none()
@@ -448,16 +452,12 @@ impl Orbit {
                     && missed(WarmArt::Cover(entries[next].clone()));
             }
             for entry in entries.iter().skip(first).take(count) {
-                if self.theme_cover_image(entry).is_none() && missed(WarmArt::Cover(entry.clone())) {
+                if self.cached_variant(&self.cover_path(entry), targets.cover).is_none() && missed(WarmArt::Cover(entry.clone())) {
                     art.completed_misses.entries.insert(crate::theme_adapter::entry_id(entry.path()));
                 }
             }
         }
         art
-    }
-
-    fn theme_cover_image(&self, entry: &Entry) -> Option<&std::sync::Arc<Pixmap>> {
-        self.cached_variant(&self.cover_path(entry), self.targets.cover)
     }
 
     fn cached_image(&self, path: &Path) -> Option<&std::sync::Arc<Pixmap>> {
@@ -1916,6 +1916,7 @@ pub(crate) async fn art_ready() {
     else { std::future::pending::<()>().await; }
 }
 struct ArtResult {
+    targets: ArtTargets,
     owner: u64,
     epoch: u64,
     task: WarmArt,
@@ -2036,6 +2037,7 @@ fn worker() -> ArtWorker {
                 let rejected = bound_result_art(&mut orbit.cache);
                 let bytes = orbit.cache.iter().filter_map(|art| art.image.as_ref()).map(|image| image.data().len()).sum();
                 let result = ArtResult {
+                    targets: job.targets,
                     owner: job.owner,
                     epoch: job.epoch,
                     task: job.task,
@@ -2090,6 +2092,9 @@ impl Orbit {
             })
     }
     pub(crate) fn warm_art_step(&mut self, work: &mut VecDeque<WarmArt>) -> bool {
+        self.warm_art_step_for_targets(work, self.targets)
+    }
+    pub(crate) fn warm_art_step_for_targets(&mut self, work: &mut VecDeque<WarmArt>, targets: ArtTargets) -> bool {
         self.refresh_art();
         ART_WORKER.with(|state| {
             let mut state = state.borrow_mut();
@@ -2148,7 +2153,7 @@ impl Orbit {
                         }
                         self.completed_tasks
                             .push_front(CompletedTask {
-                                key, metadata, admission_rejected: rejected,
+                                targets: result.targets, key, metadata, admission_rejected: rejected,
                                 missing: missed || (rejected && visible),
                             });
                     }
@@ -2180,7 +2185,7 @@ impl Orbit {
                 if self
                     .completed_tasks
                     .iter()
-                    .any(|completed| completed.key == key && completed.is_resident(&task))
+                    .any(|completed| completed.key == key && completed.targets == targets && completed.is_resident(&task))
                 {
                     continue;
                 }
@@ -2204,7 +2209,7 @@ impl Orbit {
                 // A missing path has to be resolved by the worker at least once.
                 if let Some(index) = path
                     .as_ref()
-                    .and_then(|path| self.cache.iter().position(|item| &item.path == path && item.target == self.task_target(&task)))
+                    .and_then(|path| self.cache.iter().position(|item| &item.path == path && item.target == Self::task_target(&task, targets)))
                 {
                     let item = self.cache.remove(index).unwrap();
                     self.cache.push_front(item);
@@ -2252,7 +2257,7 @@ impl Orbit {
                     started: TEST_ART_STARTED.with(|slot| slot.borrow().clone()),
                     ink: self.ink_art,
                     tall: self.tall_art,
-                    targets: self.targets,
+                    targets,
                     task: task.clone(),
                     network_paths,
                     container,
@@ -3398,7 +3403,7 @@ mod pipeline_tests {
         assert!(art.is_empty());
         let mut orbit = Orbit::new();
         let task = WarmArt::Cover(Entry::Game(crate::entry::game::Game::new("rejected".into())));
-        orbit.completed_tasks.push_back(CompletedTask { key: task.key(), admission_rejected: true, missing: true, metadata: None });
+        orbit.completed_tasks.push_back(CompletedTask { targets: orbit.targets, key: task.key(), admission_rejected: true, missing: true, metadata: None });
         orbit.cancel_selection();
         assert!(orbit.completed_tasks.is_empty());
         let account = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

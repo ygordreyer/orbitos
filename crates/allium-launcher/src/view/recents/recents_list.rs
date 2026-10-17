@@ -41,6 +41,10 @@ impl RecentsList {
         self.list.navigation_warm_ready()
     }
 
+    pub(crate) fn details_warm_model(&mut self, handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId) -> Option<super::super::entry_list::NavigationWarm> {
+        self.list.details_warm_model(handle, screen)
+    }
+
     pub(crate) fn navigation_warm_model(
         &mut self,
         handle: &common::theme::ThemeHandle,

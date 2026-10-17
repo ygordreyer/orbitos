@@ -49,6 +49,10 @@ impl Games {
     pub(crate) fn clear_theme(&mut self) -> Result<()> {
         self.list.clear_theme()
     }
+    pub(crate) fn details_warm_model(&mut self, handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId) -> Option<super::entry_list::NavigationWarm> {
+        self.list.details_warm_model(handle, screen)
+    }
+
     pub(crate) fn navigation_warm_model(
         &mut self,
         handle: &common::theme::ThemeHandle,

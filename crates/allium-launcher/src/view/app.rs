@@ -156,6 +156,9 @@ enum NavigationWarmStage {
         VecDeque<common::theme::render::NavigationRasterWarm>,
     ),
     Rasters(VecDeque<common::theme::render::NavigationRasterWarm>),
+    DetailsArtwork(super::entry_list::NavigationWarm),
+    DetailsImages(common::theme::render::DetailImageWarm),
+    DetailShadows,
 }
 
 #[cfg(test)]
@@ -673,7 +676,9 @@ where
             None => "plan",
             Some(NavigationWarmStage::Artwork(_)) => "artwork",
             Some(NavigationWarmStage::Images(_, _)) => "image_transform",
-            Some(NavigationWarmStage::Rasters(rasters)) if rasters.is_empty() => "detail_shadow",
+            Some(NavigationWarmStage::DetailsArtwork(_)) => "details_artwork",
+            Some(NavigationWarmStage::DetailsImages(_)) => "details_image_transform",
+            Some(NavigationWarmStage::DetailShadows) => "detail_shadow",
             Some(NavigationWarmStage::Rasters(_)) => "raster",
         }
     }
@@ -781,14 +786,38 @@ where
             }
             NavigationWarmStage::Rasters(mut rasters) => {
                 let Some(raster) = rasters.pop_front() else {
-                    let done = self.detail_shadows.as_mut()
-                        .is_none_or(|shadows| frame.prewarm_detail_shadow_step(shadows));
-                    current.stage = NavigationWarmStage::Rasters(rasters);
+                    let plan = match self.selected {
+                        0 => self.views.0.details_warm_model(&handle, frame.screen()),
+                        1 => self.views.1.details_warm_model(&handle, frame.screen()),
+                        _ => None,
+                    };
+                    current.stage = plan.map(NavigationWarmStage::DetailsArtwork)
+                        .unwrap_or(NavigationWarmStage::DetailShadows);
                     *work = Some(current);
-                    return Ok(done);
+                    return Ok(false);
                 };
                 frame.prewarm_navigation_raster(raster)?;
                 NavigationWarmStage::Rasters(rasters)
+            }
+            NavigationWarmStage::DetailsArtwork(mut plan) => {
+                let ready = match self.selected {
+                    0 => self.views.0.navigation_warm_art_step(&mut plan),
+                    1 => self.views.1.navigation_warm_art_step(&mut plan),
+                    _ => return Ok(true),
+                };
+                if ready { NavigationWarmStage::DetailsImages(frame.detail_images(&plan.input)) }
+                else { NavigationWarmStage::DetailsArtwork(plan) }
+            }
+            NavigationWarmStage::DetailsImages(mut images) => {
+                if frame.prewarm_detail_image_step(&mut images)? { NavigationWarmStage::DetailShadows }
+                else { NavigationWarmStage::DetailsImages(images) }
+            }
+            NavigationWarmStage::DetailShadows => {
+                let done = self.detail_shadows.as_mut()
+                    .is_none_or(|shadows| frame.prewarm_detail_shadow_step(shadows));
+                current.stage = NavigationWarmStage::DetailShadows;
+                *work = Some(current);
+                return Ok(done);
             }
         };
         *work = Some(current);
@@ -1616,6 +1645,108 @@ mod integration_navigation_tests {
     use crate::consoles::ConsoleMapper;
     use common::database::Database;
     use common::theme::{ThemeHandle, fonts::FontBank, runtime::ThemeSnapshot};
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn selected_details_idle_images_match_cold_open_and_drop_on_selection_change() {
+        let root = common::constants::ALLIUM_GAMES_DIR.join("integration-details-warm");
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let database = Database::in_memory().unwrap();
+        for index in 0..2 {
+            let path = root.join(format!("Details {index}.chd"));
+            std::fs::write(&path, []).unwrap();
+            for (suffix, w, h) in [("orbit", 101, 101), ("hero", 360, 210), ("logo", 220, 96)] {
+                let mut art = tiny_skia::Pixmap::new(w, h).unwrap();
+                for (at, pixel) in art.data_mut().chunks_exact_mut(4).enumerate() {
+                    pixel.copy_from_slice(&[((at + index * 19) % 173) as u8, (at / 31 % 173) as u8, 91, 173]);
+                }
+                art.save_png(root.join(format!("Imgs/Details {index}.{suffix}.png"))).unwrap();
+                if suffix == "orbit" { art.save_png(root.join(format!("Imgs/Details {index}.png"))).unwrap(); }
+            }
+            let game: common::database::NewGame = crate::entry::game::Game::new(path).into();
+            database.update_games(&[game.clone()]).unwrap();
+            database.increment_play_count(&game).unwrap();
+        }
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        styles.recents.use_recents_carousel = false;
+        let mut map = type_map::TypeMap::new();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let bank = FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        let pack = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../themes/compact-plus").canonicalize().unwrap();
+        let handle = ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 901).unwrap();
+        res.insert(Some(handle.clone()));
+        let rect = Rect::new(0, 54, 640, 376);
+        let views = (
+            Recents::load_or_new(rect, res.clone(), None).unwrap(),
+            Games::load_or_new(rect, res.clone(), None).unwrap(),
+            Apps::load_or_new(rect, res.clone(), None).unwrap(),
+            Settings::new(rect, res.clone(), Default::default()).unwrap(),
+        );
+        let mut app = App::new(Rect::new(0, 0, 640, 480), res.clone(), views, 0,
+            DefaultPlatform::new().unwrap().battery().unwrap()).unwrap();
+        let mut display = <DefaultPlatform as Platform>::Display::default();
+        let style = res.get::<Stylesheet>().clone();
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        let mut work = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut saw_details = false;
+        loop {
+            // Artwork notifications are consumed by the normal media poll in the real loop.
+            app.idle_media_step();
+            if app.should_draw() {
+                app.prepare_theme().unwrap();
+                app.draw(&mut display, &style).unwrap();
+            }
+            let done = app.prewarm_navigation_step(&mut work, 1).unwrap();
+            saw_details |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsImages(_)));
+            if done { break; }
+            assert!(std::time::Instant::now() < deadline, "Details warm timeout");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(saw_details);
+        app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        let mut models = app.theme_models(&handle).unwrap().unwrap();
+        app.normalize_theme_inputs(&handle, &mut models);
+        let details = models.last().unwrap();
+        assert_eq!(details.screen, common::theme::pack::ScreenId::GameDetail);
+        assert_eq!(details.art.selected_cover.as_ref().unwrap().width(), 101);
+        assert_eq!(details.art.selected_hero.as_ref().unwrap().width(), 360);
+        #[cfg(feature = "perf-bench")]
+        {
+            common::perf_trace::start_probe(root.join("trace.log").to_str().unwrap());
+            common::perf_trace::begin_render();
+        }
+        let hot = common::theme::render::PreparedFrame::prepare(handle.clone(), details).unwrap();
+        #[cfg(feature = "perf-bench")]
+        assert_eq!(common::perf_trace::probe_counts()["image_misses"], 0);
+        let cold_theme = ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 902).unwrap();
+        let cold = common::theme::render::PreparedFrame::prepare(cold_theme, details).unwrap();
+        assert_eq!(hot.pixels().data(), cold.pixels().data());
+        app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        app.prepare_theme().unwrap();
+        app.draw(&mut display, &style).unwrap();
+        work = None;
+        while !matches!(work.as_ref().map(|w: &NavigationWarm| &w.stage), Some(NavigationWarmStage::DetailsImages(_))) {
+            assert!(!app.prewarm_navigation_step(&mut work, 1).unwrap());
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(!app.prewarm_navigation_step_with_pending(&mut work, 1, || true).unwrap());
+        assert!(matches!(work.as_ref().unwrap().stage, NavigationWarmStage::DetailsImages(_)));
+        app.handle_key_event(KeyEvent::Pressed(Key::Down), tx, &mut VecDeque::new()).await.unwrap();
+        app.prewarm_navigation_step(&mut work, 1).unwrap();
+        assert!(work.is_none(), "selection change retained speculative Details work");
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(orbit_fixture)]

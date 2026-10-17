@@ -44,10 +44,19 @@ pub(super) fn source_identity(source: &Arc<Pixmap>) -> SourceIdentity {
     })
 }
 
+pub(super) fn remember_source_identity(source: &Arc<Pixmap>, identity: SourceIdentity) {
+    IDENTITIES.with(|identities| {
+        let mut identities = identities.borrow_mut();
+        identities.retain(|(held, _)| held.strong_count() > 0 && !held.ptr_eq(&Arc::downgrade(source)));
+        if identities.len() >= 128 { identities.pop_back(); }
+        identities.push_front((Arc::downgrade(source), identity));
+    });
+}
+
 const PIXEL_LIMIT: usize = 1536 * 1024;
 const ENTRY_LIMIT: usize = 16;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct ImageKey {
     pub generation: u64,
     pub screen: ScreenId,
@@ -116,6 +125,18 @@ impl ImageCache {
         self.entries.push_front(entry);
         Some(pixels)
     }
+    // A first source digest can exceed the input-thread idle slice. The worker supplies it.
+    pub fn get_known(&mut self, key: &ImageKey, source: &Arc<Pixmap>) -> Option<Arc<Pixmap>> {
+        let known = IDENTITIES.with(|identities| identities.borrow().iter()
+            .any(|(held, _)| held.ptr_eq(&Arc::downgrade(source))));
+        if known { self.get(key, source) } else { None }
+    }
+
+    pub fn prewarm_fits(&self, bytes: usize) -> bool {
+        self.bytes.saturating_add(bytes) <= self.pixel_limit()
+            && self.entries.len() < self.entry_limit()
+    }
+
     pub fn reserve(&mut self, bytes: usize) {
         while !self.entries.is_empty()
             && (self.bytes + bytes > self.pixel_limit() || self.entries.len() >= self.entry_limit())

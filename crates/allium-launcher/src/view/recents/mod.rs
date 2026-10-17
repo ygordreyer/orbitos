@@ -53,6 +53,10 @@ impl Recents {
         matches!(self, Self::List(list) if list.navigation_warm_ready())
     }
 
+    pub(crate) fn details_warm_model(&mut self, handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId) -> Option<super::entry_list::NavigationWarm> {
+        match self { Self::List(list) => list.details_warm_model(handle, screen), Self::Carousel(_) => None }
+    }
+
     pub(crate) fn navigation_warm_model(
         &mut self,
         handle: &common::theme::ThemeHandle,

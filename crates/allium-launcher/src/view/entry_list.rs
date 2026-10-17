@@ -37,6 +37,7 @@ pub(crate) struct NavigationWarm {
     count: usize,
     metadata: bool,
     ink: bool,
+    targets: Option<common::theme::art::Targets>,
 }
 
 #[derive(Debug)]
@@ -470,11 +471,17 @@ where
             return child.navigation_warm_art_step(work);
         }
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
-        orbit.warm_art_step(&mut work.artwork);
+        if let Some(targets) = work.targets {
+            orbit.warm_art_step_for_targets(&mut work.artwork, targets);
+        } else {
+            orbit.warm_art_step(&mut work.artwork);
+        }
         if !work.artwork.is_empty() || orbit.art_pending() {
             return false;
         }
-        work.input.art = orbit.theme_art(&self.entries, work.selected, work.first, work.count);
+        work.input.art = if let Some(targets) = work.targets {
+            orbit.theme_art_for_targets(&self.entries, work.selected, work.first, work.count, targets)
+        } else { orbit.theme_art(&self.entries, work.selected, work.first, work.count) };
         if let Some(Entry::Game(game)) = self.entries.get(work.selected)
             && work.metadata
         {
@@ -497,6 +504,24 @@ where
             }
         }
         true
+    }
+
+    pub(crate) fn details_warm_model(&mut self, handle: &common::theme::ThemeHandle, screen: common::theme::pack::ScreenId) -> Option<NavigationWarm> {
+        use common::theme::{frame::FrameInputs, pack::ScreenId};
+        if let Some(child) = self.child.as_mut() { return child.details_warm_model(handle, screen); }
+        if !handle.pack().ink() || !self.root_tab_navigation_ready() { return None; }
+        let selected = self.list.selected();
+        let Some(Entry::Game(_)) = self.entries.get(selected) else { return None; };
+        let components = &handle.pack().screens.get(&ScreenId::GameDetail)?.components;
+        let mut demand = super::art_queue::Demand::from_components(components, true);
+        demand.metadata = false;
+        let mut artwork = super::art_queue::plan(&self.entries, selected, selected, 1, 1, demand);
+        artwork.retain(|task| task.entry().path() == self.entries[selected].path());
+        Some(NavigationWarm {
+            input: FrameInputs::new(ScreenId::GameDetail), artwork, selected, first: selected, count: 1,
+            metadata: false, ink: true,
+            targets: Some(common::theme::art::Targets::for_screens(handle.pack(), &[screen, ScreenId::GameDetail])),
+        })
     }
 
     pub(crate) fn navigation_warm_model(
@@ -605,6 +630,7 @@ where
             count,
             metadata,
             ink,
+            targets: None,
         }))
     }
 
