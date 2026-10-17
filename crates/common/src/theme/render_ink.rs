@@ -274,6 +274,72 @@ struct CachedShelf {
 }
 thread_local! { static PREVIEW_MASK: RefCell<Option<(tiny_skia::Mask, u32)>> = const { RefCell::new(None) }; }
 thread_local! { static SHELVES: RefCell<VecDeque<CachedShelf>> = const { RefCell::new(VecDeque::new()) }; }
+#[derive(Clone, Copy)]
+struct RowTextGeometry {
+    bounds: (f32, f32),
+    cap: f32,
+    metrics: (f32, f32, f32),
+}
+#[derive(PartialEq, Eq)]
+struct GeometryKey {
+    generation: u64,
+    family: FontId,
+    weight: u32,
+    size: u32,
+    line: u32,
+    tracking: u32,
+    upper: bool,
+    dimensions: (u32, u32),
+    focused: bool,
+    text: String,
+}
+struct CachedGeometry {
+    theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
+    key: GeometryKey,
+    value: RowTextGeometry,
+}
+const GEOMETRY_LIMIT: usize = 256 * 1024;
+const GEOMETRY_ENTRIES: usize = 512;
+thread_local! { static GEOMETRY: RefCell<VecDeque<CachedGeometry>> = const { RefCell::new(VecDeque::new()) }; }
+fn row_text_geometry(theme: &ThemeHandle, ty: &Type, text: &str, rect: Rect, focused: bool) -> RowTextGeometry {
+    let key = GeometryKey { generation: theme.generation(), family: ty.family, weight: ty.weight,
+        size: ty.size.to_bits(), line: ty.line, tracking: ty.tracking.to_bits(), upper: ty.upper,
+        dimensions: (rect.2, rect.3), focused, text: text.into() };
+    #[cfg(test)]
+    let enabled = !UNCACHED.get();
+    #[cfg(not(test))]
+    let enabled = true;
+    let hit = enabled.then(|| GEOMETRY.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|e| e.theme.ptr_eq(&theme.weak())
+            && e.theme.strong_count() > 0 && e.key == key)?;
+        let entry = cache.remove(index).unwrap();
+        let value = entry.value;
+        cache.push_front(entry);
+        Some(value)
+    })).flatten();
+    if let Some(value) = hit { return value; }
+    let value = RowTextGeometry { bounds: ty.ink_bounds(text), cap: ty.cap(), metrics: ty.metrics(&ty.value(text)) };
+    if enabled && !HERO_SCRATCH.get() {
+        GEOMETRY.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.retain(|e| e.theme.strong_count() > 0);
+            // Slots are reserved once and len stays below them, so the deque never regrows.
+            let len = cache.len();
+            if cache.capacity() < GEOMETRY_ENTRIES { cache.reserve_exact(GEOMETRY_ENTRIES - len); }
+            let slots = cache.capacity() * std::mem::size_of::<CachedGeometry>();
+            let bytes = key.text.capacity();
+            let mut total = slots + cache.iter().map(|e| e.key.text.capacity()).sum::<usize>();
+            if slots + bytes <= GEOMETRY_LIMIT {
+                while cache.len() >= GEOMETRY_ENTRIES || total + bytes > GEOMETRY_LIMIT {
+                    total -= cache.pop_back().unwrap().key.text.capacity();
+                }
+                cache.push_front(CachedGeometry { theme: theme.weak(), key, value });
+            }
+        });
+    }
+    value
+}
 struct CachedText {
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
     key: String,
@@ -1527,31 +1593,33 @@ impl PreparedFrame {
             }
             lines.push((&row.subtitle, st));
         }
+        let geometry: Vec<_> = lines.iter().map(|(text, style)|
+            row_text_geometry(&self.theme, style, text, rect, focused)).collect();
         let mut relative = Vec::new();
         let mut y = 0.0;
-        for (text, style) in &lines {
-            relative.push(y + style.ink_bounds(text).0);
+        for (i, (_, style)) in lines.iter().enumerate() {
+            relative.push(y + geometry[i].bounds.0);
             y += style.line as f32;
         }
         let top = lines
             .iter()
             .enumerate()
-            .map(|(i, (text, t))| {
+            .map(|(i, (text, _))| {
                 relative[i]
                     - if symbol(text) {
-                        t.ink_bounds(text).0
+                        geometry[i].bounds.0
                     } else {
-                        t.cap()
+                        geometry[i].cap
                     }
             })
             .fold(f32::INFINITY, f32::min);
         let bottom = lines
             .iter()
             .enumerate()
-            .map(|(i, (text, t))| {
+            .map(|(i, (text, _))| {
                 relative[i]
                     + if symbol(text) {
-                        t.ink_bounds(text).1
+                        geometry[i].bounds.1
                     } else {
                         0.0
                     }
@@ -1562,11 +1630,11 @@ impl PreparedFrame {
         let mut vt = self.ink_type(&action_component, false);
         vt.color = ty.color;
         vt.size *= 0.82;
+        let value_geometry = row_text_geometry(&self.theme, &vt, &row.value, rect, focused);
         let value_width = if row.value.is_empty() {
             0.0
         } else {
-            vt.metrics(&vt.value(&row.value))
-                .0
+            value_geometry.metrics.0
                 .ceil()
                 .min(r.2 as f32 * 0.38)
         };
@@ -1577,9 +1645,9 @@ impl PreparedFrame {
                 0.0
             })
         .max(1.0);
-        let title_ink = ty.metrics(&ty.value(&row.label));
+        let title_ink = geometry[0].metrics;
         let title_width = copy_width.min(title_ink.2 - title_ink.1);
-        let vi = vt.metrics(&vt.value(&row.value));
+        let vi = value_geometry.metrics;
         let value_extent = value_width.min(vi.2 - vi.1);
         let centered = align == Align::Center && value_width > 0.0;
         let start = r.0 as f32 + (r.2 as f32 - title_width - value_extent - 7.0) / 2.0;
@@ -3246,3 +3314,69 @@ mod warm_tests;
 #[cfg(test)]
 #[path = "render_ink_baseline_tests.rs"]
 mod baseline_tests;
+
+#[cfg(test)]
+mod row_geometry_tests {
+    use super::*;
+    use crate::theme::render_navigation::tests::theme;
+
+    fn bits(value: RowTextGeometry) -> [u32; 6] {
+        [value.bounds.0.to_bits(), value.bounds.1.to_bits(), value.cap.to_bits(),
+            value.metrics.0.to_bits(), value.metrics.1.to_bits(), value.metrics.2.to_bits()]
+    }
+    #[test]
+    fn row_geometry_is_bit_exact_and_invalidates_style_dimensions_focus_and_theme() {
+        GEOMETRY.with(|c| c.borrow_mut().clear());
+        let theme = theme("compact-plus", "square");
+        let component = theme.pack().screens[&ScreenId::Recents].components.iter()
+            .find(|c| c.kind == Kind::Entries).unwrap();
+        let ty = ink_text_layout(&theme, component, false);
+        let rect = Rect(12, 30, 232, 52);
+        for text in ["AV Atari café", "↑ ↓", "", "  ", "Pokémon 日本語"] {
+            let expected = RowTextGeometry { bounds: ty.ink_bounds(text), cap: ty.cap(), metrics: ty.metrics(&ty.value(text)) };
+            assert_eq!(bits(row_text_geometry(&theme, &ty, text, rect, false)), bits(expected));
+            GUIDE_GLYPH_VISITS.with(|n| n.set(0));
+            assert_eq!(bits(row_text_geometry(&theme, &ty, text, rect, false)), bits(expected));
+            assert_eq!(GUIDE_GLYPH_VISITS.with(|n| n.get()), 0, "hit walked glyph outlines");
+        }
+        let len = || GEOMETRY.with(|c| c.borrow().len());
+        let before = len();
+        for index in 0..6 {
+            let mut changed = ty.clone();
+            match index {
+                0 => changed.size += 1.0,
+                1 => changed.tracking += 0.25,
+                2 => changed.upper = !changed.upper,
+                3 => changed.line += 1,
+                4 => { changed.family = FontId::BarlowCondensed; changed.weight += 100; },
+                _ => changed.weight += 1,
+            }
+            row_text_geometry(&theme, &changed, "AV Atari café", rect, false);
+            assert_eq!(len(), before + index + 1);
+        }
+        row_text_geometry(&theme, &ty, "AV Atari café", Rect(12, 30, 233, 52), false);
+        row_text_geometry(&theme, &ty, "AV Atari café", rect, true);
+        let changed_theme = theme.generation_copy(theme.generation() + 1);
+        row_text_geometry(&changed_theme, &ty, "AV Atari café", rect, false);
+        let new_font_theme = self::theme("compact-plus", "square");
+        row_text_geometry(&new_font_theme, &ty, "AV Atari café", rect, false);
+        assert_eq!(len(), before + 10);
+        drop(new_font_theme);
+        row_text_geometry(&theme, &ty, "new value", rect, false);
+        assert!(GEOMETRY.with(|c| c.borrow().iter().all(|e| e.theme.strong_count() > 0)));
+        for i in 0..2000 {
+            row_text_geometry(&theme, &ty, &format!("s{i}"), rect, false);
+        }
+        for i in 0..1000 {
+            row_text_geometry(&theme, &ty, &format!("{i:04}{}", "x".repeat(512)), rect, false);
+        }
+        GEOMETRY.with(|c| {
+            let c = c.borrow();
+            let bytes = c.capacity() * std::mem::size_of::<CachedGeometry>()
+                + c.iter().map(|e| e.key.text.capacity()).sum::<usize>();
+            assert!(bytes <= GEOMETRY_LIMIT);
+            assert!(c.front().unwrap().key.text.starts_with("0999"));
+            assert!(!c.iter().any(|e| e.key.text == "AV Atari café"));
+        });
+    }
+}

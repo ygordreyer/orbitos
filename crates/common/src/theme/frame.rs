@@ -30,7 +30,7 @@ pub struct Status {
     pub charging: bool,
     pub network: Option<String>,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hint {
     pub button: String,
     pub label: String,

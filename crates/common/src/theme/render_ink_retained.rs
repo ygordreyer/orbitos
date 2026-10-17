@@ -1,5 +1,6 @@
 use super::super::retained;
 use super::*;
+use std::rc::Rc;
 
 const ACTIVE_LIMIT: usize = 8 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 12 * 1024 * 1024;
@@ -65,13 +66,15 @@ struct Entry {
     bounds: Rect,
     dependencies: retained::Inputs,
     before: Vec<u8>,
+    // A token is shared only by byte-identical, unmodified underlays.
+    underlay: Rc<()>,
     targets: Vec<Target>,
     text: Vec<(String, Rect)>,
 }
 enum Paint {
     Component,
     Hero(Vec<Component>),
-    Panel { group: Vec<Component>, key: String },
+    Panel { group: Vec<Component>, key: Rc<str> },
     ShelfCard(usize),
     ShelfPeek,
 }
@@ -92,15 +95,72 @@ const PANEL_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Default)]
 struct Panels(VecDeque<Panel>);
 struct Panel {
-    key: String,
+    key: PanelKey,
     sources: Vec<Option<std::sync::Weak<Pixmap>>>,
     before: Vec<u8>,
+    underlay: Rc<()>,
     pixels: Vec<u8>,
     text: Vec<(String, Rect)>,
 }
+#[derive(PartialEq, Eq)]
+struct PanelKey {
+    descriptor: Rc<str>,
+    raster_revision: Option<String>,
+    text: std::collections::BTreeMap<Binding, String>,
+    rows: std::collections::BTreeMap<Binding, Vec<Row>>,
+    selected: std::collections::BTreeMap<Binding, String>,
+    pagination: Option<crate::theme::frame::Pagination>,
+    detail_lines: Vec<crate::theme::frame::DetailLine>,
+    metadata: Vec<(String, String)>,
+    facts: Vec<(String, String)>,
+    navigation: std::collections::BTreeMap<crate::theme::pack::NavGroup, Vec<Row>>,
+    focus: crate::theme::frame::Focus,
+    hints: Vec<crate::theme::frame::Hint>,
+    suppress_hints: bool,
+    progress: Option<u32>,
+    keyboard: Vec<String>,
+    keyboard_cursor: (usize, usize),
+    next_cover_expected: bool,
+    art_entries: Vec<String>,
+}
+impl PanelKey {
+    fn new(descriptor: &Rc<str>, input: &FrameInputs) -> Self {
+        Self { descriptor: descriptor.clone(), raster_revision: input.raster_revision.clone(),
+            text: input.text.clone(), rows: input.rows.clone(), selected: input.selected.clone(),
+            pagination: input.pagination, detail_lines: input.detail_lines.clone(),
+            metadata: input.metadata.clone(), facts: input.facts.clone(),
+            navigation: input.navigation.clone(), focus: input.focus.clone(), hints: input.hints.clone(),
+            suppress_hints: input.suppress_hints, progress: input.progress.map(f32::to_bits),
+            keyboard: input.keyboard.clone(), keyboard_cursor: input.keyboard_cursor,
+            next_cover_expected: input.art.next_cover_expected,
+            art_entries: input.art.entries.keys().cloned().collect() }
+    }
+    fn bytes(&self) -> usize {
+        let row_bytes = |r: &Row| r.id.capacity() + r.label.capacity() + r.subtitle.capacity() + r.value.capacity();
+        // BTreeMap node overhead is bounded conservatively, including unused node slots.
+        self.descriptor.len() + self.raster_revision.as_ref().map_or(0, String::capacity)
+            + self.text.iter().chain(&self.selected).map(|(_, v)| 1024 + v.capacity()).sum::<usize>()
+            + self.rows.iter().map(|(_, rs)| 1024 + rs.capacity() * std::mem::size_of::<Row>()
+                + rs.iter().map(row_bytes).sum::<usize>()).sum::<usize>()
+            + self.navigation.iter().map(|(_, rs)| 1024 + rs.capacity() * std::mem::size_of::<Row>()
+                + rs.iter().map(row_bytes).sum::<usize>()).sum::<usize>()
+            + self.detail_lines.capacity() * std::mem::size_of::<crate::theme::frame::DetailLine>()
+            + self.detail_lines.iter().map(|l| l.text.capacity()).sum::<usize>()
+            + [&self.metadata, &self.facts].iter().map(|rs| rs.capacity() * std::mem::size_of::<(String, String)>()
+                + rs.iter().map(|(k, v)| k.capacity() + v.capacity()).sum::<usize>()).sum::<usize>()
+            + self.focus.component.capacity() + self.focus.item.as_ref().map_or(0, String::capacity)
+            + self.hints.capacity() * std::mem::size_of::<crate::theme::frame::Hint>()
+            + self.hints.iter().map(|h| h.button.capacity() + h.label.capacity()).sum::<usize>()
+            + [&self.keyboard, &self.art_entries].iter().map(|ss| ss.capacity() * std::mem::size_of::<String>()
+                + ss.iter().map(String::capacity).sum::<usize>()).sum::<usize>()
+    }
+}
+fn same_underlay(a: &Rc<()>, b: &Rc<()>, before: &[u8], other: &[u8]) -> bool {
+    Rc::ptr_eq(a, b) || super::super::equal_words(before, other)
+}
 impl Panel {
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.key.capacity()
+        std::mem::size_of::<Self>() + self.key.bytes()
             + self.sources.capacity() * std::mem::size_of::<Option<std::sync::Weak<Pixmap>>>()
             + self.before.capacity() + self.pixels.capacity()
             + self.text.capacity() * std::mem::size_of::<(String, Rect)>()
@@ -882,6 +942,7 @@ impl PreparedFrame {
         restore(&mut self.pixels, bounds, &saved);
         self.ink_cache.entries[index].bounds = bounds;
         self.ink_cache.entries[index].before = before;
+        self.ink_cache.entries[index].underlay = Rc::new(());
     }
     pub(in crate::theme::render) fn prewarm_ink_navigation(
         &mut self,
@@ -1009,8 +1070,8 @@ impl PreparedFrame {
                     && (r.1..r.1 + r.3).enumerate().all(|(row, y)| {
                         let at = ((y * 640 + r.0) * 4) as usize;
                         let src = row * r.2 as usize * 4;
-                        self.pixels.data()[at..at + r.2 as usize * 4]
-                            == entry.before[src..src + r.2 as usize * 4]
+                        super::super::equal_words(&self.pixels.data()[at..at + r.2 as usize * 4],
+                            &entry.before[src..src + r.2 as usize * 4])
                     })
             });
             let Some(index) = index else { return false };
@@ -1069,38 +1130,36 @@ impl PreparedFrame {
         }
         Ok(())
     }
-    fn ink_panel(&mut self, group: &[Component], descriptor: &str, r: Rect, input: &FrameInputs,
-        before: &[u8], panels: &mut Panels) -> Result<()> {
-        if HERO_SCRATCH.get() {
-            for c in group { self.ink_paint_component(c, input)?; }
-            return Ok(());
-        }
-        // Debug strings preserve exact strings, float values and descriptor fields. Artwork
-        // uses weak allocation identities so the cache cannot pin decoded media in memory.
-        let key = format!("{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
-            descriptor, input.raster_revision, input.text, input.rows,
-            input.selected, input.pagination, input.detail_lines, input.metadata, input.facts,
-            input.navigation, input.focus, input.hints, input.suppress_hints, input.progress,
-            input.keyboard, input.keyboard_cursor, input.art.next_cover_expected,
-            input.art.entries.keys().collect::<Vec<_>>());
-        let sources = panel_sources(input);
-        let hit = panels.0.iter().position(|entry| entry.key == key
+    fn ink_panel_hit(&mut self, key: &PanelKey, sources: &[Option<std::sync::Weak<Pixmap>>],
+        r: Rect, before: &[u8], underlay: &Rc<()>, panels: &mut Panels) -> bool {
+        let hit = panels.0.iter().position(|entry| entry.key == *key
             && entry.sources.len() == sources.len()
-            && entry.sources.iter().zip(&sources).all(|(a, b)| match (a, b) {
+            && entry.sources.iter().zip(sources).all(|(a, b)| match (a, b) {
                 (Some(a), Some(b)) => a.strong_count() > 0 && a.ptr_eq(b),
                 (None, None) => true,
                 _ => false,
-            }) && entry.before == before);
+            }) && same_underlay(&entry.underlay, underlay, &entry.before, before));
         if let Some(index) = hit {
-            let entry = panels.0.remove(index).unwrap();
+            let mut entry = panels.0.remove(index).unwrap();
+            entry.underlay = underlay.clone();
             restore(&mut self.pixels, r, &entry.pixels);
             self.text_boxes.extend(entry.text.iter().cloned());
             panels.0.push_front(entry);
             crate::perf_trace::count(crate::perf_trace::Count::PanelHit, 1);
             crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, r.2 as u64 * r.3 as u64);
             crate::perf_trace::count(crate::perf_trace::Count::InkBitmapPixels, r.2 as u64 * r.3 as u64);
+            return true;
+        }
+        false
+    }
+    fn ink_panel(&mut self, group: &[Component], key: PanelKey,
+        sources: Vec<Option<std::sync::Weak<Pixmap>>>, r: Rect, input: &FrameInputs,
+        before: &[u8], underlay: &Rc<()>, panels: &mut Panels) -> Result<()> {
+        if HERO_SCRATCH.get() {
+            for c in group { self.ink_paint_component(c, input)?; }
             return Ok(());
         }
+        if self.ink_panel_hit(&key, &sources, r, before, underlay, panels) { return Ok(()); }
         crate::perf_trace::count(crate::perf_trace::Count::PanelMiss, 1);
         let text = self.text_boxes.len();
         // Keep the original source-over order and integer rounding against the real underlay.
@@ -1122,7 +1181,7 @@ impl PreparedFrame {
             }
             Ok(())
         })?;
-        let mut panel = Panel { key, sources, before: Vec::new(), pixels: Vec::new(),
+        let mut panel = Panel { key, sources, before: Vec::new(), underlay: underlay.clone(), pixels: Vec::new(),
             text: self.text_boxes[text..].to_vec() };
         if panels.reserve(panel.bytes() + before.len() * 2) {
             {
@@ -1159,7 +1218,7 @@ impl PreparedFrame {
                     for _ in 1..group.len() { pending.next(); }
                     let bounds = group.iter().map(effects::paint_bounds).reduce(union).unwrap();
                     let key = format!("{:?}:{:?}:{}:{}", group, bounds,
-                        self.theme.generation(), self.theme.digest());
+                        self.theme.generation(), self.theme.digest()).into();
                     operations.push(Operation { component: c.clone(), row: None,
                         bounds, paint: Paint::Panel { group, key } });
                 } else if c.kind == Kind::Image
@@ -1422,6 +1481,23 @@ impl PreparedFrame {
             }
             let covered = self.damage.iter().any(|d| inside(*d, r));
             let has_overlap = self.damage.iter().any(|d| overlap(*d, r));
+            let panel_input = if let Paint::Panel { key, .. } = &op.paint {
+                Some((PanelKey::new(key, input), panel_sources(input)))
+            } else { None };
+            if incremental && !has_overlap {
+                if let Some((key, sources)) = &panel_input {
+                    let entry = &mut cache.entries[index];
+                    let text = self.text_boxes.len();
+                    if self.ink_panel_hit(key, sources, r, &entry.before, &entry.underlay, &mut cache.panels) {
+                        entry.dependencies = retained::capture(&deps);
+                        entry.text = self.text_boxes[text..].to_vec();
+                        self.targets.extend(entry.targets.iter().cloned());
+                        self.damage.push(r);
+                        continue;
+                    }
+                }
+            }
+            let mut underlay = if incremental { cache.entries[index].underlay.clone() } else { Rc::new(()) };
             let old_final = (incremental && !covered && has_overlap).then(|| {
                 cache.admit_active((r.2 * r.3 * 4) as usize);
                 capture(&self.pixels, r)
@@ -1438,6 +1514,7 @@ impl PreparedFrame {
                 let mut before = std::mem::take(&mut cache.entries[index].before);
                 if has_overlap {
                     capture_into(&self.pixels, r, &mut before);
+                    underlay = Rc::new(());
                 }
                 before
             } else {
@@ -1448,8 +1525,9 @@ impl PreparedFrame {
             let text = self.text_boxes.len();
             let clip = (incremental && !changed && !covered).then(|| replay_clip(r, &self.damage));
             with_replay_clip(clip, || -> Result<()> {
-                if let Paint::Panel { group, key } = &op.paint {
-                    self.ink_panel(group, key, r, input, &before, &mut cache.panels)?;
+                if let Paint::Panel { group, .. } = &op.paint {
+                    let (key, sources) = panel_input.unwrap();
+                    self.ink_panel(group, key, sources, r, input, &before, &underlay, &mut cache.panels)?;
                 } else {
                     self.ink_paint_operation(op, r, input)?;
                 }
@@ -1477,6 +1555,7 @@ impl PreparedFrame {
                 bounds: r,
                 dependencies: retained::capture(&deps),
                 before,
+                underlay,
                 targets: self.targets[targets..].to_vec(),
                 text: self.text_boxes[text..].to_vec(),
             };

@@ -40,8 +40,10 @@ pub enum Count {
     FlushedPixels,
     ComposedPixels,
     ConvertedPixels,
+    /// Actual pixel-pair inspections, including the bounded dense-damage sample.
     ComparedPixels,
     ScannedPixels,
+    /// Differing inspected pairs, not an estimate of uninspected dense damage.
     ChangedPixels,
     ImageHit,
     ImageMiss,

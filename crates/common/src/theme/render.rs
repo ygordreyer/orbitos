@@ -54,6 +54,36 @@ pub struct PreparedFrame {
     pub targets: Vec<Target>,
     pub text_boxes: Vec<(String, Rect)>,
 }
+fn pixel_word(bytes: &[u8]) -> u32 {
+    u32::from_ne_bytes(bytes[..4].try_into().unwrap())
+}
+pub(super) fn equal_words(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.chunks_exact(4).zip(b.chunks_exact(4))
+        .all(|(a, b)| pixel_word(a) == pixel_word(b))
+        && a[a.len() / 4 * 4..].iter().zip(&b[b.len() / 4 * 4..]).all(|(a, b)| a == b)
+}
+fn dense_damage(source: &[u8], target: &[u8], rect: Rect) -> bool {
+    let area = rect.2 as usize * rect.3 as usize;
+    if area < 1024 { return false; }
+    let mut changed = 0;
+    for sample in 0..32 {
+        let x = (sample % 4 * 2 + 1) * rect.2 as usize / 8;
+        let y = (sample / 4 * 2 + 1) * rect.3 as usize / 16;
+        let at = ((rect.1 as usize + y) * 640 + rect.0 as usize + x) * 4;
+        changed += usize::from(pixel_word(&source[at..]) != pixel_word(&target[at..]));
+    }
+    crate::perf_trace::count(crate::perf_trace::Count::ComparedPixels, 32);
+    crate::perf_trace::count(crate::perf_trace::Count::ChangedPixels, changed as u64);
+    changed >= 16
+}
+fn copy_damage(source: &[u8], target: &mut [u8], rect: Rect) {
+    for y in rect.1..rect.1 + rect.3 {
+        let at = (y as usize * 640 + rect.0 as usize) * 4;
+        let end = at + rect.2 as usize * 4;
+        target[at..end].copy_from_slice(&source[at..end]);
+    }
+    crate::perf_trace::count(crate::perf_trace::Count::CopiedPixels, rect.2 as u64 * rect.3 as u64);
+}
 fn changed_runs(source: &[u8], target: &[u8]) -> Vec<(usize, usize)> {
     let mut runs = vec![];
     let mut first = None;
@@ -64,7 +94,7 @@ fn changed_runs(source: &[u8], target: &[u8]) -> Vec<(usize, usize)> {
         .zip(target.chunks_exact(4))
         .enumerate()
     {
-        if a != b {
+        if pixel_word(a) != pixel_word(b) {
             first.get_or_insert(x);
             last = x + 1;
             changed += 1;
@@ -432,6 +462,11 @@ impl PreparedFrame {
         let mut dest = display.pixmap_mut();
         let mut damage: Vec<DrawRect> = Vec::new();
         for rect in &self.damage {
+            if dense_damage(self.pixels.data(), dest.data_mut(), *rect) {
+                copy_damage(self.pixels.data(), dest.data_mut(), *rect);
+                damage.push(DrawRect::new(rect.0 as i32, rect.1 as i32, rect.2, rect.3));
+                continue;
+            }
             let mut previous: Vec<(usize, usize, usize)> = vec![];
             for y in rect.1..rect.1 + rect.3 {
                 let at = (y as usize * 640 + rect.0 as usize) * 4;
@@ -2214,4 +2249,67 @@ mod selection_bench;
 #[doc(hidden)]
 pub fn benchmark_blit(dest: &mut tiny_skia::PixmapMut<'_>, x: i32, y: i32, source: tiny_skia::PixmapRef<'_>) {
     ink_blit::draw(dest, x, y, source);
+}
+
+#[cfg(test)]
+mod dense_damage_tests {
+    use super::*;
+    #[test]
+    fn dense_copy_and_exact_scanner_produce_identical_pixels() {
+        let rect = Rect(425, 16, 206, 408);
+        let source: Vec<u8> = (0..640 * 480 * 4).map(|i| (i * 17 + i / 257) as u8).collect();
+        for density in [0, 1, 25, 50, 77, 100] {
+            let mut initial = source.clone();
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    if ((x * 73 + y * 37) % 100) < density {
+                        initial[((y * 640 + x) * 4) as usize] ^= 123;
+                    }
+                }
+            }
+            let mut exact = initial.clone();
+            for y in rect.1..rect.1 + rect.3 {
+                let at = ((y * 640 + rect.0) * 4) as usize;
+                let end = at + rect.2 as usize * 4;
+                for (first, last) in changed_runs(&source[at..end], &exact[at..end]) {
+                    exact[at + first * 4..at + last * 4].copy_from_slice(&source[at + first * 4..at + last * 4]);
+                }
+            }
+            let mut dense = initial.clone();
+            copy_damage(&source, &mut dense, rect);
+            assert_eq!(dense, exact, "density {density}");
+            assert_eq!(dense, source);
+            if density == 0 || density == 100 {
+                assert_eq!(dense_damage(&source, &initial, rect), density == 100);
+            }
+        }
+        assert!(!dense_damage(&source, &vec![0; source.len()], Rect(0, 0, 3, 3)));
+    }
+    #[test]
+    fn word_comparison_checks_unaligned_words_tails_lengths_and_run_gaps() {
+        let bytes = vec![42; 67];
+        for len in 0..65 {
+            assert!(equal_words(&bytes[1..1 + len], &bytes[2..2 + len]));
+            for at in 0..len {
+                let mut changed = bytes[1..1 + len].to_vec();
+                changed[at] ^= 1;
+                assert!(!equal_words(&changed, &bytes[2..2 + len]));
+            }
+        }
+        assert!(!equal_words(&bytes[..1], &bytes[..2]));
+        let source = [0; 80];
+        for positions in [vec![0, 7], vec![0, 8], vec![0, 9], vec![19], vec![]] {
+            let mut target = source;
+            for x in &positions { target[x * 4] = 1; }
+            let runs = changed_runs(&source, &target);
+            let expected = match positions.as_slice() {
+                [0, 7] => vec![(0, 8)],
+                [0, 8] => vec![(0, 9)],
+                [0, 9] => vec![(0, 1), (9, 10)],
+                [19] => vec![(19, 20)],
+                _ => vec![],
+            };
+            assert_eq!(runs, expected);
+        }
+    }
 }

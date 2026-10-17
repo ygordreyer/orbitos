@@ -130,6 +130,7 @@ fn panelcache_input_invalidations_miss_and_match_cold_pixels() {
         // Corrupt only the saved underlay. Equal child inputs still cannot reuse those pixels.
         let mut frame = frame;
         frame.ink_cache.panels.0.front_mut().unwrap().before[0] ^= 1;
+        frame.ink_cache.panels.0.front_mut().unwrap().underlay = Rc::new(());
         let frame = draw(&theme, &input(&theme, 1, &arts), Some(frame));
         let frame = draw(&theme, &base, Some(frame));
         assert_eq!(count(Count::PanelHit), 0);
@@ -223,5 +224,174 @@ fn panelcache_byte_budget_evicts_lru_and_refuses_oversized_entries() {
         let before = frame.ink_cache.panels.0.len();
         assert!(!frame.ink_cache.panels.reserve(PANEL_LIMIT + 1));
         assert_eq!(frame.ink_cache.panels.0.len(), before);
+    });
+}
+
+#[test]
+fn panelcache_underlay_identity_fallback_and_restore_work() {
+    probe(|| {
+        let arts = arts();
+        let theme = theme("compact-plus", "square");
+        let base = input(&theme, 0, &arts);
+        let next = input(&theme, 1, &arts);
+        for fallback in [false, true] {
+            let frame = draw(&theme, &base, None);
+            let mut frame = draw(&theme, &next, Some(frame));
+            let panel = frame.ink_cache.panels.0.back_mut().unwrap();
+            if fallback { panel.underlay = Rc::new(()); }
+            let mut display = crate::theme::render::tests::TestDisplay(frame.pixels.as_ref().to_owned());
+            let entry = frame.ink_cache.entries.iter().find(|e| e.bounds == Rect(425, 16, 206, 408)).unwrap();
+            assert_eq!(Rc::ptr_eq(&panel.underlay, &entry.underlay), !fallback);
+            frame = draw(&theme, &base, Some(frame));
+            assert_eq!(count(Count::PanelHit), 1);
+            assert_eq!(count(Count::RestoreBytes), 106496 + 336192,
+                "a proven hit must copy only the row underlays and final panel");
+            frame.paint_damage(&mut display);
+            assert_eq!(display.0.data(), frame.pixels.data());
+            println!("HITPATH warm compared={} copied={} restore={}", count(Count::ComparedPixels),
+                count(Count::CopiedPixels), count(Count::RestoreBytes));
+            assert!(count(Count::ComparedPixels) < 110672, "dense rows were scanned");
+            identical(&frame, &base);
+        }
+        let token = Rc::new(());
+        let other = Rc::new(());
+        assert!(same_underlay(&token, &token, &[1; 17], &[2; 17]), "identity must bypass the scan");
+        assert!(same_underlay(&token, &other, &[1; 17], &[1; 17]));
+        assert!(!same_underlay(&token, &other, &[1; 17], &[2; 17]));
+        let frame = draw(&theme, &base, None);
+        let frame = draw(&theme, &next, Some(frame));
+        assert_eq!(count(Count::PanelMiss), 1);
+        assert!(count(Count::RestoreBytes) >= 106496 + 336192);
+        identical(&frame, &next);
+    });
+}
+
+#[test]
+fn panelcache_typed_key_covers_each_previous_debug_dependency() {
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    let base = input(&theme, 0, &arts);
+    let descriptor: Rc<str> = "descriptors:bounds:generation:digest".into();
+    let key = PanelKey::new(&descriptor, &base);
+    let changes: Vec<Box<dyn Fn(&mut FrameInputs)>> = vec![
+        Box::new(|i| i.raster_revision = Some("equal values, new revision".into())),
+        Box::new(|i| { i.text.insert(Binding::Title, "changed".into()); }),
+        Box::new(|i| i.rows.get_mut(&Binding::Entries).unwrap()[0].enabled = false),
+        Box::new(|i| { i.selected.insert(Binding::Entries, "changed".into()); }),
+        Box::new(|i| i.pagination = Some(crate::theme::frame::Pagination { page: 1, total: 9 })),
+        Box::new(|i| i.detail_lines.push(crate::theme::frame::DetailLine { text: "line".into(), heading: true, gap_before: 3 })),
+        Box::new(|i| i.metadata.push(("key".into(), "value".into()))),
+        Box::new(|i| i.facts.push(("key".into(), "value".into()))),
+        Box::new(|i| { i.navigation.insert(crate::theme::pack::NavGroup::Primary, vec![Row { id: "nav".into(), label: "new".into(), subtitle: String::new(), value: String::new(), enabled: true }]); }),
+        Box::new(|i| i.focus.component = "changed".into()),
+        Box::new(|i| i.hints.push(crate::theme::frame::Hint { button: "A".into(), label: "changed".into() })),
+        Box::new(|i| i.suppress_hints = !i.suppress_hints),
+        Box::new(|i| i.progress = Some(0.25)),
+        Box::new(|i| i.keyboard.push("key".into())),
+        Box::new(|i| i.keyboard_cursor = (9, 4)),
+        Box::new(|i| i.art.next_cover_expected = !i.art.next_cover_expected),
+        Box::new(|i| { i.art.entries.insert("new identity".into(), i.art.selected_cover.clone().unwrap()); }),
+    ];
+    for (index, change) in changes.iter().enumerate() {
+        let mut changed = base.clone();
+        change(&mut changed);
+        assert!(PanelKey::new(&descriptor, &changed) != key, "dependency {index}");
+    }
+    for changed in ["other descriptor:bounds:generation:digest", "descriptors:other bounds:generation:digest",
+        "descriptors:bounds:other generation:digest", "descriptors:bounds:generation:other digest"] {
+        assert!(PanelKey::new(&Rc::from(changed), &base) != key);
+    }
+    let mut live = base.clone();
+    live.status.clock = Some("23:59".into());
+    live.art.completed_misses.selected_cover = true;
+    assert!(PanelKey::new(&descriptor, &live) == key);
+}
+
+#[test]
+fn panelcache_prior_overlap_restores_and_renews_underlay_before_hit() {
+    probe(|| {
+        let theme = altered_theme(|cs| {
+            let mut panel = cs.iter().find(|c| c.kind == Kind::Panel).unwrap().clone();
+            panel.id = "underlay-overlap".into();
+            panel.rect = Rect(430, 20, 32, 32);
+            panel.radius = Some(0);
+            let first = cs.iter().position(|c| c.binding == Some(Binding::SelectedHero)).unwrap();
+            cs.insert(first, panel);
+        });
+        let arts = arts();
+        let base = input(&theme, 0, &arts);
+        let mut frame = draw(&theme, &base, None);
+        let panel_index = frame.ink_cache.plan.as_ref().unwrap().operations.iter()
+            .position(|op| matches!(op.paint, Paint::Panel { .. })).unwrap();
+        let token = frame.ink_cache.entries[panel_index].underlay.clone();
+        // Replay an equal static underlay to force prior overlapping damage.
+        let entry = frame.ink_cache.entries.iter_mut().find(|e| e.component.id == "underlay-overlap").unwrap();
+        entry.dependencies.model.raster_revision = Some("force replay".into());
+        frame = draw(&theme, &base, Some(frame));
+        assert_eq!(count(Count::PanelHit), 1);
+        assert!(!Rc::ptr_eq(&token, &frame.ink_cache.entries[panel_index].underlay));
+        assert!(count(Count::RestoreBytes) > 2 * 336192, "overlap skipped required restoration");
+        identical(&frame, &base);
+    });
+}
+
+#[test]
+fn panelcache_all_art_slots_and_expired_weak_sources_invalidate() {
+    probe(|| {
+        let arts = arts();
+        let theme = theme("compact-plus", "square");
+        let base = input(&theme, 0, &arts);
+        for slot in 0..5 {
+            let mut changed = base.clone();
+            let replacement = Arc::new((*arts[0]).clone());
+            match slot {
+                0 => changed.art.selected_hero = Some(replacement),
+                1 => changed.art.selected_logo = Some(replacement),
+                2 => changed.art.selected_cover = Some(replacement),
+                3 => changed.art.next_cover = Some(replacement),
+                _ => { let id = changed.art.entries.keys().next().unwrap().clone(); changed.art.entries.insert(id, replacement); },
+            }
+            let frame = draw(&theme, &base, None);
+            let frame = draw(&theme, &changed, Some(frame));
+            assert_eq!(count(Count::PanelHit), 0, "art slot {slot}");
+            assert_eq!(count(Count::PanelMiss), 1, "art slot {slot}");
+            identical(&frame, &changed);
+        }
+        let mut frame = draw(&theme, &base, None);
+        let descriptor = frame.ink_cache.plan.as_ref().unwrap().operations.iter().find_map(|op|
+            if let Paint::Panel { key, .. } = &op.paint { Some(key.clone()) } else { None }).unwrap();
+        let key = PanelKey::new(&descriptor, &base);
+        let panel = frame.ink_cache.panels.0.front_mut().unwrap();
+        let transient = Arc::new((*arts[0]).clone());
+        panel.sources[0] = Some(Arc::downgrade(&transient));
+        let sources = panel.sources.clone();
+        let before = panel.before.clone();
+        let token = panel.underlay.clone();
+        drop(transient);
+        let mut panels = std::mem::take(&mut frame.ink_cache.panels);
+        assert!(!frame.ink_panel_hit(&key, &sources, Rect(425, 16, 206, 408), &before, &token, &mut panels));
+    });
+}
+
+#[test]
+fn panelcache_dense_damage_copies_only_the_bound_and_counts_real_work() {
+    probe(|| {
+        let arts = arts();
+        let theme = theme("compact-plus", "square");
+        let base = input(&theme, 0, &arts);
+        let mut frame = draw(&theme, &base, None);
+        let r = Rect(425, 16, 206, 408);
+        frame.damage = vec![r];
+        let mut display = crate::theme::render::tests::TestDisplay(frame.pixels.as_ref().to_owned());
+        for y in r.1..r.1 + r.3 {
+            for x in r.0..r.0 + r.2 { display.0.data_mut()[((y * 640 + x) * 4) as usize] ^= 1; }
+        }
+        perf_trace::begin_render();
+        let damage = frame.paint_damage(&mut display);
+        assert_eq!(display.0.data(), frame.pixels.data());
+        assert_eq!(damage, vec![crate::geom::Rect::new(r.0 as i32, r.1 as i32, r.2, r.3)]);
+        assert_eq!(count(Count::ComparedPixels), 32);
+        assert_eq!(count(Count::ChangedPixels), 32);
+        assert_eq!(count(Count::CopiedPixels), r.2 as u64 * r.3 as u64);
     });
 }
