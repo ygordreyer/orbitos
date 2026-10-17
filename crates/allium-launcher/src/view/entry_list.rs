@@ -111,7 +111,7 @@ struct RecentsRevisions {
     console_revision: u64,
     language: String,
     theme_generation: u64,
-    theme_digest: String,
+    theme_digest: std::sync::Arc<str>,
     screen: common::theme::pack::ScreenId,
 }
 
@@ -166,7 +166,7 @@ thread_local! {
 #[derive(Debug)]
 struct MediaConfig {
     generation: u64,
-    digest: String,
+    digest: std::sync::Arc<str>,
     screen: common::theme::pack::ScreenId,
     stack: [Option<common::theme::pack::ScreenId>; 3],
     count: usize,
@@ -191,7 +191,7 @@ impl MediaConfig {
             .flat_map(|screen| &handle.pack().screens[screen].components).collect();
         let image = |binding| components.iter().any(|c| c.kind == Kind::Image && c.binding == Some(binding));
         Self {
-            generation: handle.generation(), digest: handle.digest().to_owned(), screen, stack,
+            generation: handle.generation(), digest: handle.digest().into(), screen, stack,
             count: crate::theme_adapter::capacity(handle, screen, Binding::Entries), ink,
             tall: handle.pack().alignment.as_ref().is_some_and(|a| a.cover_shape == "tall"),
             demand: super::art_queue::Demand::from_components(components.iter().copied(), ink),
@@ -444,7 +444,7 @@ where
             self.menu.as_ref().map(|_| ScreenId::ContextMenu),
             self.disc_picker.as_ref().map(|_| ScreenId::DiscPicker)];
         if self.media_config.as_ref().is_none_or(|config| config.generation != handle.generation()
-            || config.digest != handle.digest() || config.screen != screen || config.stack != stack)
+            || config.digest.as_ref() != handle.digest() || config.screen != screen || config.stack != stack)
         {
             self.media_config = Some(MediaConfig::new(handle, screen, stack));
         }
@@ -909,8 +909,16 @@ where
         input
     }
 
+    fn matching_media_config(&self, handle: &common::theme::ThemeHandle,
+        screen: common::theme::pack::ScreenId,
+    ) -> Option<&MediaConfig> {
+        self.media_config.as_ref().filter(|config| config.screen == screen
+            && config.generation == handle.generation() && config.digest.as_ref() == handle.digest())
+    }
+
     fn recents_semantic_key(&self, screen: common::theme::pack::ScreenId,
         handle: &common::theme::ThemeHandle, selected: usize, first: usize, count: usize,
+        path: Option<std::path::PathBuf>,
     ) -> RecentsSemanticKey {
         let revisions = RecentsRevisions {
             list_revision: self.list_revision,
@@ -922,15 +930,15 @@ where
             console_revision: self.res.revision::<ConsoleMapper>(),
             language: self.res.get::<Locale>().language(),
             theme_generation: handle.generation(),
-            theme_digest: handle.digest().to_owned(),
+            theme_digest: self.matching_media_config(handle, screen)
+                .map_or_else(|| handle.digest().into(), |config| config.digest.clone()),
             screen,
         };
         RecentsSemanticKey {
-            selected,
-            path: self.entries.get(selected).map(|entry| entry.path().to_path_buf()),
+            selected, path,
             first, count, image_focus: self.image_focus.clone(),
             cloud_rows: self.entries.iter().skip(first).take(count)
-                .map(|entry| crate::network_runtime::download_id(entry.path()).is_some()).collect(),
+                .map(|entry| crate::network_runtime::has_download(entry.path())).collect(),
             revisions,
         }
     }
@@ -938,6 +946,8 @@ where
     pub(crate) fn normalized_recents_key(&self, handle: &common::theme::ThemeHandle,
         direction: Option<isize>, status: &common::theme::frame::Status,
     ) -> Option<NormalizedRecentsKey> {
+        let _stage = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameModelKey));
         use common::theme::pack::{Binding, ScreenId};
         if !self.root_tab_navigation_ready() || self.core.is_some()
             || self.theme_screen != Some(ScreenId::Recents) { return None; }
@@ -945,9 +955,12 @@ where
             Some(direction) => self.list.navigation_selection(direction)?,
             None => (self.list.selected(), self.list.window_start()),
         };
+        // Entry replacement and reordering bump list_revision, so the normalized
+        // cache can identify the selected path by revision and index.
         Some(NormalizedRecentsKey {
             semantic: self.recents_semantic_key(ScreenId::Recents, handle, selected, first,
-                crate::theme_adapter::capacity(handle, ScreenId::Recents, Binding::Entries)),
+                self.matching_media_config(handle, ScreenId::Recents).map_or_else(
+                    || crate::theme_adapter::capacity(handle, ScreenId::Recents, Binding::Entries), |config| config.count), None),
             artwork: super::orbit::art_cache_revision(), completion: super::orbit::completion_generation(),
             stylesheet: self.res.revision::<Stylesheet>(), theme: self.res.revision::<Option<common::theme::ThemeHandle>>(),
             size: self.res.revision::<common::geom::Size>(), rect: self.rect, status: status.clone(),
@@ -957,8 +970,14 @@ where
     pub(crate) fn take_normalized_recents(&mut self, key: &NormalizedRecentsKey,
         handle: &common::theme::ThemeHandle,
     ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
-        let Some(index) = self.normalized_recents.0.iter().position(|(cached, _)| cached == key) else { return Ok(None); };
-        let (_, mut models) = self.normalized_recents.0.remove(index).unwrap();
+        let mut models = {
+            let _stage = common::perf_trace::recording()
+                .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameModelLookup));
+            let Some(index) = self.normalized_recents.0.iter().position(|(cached, _)| cached == key) else { return Ok(None); };
+            self.normalized_recents.0.remove(index).unwrap().1
+        };
+        let _stage = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameModelArtwork));
         self.apply_theme_art(handle, &mut models[0])?;
         // Artwork refresh can invalidate the proof even without a queued worker result.
         if key.artwork != super::orbit::art_cache_revision()
@@ -992,7 +1011,8 @@ where
         }
         // Modal underlays still bypass both caches. Cache only raw semantics;
         // artwork and normalization (including live status) run after this call.
-        let key = self.recents_semantic_key(screen, handle, selected, first, count);
+        let key = self.recents_semantic_key(screen, handle, selected, first, count,
+            self.entries.get(selected).map(|entry| entry.path().to_path_buf()));
         let revisions = key.revisions.clone();
         if self.menu.is_some() || self.disc_picker.is_some() {
             let mut input = self.base_theme_model(screen, handle, selected, first, count);
@@ -3010,11 +3030,19 @@ pub(crate) mod ux4_tests {
             super::super::app::normalize_theme_models(&theme, &mut models, &res, 0, status);
             models
         };
-        let models = fresh(&mut list, &status);
+        let mut models = fresh(&mut list, &status);
         let rows = models[0].rows[&Binding::Entries].as_ptr();
+        let stale_art = std::sync::Arc::new(tiny_skia::Pixmap::new(1, 1).unwrap());
+        let weak_art = std::sync::Arc::downgrade(&stale_art);
+        models[0].art.selected_logo = Some(stale_art);
         let key = list.normalized_recents_key(&theme, None, &status).unwrap();
         list.remember_normalized_recents(key.clone(), models);
+        assert!(weak_art.upgrade().is_none(), "remembered models must not retain source pixels");
+        let again = list.normalized_recents_key(&theme, None, &status).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&key.semantic.revisions.theme_digest,
+            &again.semantic.revisions.theme_digest), "warm key must share digest bytes");
         let models = list.take_normalized_recents(&key, &theme).unwrap().unwrap();
+        assert!(models[0].art.selected_logo.is_none(), "reuse must refresh stale artwork");
         assert_eq!(rows, models[0].rows[&Binding::Entries].as_ptr(), "repeat must move, not clone, normalized rows");
         let rebuilt = fresh(&mut list, &status);
         assert!(models == rebuilt);
@@ -3061,6 +3089,13 @@ pub(crate) mod ux4_tests {
             let rebuilt = fresh(&mut list, &changed.status);
             assert!(rebuilt[0].status == changed.status, "{cause} fallback normalization");
         }
+        let other_theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, theme.generation()).unwrap();
+        let other = list.normalized_recents_key(&other_theme, None, &status).unwrap();
+        assert_ne!(other.semantic.revisions.theme_digest, key.semantic.revisions.theme_digest,
+            "same generation must still compare the digest");
+        assert_eq!(other.semantic.count, crate::theme_adapter::capacity(&other_theme, ScreenId::Recents, Binding::Entries));
+        assert_ne!(other.semantic.count, key.semantic.count, "fixture must change capacity");
+        assert!(list.take_normalized_recents(&other, &other_theme).unwrap().is_none());
         // Exercise actual producer changes as well as every field of the exact key.
         for cause in ["status", "selection", "list", "media", "metadata", "locale", "consoles", "style", "size", "artwork", "completion"] {
             let models = fresh(&mut list, &status);
@@ -3087,6 +3122,17 @@ pub(crate) mod ux4_tests {
             let rebuilt = fresh(&mut list, &live_status);
             assert!(rebuilt[0].status == live_status);
         }
+        list.select(0);
+        let models = fresh(&mut list, &status);
+        let old = list.normalized_recents_key(&theme, None, &status).unwrap();
+        list.remember_normalized_recents(old.clone(), models);
+        let path = list.entries[0].path().to_owned();
+        list.sort(PathsSort { paths: vec![repo.join("replacement.gba")] }).unwrap();
+        let current = list.normalized_recents_key(&theme, None, &status).unwrap();
+        assert_ne!(list.entries[0].path(), path);
+        assert_eq!(old.semantic.selected, current.semantic.selected);
+        assert_ne!(old.semantic.revisions.list_revision, current.semantic.revisions.list_revision);
+        assert!(list.take_normalized_recents(&current, &theme).unwrap().is_none(), "path replacement");
         list.open_menu().unwrap();
         assert!(list.normalized_recents_key(&theme, None, &status).is_none(), "overlay");
         list.menu = None;
@@ -3226,10 +3272,20 @@ pub(crate) mod ux4_tests {
         let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 641).unwrap();
         let mut list = EntryList::new(Rect::new(0, 54, 640, 376), resources(),
             PathsSort { paths: vec![game.path.clone()] }).unwrap();
+        let status = common::theme::frame::Status::default();
+        let mut previous = None;
         for cached in [true, false, true] {
             crate::network_runtime::tests::set_semcache_cached(&game.path, cached);
             let model = semcache_assert_uncached(&mut list, &theme);
             assert_eq!(model.rows[&Binding::Entries][0].value, if cached { "" } else { "Cloud" });
+            let key = list.normalized_recents_key(&theme, None, &status).unwrap();
+            if let Some(old) = previous {
+                assert_ne!(key, old, "cloud transition must invalidate normalized models");
+                assert!(list.take_normalized_recents(&key, &theme).unwrap().is_none());
+            }
+            list.normalized_recents.0.clear();
+            list.remember_normalized_recents(key.clone(), vec![model]);
+            previous = Some(key);
         }
         list.release_theme_art();
     }

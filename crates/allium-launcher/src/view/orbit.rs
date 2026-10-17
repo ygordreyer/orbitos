@@ -1656,6 +1656,41 @@ mod refresh_tests {
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]
+    fn resolved_art_path_can_change_without_model_key_revisions() {
+        let root = std::env::temp_dir().canonicalize().unwrap()
+            .join(format!("allium-art-keycost-{}", std::process::id()));
+        assert!(!root.exists());
+        let tall = root.join("media/covers-tall/Game.png");
+        std::fs::create_dir_all(tall.parent().unwrap()).unwrap();
+        write_art(&tall, 1, 1, 90);
+        common::media::invalidate();
+        let entries = [Entry::Game(Game::new(root.join("Game.chd")))];
+        common::media::metadata(entries[0].path());
+        let mut orbit = Orbit::new();
+        orbit.set_cover_shape(true);
+        orbit.prepare_window(&entries, 0, 0, 1);
+        let fallback = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+        let resolved = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+        assert!(orbit.insert_cached(CachedArt { target: None,
+            path: art_path(&entries[0], "stock"), image: Some(fallback.clone()) }));
+        assert!(orbit.insert_cached(CachedArt { target: None,
+            path: tall.clone(), image: Some(resolved.clone()) }));
+        let revisions = || (art_cache_revision(), completion_generation(),
+            common::media::generation(), common::media::name_generation());
+        let before = revisions();
+        let old = orbit.theme_art(&entries, 0, 0, 1);
+        assert!(std::sync::Arc::ptr_eq(old.selected_cover.as_ref().unwrap(), &fallback));
+        assert_eq!(common::media::resolve(entries[0].path(), common::media::Kind::TallCover), Some(tall));
+        assert_eq!(revisions(), before, "path-cache hydration has no model-key revision");
+        let refreshed = orbit.theme_art(&entries, 0, 0, 1);
+        assert!(std::sync::Arc::ptr_eq(refreshed.selected_cover.as_ref().unwrap(), &resolved));
+        orbit.release_art();
+        common::media::invalidate();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn art_invalidation_reloads_replaced_files_and_previous_misses() {
         let root = std::env::temp_dir()
             .canonicalize()

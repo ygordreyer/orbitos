@@ -881,6 +881,29 @@ pub fn begin(game: &Game, reset: bool) -> Result<bool> {
         }
     })
 }
+// Catalog validation guarantees relative ROM and payload paths. Compare their
+// components without allocating joined paths, even when the bounded index is absent.
+fn descriptor_ref<'a>(runtime: &'a Runtime, path: &Path) -> Option<&'a NetworkGame> {
+    if let Some(index) = &runtime.path_index {
+        return index.get(path).map(|i| &runtime.catalog.games[*i]);
+    }
+    runtime.catalog.games.iter().find(|game| {
+        path.components().eq(runtime.config.root.components().chain(Path::new(&game.game_path).components()))
+            || game.files.iter().any(|file| {
+                let target = runtime.config.root.components().chain(Path::new(&game.cache_path).components());
+                if game.install_kind == "file" {
+                    path.components().eq(target)
+                } else {
+                    path.components().eq(target.chain(Path::new(&file.relative_path).components()))
+                }
+            })
+    })
+}
+pub(crate) fn has_download(path: &Path) -> bool {
+    with(false, |runtime| descriptor_ref(runtime, path).is_some_and(|game| {
+        runtime.status.get(&game.id).map(String::as_str) != Some("Cached")
+    }))
+}
 pub fn download_id(path: &Path) -> Option<String> {
     with(None, |runtime| {
         runtime.descriptor(path).and_then(|game| {
@@ -1360,6 +1383,57 @@ pub(crate) mod tests {
             let id = runtime.descriptor(path).unwrap().id;
             runtime.status.insert(id, if cached { "Cached" } else { "Missing" }.into());
         });
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn recents_download_predicate_matches_owned_lookup_with_and_without_index() {
+        assert!(!has_download(Path::new("unknown.chd")));
+        let f = StartupFixture::new("recents-download-predicate");
+        f.configured();
+        initialize(f.root.clone()).unwrap();
+        settle();
+        with((), |r| {
+            let mut catalog = (*r.catalog).clone();
+            let mut directory = f.game.clone();
+            directory.id = "directory".into();
+            directory.game_path = "Roms/PS/Directory/nested/disc.chd".into();
+            directory.launch_path = directory.game_path.clone();
+            directory.cache_path = "Roms/PS/Directory".into();
+            directory.install_kind = "directory".into();
+            directory.files[0].relative_path = "nested/disc.chd".into();
+            directory.files[0].http_route = format!("/v1/files/directory/{}/disc", directory.bundle_revision);
+            let mut alias = directory.files[0].clone();
+            alias.id = "other".into();
+            alias.relative_path = "other.chd".into();
+            alias.http_route = format!("/v1/files/directory/{}/other", directory.bundle_revision);
+            directory.files.push(alias);
+            catalog.games.push(directory);
+            catalog.validate().unwrap();
+            r.catalog = Arc::new(catalog);
+        });
+        let mut paths = with(Vec::new(), |r| r.catalog.games.iter().flat_map(|game| {
+            std::iter::once(PathBuf::from(&game.game_path)).chain(game.targets().unwrap())
+        }).map(|path| r.config.root.join(path)).collect::<Vec<_>>());
+        paths.extend([f.root.join("unknown.chd"), f.root.join("Roms/PS/Directory"),
+            f.root.join("Roms/PS/DirectoryOther/other.chd"), PathBuf::from("outside.chd")]);
+        for indexed in [true, false] {
+            with((), |r| r.path_index = if indexed { catalog_path_index(&r.catalog, &r.config.root) } else { None });
+            for status in [None, Some("Cached"), Some("Missing"), Some("Downloading"), Some("Unavailable")] {
+                with((), |r| {
+                    r.status.clear();
+                    if let Some(status) = status {
+                        for game in &r.catalog.games { r.status.insert(game.id.clone(), status.into()); }
+                    }
+                    for path in &paths {
+                        assert_eq!(descriptor_ref(r, path).map(|game| game.id.as_str()),
+                            descriptor_scan(&r.catalog, &r.config.root, path).as_ref().map(|game| game.id.as_str()));
+                    }
+                });
+                for path in &paths {
+                    assert_eq!(has_download(path), download_id(path).is_some(), "indexed={indexed} status={status:?} path={path:?}");
+                }
+            }
+        }
     }
     fn settle() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
