@@ -393,6 +393,72 @@ pub fn ink_text_layout(theme: &ThemeHandle, c: &Component, focused: bool) -> Ink
         family,
     }
 }
+pub(super) struct TextRaster {
+    pub(super) key: String,
+    ty: Type,
+    value: String,
+    rect: Rect,
+    count: u32,
+    align: Align,
+    overflow: Overflow,
+    center: bool,
+    guide: bool,
+    color: Color,
+    synopsis: bool,
+}
+impl TextRaster {
+    pub(super) fn bytes(&self) -> usize { self.rect.2 as usize * self.rect.3 as usize * 4 + self.key.len() }
+    pub(super) fn pixels(&self) -> Result<Arc<Pixmap>> {
+        let Self { ty, value, rect, count, align, overflow, center, guide, color, .. } = self;
+        let lines = if *guide {
+            ty.guide_lines(value, rect.2, ty.guide_line_count(rect.3, *count))
+        } else {
+            ty.lines(value, rect.2, *count, *overflow)
+        };
+        let mut pix = ink_pixmap(rect.2, rect.3)?;
+        let cap = ty.cap();
+        let block = cap + (lines.len().saturating_sub(1) as u32).saturating_mul(ty.line) as f32;
+        for (i, line) in lines.iter().enumerate() {
+            let (_, left, right) = ty.metrics(line);
+            let x = match align {
+                Align::Left => (-left).ceil(),
+                Align::Right => (rect.2 as f32 - right).floor(),
+                Align::Center => ((rect.2 as f32 - left - right) / 2.0).round(),
+            };
+            let baseline = if *center { (rect.3 as f32 - block) / 2.0 + cap } else { ty.baseline() }
+                + i as f32 * ty.line as f32;
+            raster(&mut pix, ty, line, x, baseline.round(), *color);
+        }
+        Ok(Arc::new(pix))
+    }
+}
+thread_local! { static TEXT_PLAN: RefCell<Option<Vec<TextRaster>>> = const { RefCell::new(None) }; }
+pub(super) fn collecting_text() -> bool { TEXT_PLAN.with(|plan| plan.borrow().is_some()) }
+pub(super) fn collect_detail_text(theme: ThemeHandle, input: &FrameInputs) -> Result<VecDeque<TextRaster>> {
+    let mut frame = PreparedFrame::unpainted(theme, input.screen);
+    TEXT_PLAN.with(|plan| *plan.borrow_mut() = Some(Vec::new()));
+    let result = frame.render_ink(input);
+    let mut texts = TEXT_PLAN.with(|plan| plan.borrow_mut().take().unwrap());
+    result?;
+    texts.sort_by_cached_key(|t| std::cmp::Reverse((t.synopsis, t.value.chars().count() * t.ty.size as usize)));
+    let mut seen = std::collections::HashSet::new();
+    texts.retain(|t| seen.insert(t.key.clone()));
+    Ok(texts.into())
+}
+#[cfg(test)]
+pub(super) fn clear_text_cache() { TEXT.with(|cache| cache.borrow_mut().clear()); }
+pub(super) fn text_prewarm_fits(bytes: usize) -> bool {
+    TEXT.with(|cache| cache.borrow().iter().map(|e| e.pixels.data().len() + e.key.len()).sum::<usize>() + bytes <= TEXT_LIMIT)
+}
+pub(super) fn text_cached(theme: &ThemeHandle, key: &str) -> bool {
+    TEXT.with(|cache| cache.borrow().iter().any(|e| e.theme.ptr_eq(&theme.weak()) && e.key == key))
+}
+pub(super) fn admit_text(theme: &ThemeHandle, key: String, pixels: Arc<Pixmap>) -> bool {
+    if text_cached(theme, &key) { return true; }
+    if !text_prewarm_fits(pixels.data().len() + key.len()) { return false; }
+    TEXT.with(|cache| cache.borrow_mut().push_front(CachedText { theme: theme.weak(), key, pixels }));
+    true
+}
 impl PreparedFrame {
     fn ink_type(&self, c: &Component, focused: bool) -> Type {
         ink_text_layout(&self.theme, c, focused)
@@ -459,6 +525,16 @@ impl PreparedFrame {
         ) + &format!(":{}:{}:{}", rect.2, rect.3, count);
         let key = format!("{key}:{:?}", ty.literal_color);
         let key = if guide { key + ":guide" } else { key };
+        let request = || TextRaster {
+            key: key.clone(), ty: ty.clone(), value: value.clone(), rect, count, align, overflow, center, guide,
+            color: ty.literal_color.unwrap_or_else(|| self.color(ty.color)),
+            synopsis: self.theme.pack().screens[&self.screen].components.iter()
+                .any(|c| c.id == id && c.binding == Some(Binding::SelectedBlurb)),
+        };
+        if collecting_text() {
+            TEXT_PLAN.with(|plan| plan.borrow_mut().as_mut().unwrap().push(request()));
+            return Ok(());
+        }
         let weak = self.theme.weak();
         let cached = TEXT.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -477,30 +553,7 @@ impl PreparedFrame {
             crate::perf_trace::count(crate::perf_trace::Count::TextMiss, 1);
             let _text = crate::perf_trace::recording()
                 .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
-            let lines = if guide {
-                ty.guide_lines(&value, rect.2, ty.guide_line_count(rect.3, count))
-            } else {
-                ty.lines(&value, rect.2, count, overflow)
-            };
-            let mut pix = ink_pixmap(rect.2, rect.3)?;
-            let color = ty.literal_color.unwrap_or_else(|| self.color(ty.color));
-            let cap = ty.cap();
-            let block = cap + (lines.len().saturating_sub(1) as u32).saturating_mul(ty.line) as f32;
-            for (i, line) in lines.iter().enumerate() {
-                let (_, left, right) = ty.metrics(line);
-                let x = match align {
-                    Align::Left => (-left).ceil(),
-                    Align::Right => (rect.2 as f32 - right).floor(),
-                    Align::Center => ((rect.2 as f32 - left - right) / 2.0).round(),
-                };
-                let baseline = if center {
-                    (rect.3 as f32 - block) / 2.0 + cap
-                } else {
-                    ty.baseline()
-                } + i as f32 * ty.line as f32;
-                raster(&mut pix, ty, line, x, baseline.round(), color);
-            }
-            let pix = Arc::new(pix);
+            let pix = request().pixels()?;
             let bytes = pix.data().len() + key.len();
             if bytes <= TEXT_LIMIT {
                 TEXT.with(|cache| {
@@ -542,6 +595,7 @@ impl PreparedFrame {
         style: Option<&Surface>,
     ) {
         let p = c.paint.as_ref().unwrap();
+        if collecting_text() { return; }
         if rect.2 == 0 || rect.3 == 0 {
             return;
         }
@@ -785,6 +839,7 @@ impl PreparedFrame {
             self.ink_components = Some((input.screen, state, components.clone()));
             components
         });
+        if collecting_text() { return self.render_ink_uncached(input, &components); }
         #[cfg(test)]
         if UNCACHED.get() || std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
             return self.render_ink_uncached(input, &components);
@@ -806,6 +861,13 @@ impl PreparedFrame {
         let opacity = c.paint.as_ref().unwrap().opacity.unwrap_or(1.0);
         if opacity == 0.0 {
             return Ok(());
+        }
+        if collecting_text() {
+            return if matches!(c.kind, Kind::Text | Kind::DialogActions | Kind::Navigation | Kind::Hints | Kind::Status)
+                || c.kind == Kind::Image && c.binding == Some(Binding::SelectedLogo)
+                || c.kind == Kind::AssetImage && c.paint.as_ref().unwrap().action_content.is_some() {
+                self.ink_component(c, input)
+            } else { Ok(()) };
         }
         let bounds = effects::paint_bounds(c);
         let before = if opacity < 1.0 {
@@ -2147,6 +2209,7 @@ impl PreparedFrame {
         Ok(())
     }
     fn ink_status(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+        if collecting_text() { return self.ink_status_contents(c, input); }
         // Fixed-width status icons may exceed a valid component's available space.
         // Keep absolute coordinates to preserve path rasterization, and copy back only retained bounds.
         let mut local = ink_pixmap(c.rect.0 + c.rect.2, c.rect.1 + c.rect.3)?;

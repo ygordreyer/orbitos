@@ -28,7 +28,7 @@ mod retained;
 mod tiles;
 #[path = "render_details.rs"]
 mod details;
-pub use details::DetailImageWarm;
+pub use details::{DetailImageWarm, DetailTextWarm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -324,6 +324,25 @@ impl PreparedFrame {
         self.text_boxes.truncate(text_boxes);
         result
     }
+    fn unpainted(theme: ThemeHandle, screen: ScreenId) -> Self {
+        Self {
+            theme: theme.clone(),
+            screen,
+            pixels: Pixmap::new(640, 480).unwrap(),
+            opaque: false,
+            blit: Default::default(),
+            previous_input: None,
+            component_metadata: vec![],
+            retained_layout: false,
+            tiles: Default::default(),
+            ink_cache: Default::default(),
+            damage: vec![],
+            navigation_epoch: std::sync::Arc::new(()),
+            ink_components: None,
+            targets: vec![],
+            text_boxes: vec![],
+        }
+    }
     pub fn prepare(theme: ThemeHandle, input: &FrameInputs) -> Result<Self> {
         Self::prepare_reusing(theme, input, None)
     }
@@ -340,23 +359,7 @@ impl PreparedFrame {
         if previous.is_none() {
             crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
         }
-        let mut result = previous.unwrap_or_else(|| Self {
-            theme: theme.clone(),
-            screen: input.screen,
-            pixels: Pixmap::new(640, 480).unwrap(),
-            opaque: false,
-            blit: Default::default(),
-            previous_input: None,
-            component_metadata: vec![],
-            retained_layout: false,
-            tiles: Default::default(),
-            ink_cache: Default::default(),
-            damage: vec![],
-            navigation_epoch: std::sync::Arc::new(()),
-            ink_components: None,
-            targets: vec![],
-            text_boxes: vec![],
-        });
+        let mut result = previous.unwrap_or_else(|| Self::unpainted(theme.clone(), input.screen));
         // Reuse the token allocation when no speculative work holds a weak stamp.
         // make_mut dissociates outstanding weak stamps before this model can be displayed.
         std::sync::Arc::make_mut(&mut result.navigation_epoch);
@@ -817,6 +820,7 @@ impl PreparedFrame {
         let Some(source) = input.art.selected_logo.as_ref() else {
             return Ok(false);
         };
+        if ink_renderer::collecting_text() { return Ok(true); }
         let rect = Self::logo_rect(c, source);
         let mut slot = c.clone();
         slot.fit = Some(super::pack::Fit::Contain);

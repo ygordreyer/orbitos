@@ -930,12 +930,15 @@ pub fn metadata(path: &Path) -> SharedMetadata {
 }
 /// No storage access, including when a record was evicted.
 pub fn cached_metadata(path: &Path) -> SharedMetadata {
+    try_cached_metadata(path).unwrap_or_default()
+}
+/// Distinguish a resident record from a cold or evicted identity without storage access.
+pub fn try_cached_metadata(path: &Path) -> Option<SharedMetadata> {
     CACHE.with(|c| {
         c.borrow()
             .records
             .get(&normalize(path))
             .map(|record| record.data.clone())
-            .unwrap_or_default()
     })
 }
 pub fn cached_resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
@@ -2040,7 +2043,13 @@ mod tests {
     fn metadata_only_snapshot_does_not_prepare_art_paths() {
         invalidate();
         let path = fixture().join("Complete.sfc");
+        let io = crate::perf_trace::frontend_io_ops();
+        assert!(try_cached_metadata(&path).is_none());
+        assert_eq!(crate::perf_trace::frontend_io_ops(), io);
         let prepared = prepare_game_kinds(&path, &[]);
+        let io = crate::perf_trace::frontend_io_ops();
+        assert_eq!(try_cached_metadata(&path).as_deref(), Some(prepared.metadata.as_ref()));
+        assert_eq!(crate::perf_trace::frontend_io_ops(), io);
         assert!(!prepared.metadata.name.is_empty());
         assert!(prepared.paths.is_empty());
         assert!(CACHE.with(|c| c.borrow().paths.is_empty()));
@@ -2049,6 +2058,7 @@ mod tests {
         assert_eq!(prepared.paths[0].0, Kind::Logo);
         assert!(prepared.paths[0].1.is_some());
         invalidate();
+        assert!(try_cached_metadata(&path).is_none());
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub(crate) struct NavigationWarm {
     metadata: bool,
     ink: bool,
     targets: Option<common::theme::art::Targets>,
+    pub details_text: Option<Box<dyn FnOnce(common::theme::frame::FrameInputs) -> Result<common::theme::frame::FrameInputs> + Send>>,
 }
 
 #[derive(Debug)]
@@ -511,15 +512,36 @@ where
         if let Some(child) = self.child.as_mut() { return child.details_warm_model(handle, screen); }
         if !handle.pack().ink() || !self.root_tab_navigation_ready() { return None; }
         let selected = self.list.selected();
-        let Some(Entry::Game(_)) = self.entries.get(selected) else { return None; };
+        let Some(Entry::Game(game)) = self.entries.get(selected) else { return None; };
         let components = &handle.pack().screens.get(&ScreenId::GameDetail)?.components;
         let mut demand = super::art_queue::Demand::from_components(components, true);
         demand.metadata = false;
         let mut artwork = super::art_queue::plan(&self.entries, selected, selected, 1, 1, demand);
         artwork.retain(|task| task.entry().path() == self.entries[selected].path());
+        let details_text = components.iter().any(|c| c.binding == Some(common::theme::pack::Binding::SelectedBlurb)
+            && c.paint.as_ref().is_some_and(|p| p.section_style.is_some())).then(||
+                crate::view::details::DetailsSnapshot::cached(game)).flatten().map(|snapshot| {
+            let game = game.clone();
+            let title = self.entries[selected].name().to_owned();
+            let platform = self.res.get::<ConsoleMapper>().get_console(&game.path)
+                .map(|c| c.name.clone()).unwrap_or_default();
+            let theme = handle.clone();
+            let focus = Self::detail_targets(handle)[0].clone();
+            Box::new(move |base: FrameInputs| {
+                // Section pagination excludes history, so no UI-thread database query is needed.
+                let mut details = crate::view::details::Details::from_snapshot(&game, &platform, snapshot);
+                details.reflow(&theme);
+                let mut input = details.frame_input(&theme, &title, focus);
+                input.art = base.art;
+                input.status = base.status;
+                input.navigation = base.navigation;
+                input.selected = base.selected;
+                Ok(input)
+            }) as Box<dyn FnOnce(FrameInputs) -> Result<FrameInputs> + Send>
+        });
         Some(NavigationWarm {
             input: FrameInputs::new(ScreenId::GameDetail), artwork, selected, first: selected, count: 1,
-            metadata: false, ink: true,
+            metadata: false, ink: true, details_text,
             targets: Some(common::theme::art::Targets::for_screens(handle.pack(), &[screen, ScreenId::GameDetail])),
         })
     }
@@ -631,6 +653,7 @@ where
             metadata,
             ink,
             targets: None,
+            details_text: None,
         }))
     }
 
@@ -798,76 +821,12 @@ where
         }
         let mut models = vec![input];
         if let Some(details) = &self.details {
-            let mut detail = FrameInputs::new(ScreenId::GameDetail);
-            detail.pagination = Some(common::theme::frame::Pagination { page: details.page + 1, total: details.pages.len() });
-            detail.detail_lines = details.section_pages.get(details.page).cloned().unwrap_or_default();
-            if let Some(entry) = self.entries.get(selected) {
-                detail
-                    .text
-                    .insert(Binding::SelectedTitle, entry.name().into());
-            }
-            detail
-                .text
-                .insert(Binding::SelectedMetadata, details.metadata.clone());
-            if handle.pack().ink() {
-                detail.metadata = details.metadata_runs.clone();
-                detail.facts = details.facts.clone();
-                detail
-                    .text
-                    .insert(Binding::SelectedSource, details.source.clone());
-                detail.text.insert(
-                    Binding::Pagination,
-                    format!("{} / {}", details.page + 1, details.pages.len()),
-                );
-                detail
-                    .text
-                    .insert(Binding::SelectedBlurb, details.pages[details.page].clone());
-            } else {
-                detail.text.insert(Binding::SelectedBlurb, details.text());
-            }
+            let focus = if handle.pack().ink() {
+                let targets = Self::detail_targets(handle);
+                targets[self.detail_action % targets.len()].clone()
+            } else { Default::default() };
+            let mut detail = details.frame_input(handle, self.entries.get(selected).map_or("", Entry::name), focus);
             detail.art = models[0].art.clone();
-            detail.rows.insert(Binding::Entries, vec![]);
-            detail.rows.insert(
-                Binding::Actions,
-                if handle.pack().ink() {
-                    vec![
-                        Row {
-                            subtitle: String::new(),
-                            id: "play".into(),
-                            label: "Play".into(),
-                            value: String::new(),
-                            enabled: true,
-                        },
-                        Row {
-                            subtitle: String::new(),
-                            id: "back".into(),
-                            label: "Back".into(),
-                            value: String::new(),
-                            enabled: true,
-                        },
-                    ]
-                } else {
-                    vec![]
-                },
-            );
-            if handle.pack().ink() {
-                let targets=Self::detail_targets(handle);
-                detail.focus=targets[self.detail_action % targets.len()].clone();
-            }
-            detail.hints = vec![
-                Hint {
-                    button: "A".into(),
-                    label: "Play".into(),
-                },
-                Hint {
-                    button: "B".into(),
-                    label: "Back".into(),
-                },
-                Hint {
-                    button: "Dpad".into(),
-                    label: "More information".into(),
-                },
-            ];
             models.push(detail);
         }
         if let Some(menu) = self.menu.as_mut() {

@@ -21,7 +21,49 @@ pub(crate) struct Details {
     sections: Vec<(Option<String>, String)>,
     full_text: String,
 }
+// All lookup policy, including explicit containers, belongs to the UI thread.
+pub(crate) struct DetailsSnapshot {
+    metadata: std::sync::Arc<common::media::Metadata>,
+    description: Option<String>,
+    fallback: Option<MetadataEntry>,
+}
+impl DetailsSnapshot {
+    pub(crate) fn cached(game: &Game) -> Option<Self> {
+        let metadata = common::media::try_cached_metadata(&game.path)?;
+        METADATA_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let source = |path: &Path| cache.sources.iter().find(|s| s.path == path).map(|s| &s.value);
+            let fallback = if game.path.starts_with(common::constants::ALLIUM_GAMES_DIR.join("PS")) {
+                match source(&common::constants::ALLIUM_BASE_DIR.join("metadata/game-details.json"))? {
+                    CachedValue::Catalog(catalog) => matching_entry(catalog, &game.path),
+                    _ => None,
+                }
+            } else { None };
+            let description = if !metadata.desc.trim().is_empty() {
+                Some(metadata.desc.clone())
+            } else {
+                let parent = game.path.parent()?;
+                let mut description = None;
+                for name in ["gamelist.xml", "miyoogamelist.xml"] {
+                    match source(&parent.join(name))? {
+                        CachedValue::Synopses(map) => {
+                            description = map.get(&game.path).cloned();
+                            if description.is_some() { break; }
+                        }
+                        CachedValue::Skipped => {}
+                        _ => break,
+                    }
+                }
+                description
+            };
+            Some(Self { metadata, description, fallback })
+        })
+    }
+}
 impl Details {
+    pub(crate) fn from_snapshot(game: &Game, platform: &str, snapshot: DetailsSnapshot) -> Self {
+        Self::build(game, platform, &snapshot.metadata, snapshot.description, snapshot.fallback.as_ref())
+    }
     pub fn new(game: &Game, platform: &str) -> Self {
         let fallback = fallback(game);
         let metadata = common::media::metadata(&game.path);
@@ -329,6 +371,75 @@ impl Details {
             self.page + 1,
             self.pages.len()
         )
+    }
+    pub(crate) fn frame_input(&self, handle: &common::theme::ThemeHandle, title: &str,
+        focus: common::theme::frame::Focus) -> common::theme::frame::FrameInputs {
+        use common::theme::{frame::{FrameInputs, Hint, Row}, pack::{Binding, ScreenId}};
+        let mut detail = FrameInputs::new(ScreenId::GameDetail);
+        detail.pagination = Some(common::theme::frame::Pagination { page: self.page + 1, total: self.pages.len() });
+        detail.detail_lines = self.section_pages.get(self.page).cloned().unwrap_or_default();
+        detail.text.insert(Binding::SelectedTitle, title.into());
+        detail
+            .text
+            .insert(Binding::SelectedMetadata, self.metadata.clone());
+        if handle.pack().ink() {
+            detail.metadata = self.metadata_runs.clone();
+            detail.facts = self.facts.clone();
+            detail
+                .text
+                .insert(Binding::SelectedSource, self.source.clone());
+            detail.text.insert(
+                Binding::Pagination,
+                format!("{} / {}", self.page + 1, self.pages.len()),
+            );
+            detail
+                .text
+                .insert(Binding::SelectedBlurb, self.pages[self.page].clone());
+        } else {
+            detail.text.insert(Binding::SelectedBlurb, self.text());
+        }
+        detail.rows.insert(Binding::Entries, vec![]);
+        detail.rows.insert(
+            Binding::Actions,
+            if handle.pack().ink() {
+                vec![
+                    Row {
+                        subtitle: String::new(),
+                        id: "play".into(),
+                        label: "Play".into(),
+                        value: String::new(),
+                        enabled: true,
+                    },
+                    Row {
+                        subtitle: String::new(),
+                        id: "back".into(),
+                        label: "Back".into(),
+                        value: String::new(),
+                        enabled: true,
+                    },
+                ]
+            } else {
+                vec![]
+            },
+        );
+        if handle.pack().ink() {
+            detail.focus = focus;
+        }
+        detail.hints = vec![
+            Hint {
+                button: "A".into(),
+                label: "Play".into(),
+            },
+            Hint {
+                button: "B".into(),
+                label: "Back".into(),
+            },
+            Hint {
+                button: "Dpad".into(),
+                label: "More information".into(),
+            },
+        ];
+        detail
     }
     pub fn turn(&mut self, forward: bool) {
         self.page = if forward {
@@ -1176,6 +1287,43 @@ mod cache_tests {
 #[cfg(test)]
 mod media_contract_tests {
     use super::*;
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn selected_details_idle_snapshot_preserves_cached_fallback_and_synopsis() {
+        let root = common::constants::ALLIUM_GAMES_DIR.join("PS/snapshot-details");
+        fs::create_dir_all(&root).unwrap();
+        let game = Game::new(root.join("R4 - Ridge Racer Type 4 (USA).chd"));
+        fs::write(root.join("gamelist.xml"), "<gameList><game><path>./R4 - Ridge Racer Type 4 (USA).chd</path><developer>Local studio</developer></game></gameList>").unwrap();
+        common::media::invalidate();
+        invalidate_metadata();
+        assert!(DetailsSnapshot::cached(&game).is_none());
+        assert_eq!(common::media::metadata(&game.path).developer, "Local studio");
+        // A resident media record alone cannot substitute for a cold fallback or synopsis.
+        assert!(DetailsSnapshot::cached(&game).is_none());
+        let real = Details::new(&game, "PlayStation");
+        #[cfg(feature = "perf-bench")]
+        let io = common::perf_trace::frontend_io_ops();
+        let snapshot = DetailsSnapshot::cached(&game).unwrap();
+        #[cfg(feature = "perf-bench")]
+        assert_eq!(common::perf_trace::frontend_io_ops(), io);
+        let warmed = std::thread::spawn(move || {
+            #[cfg(feature = "perf-bench")]
+            let io = common::perf_trace::frontend_io_ops();
+            let details = Details::from_snapshot(&game, "PlayStation", snapshot);
+            #[cfg(feature = "perf-bench")]
+            assert_eq!(common::perf_trace::frontend_io_ops(), io);
+            details
+        }).join().unwrap();
+        assert_eq!(warmed.full_text, real.full_text);
+        assert_eq!(warmed.facts, real.facts);
+        assert_eq!(warmed.source, real.source);
+        assert_eq!(warmed.pages, real.pages);
+        assert!(warmed.full_text.contains("Local studio"));
+        assert!(!warmed.full_text.contains("Synopsis unavailable"));
+        fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+        invalidate_metadata();
+    }
     #[test]
     fn details_reads_gamelist_metadata_with_no_unavailable_placeholders() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

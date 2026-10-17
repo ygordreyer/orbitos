@@ -157,7 +157,8 @@ enum NavigationWarmStage {
     ),
     Rasters(VecDeque<common::theme::render::NavigationRasterWarm>),
     DetailsArtwork(super::entry_list::NavigationWarm),
-    DetailsImages(common::theme::render::DetailImageWarm),
+    DetailsImages(common::theme::render::DetailImageWarm, super::entry_list::NavigationWarm),
+    DetailsText(common::theme::render::DetailTextWarm),
     DetailShadows,
 }
 
@@ -677,7 +678,8 @@ where
             Some(NavigationWarmStage::Artwork(_)) => "artwork",
             Some(NavigationWarmStage::Images(_, _)) => "image_transform",
             Some(NavigationWarmStage::DetailsArtwork(_)) => "details_artwork",
-            Some(NavigationWarmStage::DetailsImages(_)) => "details_image_transform",
+            Some(NavigationWarmStage::DetailsImages(..)) => "details_image_transform",
+            Some(NavigationWarmStage::DetailsText(_)) => "details_text",
             Some(NavigationWarmStage::DetailShadows) => "detail_shadow",
             Some(NavigationWarmStage::Rasters(_)) => "raster",
         }
@@ -805,12 +807,23 @@ where
                     1 => self.views.1.navigation_warm_art_step(&mut plan),
                     _ => return Ok(true),
                 };
-                if ready { NavigationWarmStage::DetailsImages(frame.detail_images(&plan.input)) }
+                if ready { NavigationWarmStage::DetailsImages(frame.detail_images(&plan.input), plan) }
                 else { NavigationWarmStage::DetailsArtwork(plan) }
             }
-            NavigationWarmStage::DetailsImages(mut images) => {
-                if frame.prewarm_detail_image_step(&mut images)? { NavigationWarmStage::DetailShadows }
-                else { NavigationWarmStage::DetailsImages(images) }
+            NavigationWarmStage::DetailsImages(mut images, mut plan) => {
+                if frame.prewarm_detail_image_step(&mut images)? {
+                    if let Some(model) = plan.details_text.take() {
+                        let status = if self.res.get::<Stylesheet>().status_bar.hide_status_in_launcher {
+                            Default::default()
+                        } else { self.status_bar.theme_inputs() };
+                        prepare_theme_inputs(std::slice::from_mut(&mut plan.input), &self.res, self.selected, &status);
+                        NavigationWarmStage::DetailsText(frame.detail_texts(move || model(plan.input)))
+                    } else { NavigationWarmStage::DetailShadows }
+                } else { NavigationWarmStage::DetailsImages(images, plan) }
+            }
+            NavigationWarmStage::DetailsText(mut text) => {
+                if frame.prewarm_detail_text_step(&mut text)? { NavigationWarmStage::DetailShadows }
+                else { NavigationWarmStage::DetailsText(text) }
             }
             NavigationWarmStage::DetailShadows => {
                 let done = self.detail_shadows.as_mut()
@@ -1648,12 +1661,17 @@ mod integration_navigation_tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(orbit_fixture)]
-    async fn selected_details_idle_images_match_cold_open_and_drop_on_selection_change() {
+    async fn selected_details_idle_images_and_text_match_cold_open_and_drop_on_selection_change() {
         let root = common::constants::ALLIUM_GAMES_DIR.join("integration-details-warm");
         std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        std::fs::write(root.join("gamelist.xml"), format!("<gameList>{}</gameList>", (0..2).map(|index| format!(
+            "<game><path>./Network {index}</path><desc>{}</desc><developer>Human Entertainment</developer><publisher>ASCII</publisher><genre>Adventure, Horror</genre><releasedate>19970930T000000</releasedate><players>1</players><scraper>Fixture scraper</scraper></game>",
+            "A young heroine explores a mansion and searches for her friends. A shadow follows her through the rooms. ".repeat(6)
+        )).collect::<String>())).unwrap();
         let database = Database::in_memory().unwrap();
         for index in 0..2 {
-            let path = root.join(format!("Details {index}.chd"));
+            let path = root.join(format!("Network {index}/Discs/Details {index}.chd"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, []).unwrap();
             for (suffix, w, h) in [("orbit", 101, 101), ("hero", 360, 210), ("logo", 220, 96)] {
                 let mut art = tiny_skia::Pixmap::new(w, h).unwrap();
@@ -1693,11 +1711,45 @@ mod integration_navigation_tests {
         let mut display = <DefaultPlatform as Platform>::Display::default();
         let style = res.get::<Stylesheet>().clone();
         let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        common::media::invalidate();
+        common::media::set_game_containers((0..2).map(|index| (
+            root.join(format!("Network {index}/Discs/Details {index}.chd")),
+            root.join(format!("Network {index}")),
+        )));
+        #[cfg(feature = "perf-bench")]
+        let io = common::perf_trace::frontend_io_ops();
+        let cold_plan = app.views.0.details_warm_model(&handle, common::theme::pack::ScreenId::Recents).unwrap();
+        assert!(cold_plan.details_text.is_none(), "cold metadata produced a text plan");
+        #[cfg(feature = "perf-bench")]
+        assert_eq!(common::perf_trace::frontend_io_ops(), io, "planning performed cold IO");
+        drop(cold_plan);
+        // Populate the normal UI-thread cache, including the explicit container aliases.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        for index in 0..2 {
+            loop {
+                common::media::poll_name_indexes();
+                let data = common::media::metadata(&root.join(format!("Network {index}/Discs/Details {index}.chd")));
+                if data.developer == "Human Entertainment" { break; }
+                assert!(std::time::Instant::now() < deadline, "UI metadata did not become resident");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        let mut snapshot_plan = app.views.0.details_warm_model(&handle, common::theme::pack::ScreenId::Recents).unwrap();
+        let model = snapshot_plan.details_text.take().unwrap();
+        let warmed = std::thread::spawn(move || {
+            #[cfg(feature = "perf-bench")]
+            let io = common::perf_trace::frontend_io_ops();
+            let input = model(snapshot_plan.input).unwrap();
+            #[cfg(feature = "perf-bench")]
+            assert_eq!(common::perf_trace::frontend_io_ops(), io, "worker performed metadata IO");
+            input
+        }).join().unwrap();
+        assert!(warmed.facts.iter().any(|(key, value)| key == "Developer" && value == "Human Entertainment"));
         app.prepare_theme().unwrap();
         app.draw(&mut display, &style).unwrap();
         let mut work = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut saw_details = false;
+        let mut saw_text = false;
         loop {
             // Artwork notifications are consumed by the normal media poll in the real loop.
             app.idle_media_step();
@@ -1706,17 +1758,23 @@ mod integration_navigation_tests {
                 app.draw(&mut display, &style).unwrap();
             }
             let done = app.prewarm_navigation_step(&mut work, 1).unwrap();
-            saw_details |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsImages(_)));
+            saw_details |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsImages(..)));
+            saw_text |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsText(_)));
             if done { break; }
             assert!(std::time::Instant::now() < deadline, "Details warm timeout");
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert!(saw_details);
+        assert!(saw_details && saw_text);
         app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
         let mut models = app.theme_models(&handle).unwrap().unwrap();
         app.normalize_theme_inputs(&handle, &mut models);
         let details = models.last().unwrap();
         assert_eq!(details.screen, common::theme::pack::ScreenId::GameDetail);
+        assert_eq!(details.text, warmed.text);
+        assert_eq!(details.metadata, warmed.metadata);
+        assert_eq!(details.facts, warmed.facts);
+        assert_eq!(details.detail_lines, warmed.detail_lines);
+        assert_eq!(details.pagination, warmed.pagination);
         assert_eq!(details.art.selected_cover.as_ref().unwrap().width(), 101);
         assert_eq!(details.art.selected_hero.as_ref().unwrap().width(), 360);
         #[cfg(feature = "perf-bench")]
@@ -1726,7 +1784,10 @@ mod integration_navigation_tests {
         }
         let hot = common::theme::render::PreparedFrame::prepare(handle.clone(), details).unwrap();
         #[cfg(feature = "perf-bench")]
-        assert_eq!(common::perf_trace::probe_counts()["image_misses"], 0);
+        {
+            assert_eq!(common::perf_trace::probe_counts()["image_misses"], 0);
+            assert_eq!(common::perf_trace::probe_counts()["text_misses"], 0);
+        }
         let cold_theme = ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 902).unwrap();
         let cold = common::theme::render::PreparedFrame::prepare(cold_theme, details).unwrap();
         assert_eq!(hot.pixels().data(), cold.pixels().data());
@@ -1734,17 +1795,34 @@ mod integration_navigation_tests {
         app.prepare_theme().unwrap();
         app.draw(&mut display, &style).unwrap();
         work = None;
-        while !matches!(work.as_ref().map(|w: &NavigationWarm| &w.stage), Some(NavigationWarmStage::DetailsImages(_))) {
+        while !matches!(work.as_ref().map(|w: &NavigationWarm| &w.stage), Some(NavigationWarmStage::DetailsImages(..))) {
             assert!(!app.prewarm_navigation_step(&mut work, 1).unwrap());
             assert!(std::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert!(!app.prewarm_navigation_step_with_pending(&mut work, 1, || true).unwrap());
-        assert!(matches!(work.as_ref().unwrap().stage, NavigationWarmStage::DetailsImages(_)));
+        assert!(matches!(work.as_ref().unwrap().stage, NavigationWarmStage::DetailsImages(..)));
+        while !matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsText(_))) {
+            assert!(!app.prewarm_navigation_step(&mut work, 1).unwrap());
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(!app.prewarm_navigation_step_with_pending(&mut work, 1, || true).unwrap());
+        assert!(matches!(work.as_ref().unwrap().stage, NavigationWarmStage::DetailsText(_)));
+        app.prewarm_navigation_step(&mut work, 1).unwrap();
+        let stale = work.as_ref().unwrap().media_generation;
+        common::media::invalidate();
+        assert_ne!(common::media::generation(), stale);
+        app.prewarm_navigation_step(&mut work, 1).unwrap();
+        assert!(work.is_none(), "media invalidation retained in-flight Details work");
+        // A new plan still expires when the selected game changes.
+        app.prewarm_navigation_step(&mut work, 1).unwrap();
+        assert!(work.is_some());
         app.handle_key_event(KeyEvent::Pressed(Key::Down), tx, &mut VecDeque::new()).await.unwrap();
         app.prewarm_navigation_step(&mut work, 1).unwrap();
         assert!(work.is_none(), "selection change retained speculative Details work");
         std::fs::remove_dir_all(root).unwrap();
+        common::media::set_game_containers(std::iter::empty());
         common::media::invalidate();
     }
 
