@@ -148,7 +148,6 @@ pub(crate) struct NavigationWarm {
     name_generation: u64,
     direction: isize,
     stage: NavigationWarmStage,
-    shadows: Option<common::theme::render::DetailShadowWarm>,
 }
 enum NavigationWarmStage {
     Artwork(super::entry_list::NavigationWarm),
@@ -188,6 +187,8 @@ where
     dirty: bool,
     theme_dirty: bool,
     navigation_direction: isize,
+    // Static Details geometry outlives selection-specific navigation plans.
+    detail_shadows: Option<common::theme::render::DetailShadowWarm>,
     content_complete: bool,
     theme_scene: Option<crate::theme_adapter::ThemeScene>,
     present_damage: Option<Vec<Rect>>,
@@ -303,6 +304,7 @@ where
             dirty: true,
             theme_dirty: true,
             navigation_direction: 1,
+            detail_shadows: None,
             content_complete: true,
             theme_scene: None,
             present_damage: None,
@@ -377,7 +379,7 @@ where
 
     #[cfg(test)]
     pub(crate) fn proof_detail_shadow_warming(&self, work: &Option<NavigationWarm>) -> bool {
-        work.as_ref().is_some_and(|work| work.shadows.is_some())
+        work.is_some() && self.detail_shadows.is_some()
     }
 
     #[cfg(test)]
@@ -665,13 +667,13 @@ where
             })
     }
 
-    #[cfg(feature = "perf-bench")]
+    #[cfg(any(test, feature = "perf-bench"))]
     pub(crate) fn navigation_warm_kind(&self, work: &Option<NavigationWarm>) -> &'static str {
-        if work.as_ref().is_some_and(|work| work.shadows.is_some()) { return "detail_shadow"; }
         match work.as_ref().map(|work| &work.stage) {
             None => "plan",
             Some(NavigationWarmStage::Artwork(_)) => "artwork",
             Some(NavigationWarmStage::Images(_, _)) => "image_transform",
+            Some(NavigationWarmStage::Rasters(rasters)) if rasters.is_empty() => "detail_shadow",
             Some(NavigationWarmStage::Rasters(_)) => "raster",
         }
     }
@@ -734,6 +736,9 @@ where
                 _ => None,
             };
             common::perf_trace::count(common::perf_trace::Count::PlanBuilds, 1);
+            if self.detail_shadows.as_ref().is_none_or(|shadows| !shadows.theme_matches(&handle)) {
+                self.detail_shadows = Some(frame.detail_shadow_warm());
+            }
             *work = Some(NavigationWarm {
                 stamp: frame.navigation_stamp(),
                 media_generation: common::media::generation(),
@@ -741,16 +746,10 @@ where
                 direction,
                 stage: plan.map(NavigationWarmStage::Artwork)
                     .unwrap_or_else(|| NavigationWarmStage::Rasters(VecDeque::new())),
-                shadows: Some(frame.detail_shadow_warm()),
             });
             return Ok(false);
         };
         if input_pending() {
-            *work = Some(current);
-            return Ok(false);
-        }
-        if let Some(shadows) = &mut current.shadows {
-            if frame.prewarm_detail_shadow_step(shadows) { current.shadows = None; }
             *work = Some(current);
             return Ok(false);
         }
@@ -782,12 +781,13 @@ where
             }
             NavigationWarmStage::Rasters(mut rasters) => {
                 let Some(raster) = rasters.pop_front() else {
-                    return Ok(true);
+                    let done = self.detail_shadows.as_mut()
+                        .is_none_or(|shadows| frame.prewarm_detail_shadow_step(shadows));
+                    current.stage = NavigationWarmStage::Rasters(rasters);
+                    *work = Some(current);
+                    return Ok(done);
                 };
                 frame.prewarm_navigation_raster(raster)?;
-                if rasters.is_empty() {
-                    return Ok(true);
-                }
                 NavigationWarmStage::Rasters(rasters)
             }
         };

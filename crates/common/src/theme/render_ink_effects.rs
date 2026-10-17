@@ -212,6 +212,18 @@ fn shadow_admit(theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>, key:
         }
     });
 }
+fn shadow_prewarm_fits(bytes: usize) -> bool {
+    SHADOWS.with(|cache| {
+        let cache = cache.borrow();
+        cache.len() < 64
+            && cache.iter().map(|e| e.pixels.data().len()).sum::<usize>() + bytes <= 2 * 1024 * 1024
+    })
+}
+fn shadow_prewarm_admit(theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>, key: ShadowKey, pixels: Arc<Pixmap>) -> bool {
+    if !shadow_prewarm_fits(pixels.data().len()) { return false; }
+    SHADOWS.with(|cache| cache.borrow_mut().push_front(CachedShadow { theme, key, pixels }));
+    true
+}
 struct ShadowJob {
     key: ShadowKey,
     pixels: Pixmap,
@@ -282,10 +294,22 @@ impl ShadowJob {
 
 /// UI-thread cache work; owns scratch pixels and never borrows presentation state.
 pub struct DetailShadowWarm {
-    stamp: NavigationStamp,
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
     keys: VecDeque<ShadowKey>,
     job: Option<ShadowJob>,
+}
+impl std::fmt::Debug for DetailShadowWarm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetailShadowWarm")
+            .field("remaining", &self.keys.len())
+            .field("in_progress", &self.job.is_some())
+            .finish()
+    }
+}
+impl DetailShadowWarm {
+    pub fn theme_matches(&self, theme: &ThemeHandle) -> bool {
+        self.theme.ptr_eq(&theme.weak())
+    }
 }
 impl PreparedFrame {
     fn shadow_key(&self, rect: Rect, radius: u32, shadow: &Shadow) -> Option<(ShadowKey, i32, i32)> {
@@ -340,11 +364,11 @@ impl PreparedFrame {
                 }
             }
         }
-        DetailShadowWarm { stamp: self.navigation_stamp(), theme: self.theme.weak(), keys, job: None }
+        DetailShadowWarm { theme: self.theme.weak(), keys, job: None }
     }
     /// At most four convolution scanlines or four tint rows, with no framebuffer writes.
     pub fn prewarm_detail_shadow_step(&self, work: &mut DetailShadowWarm) -> bool {
-        if !self.navigation_is_current(&work.stamp) || !self.theme.weak().ptr_eq(&work.theme) {
+        if !work.theme_matches(&self.theme) {
             work.keys.clear();
             work.job = None;
             return true;
@@ -355,12 +379,18 @@ impl PreparedFrame {
                 work.job = None;
             } else if job.step() {
                 let job = work.job.take().unwrap();
-                shadow_admit(work.theme.clone(), job.key, Arc::new(job.pixels));
+                if !shadow_prewarm_admit(work.theme.clone(), job.key, Arc::new(job.pixels)) {
+                    work.keys.clear();
+                }
             }
             return work.job.is_none() && work.keys.is_empty();
         }
         let Some(key) = work.keys.pop_front() else { return true; };
         if shadow_lookup(&work.theme, &key).is_none() {
+            if !shadow_prewarm_fits(key.tile.0 as usize * key.tile.1 as usize * 4) {
+                work.keys.clear();
+                return true;
+            }
             work.job = Some(ShadowJob::new(key));
         }
         work.job.is_none() && work.keys.is_empty()

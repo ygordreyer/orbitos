@@ -214,7 +214,13 @@ async fn details_shadow_batches_yield_to_input_without_changing_presentation_or_
     let mut work = None;
     assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
     assert!(app.view.proof_detail_shadow_warming(&work));
-    // The first tick creates a job, subsequent ticks advance bounded scanlines.
+    let started = std::time::Instant::now();
+    while app.view.navigation_warm_kind(&work) != "detail_shadow" {
+        assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    // The first shadow tick creates a job, subsequent ticks advance bounded scanlines.
     for batch in 0..12 {
         assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
         assert!(app.view.proof_detail_shadow_warming(&work));
@@ -237,5 +243,45 @@ async fn details_shadow_batches_yield_to_input_without_changing_presentation_or_
         assert_eq!(app.view.proof_navigation_scene(), scene);
         assert_eq!(app.view.proof_game_theme_inputs()[0].focus.item, selected);
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn artwork_precedes_incomplete_shadows_after_selection_restarts() {
+    let (_reset, mut app) = launcher_fixture();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../themes/compact-plus").canonicalize().unwrap();
+    let bank = common::theme::fonts::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+    let handle = common::theme::ThemeHandle::prepare(
+        common::theme::runtime::ThemeSnapshot::load(&root).unwrap(), &bank, 902,
+    ).unwrap();
+    app.res.insert(Some(handle));
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await.unwrap();
+    let mut work = None;
+    let (tx, _rx) = mpsc::channel(100);
+    for selection in 0..3 {
+        assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
+        assert_eq!(app.view.navigation_warm_kind(&work), "artwork");
+        let started = std::time::Instant::now();
+        let mut steps = 0;
+        while app.view.navigation_warm_kind(&work) == "artwork" {
+            assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
+            steps += 1;
+            assert!(steps < 100, "artwork stalled behind incomplete shadows");
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(app.view.proof_detail_shadow_warming(&work));
+        if selection < 2 {
+            let before = app.view.proof_game_theme_inputs()[0].focus.item.clone();
+            app.view.handle_key_event(KeyEvent::Pressed(Key::Down), tx.clone(), &mut VecDeque::new())
+                .await.unwrap();
+            app.present_frame(false, &mut overlay).await.unwrap();
+            assert_ne!(app.view.proof_game_theme_inputs()[0].focus.item, before);
+            // The event loop drops navigation plans on input.
+            work = None;
+        }
     }
 }

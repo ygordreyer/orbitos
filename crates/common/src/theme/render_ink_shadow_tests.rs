@@ -195,3 +195,69 @@ fn recents_and_details_shadow_tiles_share_the_existing_cache_budget() {
         assert_eq!(cache.iter().map(|entry| entry.pixels.data().len()).sum::<usize>(), 1_531_136);
     });
 }
+
+#[test]
+fn speculative_shadow_admission_never_evicts_existing_entries() {
+    use crate::theme::render_navigation::tests::{arts, model, theme};
+    let handle = theme("big-picture", "square");
+    let input = model(&handle, ScreenId::Recents, 0, &arts());
+    SHADOWS.with(|cache| cache.borrow_mut().clear());
+    let frame = PreparedFrame::prepare(handle, &input).unwrap();
+    let existing = SHADOWS.with(|cache| cache.borrow().iter()
+        .map(|entry| (entry.key.clone(), entry.pixels.clone())).collect::<Vec<_>>());
+    assert!(!existing.is_empty());
+    let mut work = frame.detail_shadow_warm();
+    let requested = work.keys.iter().filter(|key| shadow_lookup(&frame.theme.weak(), key).is_none())
+        .map(|key| key.tile.0 as usize * key.tile.1 as usize * 4).sum::<usize>();
+    assert!(existing.iter().map(|(_, pixels)| pixels.data().len()).sum::<usize>() + requested > 2 * 1024 * 1024);
+    let mut steps = 0;
+    while !frame.prewarm_detail_shadow_step(&mut work) {
+        steps += 1;
+        assert!(steps < 1000);
+    }
+    assert!(work.job.is_none() && work.keys.is_empty());
+    SHADOWS.with(|cache| {
+        let cache = cache.borrow();
+        assert!(cache.iter().map(|entry| entry.pixels.data().len()).sum::<usize>() <= 2 * 1024 * 1024);
+        for (key, pixels) in &existing {
+            assert!(cache.iter().any(|entry| entry.key == *key && Arc::ptr_eq(&entry.pixels, pixels)));
+        }
+    });
+    for _ in 0..3 {
+        assert!(frame.prewarm_detail_shadow_step(&mut work));
+        assert!(work.job.is_none() && work.keys.is_empty());
+    }
+    // Recheck admission at completion if render-time entries filled the budget mid-job.
+    let key = existing[0].0.clone();
+    let pixels = Arc::new(Pixmap::new(640, 480).unwrap());
+    assert!(!shadow_prewarm_admit(frame.theme.weak(), key, pixels));
+    for (key, pixels) in existing {
+        assert!(Arc::ptr_eq(&shadow_lookup(&frame.theme.weak(), &key).unwrap(), &pixels));
+    }
+}
+
+#[test]
+fn details_shadow_job_survives_selection_and_navigation_stamp_changes() {
+    use crate::theme::render_navigation::tests::{arts, model, theme};
+    let handle = theme("compact-plus", "square");
+    let arts = arts();
+    SHADOWS.with(|cache| cache.borrow_mut().clear());
+    let frame = PreparedFrame::prepare(handle.clone(), &model(&handle, ScreenId::Recents, 0, &arts)).unwrap();
+    let mut work = frame.detail_shadow_warm();
+    assert!(!frame.prewarm_detail_shadow_step(&mut work));
+    assert!(!frame.prewarm_detail_shadow_step(&mut work));
+    let pixels = work.job.as_ref().unwrap().pixels.data().as_ptr();
+    let rows = work.job.as_ref().unwrap().gaussian.row;
+    let selected = PreparedFrame::prepare(handle.clone(), &model(&handle, ScreenId::Recents, 1, &arts)).unwrap();
+    assert!(!selected.navigation_is_current(&frame.navigation_stamp()));
+    assert!(work.theme_matches(&handle));
+    assert!(!selected.prewarm_detail_shadow_step(&mut work));
+    assert_eq!(work.job.as_ref().unwrap().pixels.data().as_ptr(), pixels);
+    assert!(work.job.as_ref().unwrap().gaussian.row > rows);
+    let mut steps = 0;
+    while !selected.prewarm_detail_shadow_step(&mut work) {
+        steps += 1;
+        assert!(steps < 1000);
+    }
+    assert!(work.job.is_none() && work.keys.is_empty());
+}
