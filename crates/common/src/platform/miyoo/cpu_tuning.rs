@@ -127,7 +127,7 @@ fn try_lease_lock(path: &Path) -> io::Result<Option<fs::File>> {
     }
 }
 
-/// Inhibit new navigation boosts until the daemon resumes the launcher.
+/// Inhibit new input boosts until the daemon resumes the launcher.
 /// The OS releases the lock even if the daemon exits unexpectedly.
 pub struct InputBoostPause {
     _lock: fs::File,
@@ -333,7 +333,7 @@ impl InputBoost {
     }
 }
 
-/// Extend the navigation boost without repeating sysfs writes within its window.
+/// Extend the input boost without repeating sysfs writes within its window.
 pub fn boost_input() {
     system()
         .input_boost

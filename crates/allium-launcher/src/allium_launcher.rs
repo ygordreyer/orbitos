@@ -64,6 +64,11 @@ fn navigation_key(event: KeyEvent) -> Option<Key> {
     }
 }
 
+#[cfg(any(feature = "miyoo", test))]
+fn boosts_cpu(event: KeyEvent) -> bool {
+    matches!(event, KeyEvent::Pressed(_) | KeyEvent::Autorepeat(_))
+}
+
 async fn poll_platform_input(platform: &mut DefaultPlatform) -> KeyEvent {
     #[cfg(all(
         test,
@@ -493,7 +498,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 KeyEvent::Autorepeat(_) => {}
             }
             #[cfg(feature = "miyoo")]
-            if navigation_key(event).is_some() {
+            if boosts_cpu(event) {
                 common::platform::cpu_tuning::boost_input();
             }
             #[cfg(all(
@@ -882,6 +887,20 @@ fn set_wallpaper(display: &mut impl Display, path: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod input_boost_tests {
+    use super::*;
+
+    #[test]
+    fn presses_and_repeats_boost_cpu_but_releases_do_not() {
+        for key in [Key::B, Key::Start, Key::Up, Key::A, Key::Menu, Key::Power] {
+            assert!(boosts_cpu(KeyEvent::Pressed(key)), "{key:?}");
+            assert!(boosts_cpu(KeyEvent::Autorepeat(key)), "{key:?}");
+            assert!(!boosts_cpu(KeyEvent::Released(key)), "{key:?}");
+        }
+    }
 }
 
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
