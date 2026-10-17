@@ -22,6 +22,7 @@ use crate::display::overlay::{
     PreparedOverlay,
 };
 use crate::display::{Display, RectHold};
+use crate::display::packed::{PackDiagnostic, PackedRow, PackedSpans};
 use crate::geom::Rect;
 
 /// Pause between stamping passes, matching Onion; probing or yielding instead costs whole
@@ -234,6 +235,101 @@ impl FramebufferDisplay {
         validate_layout(&self.iface, self.iface.var_screen_info.yoffset as usize)
     }
 
+    fn packed_layout(&self) -> [u64; 32] {
+        let v = &self.iface.var_screen_info;
+        let f = &self.iface.fix_screen_info;
+        [self.overlay_instance, v.xres as u64, v.yres as u64, v.xres_virtual as u64,
+            v.yres_virtual as u64, v.xoffset as u64, v.yoffset as u64, v.bits_per_pixel as u64,
+            v.grayscale as u64, v.nonstd as u64, v.rotate as u64, v.vmode as u64,
+            v.red.offset as u64, v.red.length as u64, v.red.msb_right as u64,
+            v.green.offset as u64, v.green.length as u64, v.green.msb_right as u64,
+            v.blue.offset as u64, v.blue.length as u64, v.blue.msb_right as u64,
+            v.transp.offset as u64, v.transp.length as u64, v.transp.msb_right as u64,
+            f.line_length as u64, f.smem_start as u64, f.smem_len as u64,
+            f.fb_type as u64, f.visual as u64, self.iface.frame.len() as u64, self.iface.frame.as_ptr() as u64, 0]
+    }
+
+    fn write_packed_rect(&mut self, area: Rect, packed: &PackedSpans) -> Result<bool> {
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        let location = self.iface.var_screen_info.yoffset as usize * width * 4;
+        let (x0, x1) = (area.x as usize, area.right() as usize);
+        let mut copied_pixels = 0;
+        for y in area.y as usize..area.bottom() as usize {
+            let first = packed.rows.partition_point(|row| row.y < y);
+            let mut x = x0;
+            for row in packed.rows[first..].iter().take_while(|row| row.y == y) {
+                let left = row.x0.max(x);
+                let right = row.x1.min(x1);
+                if left >= right { continue; }
+                if x < left { self.write_rect(Rect::new(x as i32, y as i32, (left - x) as u32, 1))?; }
+                let at = location + ((height - 1 - y) * width + width - right) * 4;
+                let start = row.start + (row.x1 - right) * 4;
+                let len = (right - left) * 4;
+                self.iface.frame[at..at + len].copy_from_slice(&packed.bytes[start..start + len]);
+                copied_pixels += right - left;
+                x = right;
+            }
+            if x < x1 { self.write_rect(Rect::new(x as i32, y as i32, (x1 - x) as u32, 1))?; }
+        }
+        crate::perf_trace::count(crate::perf_trace::Count::FlushedPixels, copied_pixels as u64);
+        Ok(copied_pixels != 0)
+    }
+
+    fn present_rects(&mut self, areas: &[Rect], packed: Option<&PackedSpans>) -> Result<()> {
+        self.refresh_present_layout()?;
+        let packed = packed.filter(|packed| {
+            let reason = if packed.layout != self.packed_layout() { "layout_or_format" }
+                else if packed.revision != self.composition_revision { "composition_revision" }
+                else if packed.candidate != Arc::as_ptr(&self.pixmap.0) as usize { "candidate_identity" }
+                else if packed.damage != areas { "damage_mismatch" }
+                else { "hit" };
+            if crate::perf_trace::recording() { crate::perf_trace::packed_span_reason(reason); }
+            reason == "hit"
+        });
+        let layout_changed = self
+            .page_history
+            .as_ref()
+            .is_some_and(|h| !h.matches(&self.iface));
+        if self.page_history.is_none() || layout_changed {
+            self.page_history = PageHistory::new(&self.iface);
+        }
+        let Some(history) = &mut self.page_history else {
+            if packed.is_some() && crate::perf_trace::recording() { crate::perf_trace::packed_span_reason("untracked_layout"); }
+            crate::perf_trace::present_reason("untracked_layout");
+            return self.flush();
+        };
+        let Some(page) = history.page(self.iface.var_screen_info.yoffset) else {
+            if packed.is_some() && crate::perf_trace::recording() { crate::perf_trace::packed_span_reason("unaligned_page"); }
+            crate::perf_trace::present_reason("unaligned_page");
+            return self.flush();
+        };
+        let valid = history.is_valid(page);
+        history.add(areas);
+        let damage = history.damage(page);
+        let full_damage = damage.len() == 1 && damage[0] == self.bounding_box();
+        crate::perf_trace::present_reason(if layout_changed {
+            "framebuffer_layout_changed"
+        } else if !valid {
+            "page_uninitialized"
+        } else if full_damage {
+            "damage_full"
+        } else {
+            "partial_page_history"
+        });
+        crate::perf_trace::damage(&damage);
+        let mut copied = false;
+        for area in damage {
+            if let Some(packed) = packed { copied |= self.write_packed_rect(area, packed)?; }
+            else { self.write_rect(area)?; }
+        }
+        if copied && crate::perf_trace::recording() {
+            crate::perf_trace::count(crate::perf_trace::Count::PackedSpanHit, 1);
+        }
+        self.page_history.as_mut().unwrap().presented(page);
+        Ok(())
+    }
+
     fn write_rect(&mut self, rect: Rect) -> Result<()> {
         let yoffset = self.iface.var_screen_info.yoffset as usize;
         self.write_rect_at(rect, yoffset)
@@ -397,6 +493,76 @@ impl Display for FramebufferDisplay {
         true
     }
 
+    fn pack_spans(&mut self, pixels: &Arc<Pixmap>, areas: &[Rect], available: usize, diagnostic: &mut PackDiagnostic) -> Result<Option<PackedSpans>> {
+        self.refresh_present_layout()?;
+        let v = &self.iface.var_screen_info;
+        macro_rules! decline {
+            ($reason:expr) => {{
+                *diagnostic = PackDiagnostic::new($reason);
+                diagnostic.record();
+                return Ok(None);
+            }};
+        }
+        if v.bits_per_pixel != 32 { decline!("pack_format:bits_per_pixel"); }
+        if v.grayscale != 0 { decline!("pack_format:grayscale"); }
+        if v.nonstd != 0 { decline!("pack_format:nonstd"); }
+        if (v.red.offset, v.red.length, v.red.msb_right) != (16, 8, 0) { decline!("pack_format:red"); }
+        if (v.green.offset, v.green.length, v.green.msb_right) != (8, 8, 0) { decline!("pack_format:green"); }
+        if (v.blue.offset, v.blue.length, v.blue.msb_right) != (0, 8, 0) { decline!("pack_format:blue"); }
+        if v.transp.msb_right != 0 || !(v.transp.length == 0 || (v.transp.offset, v.transp.length) == (24, 8)) {
+            decline!("pack_format:transp");
+        }
+        if pixels.width() != self.width() || pixels.height() != self.height() { decline!("pack_size"); }
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        let mut rows = Vec::new();
+        for y in 0..height {
+            let mut intervals: Vec<_> = areas.iter().filter(|r| r.y <= y as i32 && r.bottom() > y as i32)
+                .filter_map(|r| {
+                    let x0 = (r.x.max(0) as usize / 8 * 8).min(width);
+                    let x1 = (r.right().max(0) as usize).div_ceil(8).saturating_mul(8).min(width);
+                    (x0 < x1).then_some((x0, x1))
+                }).collect();
+            intervals.sort_unstable();
+            for (x0, x1) in intervals {
+                if let Some(row) = rows.last_mut().filter(|row: &&mut PackedRow| row.y == y && row.x1 >= x0) {
+                    row.x1 = row.x1.max(x1);
+                } else { rows.push(PackedRow { y, x0, x1, start: 0 }); }
+            }
+        }
+        let length: usize = rows.iter().map(|row| (row.x1 - row.x0) * 4).sum();
+        let mut packed = PackedSpans { layout: self.packed_layout(), base: Arc::as_ptr(&self.pixmap.0) as usize,
+            candidate: Arc::as_ptr(pixels) as usize, revision: self.composition_revision,
+            damage: areas.to_vec(), rows, bytes: Vec::new() };
+        if length == 0 { decline!("pack_empty"); }
+        let needed = packed.charge().saturating_add(length);
+        if needed > available {
+            *diagnostic = PackDiagnostic { reason: "pack_budget", needed_bytes: needed, available_bytes: available };
+            diagnostic.record();
+            return Ok(None);
+        }
+        packed.bytes = vec![0; length];
+        if packed.charge() > available {
+            *diagnostic = PackDiagnostic { reason: "pack_budget_capacity", needed_bytes: packed.charge(), available_bytes: available };
+            diagnostic.record();
+            return Ok(None);
+        }
+        let mut start = 0;
+        for row in &mut packed.rows {
+            row.start = start;
+            let len = (row.x1 - row.x0) * 4;
+            crate::platform::framebuffer_pixels::write_reversed_bgra(&mut packed.bytes[start..start + len],
+                &pixels.data()[(row.y * width + row.x0) * 4..(row.y * width + row.x1) * 4]);
+            start += len;
+        }
+        *diagnostic = PackDiagnostic::new("hit");
+        Ok(Some(packed))
+    }
+
+    fn packed_base_matches(&self, packed: &PackedSpans) -> bool {
+        packed.base == Arc::as_ptr(&self.pixmap.0) as usize && packed.revision == self.composition_revision
+    }
+
     fn sync(&mut self) -> Result<()> {
         self.page_history = None;
         self.iface.var_screen_info = Framebuffer::get_var_screeninfo(&self.iface.device)
@@ -473,41 +639,11 @@ impl Display for FramebufferDisplay {
     }
 
     fn flush_rects(&mut self, areas: &[Rect]) -> Result<()> {
-        self.refresh_present_layout()?;
-        let layout_changed = self
-            .page_history
-            .as_ref()
-            .is_some_and(|h| !h.matches(&self.iface));
-        if self.page_history.is_none() || layout_changed {
-            self.page_history = PageHistory::new(&self.iface);
-        }
-        let Some(history) = &mut self.page_history else {
-            crate::perf_trace::present_reason("untracked_layout");
-            return self.flush();
-        };
-        let Some(page) = history.page(self.iface.var_screen_info.yoffset) else {
-            crate::perf_trace::present_reason("unaligned_page");
-            return self.flush();
-        };
-        let valid = history.is_valid(page);
-        history.add(areas);
-        let damage = history.damage(page);
-        let full_damage = damage.len() == 1 && damage[0] == self.bounding_box();
-        crate::perf_trace::present_reason(if layout_changed {
-            "framebuffer_layout_changed"
-        } else if !valid {
-            "page_uninitialized"
-        } else if full_damage {
-            "damage_full"
-        } else {
-            "partial_page_history"
-        });
-        crate::perf_trace::damage(&damage);
-        for area in damage {
-            self.write_rect(area)?;
-        }
-        self.page_history.as_mut().unwrap().presented(page);
-        Ok(())
+        self.present_rects(areas, None)
+    }
+
+    fn flush_packed_rects(&mut self, areas: &[Rect], packed: &PackedSpans) -> Result<()> {
+        self.present_rects(areas, Some(packed))
     }
 
     fn read_rect(&mut self, area: Rect) -> Result<()> {

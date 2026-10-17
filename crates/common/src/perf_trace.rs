@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-const COUNT_LEN: usize = 43;
+const COUNT_LEN: usize = 44;
 const STAGE_NAMES: [&str; 25] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
@@ -79,6 +79,7 @@ pub enum Count {
     NeighborPointerAdopt,
     NeighborDamageCopy,
     FullFrameDetach,
+    PackedSpanHit,
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
@@ -119,6 +120,9 @@ struct Trace {
     damage_pixels: u64,
     render_reason: &'static str,
     present_reason: &'static str,
+    packed_reason: &'static str,
+    packed_needed_bytes: usize,
+    packed_available_bytes: usize,
     neighbor_build: &'static str,
     neighbor_adopt: &'static str,
     neighbor_warm: &'static str,
@@ -184,6 +188,9 @@ fn install(path: &str) -> std::io::Result<()> {
             damage_pixels: 0,
             render_reason: "none",
             present_reason: "none",
+            packed_reason: "none",
+            packed_needed_bytes: 0,
+            packed_available_bytes: 0,
             neighbor_build: "not_attempted",
             neighbor_adopt: "not_attempted",
             neighbor_warm: "not_evaluated",
@@ -428,6 +435,9 @@ pub fn begin_render() {
             t.damage_pixels = 0;
             t.render_reason = "none";
             t.present_reason = "none";
+            t.packed_reason = "none";
+            t.packed_needed_bytes = 0;
+            t.packed_available_bytes = 0;
         }
     });
 }
@@ -467,6 +477,10 @@ pub fn drawn_frame() {
             "ram_hit": trace.hits[0], "disk_cache_hit": trace.hits[1], "png_decode": trace.hits[2],
             "wall_us": trace.started.map_or(0, |start| start.elapsed().as_micros()),
         });
+        row["packed_span_reason"] = trace.packed_reason.into();
+        row["packed_span_needed_bytes"] = trace.packed_needed_bytes.into();
+        row["packed_span_available_bytes"] = trace.packed_available_bytes.into();
+        row["packed_span_hit"] = trace.counts[43].into();
         row["art_fitted_hits"] = trace.counts[30].into();
         row["art_fitted_misses"] = trace.counts[31].into();
         row["event"] = "frame".into();
@@ -957,6 +971,21 @@ pub fn render_reason(reason: &'static str) {
         }
     });
 }
+pub fn packed_span_reason(reason: &'static str) {
+    TRACE.with(|t| {
+        if let Some(t) = t.borrow_mut().as_mut() { t.packed_reason = reason; }
+    });
+}
+
+pub fn packed_span_budget(needed: usize, available: usize) {
+    TRACE.with(|t| {
+        if let Some(t) = t.borrow_mut().as_mut() {
+            t.packed_needed_bytes = needed;
+            t.packed_available_bytes = available;
+        }
+    });
+}
+
 pub fn present_reason(reason: &'static str) {
     TRACE.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
@@ -1001,11 +1030,12 @@ pub fn probe_counts() -> serde_json::Value {
             "hero_hits":t.counts[32],"hero_misses":t.counts[33],"hero_prewarm_publishes":t.counts[34],
             "panel_hits":t.counts[35],"panel_misses":t.counts[36],
             "neighbor_hits":t.counts[37],"neighbor_misses":t.counts[38],"neighbor_built":t.counts[39],
-            "neighbor_pointer_adopts":t.counts[40],"neighbor_damage_copies":t.counts[41],"full_frame_detaches":t.counts[42],
+            "neighbor_pointer_adopts":t.counts[40],"neighbor_damage_copies":t.counts[41],"full_frame_detaches":t.counts[42],"packed_span_hit":t.counts[43],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
             "text_hits":t.counts[0],"text_misses":t.counts[1],"blit_map_builds":t.counts[3],
             "damage_rects":t.damage_rects,"damage_pixels":t.damage_pixels,
-            "render_reason":t.render_reason,"full_present_reason":t.present_reason})
+            "render_reason":t.render_reason,"full_present_reason":t.present_reason,"packed_span_reason":t.packed_reason,
+            "packed_span_needed_bytes":t.packed_needed_bytes,"packed_span_available_bytes":t.packed_available_bytes})
     })
 }
 
@@ -1234,7 +1264,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
             "presented_monotonic_us": t.presented_us,
             "stage_begin_monotonic_us": t.frame_stage_begin, "stage_end_monotonic_us": t.frame_stage_end},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts.as_slice()},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach"],
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach", "packed_span_hit"],
         "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })
@@ -1714,8 +1744,8 @@ mod measurement_tests {
         drawn_frame();
         let legacy: LegacyFrame = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(legacy.event, "frame");
-        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach"]);
-        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34, 35, 36, 0, 0, 0, 40, 41, 42]);
+        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach", "packed_span_hit"]);
+        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34, 35, 36, 0, 0, 0, 40, 41, 42, 0]);
         TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }

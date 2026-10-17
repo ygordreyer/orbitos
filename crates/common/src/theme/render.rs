@@ -214,6 +214,20 @@ impl PreparedFrame {
         if crate::perf_trace::recording() { crate::perf_trace::neighbor_build("built"); }
         Ok(Some((frame, charge)))
     }
+    pub fn pack_neighbor(&self, display: &mut impl Display, available: usize, diagnostic: &mut crate::display::packed::PackDiagnostic) -> Result<Option<crate::display::packed::PackedSpans>> {
+        if !self.can_prepare_neighbor() {
+            *diagnostic = crate::display::packed::PackDiagnostic::new("pack_ineligible");
+            diagnostic.record();
+            return Ok(None);
+        }
+        if self.presented_pixels.is_some() {
+            *diagnostic = crate::display::packed::PackDiagnostic::new("pack_presented_pixels");
+            diagnostic.record();
+            return Ok(None);
+        }
+        let damage: Vec<_> = self.damage.iter().map(|r| DrawRect::new(r.0 as i32, r.1 as i32, r.2, r.3)).collect();
+        display.pack_spans(&self.pixels.0, &damage, available, diagnostic)
+    }
     pub fn neighbor_matches(&self, theme: &ThemeHandle, input: &FrameInputs) -> bool {
         if !self.navigation_theme_matches(theme) || self.theme.digest() != theme.digest()
             || !Self::neighbor_input(input) || !self.input_matches(input) { return false; }

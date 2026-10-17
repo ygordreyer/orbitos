@@ -175,6 +175,9 @@ fn frameptr_unsupported_display_keeps_damage_copy_fallback() {
     let next = model(&theme, ScreenId::Recents, 1, &arts);
     let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
     let mut display = tests::TestDisplay(base.pixels.as_ref().to_owned());
+    let mut diagnostic = crate::display::packed::PackDiagnostic::default();
+    assert!(candidate.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut diagnostic).unwrap().is_none());
+    assert_eq!(diagnostic.reason, "pack_unsupported_display");
     candidate.recycle_neighbor_base(base);
     let trace = std::env::temp_dir().join(format!("frameptr-fallback-{}.jsonl", std::process::id()));
     crate::perf_trace::start_probe(trace.to_str().unwrap());
@@ -186,6 +189,31 @@ fn frameptr_unsupported_display_keeps_damage_copy_fallback() {
     std::fs::remove_file(trace).unwrap();
     identical(&candidate, &theme, &next);
     assert!(equal_words(display.0.data(), candidate.pixels().data()));
+}
+
+#[test]
+fn prepack_neighbor_declines_distinguish_ineligible_and_presented_pixels() {
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+    let next = model(&theme, ScreenId::Recents, 1, &arts);
+    let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+    let mut display = tests::TestDisplay(base.pixels.as_ref().to_owned());
+    let trace = std::env::temp_dir().join(format!("prepack-neighbor-declines-{}.jsonl", std::process::id()));
+    crate::perf_trace::start_probe(trace.to_str().unwrap());
+    let mut diagnostic = crate::display::packed::PackDiagnostic::default();
+    candidate.opaque = false;
+    assert!(candidate.pack_neighbor(&mut display, usize::MAX, &mut diagnostic).unwrap().is_none());
+    assert_eq!(diagnostic.reason, "pack_ineligible");
+    assert_eq!(crate::perf_trace::probe_counts()["packed_span_reason"], "pack_ineligible");
+    candidate.opaque = true;
+    candidate.presented_pixels = Some((std::sync::Arc::downgrade(&candidate.pixels.0), Default::default()));
+    assert!(candidate.can_prepare_neighbor());
+    assert!(candidate.pack_neighbor(&mut display, usize::MAX, &mut diagnostic).unwrap().is_none());
+    assert_eq!(diagnostic.reason, "pack_presented_pixels");
+    assert_eq!(crate::perf_trace::probe_counts()["packed_span_reason"], "pack_presented_pixels");
+    crate::perf_trace::stop_probe();
+    std::fs::remove_file(trace).unwrap();
 }
 
 #[test]

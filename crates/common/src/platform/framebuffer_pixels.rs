@@ -176,7 +176,7 @@ pub(super) fn write_rotated_bgra(
     }
 }
 
-fn write_reversed_bgra(target: &mut [u8], source: &[u8]) {
+pub(crate) fn write_reversed_bgra(target: &mut [u8], source: &[u8]) {
     #[cfg(all(
         any(target_arch = "arm", target_arch = "aarch64"),
         target_feature = "neon"

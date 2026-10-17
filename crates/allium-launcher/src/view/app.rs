@@ -83,7 +83,7 @@ impl std::fmt::Debug for ParkedDetails {
     }
 }
 
-const NEIGHBOR_LIMIT: usize = 4 * 1024 * 1024;
+const NEIGHBOR_LIMIT: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct NeighborGeneration<L = common::locale::LanguageIdentifier> {
@@ -110,12 +110,20 @@ impl NeighborGeneration {
 struct NeighborGraveyard {
     base: Option<common::theme::render::RetiredFrame>,
     siblings: Vec<PreparedNeighbor>,
+    packed: [Option<common::display::packed::PackedSpans>; 2],
+    adopted_pack: Option<usize>,
+    adopted_diagnostic: Option<common::display::packed::PackDiagnostic>,
+    packed_reason: Option<&'static str>,
 }
 impl NeighborGraveyard {
     fn clear(&mut self) {
         let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameRetire);
         self.base = None;
         self.siblings.clear();
+        self.packed = [None, None];
+        self.adopted_pack = None;
+        self.adopted_diagnostic = None;
+        self.packed_reason = None;
     }
 }
 impl std::fmt::Debug for NeighborGraveyard {
@@ -130,7 +138,38 @@ struct PreparedNeighbor {
     generation: NeighborGeneration,
     frame: common::theme::render::PreparedFrame,
     charge: usize,
+    packed: Option<common::display::packed::PackedSpans>,
+    pack_diagnostic: common::display::packed::PackDiagnostic,
 }
+fn retire_neighbor_packs(neighbors: &mut Vec<PreparedNeighbor>, graveyard: &mut NeighborGraveyard, reason: &'static str) {
+    for neighbor in neighbors.iter_mut() {
+        if retire_neighbor_pack(neighbor, graveyard).is_some() { graveyard.packed_reason = Some(reason); }
+    }
+    neighbors.clear();
+}
+fn retire_neighbor_pack(neighbor: &mut PreparedNeighbor, graveyard: &mut NeighborGraveyard) -> Option<usize> {
+    let packed = neighbor.packed.take()?;
+    let slot = graveyard.packed.iter().position(Option::is_none).expect("two neighbor pack slots");
+    graveyard.packed[slot] = Some(packed);
+    Some(slot)
+}
+
+// One candidate per idle turn; a refused priority candidate also blocks its sibling.
+fn pack_neighbors(neighbors: &mut [PreparedNeighbor], display: &mut impl Display) -> Result<bool> {
+    let available = NEIGHBOR_LIMIT.saturating_sub(neighbors.iter().map(|c| c.charge).sum());
+    for candidate in neighbors {
+        if candidate.packed.is_some() { continue; }
+        if candidate.pack_diagnostic.reason != "no_pack_built" { return Ok(false); }
+        candidate.packed = candidate.frame.pack_neighbor(display, available, &mut candidate.pack_diagnostic)?;
+        if let Some(packed) = &candidate.packed {
+            candidate.charge += packed.charge();
+            candidate.pack_diagnostic = common::display::packed::PackDiagnostic::new("hit");
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 impl std::fmt::Debug for PreparedNeighbor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedNeighbor").field("charge", &self.charge).finish_non_exhaustive()
@@ -194,7 +233,7 @@ fn prepare_theme_frames(
             if candidate.frame.neighbor_matches(handle, top) { return true; }
             if tracing { rejection = candidate.frame.neighbor_rejection_reason(handle, top); }
             false
-        }).map(|index| neighbors.swap_remove(index).frame)
+        }).map(|index| neighbors.swap_remove(index))
     } else { None };
     drop(search);
     if tracing && top.screen == ScreenId::Recents {
@@ -209,9 +248,13 @@ fn prepare_theme_frames(
             // No new candidates can be built until idle has drained the graveyard.
             debug_assert!(graveyard.base.is_none() && graveyard.siblings.is_empty());
             std::mem::swap(neighbors, &mut graveyard.siblings);
-        } else { neighbors.clear(); }
+        } else { retire_neighbor_packs(neighbors, graveyard, if models.len() != 1 { "pack_drop_overlay" }
+            else if !can_park { "pack_drop_network" } else { "pack_drop_prepare" }); }
     }
-    let top = if let Some(mut candidate) = candidate {
+    let top = if let Some(mut neighbor) = candidate {
+        graveyard.adopted_diagnostic = Some(neighbor.pack_diagnostic);
+        graveyard.adopted_pack = retire_neighbor_pack(&mut neighbor, graveyard);
+        let mut candidate = neighbor.frame;
         graveyard.base = Some(candidate.recycle_neighbor_base(old.unwrap()));
         *adopted = true;
         common::perf_trace::count(common::perf_trace::Count::NeighborHit, 1);
@@ -399,6 +442,8 @@ where
     neighbor_graveyard: NeighborGraveyard,
     neighbor_base: Option<common::theme::render::NavigationStamp>,
     neighbor_adopted: bool,
+    present_packed: Option<usize>,
+    present_pack_diagnostic: common::display::packed::PackDiagnostic,
     media_deferred: bool,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
@@ -518,9 +563,11 @@ where
             theme_scene: None,
             parked_details: None,
             neighbors: Vec::with_capacity(2),
-            neighbor_graveyard: NeighborGraveyard { base: None, siblings: Vec::with_capacity(2) },
+            neighbor_graveyard: NeighborGraveyard { base: None, siblings: Vec::with_capacity(2), packed: [None, None], ..Default::default() },
             neighbor_base: None,
             neighbor_adopted: false,
+            present_packed: None,
+            present_pack_diagnostic: common::display::packed::PackDiagnostic::new("not_adopted"),
             media_deferred: false,
             present_damage: None,
             theme_was_layered: false,
@@ -848,13 +895,108 @@ where
         if common::perf_trace::recording() && (self.neighbor_base.is_some() || !self.neighbors.is_empty()) {
             common::perf_trace::neighbor_build(reason);
         }
-        self.neighbors.clear();
+        retire_neighbor_packs(&mut self.neighbors, &mut self.neighbor_graveyard, match reason {
+            "invalidated:status" => "pack_drop_status",
+            "invalidated:artwork_completion" => "pack_drop_artwork",
+            "invalidated:release_details" => "pack_drop_details",
+            "invalidated:full_present" => "pack_drop_full",
+            "invalidated:animation" => "pack_drop_animation",
+            "invalidated:toast" => "pack_drop_toast",
+            "invalidated:network_blocked" => "pack_drop_network",
+            "invalidated:redraw" => "pack_drop_redraw",
+            _ => "pack_drop_view",
+        });
         self.neighbor_base = None;
         self.neighbor_adopted = false;
     }
     pub(crate) fn take_present_damage(&mut self) -> Option<Vec<Rect>> {
         self.present_damage.take()
     }
+    pub(crate) fn flush_prepared_damage(&self, display: &mut impl Display, damage: &[Rect]) -> Result<()> {
+        if let Some(slot) = self.present_packed {
+            if let Some(packed) = &self.neighbor_graveyard.packed[slot] {
+                return display.flush_packed_rects(damage, packed);
+            }
+            if common::perf_trace::recording() { common::perf_trace::packed_span_reason("pack_missing_slot"); }
+        } else if common::perf_trace::recording() {
+            self.present_pack_diagnostic.record();
+        }
+        display.flush_rects(damage)
+    }
+
+    pub(crate) fn prepack_neighbors(&mut self, display: &mut impl Display, mut input_pending: impl FnMut() -> bool) -> Result<bool> {
+        if input_pending() { return Ok(false); }
+        pack_neighbors(&mut self.neighbors, display)
+    }
+
+    pub(crate) fn idle_navigation_step(&mut self, display: &mut impl Display,
+        work: &mut Option<NavigationWarm>, steps: &mut usize, mut input_pending: impl FnMut() -> bool,
+    ) -> Result<()> {
+        if self.prepack_neighbors(display, &mut input_pending)? { return Ok(()); }
+        if *steps < 2 && self.prewarm_navigation_step_with_pending(work,
+            if *steps == 0 { 1 } else { -1 }, input_pending)? { *steps += 1; }
+        Ok(())
+    }
+
+    fn draw_prepared_theme(&mut self, display: &mut impl Display) -> Result<Option<bool>> {
+        self.present_damage = None;
+        self.present_packed = None;
+        self.present_pack_diagnostic = common::display::packed::PackDiagnostic::new(self.neighbor_graveyard.packed_reason.unwrap_or("not_adopted"));
+        if crate::theme_adapter::active(&self.res) {
+            if self.theme_scene.as_ref().is_some_and(|scene|
+                scene.frames.iter().any(|frame| !frame.pixels_usable()))
+            {
+                self.theme_scene = None;
+                self.invalidate_neighbors();
+                self.dirty = true;
+                self.prepare_theme()?;
+            }
+            if let Some(scene) = &mut self.theme_scene {
+                if !self.theme_dirty && !self.dirty {
+                    return Ok(Some(false));
+                }
+                let layered = scene.frames.len() != 1;
+                let top = scene.frames.last_mut().unwrap();
+                let opaque_top = top.is_opaque();
+                let same_top = self.theme_presented_screen == Some(top.screen());
+                if !self.dirty && ((!layered && !self.theme_was_layered)
+                    || (opaque_top && same_top)) {
+                    self.present_damage = Some(if std::mem::take(&mut self.neighbor_adopted) {
+                        self.present_pack_diagnostic = self.neighbor_graveyard.adopted_diagnostic.unwrap_or_default();
+                        if let Some(slot) = self.neighbor_graveyard.adopted_pack {
+                            if self.neighbor_graveyard.packed[slot].as_ref().is_some_and(|packed| display.packed_base_matches(packed)) {
+                                self.present_packed = Some(slot);
+                            } else { self.present_pack_diagnostic = common::display::packed::PackDiagnostic::new(if self.neighbor_graveyard.packed[slot].is_none() {
+                                "pack_missing_slot"
+                            } else { "base_mismatch" }); }
+                        }
+                        top.adopt_neighbor_damage(display)
+                    } else { top.paint_damage(display) }.ok_or_else(|| anyhow::anyhow!("expired prepared frame"))?);
+                } else if opaque_top {
+                    top.paint(display);
+                } else {
+                    for frame in &scene.frames {
+                        frame.paint(display);
+                    }
+                }
+                self.neighbor_adopted = false;
+                let top = scene.frames.last().unwrap();
+                if common::perf_trace::recording() && !self.neighbors.is_empty() {
+                    common::perf_trace::neighbor_build("invalidated:draw");
+                }
+                retire_neighbor_packs(&mut self.neighbors, &mut self.neighbor_graveyard, "pack_drop_draw");
+                self.neighbor_base = (scene.frames.len() == 1 && top.can_prepare_neighbor()
+                    && display.width() == 640 && display.height() == 480).then(|| top.navigation_stamp());
+                self.theme_presented_screen = Some(top.screen());
+                self.theme_was_layered = scene.frames.len() != 1;
+                self.theme_dirty = false;
+                self.dirty = false;
+                return Ok(Some(self.present_damage.as_ref().is_none_or(|damage| !damage.is_empty())));
+            }
+        }
+        Ok(None)
+    }
+
     fn details_active(&self) -> bool {
         if self.search_view.is_active() {
             return false;
@@ -991,9 +1133,15 @@ where
         let locale = self.res.get::<Locale>();
         let generation = NeighborGeneration::current(&self.res, &locale.lang);
         let resident = self.neighbors.len();
-        self.neighbors.retain(|candidate| candidate.generation.borrowed() == generation
-            && candidate.frame.navigation_theme_matches(&handle));
+        self.neighbors.retain_mut(|candidate| {
+            let keep = candidate.generation.borrowed() == generation && candidate.frame.navigation_theme_matches(&handle);
+            if !keep && retire_neighbor_pack(candidate, &mut self.neighbor_graveyard).is_some() {
+                self.neighbor_graveyard.packed_reason = Some("pack_drop_generation");
+            }
+            keep
+        });
         drop(locale);
+        self.neighbor_graveyard.clear();
         if common::perf_trace::recording() && self.neighbors.len() != resident {
             common::perf_trace::neighbor_build("invalidated:generation_or_theme");
         }
@@ -1108,9 +1256,9 @@ where
                         if input_pending() { current.stage = NavigationWarmStage::NeighborFrame(target_direction, final_pass);
                             *work = Some(current); return Ok(false); }
                         let available = NEIGHBOR_LIMIT - self.neighbors.iter().map(|c| c.charge).sum::<usize>();
-                        if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available)? {
+                        if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available.saturating_sub(std::mem::size_of::<PreparedNeighbor>()))? {
                             self.neighbors.push(PreparedNeighbor { base: frame.navigation_stamp(),
-                                generation: NeighborGeneration::current(&self.res, self.res.get::<Locale>().lang.clone()), frame: candidate, charge });
+                                generation: NeighborGeneration::current(&self.res, self.res.get::<Locale>().lang.clone()), frame: candidate, charge: charge + std::mem::size_of::<PreparedNeighbor>(), packed: None, pack_diagnostic: Default::default() });
                         }
                     } else if common::perf_trace::recording() {
                         common::perf_trace::neighbor_build("not_eligible:no_target");
@@ -1255,7 +1403,13 @@ where
             let resident = self.neighbors.len();
             {
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::NeighborFilter);
-                self.neighbors.retain(|candidate| candidate.generation.borrowed() == generation);
+                self.neighbors.retain_mut(|candidate| {
+                    let keep = candidate.generation.borrowed() == generation;
+                    if !keep && retire_neighbor_pack(candidate, &mut self.neighbor_graveyard).is_some() {
+                        self.neighbor_graveyard.packed_reason = Some("pack_drop_generation");
+                    }
+                    keep
+                });
             }
             drop(locale);
             if common::perf_trace::recording() && self.neighbors.len() != resident {
@@ -1484,51 +1638,7 @@ where
         display: &mut <DefaultPlatform as Platform>::Display,
         styles: &Stylesheet,
     ) -> Result<bool> {
-        self.present_damage = None;
-        if crate::theme_adapter::active(&self.res) {
-            if self.theme_scene.as_ref().is_some_and(|scene|
-                scene.frames.iter().any(|frame| !frame.pixels_usable()))
-            {
-                self.theme_scene = None;
-                self.invalidate_neighbors();
-                self.dirty = true;
-                self.prepare_theme()?;
-            }
-            if let Some(scene) = &mut self.theme_scene {
-                if !self.theme_dirty && !self.dirty {
-                    return Ok(false);
-                }
-                let layered = scene.frames.len() != 1;
-                let top = scene.frames.last_mut().unwrap();
-                let opaque_top = top.is_opaque();
-                let same_top = self.theme_presented_screen == Some(top.screen());
-                if !self.dirty && ((!layered && !self.theme_was_layered)
-                    || (opaque_top && same_top)) {
-                    self.present_damage = Some(if std::mem::take(&mut self.neighbor_adopted) {
-                        top.adopt_neighbor_damage(display)
-                    } else { top.paint_damage(display) }.ok_or_else(|| anyhow::anyhow!("expired prepared frame"))?);
-                } else if opaque_top {
-                    top.paint(display);
-                } else {
-                    for frame in &scene.frames {
-                        frame.paint(display);
-                    }
-                }
-                self.neighbor_adopted = false;
-                let top = scene.frames.last().unwrap();
-                if common::perf_trace::recording() && !self.neighbors.is_empty() {
-                    common::perf_trace::neighbor_build("invalidated:draw");
-                }
-                self.neighbors.clear();
-                self.neighbor_base = (scene.frames.len() == 1 && top.can_prepare_neighbor()
-                    && display.width() == 640 && display.height() == 480).then(|| top.navigation_stamp());
-                self.theme_presented_screen = Some(top.screen());
-                self.theme_was_layered = scene.frames.len() != 1;
-                self.theme_dirty = false;
-                self.dirty = false;
-                return Ok(self.present_damage.as_ref().is_none_or(|damage| !damage.is_empty()));
-            }
-        }
+        if let Some(drawn) = self.draw_prepared_theme(display)? { return Ok(drawn); }
         let display_styles = styles.display_style();
         let styles = &display_styles;
         let app_dirty = self.dirty;

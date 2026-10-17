@@ -409,12 +409,9 @@ impl AlliumLauncher<DefaultPlatform> {
                         if media_pending {continue;}
                     }
                     if pending_input.is_ready(&mut self.platform) { continue; }
-                    if warm_steps<2 && warm_allowed {
-                        if self.view.prewarm_navigation_step_with_pending(
-                            &mut warm_work,
-                            if warm_steps==0 {1} else {-1},
-                            || pending_input.is_ready(&mut self.platform),
-                        )? {warm_steps+=1;}
+                    if warm_allowed {
+                        self.view.idle_navigation_step(&mut self.display, &mut warm_work, &mut warm_steps,
+                            || pending_input.is_ready(&mut self.platform))?;
                     }
                     if pending_input.is_ready(&mut self.platform) { continue; }
                     if keys.values().all(|pressed| !pressed) && media_poll.elapsed()>=std::time::Duration::from_secs(1) {
@@ -637,8 +634,9 @@ impl AlliumLauncher<DefaultPlatform> {
                     present_damage.filter(|_| !*overlay_was_drawn && !network_dirty)
                 {
                     common::perf_trace::present_reason("partial");
-                    self.display.flush_rects(&damage)?;
+                    self.view.flush_prepared_damage(&mut self.display, &damage)?;
                 } else {
+                    if common::perf_trace::recording() { common::perf_trace::packed_span_reason("full_present_or_overlay"); }
                     common::perf_trace::present_reason(if network_dirty {
                         "network_dirty"
                     } else if *overlay_was_drawn {

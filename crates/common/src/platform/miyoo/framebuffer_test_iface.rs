@@ -164,6 +164,10 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
         xres_virtual: w,
         yres_virtual: h * 2,
         bits_per_pixel: 32,
+        red: Bitfield { offset: 16, length: 8, msb_right: 0 },
+        green: Bitfield { offset: 8, length: 8, msb_right: 0 },
+        blue: Bitfield { offset: 0, length: 8, msb_right: 0 },
+        transp: Bitfield { offset: 24, length: 8, msb_right: 0 },
         ..VarScreeninfo::default()
     };
     let fix = FixScreeninfo {
@@ -359,6 +363,7 @@ impl PresenterProbe {
     pub fn new(width: u32, height: u32) -> Self {
         Self(test_display(width, height))
     }
+    pub fn display(&mut self) -> &mut impl crate::display::Display { &mut self.0 }
     pub fn set_page(&mut self, page: u32) {
         OBSERVED.with(|state| state.borrow_mut().0.yoffset = page * self.0.pixmap.height());
     }
@@ -536,6 +541,7 @@ fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
             let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
             let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
             let prepared_pointer = candidate.pixels().data().as_ptr();
+            let packed = candidate.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut Default::default()).unwrap().unwrap();
             graveyard.push(candidate.recycle_neighbor_base(base));
             // Pan after preparation. Repair must still use the complete logical candidate base.
             let page = (step % 2) as u32;
@@ -556,7 +562,7 @@ fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
             assert_eq!(display.pixmap().data(), reference.pixels().data());
             assert_eq!(candidate.targets, reference.targets);
             assert_eq!(candidate.text_boxes, reference.text_boxes);
-            display.flush_rects(&damage).unwrap();
+            display.flush_packed_rects(&damage, &packed).unwrap();
             assert_visible(&display, page as usize, "adopted page");
             OBSERVED.with(|state| state.borrow_mut().0.yoffset = (1 - page) * 480);
             display.flush_rects(&[]).unwrap();
@@ -571,9 +577,10 @@ fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
             let next = model(&theme, ScreenId::Recents, 2, &arts);
             let (mut hit, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap()
                 .unwrap_or_else(|| panic!("{name} {change}: {:?}, {}", base.neighbor_charge(&next), base.neighbor_ineligible_reason()));
+            let packed = hit.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut Default::default()).unwrap().unwrap();
             let _retired = hit.recycle_neighbor_base(base);
             let damage = hit.adopt_neighbor_damage(&mut display).unwrap();
-            display.flush_rects(&damage).unwrap();
+            display.flush_packed_rects(&damage, &packed).unwrap();
             current = next;
             match change {
                 "status" => current.status.clock = Some("15:21".into()),
@@ -646,9 +653,11 @@ fn frameptr_menu_and_details_round_trips_after_adoption_match_reference() {
         for overlay_screen in [ScreenId::ContextMenu, ScreenId::GameDetail, ScreenId::ContextMenu, ScreenId::GameDetail] {
             let input = model(&theme, ScreenId::Recents, 1, &arts);
             let (mut candidate, _) = base.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().unwrap();
+            let packed = candidate.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut Default::default()).unwrap();
             candidate.recycle_neighbor_base(base);
             let damage = candidate.adopt_neighbor_damage(&mut display).unwrap();
-            display.flush_rects(&damage).unwrap();
+            if let Some(packed) = &packed { display.flush_packed_rects(&damage, packed).unwrap(); }
+            else { display.flush_rects(&damage).unwrap(); }
             assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
             let pixels = display.pixmap().data().to_vec();
             base = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(candidate)).unwrap();
@@ -770,4 +779,179 @@ fn frameptr_expired_art_before_first_retained_read_requires_full_render() {
         display.flush_rects(&damage).unwrap();
         assert_visible(&display, 0, "expired retained frame full render");
     }
+}
+
+#[test]
+fn prepack_page_history_and_fallbacks_match_normal_present_bytes() {
+    use super::*;
+    for case in ["both_valid", "one_valid", "external_pan", "stale_repair", "remap", "format", "identity", "damage", "read"] {
+        let mut display = test_display(32, 24);
+        let mut normal = test_display(32, 24);
+        for target in [&mut display, &mut normal] {
+            OBSERVED.with(|state| state.borrow_mut().0.yoffset = 0);
+            target.clear(Color::new(17, 53, 91)).unwrap();
+            target.flush().unwrap();
+            if case != "one_valid" {
+                OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24);
+                target.flush_rects(&[]).unwrap();
+                OBSERVED.with(|state| state.borrow_mut().0.yoffset = 0);
+                target.refresh_present_layout().unwrap();
+            }
+            if case == "one_valid" {
+                OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24);
+                target.refresh_present_layout().unwrap();
+            }
+            if case == "stale_repair" {
+                OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24);
+                crate::display::fill_rect(&mut target.pixmap_mut(), Rect::new(23, 17, 2, 3), Color::new(99, 17, 28));
+                target.flush_rects(&[Rect::new(23, 17, 2, 3)]).unwrap();
+                OBSERVED.with(|state| state.borrow_mut().0.yoffset = 0);
+                target.refresh_present_layout().unwrap();
+            }
+        }
+        let mut candidate = display.pixmap.as_ref().to_owned();
+        let areas = [Rect::new(-2, 2, 7, 3), Rect::new(4, 3, 7, 2), Rect::new(29, 22, 9, 9)];
+        for (i, area) in areas.iter().enumerate() {
+            crate::display::fill_rect(&mut candidate.as_mut(), *area, Color::new(130 + i as u8, 37, 213));
+        }
+        let candidate = Arc::new(candidate);
+        let packed = display.pack_spans(&candidate, &areas, 1024 * 1024, &mut Default::default()).unwrap().unwrap();
+        assert!(display.packed_base_matches(&packed));
+        assert!(packed.rows.iter().any(|row| row.x0 == 0 && row.x1 == 16), "aligned union");
+        assert!(packed.rows.iter().any(|row| row.x1 == 32), "right-edge expansion");
+        display.set_shared_pixmap(&candidate);
+        normal.set_shared_pixmap(&candidate);
+        drop(candidate);
+        if case == "external_pan" { OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24); }
+        if case == "format" { OBSERVED.with(|state| state.borrow_mut().0.red.offset = 7); }
+        if case == "identity" {
+            display.pixmap = display.pixmap.as_ref().to_owned().into();
+        }
+        if case == "read" { display.read_rect(Rect::new(0, 0, 1, 1)).unwrap(); normal.read_rect(Rect::new(0, 0, 1, 1)).unwrap(); }
+        let damage = if case == "damage" { vec![Rect::new(0, 0, 32, 24)] } else { areas.to_vec() };
+        let trace = std::env::temp_dir().join(format!("prepack-{}-{case}.jsonl", std::process::id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        if case == "remap" {
+            OBSERVED.with(|state| state.borrow_mut().1.smem_start += 4096);
+            NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; display.iface.frame.len()]));
+        }
+        display.flush_packed_rects(&damage, &packed).unwrap();
+        let counts = crate::perf_trace::probe_counts();
+        crate::perf_trace::stop_probe();
+        std::fs::remove_file(trace).unwrap();
+        if case == "remap" { NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; normal.iface.frame.len()])); }
+        normal.flush_rects(&damage).unwrap();
+        assert_eq!(display.iface.frame, normal.iface.frame, "{case}");
+        let hit = matches!(case, "both_valid" | "one_valid" | "stale_repair");
+        assert_eq!(counts["packed_span_hit"], u64::from(hit), "{case}");
+        if case == "both_valid" { assert_eq!(counts["converted_pixels"], 0); }
+        if case == "one_valid" { assert!(counts["converted_pixels"].as_u64().unwrap() > 0); }
+        if case == "stale_repair" { assert!(counts["converted_pixels"].as_u64().unwrap() > 0); }
+        if !matches!(case, "damage" | "read") { assert_visible(&display, if matches!(case, "external_pan" | "one_valid") { 1 } else { 0 }, case); }
+        println!("PREPACK parity={case} hit={} converted={}", counts["packed_span_hit"], counts["converted_pixels"]);
+    }
+}
+
+#[test]
+fn prepack_capacity_is_charged_and_unsupported_format_is_not_packed() {
+    use super::*;
+    let mut display = test_display(640, 480);
+    let candidate = Arc::new(Pixmap::new(640, 480).unwrap());
+    let damage = [Rect::new(0, 0, 640, 174), Rect::new(0, 174, 128, 1)];
+    let packed = display.pack_spans(&candidate, &damage, usize::MAX, &mut Default::default()).unwrap().unwrap();
+    assert_eq!(packed.bytes.len(), 445_952);
+    let charge = packed.charge();
+    println!("PREPACK bytes={} rows={} row_capacity={} row_size={} damage_capacity={} payload_size={} charge={charge}",
+        packed.bytes.capacity(), packed.rows.len(), packed.rows.capacity(), std::mem::size_of::<PackedRow>(),
+        packed.damage.capacity(), std::mem::size_of::<PackedSpans>());
+    let mut diagnostic = PackDiagnostic::default();
+    assert!(display.pack_spans(&candidate, &damage, charge - 1, &mut diagnostic).unwrap().is_none());
+    assert_eq!(diagnostic.reason, "pack_budget");
+    assert_eq!((diagnostic.needed_bytes, diagnostic.available_bytes), (charge, charge - 1));
+    assert_eq!(display.pack_spans(&candidate, &damage, charge, &mut Default::default()).unwrap().unwrap().charge(), charge);
+    OBSERVED.with(|state| state.borrow_mut().0.red.offset = 0);
+    assert!(display.pack_spans(&candidate, &damage, usize::MAX, &mut Default::default()).unwrap().is_none());
+    OBSERVED.with(|state| state.borrow_mut().0.red.offset = 16);
+    OBSERVED.with(|state| state.borrow_mut().0.bits_per_pixel = 64);
+    // Keep the legacy wider-pixel layout valid, but outside packed admission.
+    OBSERVED.with(|state| { let mut state = state.borrow_mut(); state.1.line_length *= 2; });
+    NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; 640 * 480 * 8 * 2 + 64]));
+    assert!(display.pack_spans(&candidate, &damage, usize::MAX, &mut Default::default()).unwrap().is_none());
+}
+
+#[test]
+fn prepack_declines_name_each_refreshed_format_field_size_and_empty_damage() {
+    use super::*;
+    let mutations: &[(&str, fn(&mut VarScreeninfo))] = &[
+        ("bits_per_pixel", |v| v.bits_per_pixel = 64),
+        ("grayscale", |v| v.grayscale = 1),
+        ("nonstd", |v| v.nonstd = 1),
+        ("red", |v| v.red.offset = 0),
+        ("red", |v| v.red.length = 7),
+        ("red", |v| v.red.msb_right = 1),
+        ("green", |v| v.green.offset = 0),
+        ("green", |v| v.green.length = 7),
+        ("green", |v| v.green.msb_right = 1),
+        ("blue", |v| v.blue.offset = 16),
+        ("blue", |v| v.blue.length = 7),
+        ("blue", |v| v.blue.msb_right = 1),
+        ("transp", |v| v.transp.offset = 0),
+        ("transp", |v| v.transp.length = 7),
+        ("transp", |v| v.transp.msb_right = 1),
+    ];
+    let candidate = Arc::new(Pixmap::new(32, 24).unwrap());
+    let damage = [Rect::new(0, 0, 16, 8)];
+    let trace = std::env::temp_dir().join(format!("prepack-declines-{}.jsonl", std::process::id()));
+    crate::perf_trace::start_probe(trace.to_str().unwrap());
+    for (field, mutate) in mutations {
+        let mut display = test_display(32, 24);
+        OBSERVED.with(|state| mutate(&mut state.borrow_mut().0));
+        if *field == "bits_per_pixel" {
+            OBSERVED.with(|state| state.borrow_mut().1.line_length *= 2);
+            NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; 32 * 24 * 8 * 2 + 64]));
+        }
+        let mut diagnostic = PackDiagnostic::default();
+        assert!(display.pack_spans(&candidate, &damage, usize::MAX, &mut diagnostic).unwrap().is_none());
+        assert_eq!(diagnostic.reason, format!("pack_format:{field}"));
+        assert_eq!(crate::perf_trace::probe_counts()["packed_span_reason"], diagnostic.reason);
+        println!("PREPACK3 decline={}", diagnostic.reason);
+    }
+    let mut display = test_display(32, 24);
+    let mut diagnostic = PackDiagnostic::default();
+    let wrong_size = Arc::new(Pixmap::new(31, 24).unwrap());
+    assert!(display.pack_spans(&wrong_size, &damage, usize::MAX, &mut diagnostic).unwrap().is_none());
+    assert_eq!(diagnostic.reason, "pack_size");
+    for damage in [&[][..], &[Rect::new(32, 24, 8, 8)][..]] {
+        assert!(display.pack_spans(&candidate, damage, 0, &mut diagnostic).unwrap().is_none());
+        assert_eq!(diagnostic.reason, "pack_empty");
+        assert_eq!(crate::perf_trace::probe_counts()["packed_span_reason"], "pack_empty");
+    }
+    crate::perf_trace::stop_probe();
+    std::fs::remove_file(trace).unwrap();
+}
+
+#[test]
+fn prepack_triple_buffer_pan_and_unused_alpha_pack_with_two_resident_frames() {
+    use super::*;
+    let mut display = test_display(640, 480);
+    OBSERVED.with(|state| state.borrow_mut().0.yres_virtual = 1440);
+    NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; 640 * 1440 * 4]));
+    let candidate = Arc::new(Pixmap::new(640, 480).unwrap());
+    let damage = [Rect::new(0, 0, 640, 174), Rect::new(0, 174, 128, 1)];
+    let available = 4 * 1024 * 1024 - 2 * 640 * 480 * 4;
+    let mut diagnostic = PackDiagnostic::default();
+    let first = display.pack_spans(&candidate, &damage, available, &mut diagnostic).unwrap().unwrap();
+    let revision = display.composition_revision;
+    for page in [0, 1, 2] {
+        OBSERVED.with(|state| { let mut state = state.borrow_mut();
+            state.0.yoffset = page * 480;
+            state.0.transp.length = 0;
+            state.0.transp.offset = 0;
+        });
+        let packed = display.pack_spans(&candidate, &damage, available, &mut diagnostic).unwrap().unwrap();
+        assert_eq!(packed.charge(), first.charge());
+        assert_eq!(diagnostic.reason, "hit");
+        assert_eq!(display.composition_revision, revision, "pan must not invalidate the base");
+    }
+    println!("PREPACK3 triple_buffer available={available} needed={} headroom={}", first.charge(), available - first.charge());
 }

@@ -2,6 +2,7 @@ pub mod color;
 pub mod font;
 pub mod image;
 pub mod overlay;
+pub mod packed;
 pub mod settings;
 
 use std::sync::Arc;
@@ -145,6 +146,20 @@ pub trait Display: Sized {
     /// if unsupported. Subsequent writes must preserve other owners' pixels.
     fn set_shared_pixmap(&mut self, _pixels: &Arc<tiny_skia::Pixmap>) -> bool {
         false
+    }
+
+    /// Set the diagnostic on every successful return, including declined admission.
+    fn pack_spans(&mut self, _pixels: &Arc<tiny_skia::Pixmap>, _areas: &[Rect], _available: usize, diagnostic: &mut packed::PackDiagnostic) -> Result<Option<packed::PackedSpans>> {
+        *diagnostic = packed::PackDiagnostic::new("pack_unsupported_display");
+        diagnostic.record();
+        Ok(None)
+    }
+
+    fn packed_base_matches(&self, _packed: &packed::PackedSpans) -> bool { false }
+
+    fn flush_packed_rects(&mut self, areas: &[Rect], _packed: &packed::PackedSpans) -> Result<()> {
+        if crate::perf_trace::recording() { crate::perf_trace::packed_span_reason("unsupported_display"); }
+        self.flush_rects(areas)
     }
 
     /// Apply a function to all pixels
