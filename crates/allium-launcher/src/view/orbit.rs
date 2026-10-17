@@ -128,6 +128,8 @@ pub struct Orbit {
     ink_art: bool,
     tall_art: bool,
     targets: ArtTargets,
+    theme_identity: Option<(u64, String)>,
+    covered_art: Vec<(PathBuf, Option<ArtTarget>)>,
     retired: Vec<std::sync::Weak<Pixmap>>,
     dirty: bool,
     worker_id: u64,
@@ -153,6 +155,8 @@ impl Orbit {
             ink_art: false,
             tall_art: false,
             targets: ArtTargets::default(),
+            theme_identity: None,
+            covered_art: Vec::new(),
             retired: Vec::new(),
             dirty: true,
             worker_id: {
@@ -234,9 +238,32 @@ impl Orbit {
     pub(crate) fn set_art_targets(&mut self, targets: ArtTargets) {
         if self.targets != targets {
             self.cancel_selection();
-            self.completed_tasks.clear();
             self.targets = targets;
         }
+    }
+    pub(crate) fn set_art_theme(&mut self, handle: &common::theme::ThemeHandle) -> bool {
+        let changed = self.theme_identity.as_ref().is_none_or(|(generation, digest)| {
+            *generation != handle.generation() || digest != handle.digest()
+        });
+        if changed {
+            self.release_art();
+            self.theme_identity = Some((handle.generation(), handle.digest().to_owned()));
+        }
+        self.refresh_art();
+        changed
+    }
+    pub(crate) fn protect_covered(&mut self, entry: Option<&Entry>, targets: ArtTargets) {
+        self.covered_art.clear();
+        if let Some(entry) = entry {
+            self.covered_art.extend([
+                (art_path(entry, "heroes"), targets.hero),
+                (art_path(entry, "logos"), targets.logo),
+                (self.cover_path(entry), targets.cover),
+            ]);
+        }
+    }
+    fn is_covered(&self, item: &CachedArt) -> bool {
+        self.covered_art.iter().any(|(path, target)| *path == item.path && *target == item.target)
     }
     fn task_target(task: &WarmArt, targets: ArtTargets) -> Option<ArtTarget> {
         match task {
@@ -437,7 +464,7 @@ impl Orbit {
         if common::perf_trace::recording() {
             let missed = |task: WarmArt| {
                 let key = task.key();
-                self.completed_tasks.iter().any(|completed| completed.key == key && completed.targets == targets && completed.missing)
+                self.completed_tasks.iter().any(|completed| completed.key == key && Self::task_target(&task, completed.targets) == Self::task_target(&task, targets) && completed.missing)
             };
             if let Some(entry) = entries.get(selected) {
                 art.completed_misses.selected_cover = art.selected_cover.is_none()
@@ -552,7 +579,8 @@ impl Orbit {
             let Some(index) = self
                 .cache
                 .iter()
-                .rposition(|item| !self.is_protected(item))
+                .rposition(|item| !self.is_protected(item) && !self.is_covered(item))
+                .or_else(|| self.cache.iter().rposition(|item| !self.is_protected(item)))
             else {
                 // The soft allowance is shared with inactive lists and retained frame sources.
                 // Visible sources must survive until the next frame releases those references.
@@ -675,6 +703,7 @@ impl Orbit {
         self.cancel_selection();
         self.completed_tasks.clear();
         self.protected_paths.clear();
+        self.covered_art.clear();
         while let Some(item) = self.cache.pop_back() {
             self.retire(item);
         }
@@ -2147,7 +2176,8 @@ impl Orbit {
                             ))
                         });
                         self.completed_tasks
-                            .retain(|completed| completed.key != key);
+                            .retain(|completed| completed.key != key
+                                || Self::task_target(&task, completed.targets) != Self::task_target(&task, result.targets));
                         if self.completed_tasks.len() >= 128 {
                             self.completed_tasks.pop_back();
                         }
@@ -2185,7 +2215,7 @@ impl Orbit {
                 if self
                     .completed_tasks
                     .iter()
-                    .any(|completed| completed.key == key && completed.targets == targets && completed.is_resident(&task))
+                    .any(|completed| completed.key == key && Self::task_target(&task, completed.targets) == Self::task_target(&task, targets) && completed.is_resident(&task))
                 {
                     continue;
                 }
@@ -2265,6 +2295,8 @@ impl Orbit {
                     trace: common::perf_trace::probe_path(),
                 };
                 if worker.send.try_send(job).is_ok() {
+                    #[cfg(test)]
+                    TEST_ART_REQUESTS.with(|requests| requests.set(requests.get() + 1));
                     self.pending_tasks.push_back(task);
                     worker.in_flight += 1;
                     worker.busy = Some(owner);
@@ -2290,6 +2322,12 @@ impl Orbit {
 
 #[cfg(test)]
 thread_local! { static TEST_WORKER_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static TEST_ART_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn test_art_requests() -> usize {
+    TEST_ART_REQUESTS.with(std::cell::Cell::get)
+}
 #[cfg(test)]
 thread_local! { static TEST_ART_STARTED: std::cell::RefCell<Option<std::sync::mpsc::Sender<super::art_queue::AssetKey>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
@@ -2643,6 +2681,89 @@ mod latency_tests {
         drop(previous);
         assert_eq!(orbit.source_bytes(), visible_bytes);
     }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn artkeep_covered_variants_are_bounded_and_selection_media_theme_release_them() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::ScreenId};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let snapshot = || ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap();
+        let theme = ThemeHandle::prepare(snapshot(), &bank, 501).unwrap();
+        let lower = ArtTargets::for_screens(theme.pack(), &[ScreenId::Recents]);
+        let upper = ArtTargets::for_screens(theme.pack(), &[ScreenId::GameDetail]);
+        let entry = Entry::Game(crate::entry::game::Game::new("/artkeep/first.chd".into()));
+        let next = Entry::Game(crate::entry::game::Game::new("/artkeep/second.chd".into()));
+        let mut orbit = Orbit::new();
+        orbit.set_art_theme(&theme);
+        orbit.set_ink_art(true);
+        orbit.set_art_targets(lower);
+        orbit.protect_selected(&entry);
+        orbit.protect_covered(Some(&entry), lower);
+        let variants = orbit.covered_art.clone();
+        let mut retained_bytes = 0;
+        for (path, target) in &variants {
+            let target = target.unwrap();
+            let image = Pixmap::new(target.width, target.height).unwrap();
+            retained_bytes += image.data().len();
+            assert!(orbit.insert_cached(CachedArt { path: path.clone(), target: Some(target),
+                image: Some(std::sync::Arc::new(image)) }));
+        }
+        assert_eq!(retained_bytes, 446464);
+        orbit.set_art_targets(upper);
+        for i in 0..20 {
+            assert!(orbit.insert_cached(CachedArt { path: format!("pressure-{i}").into(), target: None,
+                image: Some(std::sync::Arc::new(Pixmap::new(480, 480).unwrap())) }));
+            assert!(orbit.source_bytes() <= orbit.source_budget());
+            assert!(orbit.source_bytes() <= CACHE_PIXEL_BYTES);
+            assert!(variants.iter().all(|(path, target)| orbit.cached_variant(path, *target).is_some()));
+        }
+        // Covered variants cannot force admission beyond the shared source allowance.
+        assert!(!orbit.insert_cached(CachedArt { path: "oversized".into(), target: None,
+            image: Some(std::sync::Arc::new(Pixmap::new(2048, 1024).unwrap())) }));
+        assert!(orbit.source_bytes() <= orbit.source_budget());
+        let epoch = orbit.worker_epoch;
+        orbit.protect_selected(&next);
+        orbit.protect_covered(Some(&next), lower);
+        assert_ne!(orbit.worker_epoch, epoch);
+        assert!(orbit.covered_art.iter().all(|(path, _)| !variants.iter().any(|(old, _)| path == old)));
+        common::media::invalidate();
+        orbit.refresh_art();
+        assert!(orbit.cache.is_empty() && orbit.covered_art.is_empty());
+        orbit.protect_covered(Some(&entry), lower);
+        orbit.set_art_theme(&ThemeHandle::prepare(snapshot(), &bank, 502).unwrap());
+        assert!(orbit.cache.is_empty() && orbit.covered_art.is_empty());
+        orbit.protect_covered(Some(&entry), lower);
+        orbit.release_art();
+        assert!(orbit.covered_art.is_empty());
+        assert_eq!(orbit.source_bytes(), 0);
+    }
+
+    #[test]
+    fn artkeep_target_switch_preserves_completed_misses_per_variant() {
+        use common::theme::pack::Fit;
+        let mut orbit = Orbit::new();
+        let lower = ArtTargets { hero: Some(ArtTarget { width: 192, height: 408,
+            fit: Fit::Cover, logo_box: false }), ..ArtTargets::default() };
+        let upper = ArtTargets { hero: Some(ArtTarget { width: 256, height: 328,
+            fit: Fit::Cover, logo_box: false }), ..ArtTargets::default() };
+        let task = WarmArt::Hero(Entry::Game(crate::entry::game::Game::new("/artkeep/missing.chd".into())));
+        for targets in [lower, upper] {
+            orbit.completed_tasks.push_back(CompletedTask { targets, key: task.key(),
+                admission_rejected: false, missing: true, metadata: None });
+        }
+        let requests = test_art_requests();
+        for targets in [lower, upper, lower] {
+            orbit.set_art_targets(targets);
+            let mut work = VecDeque::from([task.clone()]);
+            orbit.warm_art_step(&mut work);
+            assert!(work.is_empty() && !orbit.art_pending());
+            assert_eq!(orbit.completed_tasks.len(), 2);
+            assert_eq!(test_art_requests(), requests);
+        }
+        orbit.release_art();
+        assert!(orbit.completed_tasks.is_empty());
+    }
+
     #[test]
     fn ram_variants_do_not_alias_sizes_or_fit_modes() {
         use common::theme::pack::Fit;

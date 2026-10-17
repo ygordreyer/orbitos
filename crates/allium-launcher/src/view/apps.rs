@@ -38,6 +38,9 @@ impl Apps {
         self.list.root_tab_navigation_ready()
     }
 
+    pub(crate) fn release_theme_art(&mut self) {
+        self.list.release_theme_art();
+    }
     pub(crate) fn clear_theme(&mut self) -> Result<()> {
         self.list.clear_theme()
     }

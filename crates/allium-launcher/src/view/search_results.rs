@@ -160,6 +160,9 @@ impl SearchResultsView {
             .idle_media_step(handle, common::theme::pack::ScreenId::SearchResults)
     }
 
+    pub(crate) fn release_theme_art(&mut self) {
+        self.list.release_theme_art();
+    }
     pub(crate) fn clear_theme(&mut self) -> Result<()> {
         self.list.clear_theme()
     }

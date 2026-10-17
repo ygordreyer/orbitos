@@ -114,6 +114,9 @@ impl Recents {
         }
     }
 
+    pub(crate) fn release_theme_art(&mut self) {
+        if let Self::List(list) = self { list.release_theme_art(); }
+    }
     pub(crate) fn clear_theme(&mut self) -> Result<()> {
         match self {
             Self::List(list) => list.clear_theme(),

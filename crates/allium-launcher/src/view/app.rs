@@ -119,6 +119,15 @@ fn prepare_theme_frames(
     Ok(frames)
 }
 
+fn visible_theme_models<'a>(
+    models: &'a [common::theme::frame::FrameInputs],
+    frames: &[common::theme::render::PreparedFrame],
+) -> &'a [common::theme::frame::FrameInputs] {
+    if frames.last().is_some_and(|frame| frame.is_opaque()) {
+        &models[models.len() - 1..]
+    } else { models }
+}
+
 pub(super) fn theme_content_complete(
     input: &common::theme::frame::FrameInputs,
     handle: &common::theme::ThemeHandle,
@@ -140,7 +149,9 @@ fn visit_theme_content_pending<const DIAGNOSE_ROWS: bool>(
 ) -> Option<(&'static str, usize)> {
     use common::theme::pack::{Arrangement, Binding, Kind};
     let has_rows = input.rows.values().any(|rows| !rows.is_empty());
-    if !has_rows && input.selected.is_empty() {
+    if !has_rows && input.screen != common::theme::pack::ScreenId::GameDetail
+        && input.selected.keys().all(|binding| *binding == Binding::Navigation)
+    {
         return None;
     }
     handle.pack().screens[&input.screen]
@@ -670,6 +681,10 @@ where
     pub(crate) fn prepare_command(&mut self, command: &Command) {
         if matches!(command, Command::Exec(_) | Command::ReloadStylesheet(..)) {
             self.release_details_frame();
+            self.views.0.release_theme_art();
+            self.views.1.release_theme_art();
+            self.views.2.release_theme_art();
+            if let Some(search) = self.search_results.as_mut() { search.release_theme_art(); }
         }
     }
     pub(crate) fn force_full_present(&mut self) {
@@ -978,23 +993,24 @@ where
         };
         self.had_theme = true;
         let models = self.theme_models(&handle)?;
-        self.content_complete = models.as_ref().is_none_or(|models| {
-            models.iter().all(|input| theme_content_complete(input, &handle))
-        });
-        if common::perf_trace::recording() {
-            let pending = models.as_ref().map_or_else(Vec::new,
-                |models| theme_content_pending_reasons(models, &handle));
-            let next_cover_expected = models.as_ref().is_some_and(|models| models.iter()
-                .any(|input| input.art.next_cover_expected));
-            common::perf_trace::content_readiness_reasons(pending, next_cover_expected);
-        }
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
             let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
             let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details)?;
+            let visible = visible_theme_models(&models, &frames);
+            self.content_complete = visible.iter().all(|input| theme_content_complete(input, &handle));
+            if common::perf_trace::recording() {
+                let pending = theme_content_pending_reasons(visible, &handle);
+                let next_cover_expected = visible.iter().any(|input| input.art.next_cover_expected);
+                common::perf_trace::content_readiness_reasons(pending, next_cover_expected);
+            }
             Some(crate::theme_adapter::ThemeScene { frames })
         } else {
             self.release_details_frame();
+            self.content_complete = true;
+            if common::perf_trace::recording() {
+                common::perf_trace::content_readiness("ready", false, 0);
+            }
             None
         };
         Ok(())
@@ -1682,6 +1698,51 @@ mod tests {
     }
 
     #[test]
+    fn normalized_empty_lists_are_content_complete() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        for screen in [ScreenId::Recents, ScreenId::Library, ScreenId::SearchResults] {
+            let mut input = FrameInputs::new(screen);
+            input.rows.insert(Binding::Entries, vec![]);
+            prepare_theme_inputs(std::slice::from_mut(&mut input), &resources(), 0, &Status::default());
+            assert_eq!(input.selected.len(), 1);
+            assert!(input.selected.contains_key(&Binding::Navigation));
+            assert!(super::theme_content_complete(&input, &theme), "{screen:?}");
+            assert!(super::theme_content_pending_reasons(&[input], &theme).is_empty(), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn normalized_opaque_details_wait_for_their_own_artwork() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        let mut models = vec![FrameInputs::new(ScreenId::Recents), FrameInputs::new(ScreenId::GameDetail)];
+        models[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
+        models[1].text.insert(Binding::SelectedTitle, "Selected game".into());
+        prepare_theme_inputs(&mut models, &resources(), 0, &Status::default());
+        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None).unwrap();
+        assert!(frames.last().unwrap().is_opaque());
+        let visible = super::visible_theme_models(&models, &frames);
+        assert_eq!(visible.len(), 1);
+        assert!(!super::theme_content_complete(&visible[0], &theme));
+        let reasons = super::theme_content_pending_reasons(visible, &theme);
+        for reason in ["selected_hero", "selected_logo", "selected_cover"] {
+            assert!(reasons.contains(&(reason, 0)), "{reasons:?}");
+        }
+        models[1].art.completed_misses = common::theme::frame::ArtMisses {
+            selected_hero: true, selected_logo: true, selected_cover: true, ..Default::default()
+        };
+        let visible = super::visible_theme_models(&models, &frames);
+        assert!(visible.iter().all(|input| super::theme_content_complete(input, &theme)));
+        assert!(super::theme_content_pending_reasons(visible, &theme).is_empty());
+        assert!(!super::theme_content_pending_reasons(&models, &theme).is_empty());
+    }
+
+    #[test]
     fn adapter_preserves_authored_library_hints_without_dialog() {
         let mut models = vec![authored(ScreenId::Library, "A", "Play")];
 
@@ -1711,10 +1772,21 @@ mod tests {
                 models[0].hints.clear();
                 let mut top = authored(screen, "B", "Back");
                 top.text.insert(Binding::SelectedTitle, "AV To é 日本語".into());
+                top.art.completed_misses = common::theme::frame::ArtMisses {
+                    selected_hero: true, selected_logo: true, selected_cover: true, ..Default::default()
+                };
                 models.push(top);
             }
             let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
             optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked).unwrap();
+            if top_screen.is_some() {
+                let mut pending = models.clone();
+                pending[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
+                assert!(!super::theme_content_pending_reasons(&pending, &theme).is_empty());
+                assert_eq!(super::theme_content_pending_reasons(
+                    super::visible_theme_models(&pending, &optimized), &theme,
+                ).is_empty(), top_screen == Some(ScreenId::GameDetail));
+            }
             let mut old = reference.into_iter();
             reference = models.iter().map(|input| PreparedFrame::prepare_reusing(theme.clone(), input, old.next()).unwrap()).collect::<Vec<_>>();
             let mut actual = <DefaultPlatform as Platform>::Display::default();
@@ -1758,7 +1830,7 @@ mod integration_navigation_tests {
         let root = common::constants::ALLIUM_GAMES_DIR.join("integration-details-warm");
         std::fs::create_dir_all(root.join("Imgs")).unwrap();
         std::fs::write(root.join("gamelist.xml"), format!("<gameList>{}</gameList>", (0..2).map(|index| format!(
-            "<game><path>./Network {index}</path><desc>{}</desc><developer>Human Entertainment</developer><publisher>ASCII</publisher><genre>Adventure, Horror</genre><releasedate>19970930T000000</releasedate><players>1</players><scraper>Fixture scraper</scraper></game>",
+            "<game><path>./Network {index}</path><marquee>./Imgs/Details {index}.logo.png</marquee><desc>{}</desc><developer>Human Entertainment</developer><publisher>ASCII</publisher><genre>Adventure, Horror</genre><releasedate>19970930T000000</releasedate><players>1</players><scraper>Fixture scraper</scraper></game>",
             "A young heroine explores a mansion and searches for her friends. A shadow follows her through the rooms. ".repeat(6)
         )).collect::<String>())).unwrap();
         let database = Database::in_memory().unwrap();
@@ -1860,6 +1932,13 @@ mod integration_navigation_tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert!(saw_details && saw_text && saw_hero);
+        let recents_art = app.theme_models(&handle).unwrap().unwrap()[0].art.clone();
+        assert!(recents_art.selected_hero.is_some() && recents_art.selected_logo.is_some()
+            && recents_art.selected_cover.is_some(), "recents sizes: {:?}, {:?}, {:?}; requests {}",
+            recents_art.selected_hero.as_ref().map(|p| (p.width(), p.height())),
+            recents_art.selected_logo.as_ref().map(|p| (p.width(), p.height())),
+            recents_art.selected_cover.as_ref().map(|p| (p.width(), p.height())),
+            super::super::orbit::test_art_requests());
         app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
         let mut models = app.theme_models(&handle).unwrap().unwrap();
         app.normalize_theme_inputs(&handle, &mut models);
@@ -1870,8 +1949,8 @@ mod integration_navigation_tests {
         assert_eq!(details.facts, warmed.facts);
         assert_eq!(details.detail_lines, warmed.detail_lines);
         assert_eq!(details.pagination, warmed.pagination);
-        assert_eq!(details.art.selected_cover.as_ref().unwrap().width(), 101);
-        assert_eq!(details.art.selected_hero.as_ref().unwrap().width(), 360);
+        assert_eq!(details.art.selected_cover.as_ref().unwrap().width(), 176);
+        assert_eq!(details.art.selected_hero.as_ref().unwrap().width(), 256);
         #[cfg(feature = "perf-bench")]
         {
             common::perf_trace::start_probe(root.join("trace.log").to_str().unwrap());
@@ -1899,10 +1978,48 @@ mod integration_navigation_tests {
         let changed = app.theme_models(&handle).unwrap().unwrap();
         assert_ne!(changed.last().unwrap().pagination, initial.pagination);
         assert_ne!(changed.last().unwrap().focus, initial.focus);
-        app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
-        app.prepare_theme().unwrap();
-        app.draw(&mut display, &style).unwrap();
-        assert!(app.parked_details.is_some());
+        for cycle in 0..4 {
+            let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.idle_media_step() {
+                if app.should_draw() {
+                    app.prepare_theme().unwrap();
+                    app.draw(&mut display, &style).unwrap();
+                }
+                assert!(std::time::Instant::now() < idle_deadline, "Details idle timeout");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let requests = super::super::orbit::test_art_requests();
+            app.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut VecDeque::new()).await.unwrap();
+            app.idle_media_step();
+            let models = app.theme_models(&handle).unwrap().unwrap();
+            assert_eq!(models.len(), 1);
+            for (before, after) in [
+                (&recents_art.selected_hero, &models[0].art.selected_hero),
+                (&recents_art.selected_logo, &models[0].art.selected_logo),
+                (&recents_art.selected_cover, &models[0].art.selected_cover),
+            ] {
+                assert!(std::sync::Arc::ptr_eq(before.as_ref().unwrap(), after.as_ref().unwrap()));
+            }
+            assert!(theme_content_pending_reasons(&models, &handle).is_empty());
+            app.prepare_theme().unwrap();
+            assert!(app.content_complete, "first close frame pending in cycle {cycle}");
+            app.draw(&mut display, &style).unwrap();
+            assert_eq!(super::super::orbit::test_art_requests(), requests, "close requested art");
+            let mut fresh_models = models;
+            app.normalize_theme_inputs(&handle, &mut fresh_models);
+            let fresh = common::theme::render::PreparedFrame::prepare(
+                ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 912).unwrap(),
+                &fresh_models[0],
+            ).unwrap();
+            assert_eq!(display.pixmap().data(), fresh.pixels().data(), "close pixels {cycle}");
+            assert!(app.parked_details.is_some());
+            if cycle < 3 {
+                app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
+                app.prepare_theme().unwrap();
+                assert!(app.content_complete);
+                app.draw(&mut display, &style).unwrap();
+            }
+        }
         app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
         app.prepare_theme().unwrap();
         app.draw(&mut display, &style).unwrap();
@@ -1970,6 +2087,10 @@ mod integration_navigation_tests {
             assert!(app.parked_details.is_some());
             app.prepare_command(&command);
             assert!(app.parked_details.is_none(), "{command:?} retained closed Details");
+            let released = app.theme_models(&handle).unwrap().unwrap();
+            assert!(released.iter().all(|input| input.art.selected_hero.is_none()
+                && input.art.selected_logo.is_none() && input.art.selected_cover.is_none()),
+                "{command:?} retained artwork sources");
             app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
             app.prepare_theme().unwrap();
         }
