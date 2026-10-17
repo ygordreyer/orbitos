@@ -34,6 +34,36 @@ static NEXT_DISPLAY_ID: AtomicU64 = AtomicU64::new(1);
 mod framebuffer_damage;
 use framebuffer_damage::PageHistory;
 
+#[inline]
+fn copy_packed_row(target: &mut [u8], source: &[u8]) {
+    #[cfg(all(target_arch = "arm", target_feature = "neon"))]
+    {
+        use core::arch::arm::{vld1q_u8, vst1q_u8};
+        assert_eq!(target.len(), source.len());
+        let mut copied = 0;
+        // The cfg guarantees NEON. Disjoint, checked slices bound every unaligned
+        // load/store to a complete 64-byte block; the tail stays slice-checked.
+        unsafe {
+            while source.len() - copied >= 64 {
+                let src = source.as_ptr().add(copied);
+                let dst = target.as_mut_ptr().add(copied);
+                let a = vld1q_u8(src);
+                let b = vld1q_u8(src.add(16));
+                let c = vld1q_u8(src.add(32));
+                let d = vld1q_u8(src.add(48));
+                vst1q_u8(dst, a);
+                vst1q_u8(dst.add(16), b);
+                vst1q_u8(dst.add(32), c);
+                vst1q_u8(dst.add(48), d);
+                copied += 64;
+            }
+        }
+        target[copied..].copy_from_slice(&source[copied..]);
+    }
+    #[cfg(not(all(target_arch = "arm", target_feature = "neon")))]
+    target.copy_from_slice(source);
+}
+
 pub struct FramebufferDisplay {
     page_history: Option<PageHistory>,
     present_damage: Vec<Rect>,
@@ -335,7 +365,7 @@ impl FramebufferDisplay {
             for row in packed.rows.iter().rev() {
                 let at = location + ((height - 1 - row.y) * width + width - row.x1) * 4;
                 let len = (row.x1 - row.x0) * 4;
-                self.iface.frame[at..at + len].copy_from_slice(&packed.bytes[row.start..row.start + len]);
+                copy_packed_row(&mut self.iface.frame[at..at + len], &packed.bytes[row.start..row.start + len]);
             }
             if crate::perf_trace::recording() {
                 crate::perf_trace::count(crate::perf_trace::Count::FlushedPixels, (packed.bytes.len() / 4) as u64);
@@ -607,7 +637,8 @@ impl Display for FramebufferDisplay {
             return Ok(None);
         }
         let mut start = 0;
-        for row in &mut packed.rows {
+        // Keep rows searchable by (y, x0), but store bytes in direct-present order.
+        for row in packed.rows.iter_mut().rev() {
             row.start = start;
             let len = (row.x1 - row.x0) * 4;
             crate::platform::framebuffer_pixels::write_reversed_bgra(&mut packed.bytes[start..start + len],

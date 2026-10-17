@@ -959,6 +959,87 @@ fn frameptr_expired_art_before_first_retained_read_requires_full_render() {
 }
 
 #[test]
+fn packed_row_copy_preserves_bytes_and_guards_at_unaligned_lengths() {
+    for len in [0, 4, 60, 64, 68, 832, 1024, 1028] {
+        for source_offset in [0, 1, 3, 7, 15] {
+            for target_offset in [0, 1, 2, 5, 15] {
+                let source: Vec<_> = (0..len + source_offset + 16)
+                    .map(|i| (i * 37 + 19) as u8).collect();
+                let mut target = vec![0xa5; len + target_offset + 16];
+                let mut expected = target.clone();
+                expected[target_offset..target_offset + len]
+                    .copy_from_slice(&source[source_offset..source_offset + len]);
+                super::copy_packed_row(&mut target[target_offset..target_offset + len],
+                    &source[source_offset..source_offset + len]);
+                assert_eq!(target, expected, "len={len} source={source_offset} target={target_offset}");
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_reverse_source_order_matches_pixel_rotation_in_direct_and_repair_paths() {
+    use super::*;
+    let (w, h) = (96, 24);
+    let areas = [Rect::new(-3, 2, 12, 9), Rect::new(33, 3, 9, 8),
+        Rect::new(65, 1, 27, 13), Rect::new(41, 6, 9, 2), Rect::new(90, 22, 12, 4)];
+    for page in [0, 1] {
+        for repair in [false, true] {
+            let mut display = test_display(w, h);
+            display.clear(Color::new(17, 53, 91)).unwrap();
+            display.flush().unwrap();
+            OBSERVED.with(|s| s.borrow_mut().0.yoffset = page * h);
+            if !repair { display.flush_rects(&[]).unwrap(); }
+            let mut candidate = display.pixmap.as_ref().to_owned();
+            for (y, row) in candidate.data_mut().chunks_exact_mut(w as usize * 4).enumerate() {
+                for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+                    if areas.iter().any(|r| r.x <= x as i32 && r.right() > x as i32
+                        && r.y <= y as i32 && r.bottom() > y as i32) {
+                        pixel.copy_from_slice(&[(x * 13 + y * 7) as u8, (y * 17) as u8,
+                            (x * 3 + y * 11) as u8, 255]);
+                    }
+                }
+            }
+            let candidate = Arc::new(candidate);
+            let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+            assert!(packed.rows.windows(2).any(|pair| pair[0].y == pair[1].y), "multiple segments per y");
+            assert!(packed.rows.windows(2).all(|pair| (pair[0].y, pair[0].x0) < (pair[1].y, pair[1].x0)));
+            let mut next_start = 0;
+            for row in packed.rows.iter().rev() {
+                assert_eq!(row.start, next_start, "reverse walk must read contiguous bytes forwards");
+                next_start += (row.x1 - row.x0) * 4;
+            }
+            assert!(packed.rows.iter().rev().zip(packed.rows.iter().rev().skip(1))
+                .all(|(a, b)| a.start < b.start));
+            assert_eq!(next_start, packed.bytes.len());
+            display.set_shared_pixmap(&candidate);
+            let mut expected = display.iface.frame.clone();
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let src = (y * w as usize + x) * 4;
+                    let dst = ((page * h) as usize * w as usize
+                        + (h as usize - 1 - y) * w as usize + w as usize - 1 - x) * 4;
+                    let p = &candidate.data()[src..src + 4];
+                    expected[dst..dst + 4].copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+                }
+            }
+            if repair {
+                display.page_history = None;
+                display.flush_packed_rects(&areas, &packed).unwrap();
+                assert_eq!(display.present_damage, vec![display.bounding_box()], "full repair uses write_packed_rect");
+            } else {
+                assert!(!display.page_history.as_ref().unwrap().needs_repair(page as usize));
+                let storage = (display.present_damage.as_ptr(), display.present_damage.capacity(), display.present_damage.len());
+                display.flush_packed_rects(&areas, &packed).unwrap();
+                assert_eq!((display.present_damage.as_ptr(), display.present_damage.capacity(), display.present_damage.len()),
+                    storage, "direct path skips repair storage");
+            }
+            assert_eq!(display.iface.frame, expected, "page={page} repair={repair}");
+        }
+    }
+}
+
+#[test]
 fn present_clean_packet_matches_legacy_repairs_and_reuses_damage_storage() {
     use super::*;
     let mut patterns = vec![
