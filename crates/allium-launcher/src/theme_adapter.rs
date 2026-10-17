@@ -234,10 +234,14 @@ pub fn drawing_style(raw: &Stylesheet, handle: Option<&ThemeHandle>) -> Styleshe
 
 pub fn entry_id(path: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(path.as_os_str().as_encoded_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 15) as usize] as char);
+    }
+    output
 }
 pub struct ThemeScene {
     pub frames: Vec<common::theme::render::PreparedFrame>,
@@ -290,4 +294,19 @@ pub fn keyboard_model(capture: common::view::KeyboardThemeInputs) -> FrameInputs
         },
     ];
     input
+}
+
+#[cfg(test)]
+mod id_tests {
+    #[test]
+    fn entry_id_preserves_sha256_hex_for_path_bytes() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+        use sha2::{Digest, Sha256};
+        for bytes in [b"".as_slice(), b"PS/Game.chd", "日本語/Game.chd".as_bytes(), b"PS/\xff.chd"] {
+            let path = Path::new(OsStr::from_bytes(bytes));
+            let expected = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+            assert_eq!(super::entry_id(path), expected);
+            assert_eq!(super::entry_id(path).len(), 64);
+        }
+    }
 }

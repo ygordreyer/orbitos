@@ -7,9 +7,9 @@ use std::{
 };
 
 const COUNT_LEN: usize = 35;
-const STAGE_NAMES: [&str; 14] = [
+const STAGE_NAMES: [&str; 15] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
-    "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore",
+    "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -928,6 +928,7 @@ pub enum Stage {
     ShadowGaussian,
     SnapshotCapture,
     SnapshotRestore,
+    SemanticModel,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -1027,6 +1028,7 @@ mod latency_stage_tests {
             Stage::SelectedInfo,
             Stage::ArtworkLookup,
             Stage::Layout,
+            Stage::SemanticModel,
             Stage::Raster,
             Stage::Present,
             Stage::ShadowGaussian,
@@ -1054,6 +1056,7 @@ mod latency_stage_tests {
             "selected_info",
             "artwork_lookup",
             "layout",
+            "semantic_model",
             "raster",
             "present",
         ] {

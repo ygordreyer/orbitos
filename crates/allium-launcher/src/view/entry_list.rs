@@ -53,6 +53,7 @@ struct SelectedInfo {
     generation: u64,
     media_generation: u64,
     adoption_generation: u64,
+    platform: String,
     metadata: String,
     metadata_runs: Vec<(String, String)>,
     blurb: String,
@@ -67,6 +68,7 @@ impl SelectedInfo {
         let generation = crate::view::details::metadata_generation();
         if slot.as_ref().is_none_or(|info| {
             info.path != game.path
+                || info.platform != platform
                 || info.generation != generation
                 || info.media_generation != common::media::generation()
                 || info.adoption_generation != super::orbit::metadata_completion_generation()
@@ -77,6 +79,7 @@ impl SelectedInfo {
                 generation,
                 media_generation: common::media::generation(),
                 adoption_generation: crate::view::orbit::metadata_completion_generation(),
+                platform: platform.to_owned(),
                 metadata: details.metadata,
                 metadata_runs: details.metadata_runs,
                 blurb: details.blurb,
@@ -85,6 +88,40 @@ impl SelectedInfo {
         slot.as_ref().unwrap()
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentsSemanticKey {
+    selected: usize,
+    path: Option<std::path::PathBuf>,
+    first: usize,
+    count: usize,
+    image_focus: Option<common::theme::frame::Focus>,
+    list_revision: u64,
+    cloud_rows: Vec<bool>,
+    media_generation: u64,
+    name_generation: u64,
+    metadata_generation: u64,
+    adoption_generation: u64,
+    locale_revision: u64,
+    console_revision: u64,
+    language: String,
+    theme_generation: u64,
+    theme_digest: String,
+    screen: common::theme::pack::ScreenId,
+}
+
+struct RecentsSemantic {
+    key: RecentsSemanticKey,
+    // Raw semantics only: artwork is acquired anew and normalization edits a clone.
+    input: common::theme::frame::FrameInputs,
+}
+impl std::fmt::Debug for RecentsSemantic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecentsSemantic").field("key", &self.key).finish_non_exhaustive()
+    }
+}
+#[cfg(test)]
+thread_local! { pub(crate) static RECENTS_SEMANTIC_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[derive(Debug)]
 pub struct EntryList<S>
@@ -95,6 +132,8 @@ where
     res: Resources,
     entries: Vec<Entry>,
     media_generation: u64,
+    list_revision: u64,
+    recents_semantic: Option<RecentsSemantic>,
     sort: S,
     list: ScrollList,
     image: Image,
@@ -210,6 +249,8 @@ where
             res,
             entries: vec![],
             media_generation: common::media::generation(),
+            list_revision: 0,
+            recents_semantic: None,
             sort,
             list,
             image,
@@ -695,29 +736,21 @@ where
         }))
     }
 
-    pub(crate) fn theme_models(
+    fn base_theme_model(
         &mut self,
         screen: common::theme::pack::ScreenId,
         handle: &common::theme::ThemeHandle,
-    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
-        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Layout);
-        use common::theme::{
-            frame::{Focus, FrameInputs, Hint, Row},
-            pack::{Binding, ScreenId},
-        };
-        if let Some(child) = self.child.as_mut() {
-            self.semantic_info = None;
-            if let Some(orbit) = self.orbit.as_mut() {
-                orbit.release_art();
-            }
-            return child.theme_models(screen, handle);
+        selected: usize,
+        first: usize,
+        count: usize,
+    ) -> common::theme::frame::FrameInputs {
+        let _semantic = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::SemanticModel));
+        use common::theme::{frame::{Focus, FrameInputs, Hint, Row}, pack::{Binding, ScreenId}};
+        #[cfg(test)]
+        if screen == ScreenId::Recents {
+            RECENTS_SEMANTIC_BUILDS.with(|count| count.set(count.get() + 1));
         }
-        let count = crate::theme_adapter::capacity(handle, screen, Binding::Entries);
-        self.list.set_visible_count_override(Some(count))?;
-        let first = self.list.window_start();
-        let selected = self.list.selected();
-        if self.theme_screen != Some(screen) {self.image_focus=None;}
-        self.theme_screen=Some(screen);
         let mut input = FrameInputs::new(screen);
         input.pagination = Some(common::theme::frame::Pagination {page: selected / count.max(1) + 1, total: self.entries.len().max(1).div_ceil(count.max(1))});
         let locale = self.res.get::<Locale>();
@@ -748,7 +781,14 @@ where
                 .collect(),
         );
         if let Some(entry) = self.entries.get(selected) {
-            let id = crate::theme_adapter::entry_id(entry.path());
+            let selected_row = selected.checked_sub(first)
+                .and_then(|index| input.rows[&Binding::Entries].get(index));
+            let id = selected_row.map(|row| row.id.clone())
+                .unwrap_or_else(|| crate::theme_adapter::entry_id(entry.path()));
+            let platform = selected_row.map(|row| row.subtitle.clone()).unwrap_or_else(|| {
+                self.res.get::<ConsoleMapper>().get_console(entry.path())
+                    .map(|c| c.name.clone()).unwrap_or_default()
+            });
             input.focus = Focus {
                 component: crate::theme_adapter::component_id(handle, screen, Binding::Entries),
                 item: Some(id.clone()),
@@ -791,12 +831,6 @@ where
                     });
                 }
             }
-            let platform = self
-                .res
-                .get::<ConsoleMapper>()
-                .get_console(entry.path())
-                .map(|c| c.name.clone())
-                .unwrap_or_default();
             let needs_info = handle.pack().screens[&screen].components.iter().any(|c| {
                 matches!(
                     c.binding,
@@ -827,7 +861,73 @@ where
         if !matches!(self.entries.get(selected), Some(Entry::Game(_))) {
             self.semantic_info = None;
         }
-        drop(locale);
+        if let Some(focus) = &self.image_focus {
+            if Self::image_actions(handle, screen).contains(focus) { input.focus = focus.clone(); }
+        }
+        input
+    }
+
+    pub(crate) fn theme_models(
+        &mut self,
+        screen: common::theme::pack::ScreenId,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        self.theme_models_covered(screen, handle, false)
+    }
+
+    pub(crate) fn theme_models_covered(
+        &mut self,
+        screen: common::theme::pack::ScreenId,
+        handle: &common::theme::ThemeHandle,
+        covered: bool,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Layout);
+        use common::theme::{
+            frame::{Focus, FrameInputs, Hint, Row},
+            pack::{Binding, ScreenId},
+        };
+        if let Some(child) = self.child.as_mut() {
+            self.semantic_info = None;
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.release_art();
+            }
+            return child.theme_models(screen, handle);
+        }
+        let count = crate::theme_adapter::capacity(handle, screen, Binding::Entries);
+        self.list.set_visible_count_override(Some(count))?;
+        let first = self.list.window_start();
+        let selected = self.list.selected();
+        if self.theme_screen != Some(screen) {self.image_focus=None;}
+        self.theme_screen=Some(screen);
+        let key = (screen == ScreenId::Recents).then(|| RecentsSemanticKey {
+            selected,
+            path: self.entries.get(selected).map(|entry| entry.path().to_path_buf()),
+            first, count, image_focus: self.image_focus.clone(),
+            list_revision: self.list_revision,
+            cloud_rows: self.entries.iter().skip(first).take(count)
+                .map(|entry| crate::network_runtime::download_id(entry.path()).is_some()).collect(),
+            media_generation: common::media::generation(),
+            name_generation: common::media::name_generation(),
+            metadata_generation: crate::view::details::metadata_generation(),
+            adoption_generation: super::orbit::metadata_completion_generation(),
+            locale_revision: self.res.revision::<Locale>(),
+            console_revision: self.res.revision::<ConsoleMapper>(),
+            language: self.res.get::<Locale>().language(),
+            theme_generation: handle.generation(),
+            theme_digest: handle.digest().to_owned(),
+            screen,
+        });
+        let cached = self.recents_semantic.as_ref().filter(|cached| {
+            covered && self.menu.is_none() && self.disc_picker.is_none()
+                && key.as_ref() == Some(&cached.key)
+        });
+        let mut input = if let Some(cached) = cached {
+            cached.input.clone()
+        } else {
+            let input = self.base_theme_model(screen, handle, selected, first, count);
+            self.recents_semantic = key.map(|key| RecentsSemantic { key, input: input.clone() });
+            input
+        };
         let needs_art = self.details.is_some()
             || self.menu.is_some()
             || handle.pack().screens[&screen].components.iter().any(|c| {
@@ -861,9 +961,6 @@ where
         if needs_art {
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets);
-        }
-        if let Some(focus)=&self.image_focus {
-            if Self::image_actions(handle,screen).contains(focus) {input.focus=focus.clone();}
         }
         let mut models = vec![input];
         if let Some(details) = &self.details {
@@ -1029,6 +1126,7 @@ where
         crate::view::details::invalidate_metadata();
         self.details = None;
         self.semantic_info = None;
+        self.recents_semantic = None;
         self.image_focus = None;
         self.orbit = None;
         self.list.set_visible_count_override(None)?;
@@ -1079,6 +1177,7 @@ where
     }
 
     async fn select_entry(&mut self, commands: Sender<Command>) -> Result<()> {
+        self.list_revision = self.list_revision.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(self.list.selected()) {
             match entry {
                 Entry::Directory(dir) => {
@@ -1149,6 +1248,8 @@ where
     }
 
     fn load_entries(&mut self) -> Result<()> {
+        self.list_revision = self.list_revision.wrapping_add(1);
+        self.recents_semantic = None;
         self.idle_media_key = None;
         self.idle_media_work.clear();
         self.idle_lower_work.clear();
@@ -1489,6 +1590,7 @@ where
                     let Some(Entry::Game(game)) = self.entries.get_mut(self.list.selected()) else {
                         return Ok(true);
                     };
+                    self.list_revision = self.list_revision.wrapping_add(1);
                     let result = self.res.get::<ConsoleMapper>().launch_game_with_disc(
                         &self.res.get(),
                         game,
@@ -1548,6 +1650,7 @@ where
                     let selected = &self.menu_entries[menu.selected()];
                     match selected {
                         MenuEntry::Favorite(_) => {
+                            self.list_revision = self.list_revision.wrapping_add(1);
                             let entry = self.entries.get_mut(self.list.selected()).unwrap();
                             if let Entry::Game(game) = entry {
                                 game.favorite = !game.favorite;
@@ -1566,6 +1669,7 @@ where
                             commands.send(Command::Redraw).await?;
                         }
                         MenuEntry::Launch(_) => {
+                            self.list_revision = self.list_revision.wrapping_add(1);
                             let entry = self.entries.get_mut(self.list.selected()).unwrap();
                             if let (Some(core), Entry::Game(game)) = (self.core.as_ref(), entry) {
                                 let db = self.res.get::<Database>();
@@ -1577,6 +1681,7 @@ where
                             self.select_entry(commands).await?;
                         }
                         MenuEntry::Reset => {
+                            self.list_revision = self.list_revision.wrapping_add(1);
                             let entry = self.entries.get_mut(self.list.selected()).unwrap();
                             match entry {
                                 Entry::Directory(_) | Entry::App(_) => {}
@@ -1949,6 +2054,7 @@ mod perf_fix_tests {
             generation: 0,
             media_generation: common::media::generation(),
             adoption_generation: crate::view::orbit::metadata_completion_generation(),
+            platform: String::new(),
             metadata: "metadata".into(),
             metadata_runs: vec![],
             blurb: "blurb".into(),
@@ -2358,6 +2464,141 @@ pub(crate) mod ux4_tests {
         common::media::invalidate();
     }
 
+    #[tokio::test]
+    #[serial_test::serial(orbit_fixture)]
+    async fn semcache_covered_recents_matches_uncached_and_invalidates() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle,
+            frame::Status, pack::{Binding, ScreenId}, render::PreparedFrame};
+        let root = common::constants::ALLIUM_GAMES_DIR.join("semcache");
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        tiny_skia::Pixmap::new(32, 32).unwrap().save_png(root.join("Imgs/Game 0.png")).unwrap();
+        std::fs::write(root.join("gamelist.xml"),
+            "<gameList><game><path>./Game 0.chd</path><desc>Adopted synopsis</desc><developer>Adopted studio</developer></game></gameList>").unwrap();
+        common::media::invalidate();
+        let paths = (0..12).map(|i| root.join(format!("Game {i}.chd"))).collect();
+        let res = resources();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let snapshot = || ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap();
+        let theme = ThemeHandle::prepare(snapshot(), &bank, 611).unwrap();
+        res.insert(Some(theme.clone()));
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res.clone(), PathsSort { paths }).unwrap();
+        let builds = || RECENTS_SEMANTIC_BUILDS.with(std::cell::Cell::get);
+        let base = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+        let Entry::Game(game) = &list.entries[0] else { unreachable!() };
+        list.details = Some(crate::view::details::Details::cached(game, ""));
+        let detail = list.theme_models(ScreenId::Recents, &theme).unwrap().pop().unwrap();
+        assert!(PreparedFrame::prepare(theme.clone(), &detail).unwrap().is_opaque());
+        let before = builds();
+        let mut cached = list.theme_models_covered(ScreenId::Recents, &theme, true).unwrap();
+        assert_eq!(builds(), before, "opaque Details rebuilt Recents");
+        assert_eq!(cached[0].rows, base.rows);
+        assert!(!list.recents_semantic.as_ref().unwrap().input.hints.is_empty());
+        assert!(list.recents_semantic.as_ref().unwrap().input.art.selected_cover.is_none());
+        let mut fresh = list.theme_models(ScreenId::Recents, &theme).unwrap();
+        assert_eq!(builds(), before + 1, "uncached control must rebuild");
+        let status = Status { clock: Some("12:34".into()), battery: Some(80), ..Default::default() };
+        super::super::app::normalize_theme_models(&theme, &mut cached, &res, 0, &status);
+        super::super::app::normalize_theme_models(&theme, &mut fresh, &res, 0, &status);
+        assert!(cached[0].hints.is_empty() && cached[0].suppress_hints);
+        assert!(!list.recents_semantic.as_ref().unwrap().input.hints.is_empty());
+        for (actual, expected) in cached.iter().zip(&fresh) {
+            assert_eq!(PreparedFrame::prepare(theme.clone(), actual).unwrap().pixels().data(),
+                PreparedFrame::prepare(theme.clone(), expected).unwrap().pixels().data());
+        }
+        let old = PreparedFrame::prepare(theme.clone(), cached.last().unwrap()).unwrap();
+        let before = builds();
+        let mut changed = list.theme_models_covered(ScreenId::Recents, &theme, true).unwrap();
+        let status = Status { clock: Some("23:59".into()), battery: Some(12), charging: true,
+            network: Some("Wi-Fi".into()) };
+        super::super::app::normalize_theme_models(&theme, &mut changed, &res, 0, &status);
+        assert_eq!(builds(), before, "status change rebuilt rows");
+        assert!(changed.iter().all(|model| model.status == status));
+        let new = PreparedFrame::prepare(theme.clone(), changed.last().unwrap()).unwrap();
+        assert_ne!(old.pixels().data(), new.pixels().data(), "new status must change visible pixels");
+        for field in ["clock", "battery"] {
+            let mut only = cached.last().unwrap().clone();
+            if field == "clock" { only.status.clock = status.clock.clone(); }
+            else { only.status.battery = status.battery; }
+            assert_ne!(old.pixels().data(), PreparedFrame::prepare(theme.clone(), &only).unwrap().pixels().data(),
+                "{field} must change visible pixels");
+        }
+        let rebuild = |list: &mut EntryList<PathsSort>, theme: &ThemeHandle, cause: &str| {
+            let before = builds();
+            list.theme_models_covered(ScreenId::Recents, theme, true).unwrap();
+            assert_eq!(builds(), before + 1, "{cause} did not rebuild");
+            list.theme_models_covered(ScreenId::Recents, theme, true).unwrap();
+            assert_eq!(builds(), before + 1, "{cause} did not settle");
+        };
+        // Metadata is adopted through the real artwork worker, independently of invalidation.
+        let adoption = super::super::orbit::metadata_completion_generation();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::super::orbit::metadata_completion_generation() == adoption {
+            list.idle_media_step(&theme, ScreenId::Recents);
+            assert!(std::time::Instant::now() < deadline, "metadata adoption timeout");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        rebuild(&mut list, &theme, "metadata adoption");
+        assert_eq!(list.recents_semantic.as_ref().unwrap().input.text[&Binding::SelectedBlurb], "Adopted synopsis");
+        // Settle worker completions before testing independent key changes.
+        while list.idle_media_step(&theme, ScreenId::Recents) {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let settled = list.theme_models_covered(ScreenId::Recents, &theme, true).unwrap();
+        assert!(settled[0].art.selected_cover.is_some(), "arriving artwork must refresh the cached raw model");
+        let before = builds();
+        list.orbit.as_mut().unwrap().release_art();
+        let evicted = list.theme_models_covered(ScreenId::Recents, &theme, true).unwrap();
+        assert!(evicted[0].art.selected_cover.is_none());
+        assert_eq!(builds(), before, "artwork eviction must only refresh artwork");
+        list.select(1);
+        rebuild(&mut list, &theme, "selection");
+        let first = list.list.window_start();
+        list.select(10);
+        list.select(1);
+        assert_ne!(list.list.window_start(), first);
+        rebuild(&mut list, &theme, "window start with unchanged selection");
+        list.entries[1] = Entry::Game(Game::new(root.join("Replacement.chd")));
+        rebuild(&mut list, &theme, "selected path");
+        list.list_revision = list.list_revision.wrapping_add(1);
+        rebuild(&mut list, &theme, "list revision");
+        list.load_entries().unwrap();
+        rebuild(&mut list, &theme, "reload");
+        list.sort(PathsSort { paths: vec![root.join("Sorted.chd")] }).unwrap();
+        rebuild(&mut list, &theme, "sort");
+        common::media::invalidate();
+        rebuild(&mut list, &theme, "media generation");
+        crate::view::details::invalidate_metadata();
+        rebuild(&mut list, &theme, "metadata generation");
+        res.insert(Locale::new("fr-FR"));
+        rebuild(&mut list, &theme, "locale");
+        assert_eq!(list.recents_semantic.as_ref().unwrap().input.text[&Binding::Title], res.get::<Locale>().t("tab-recents"));
+        res.insert(ConsoleMapper::new());
+        rebuild(&mut list, &theme, "console configuration");
+        list.image_focus = Some(common::theme::frame::Focus { component: "cover".into(), item: Some("play".into()) });
+        rebuild(&mut list, &theme, "image focus");
+        let new_theme = ThemeHandle::prepare(snapshot(), &bank, 612).unwrap();
+        rebuild(&mut list, &new_theme, "theme generation");
+        let other_theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 612).unwrap();
+        rebuild(&mut list, &other_theme, "theme identity and capacity");
+        let before = builds();
+        list.theme_models_covered(ScreenId::Library, &other_theme, true).unwrap();
+        assert!(list.recents_semantic.is_none(), "other screens must retire the Recents slot");
+        list.theme_models_covered(ScreenId::Recents, &other_theme, true).unwrap();
+        assert_eq!(builds(), before + 1, "screen change must rebuild");
+        list.details = None;
+        let revealed = list.theme_models_covered(ScreenId::Recents, &other_theme, true).unwrap();
+        assert!(!revealed[0].suppress_hints && !revealed[0].hints.is_empty());
+        list.open_menu().unwrap();
+        let before = builds();
+        list.theme_models_covered(ScreenId::Recents, &other_theme, true).unwrap();
+        assert_eq!(builds(), before + 1, "transparent menu must rebuild");
+        list.release_theme_art();
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
     #[test]
     fn ux4_focus_restores_identity_after_list_shift_and_duplicate_names() {
         let res = resources();
@@ -2464,6 +2705,7 @@ impl<S: Sort> EntryList<S> {
             .map(|entry| entry.path().to_path_buf());
         let names_changed = self.sort.refresh_names(&mut self.entries);
         if names_changed {
+            self.list_revision = self.list_revision.wrapping_add(1);
             let selected = selected_path
                 .as_ref()
                 .and_then(|path| self.entries.iter().position(|entry| entry.path() == path))

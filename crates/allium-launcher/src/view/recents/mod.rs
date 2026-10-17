@@ -126,9 +126,10 @@ impl Recents {
     pub(crate) fn theme_models(
         &mut self,
         handle: &common::theme::ThemeHandle,
+        covered: bool,
     ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
         match self {
-            Self::List(list) => Ok(Some(list.theme_models(handle)?)),
+            Self::List(list) => Ok(Some(list.theme_models(handle, covered)?)),
             Self::Carousel(_) => Ok(None),
         }
     }

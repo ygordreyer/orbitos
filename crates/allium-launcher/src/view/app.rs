@@ -48,6 +48,31 @@ fn prepare_theme_inputs(
     }
 }
 
+pub(super) fn normalize_theme_models(
+    handle: &common::theme::ThemeHandle,
+    models: &mut [common::theme::frame::FrameInputs],
+    res: &Resources,
+    selected: usize,
+    status: &common::theme::frame::Status,
+) {
+    prepare_theme_inputs(models, res, selected, status);
+    if handle.pack().ink()
+        && models.len() > 1
+        && models.last().is_some_and(|m| {
+            handle.pack().screens[&m.screen]
+                .components
+                .iter()
+                .any(|c| c.kind == common::theme::pack::Kind::Hints)
+        })
+    {
+        let underlay = models.len() - 1;
+        for model in &mut models[..underlay] {
+            model.hints.clear();
+            model.suppress_hints = true;
+        }
+    }
+}
+
 struct ParkedDetails {
     lower: common::theme::pack::ScreenId,
     frame: common::theme::render::PreparedFrame,
@@ -952,22 +977,7 @@ where
         } else {
             self.status_bar.theme_inputs()
         };
-        prepare_theme_inputs(models, &self.res, self.selected, &status);
-        if handle.pack().ink()
-            && models.len() > 1
-            && models.last().is_some_and(|m| {
-                handle.pack().screens[&m.screen]
-                    .components
-                    .iter()
-                    .any(|c| c.kind == common::theme::pack::Kind::Hints)
-            })
-        {
-            let underlay = models.len() - 1;
-            for model in &mut models[..underlay] {
-                model.hints.clear();
-                model.suppress_hints = true;
-            }
-        }
+        normalize_theme_models(handle, models, &self.res, self.selected, &status);
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
@@ -1129,7 +1139,16 @@ where
             Some(search.theme_models(&handle)?)
         } else {
             match self.selected {
-                0 => self.views.0.theme_models(&handle)?,
+                0 => {
+                    let covered = self.theme_scene.as_ref().is_some_and(|scene| {
+                        scene.frames.len() == 2
+                            && scene.frames[0].screen() == common::theme::pack::ScreenId::Recents
+                            && scene.frames.iter().all(|frame| frame.navigation_theme_matches(handle))
+                            && scene.frames[1].screen() == common::theme::pack::ScreenId::GameDetail
+                            && scene.frames[1].is_opaque()
+                    });
+                    self.views.0.theme_models(&handle, covered)?
+                },
                 1 => Some(self.views.1.theme_models(&handle)?),
                 2 => Some(self.views.2.theme_models(&handle)?),
                 3 => self.views.3.theme_models(&handle)?,
@@ -1970,6 +1989,10 @@ mod integration_navigation_tests {
         let initial = details.clone();
         app.prepare_theme().unwrap();
         app.draw(&mut display, &style).unwrap();
+        let semantic_builds = super::super::entry_list::RECENTS_SEMANTIC_BUILDS.with(std::cell::Cell::get);
+        app.prepare_theme().unwrap();
+        assert_eq!(super::super::entry_list::RECENTS_SEMANTIC_BUILDS.with(std::cell::Cell::get), semantic_builds,
+            "prepared opaque Details must reuse Recents semantics");
         for key in [Key::Down, Key::Right] {
             app.handle_key_event(KeyEvent::Pressed(key), tx.clone(), &mut VecDeque::new()).await.unwrap();
             app.prepare_theme().unwrap();

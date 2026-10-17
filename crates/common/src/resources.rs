@@ -9,6 +9,8 @@ use type_map::TypeMap;
 #[derive(Debug, Clone)]
 pub struct Resources(pub Rc<RefCell<TypeMap>>);
 
+struct Revision<T>(u64, std::marker::PhantomData<T>);
+
 impl Resources {
     /// Creates a new resource map.
     pub fn new(map: TypeMap) -> Self {
@@ -23,8 +25,15 @@ impl Resources {
         })
     }
 
+    pub fn revision<T: 'static>(&self) -> u64 {
+        self.0.borrow().get::<Revision<T>>().map_or(0, |r| r.0)
+    }
+
     /// Sets a resource in the resource map.
     pub fn insert<T: 'static>(&self, value: T) {
-        self.0.borrow_mut().insert::<T>(value);
+        let mut map = self.0.borrow_mut();
+        let revision = map.get::<Revision<T>>().map_or(1, |r| r.0.wrapping_add(1));
+        map.insert(Revision::<T>(revision, std::marker::PhantomData));
+        map.insert::<T>(value);
     }
 }

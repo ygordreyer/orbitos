@@ -78,9 +78,10 @@ impl RecentsList {
     pub(crate) fn theme_models(
         &mut self,
         handle: &common::theme::ThemeHandle,
+        covered: bool,
     ) -> Result<Vec<common::theme::frame::FrameInputs>> {
         self.list
-            .theme_models(common::theme::pack::ScreenId::Recents, handle)
+            .theme_models_covered(common::theme::pack::ScreenId::Recents, handle, covered)
     }
 
     pub fn new(rect: Rect, res: Resources, list: EntryList<RecentsSort>) -> Result<Self> {
