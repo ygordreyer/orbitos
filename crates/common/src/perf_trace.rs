@@ -6,6 +6,7 @@ use std::{
     time::Instant,
 };
 
+const COUNT_LEN: usize = 23;
 const LOG_LIMIT: u64 = 256 * 1024;
 #[derive(Clone, Copy)]
 pub enum Phase {
@@ -40,10 +41,35 @@ pub enum Count {
     ImageHit,
     ImageMiss,
     InkBitmapPixels,
+    /// Explicit raster/snapshot buffer allocations, not a process allocator census.
+    Allocations,
+    PlanBuilds,
+    ResizePixels,
+    ShadowMisses,
+    GlowMisses,
+    CaptureBytes,
+    RestoreBytes,
+    OpacityPixels,
+    PreviewMaskBytes,
+}
+#[derive(Clone, Copy)]
+struct InputTotals {
+    stages: [u64; 8],
+    cpu: [u64; 8],
+    counts: [u64; COUNT_LEN],
 }
 struct Trace {
-    counts: [u64; 14],
+    counts: [u64; COUNT_LEN],
     stages: [u64; 8],
+    frame_stages: [u64; 8],
+    input_counts: [u64; COUNT_LEN],
+    input_cpu: [u64; 8],
+    generation: u64,
+    input_epoch: u64,
+    viewport_shift: bool,
+    first_feedback_us: u64,
+    final_content_us: u64,
+    completed_input: Option<InputTotals>,
     stage_begin: [u64; 8],
     stage_end: [u64; 8],
     file: File,
@@ -84,8 +110,17 @@ fn install(path: &str) -> std::io::Result<()> {
         *trace.borrow_mut() = Some(Trace {
             file,
             path: path.into(),
-            counts: [0; 14],
+            counts: [0; COUNT_LEN],
             stages: [0; 8],
+            frame_stages: [0; 8],
+            input_counts: [0; COUNT_LEN],
+            input_cpu: [0; 8],
+            generation: 0,
+            input_epoch: 0,
+            viewport_shift: false,
+            first_feedback_us: 0,
+            final_content_us: 0,
+            completed_input: None,
             stage_begin: [0; 8],
             stage_end: [0; 8],
             cpu: [0; 8],
@@ -102,6 +137,23 @@ fn install(path: &str) -> std::io::Result<()> {
         })
     });
     Ok(())
+}
+fn thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        return unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid = 0;
+        // A null thread selects the calling thread on Darwin.
+        unsafe {
+            libc::pthread_threadid_np(0, &mut tid);
+        }
+        return tid;
+    }
+    #[allow(unreachable_code)]
+    0
 }
 fn thread_cpu_ns() -> u64 {
     #[cfg(unix)]
@@ -131,6 +183,15 @@ pub fn phase(phase: Phase) -> PhaseGuard {
         let trace = trace.as_mut()?;
         if matches!(phase, Phase::Input) {
             trace.input_us = monotonic_us();
+            trace.generation = trace.generation.wrapping_add(1);
+            trace.input_epoch = trace.input_epoch.wrapping_add(1);
+            trace.viewport_shift = false;
+            trace.first_feedback_us = 0;
+            trace.final_content_us = 0;
+            trace.completed_input = None;
+            trace.input_counts = [0; COUNT_LEN];
+            trace.input_cpu = [0; 8];
+            trace.cpu = [0; 8];
             trace.stages = [0; 8];
             trace.stage_begin = [0; 8];
             trace.stage_end = [0; 8];
@@ -155,7 +216,9 @@ impl Drop for PhaseGuard {
                     .iter()
                     .sum::<u64>()
                     .saturating_sub(timing.children);
-                trace.cpu[self.phase as usize] += duration.saturating_sub(children);
+                let elapsed = duration.saturating_sub(children);
+                trace.cpu[self.phase as usize] += elapsed;
+                trace.input_cpu[self.phase as usize] += elapsed;
             }
         });
     }
@@ -171,6 +234,7 @@ pub fn count(kind: Count, amount: u64) {
     TRACE.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
             t.counts[kind as usize] += amount;
+            t.input_counts[kind as usize] += amount;
         }
     });
 }
@@ -194,11 +258,10 @@ pub fn wake() {
 pub fn begin_render() {
     TRACE.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
-            let input = t.cpu[0];
             t.cpu = [0; 8];
-            t.cpu[0] = input;
+            t.frame_stages = [0; 8];
             t.hits = [0; 3];
-            t.counts = [0; 14];
+            t.counts = [0; COUNT_LEN];
             t.started = Some(Instant::now());
             t.render_us = monotonic_us();
             t.attempt += 1;
@@ -222,7 +285,7 @@ pub fn drawn_frame() {
         let Some(trace) = state.as_mut() else {
             return;
         };
-        let line = serde_json::json!({
+        let mut row = serde_json::json!({
             "thread": std::thread::current().name(),
             "stages": stage_values(trace),
             "frontend_io_ops": FRONTEND_IO_OPS.with(std::cell::Cell::get),
@@ -234,7 +297,7 @@ pub fn drawn_frame() {
             "image_hits":trace.counts[11], "image_misses":trace.counts[12],
             "damage_rects":trace.damage_rects,"damage_pixels":trace.damage_pixels,
             "render_reason":trace.render_reason,"full_present_reason":trace.present_reason,
-            "input_cpu_us": trace.cpu[0]/1000, "art_load_cpu_us": trace.cpu[1]/1000,
+            "input_cpu_us": trace.input_cpu[0]/1000, "art_load_cpu_us": trace.cpu[1]/1000,
             "component_prep_cpu_us": trace.cpu[2]/1000, "compose_paint_cpu_us": trace.cpu[3]/1000,
             "flush_cpu_us": trace.cpu[4]/1000,
             "render_cpu_us": trace.cpu[1..].iter().sum::<u64>()/1000,
@@ -244,9 +307,11 @@ pub fn drawn_frame() {
             "render_end_monotonic_us": monotonic_us(), "render_attempt": trace.attempt,
             "ram_hit": trace.hits[0], "disk_cache_hit": trace.hits[1], "png_decode": trace.hits[2],
             "wall_us": trace.started.map_or(0, |start| start.elapsed().as_micros()),
-        })
-        .to_string()
-            + "\n";
+        });
+        row["event"] = "frame".into();
+        row["pid"] = std::process::id().into();
+        row["measurement"] = measurement_values(trace);
+        let line = row.to_string() + "\n";
         if append_bounded(&mut trace.file, line.as_bytes()).is_err() {
             *state = None;
             return;
@@ -707,7 +772,7 @@ pub fn start_probe(path: &str) {
 pub fn probe_counts() -> serde_json::Value {
     TRACE.with(|t| {
         let t = t.borrow(); let t = t.as_ref().unwrap();
-        serde_json::json!({"stages":stage_values(t),"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
+        serde_json::json!({"measurement":measurement_values(t),"stages":stage_values(t),"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
             "converted_pixels":t.counts[7],"flushed_pixels":t.counts[5],
             "compared_pixels":t.counts[8],"scanned_pixels":t.counts[9],"changed_pixels":t.counts[10],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
@@ -743,18 +808,35 @@ pub enum Stage {
 pub struct StageGuard {
     stage: Stage,
     start: Option<u64>,
+    frame_attempt: u64,
+    input_epoch: u64,
 }
 pub fn stage(stage: Stage) -> StageGuard {
-    let start = TRACE.with(|state| {
+    let (start, frame_attempt, input_epoch) = TRACE.with(|state| {
         let mut state = state.borrow_mut();
-        let trace = state.as_mut()?;
+        let Some(trace) = state.as_mut() else {
+            return (None, 0, 0);
+        };
         let now = monotonic_us();
         if trace.stage_begin[stage as usize] == 0 {
             trace.stage_begin[stage as usize] = now;
         }
-        Some(now)
+        (
+            Some(now),
+            if trace.started.is_some() {
+                trace.attempt
+            } else {
+                0
+            },
+            trace.input_epoch,
+        )
     });
-    StageGuard { stage, start }
+    StageGuard {
+        stage,
+        start,
+        frame_attempt,
+        input_epoch,
+    }
 }
 impl Drop for StageGuard {
     fn drop(&mut self) {
@@ -762,8 +844,13 @@ impl Drop for StageGuard {
             let end = monotonic_us();
             TRACE.with(|state| {
                 if let Some(trace) = state.borrow_mut().as_mut() {
-                    trace.stages[self.stage as usize] += end.saturating_sub(start);
-                    trace.stage_end[self.stage as usize] = end;
+                    if trace.input_epoch == self.input_epoch {
+                        trace.stages[self.stage as usize] += end.saturating_sub(start);
+                        trace.stage_end[self.stage as usize] = end;
+                        if self.frame_attempt != 0 && self.frame_attempt == trace.attempt {
+                            trace.frame_stages[self.stage as usize] += end.saturating_sub(start);
+                        }
+                    }
                 }
             });
         }
@@ -847,6 +934,336 @@ mod latency_stage_tests {
         }
         assert_eq!(phases["decode"]["wall_us"], 0);
         TRACE.with(|trace| *trace.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Existing `stages` are inclusive input totals; frame totals reset at begin_render.
+fn measurement_values(t: &Trace) -> serde_json::Value {
+    let input = t.completed_input.unwrap_or_else(|| input_totals(t));
+    serde_json::json!({
+        "selection_generation": t.generation, "viewport_shift": t.viewport_shift,
+        "first_feedback_monotonic_us": t.first_feedback_us,
+        "final_content_monotonic_us": t.final_content_us,
+        "first_feedback_us": (t.first_feedback_us != 0).then(|| t.first_feedback_us.saturating_sub(t.input_us)),
+        "final_content_us": (t.final_content_us != 0).then(|| t.final_content_us.saturating_sub(t.input_us)),
+        "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts},
+        "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts},
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes"],
+        "stage_names": ["selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present", "disk_cache"],
+        "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
+    })
+}
+
+fn input_totals(t: &Trace) -> InputTotals {
+    InputTotals { stages: t.stages, cpu: t.input_cpu, counts: t.input_counts }
+}
+
+/// The current input sequence is shared by controller selection and foreground tasks.
+pub fn generation() -> u64 {
+    TRACE.with(|state| state.borrow().as_ref().map_or(0, |t| t.generation))
+}
+
+/// Call after input receipt, using the controller's generation for stale-work correlation.
+pub fn selection(generation: u64, viewport_shift: bool) {
+    TRACE.with(|state| {
+        if let Some(t) = state.borrow_mut().as_mut() {
+            t.generation = generation;
+            t.viewport_shift = viewport_shift;
+        }
+    });
+}
+
+/// Names shared with the read-only device sampler. Other lifecycle stages may use lifecycle().
+pub const LAUNCHER_ENTRY: &str = "launcher_entry";
+pub const FIRST_COMPLETED_FLUSH: &str = "first_completed_flush";
+pub const LAUNCH_PREP: &str = "launch_prep";
+pub const IMMINENT_EXEC: &str = "imminent_exec";
+pub const WORKER_SHUTDOWN: &str = "worker_shutdown";
+pub const CHILD_EXIT: &str = "child_exit";
+pub const SESSION_RECORD: &str = "session_record";
+pub const LAUNCHER_SPAWN: &str = "launcher_spawn";
+
+pub fn lifecycle(event: &'static str) {
+    initialize();
+    TRACE.with(|state| {
+        if let Some(t) = state.borrow_mut().as_mut() {
+            write_event(t, event, t.generation, None);
+        }
+    });
+}
+
+fn write_event(
+    t: &mut Trace,
+    event: &'static str,
+    generation: u64,
+    task: Option<(&'static str, u64, u64)>,
+) {
+    let line = serde_json::json!({
+        "event": event, "monotonic_us": monotonic_us(), "thread_cpu_ns": thread_cpu_ns(),
+        "pid": std::process::id(), "tid": thread_id(),
+        "selection_generation": generation, "viewport_shift": t.viewport_shift,
+        "task": task.map(|(name, wall_us, cpu_ns)| serde_json::json!({"name":name,"wall_us":wall_us,"cpu_ns":cpu_ns})),
+        "measurement": measurement_values(t),
+    }).to_string() + "\n";
+    let _ = append_bounded(&mut t.file, line.as_bytes());
+}
+
+fn content_marker(generation: u64, final_content: bool) {
+    TRACE.with(|state| {
+        if let Some(t) = state.borrow_mut().as_mut() {
+            // A delayed completion must never mark a newer selection as finished.
+            if t.generation != generation {
+                return;
+            }
+            let marker = if final_content {
+                &mut t.final_content_us
+            } else {
+                &mut t.first_feedback_us
+            };
+            if *marker != 0 {
+                return;
+            }
+            *marker = monotonic_us();
+            if final_content {
+                t.completed_input = Some(input_totals(t));
+            }
+            write_event(
+                t,
+                if final_content {
+                    "final_content"
+                } else {
+                    "first_feedback"
+                },
+                generation,
+                None,
+            );
+        }
+    });
+}
+/// Mark a completed flush. A complete first frame shares one timestamp for both
+/// milestones, so writing the feedback trace cannot inflate content latency.
+pub fn presented(generation: u64, content_complete: bool) {
+    TRACE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(t) = state.as_mut() else {
+            return;
+        };
+        if t.generation != generation {
+            return;
+        }
+        let first = t.first_feedback_us == 0;
+        let final_content = content_complete && t.final_content_us == 0;
+        if !first && !final_content {
+            return;
+        }
+        let now = monotonic_us();
+        if first {
+            t.first_feedback_us = now;
+        }
+        if final_content {
+            t.final_content_us = now;
+            t.completed_input = Some(input_totals(t));
+        }
+        if first {
+            write_event(t, "first_feedback", generation, None);
+        }
+        if final_content {
+            write_event(t, "final_content", generation, None);
+        }
+    });
+}
+
+pub fn first_feedback(generation: u64) {
+    content_marker(generation, false);
+}
+pub fn final_content(generation: u64) {
+    content_marker(generation, true);
+}
+
+pub struct TaskGuard {
+    name: &'static str,
+    generation: u64,
+    started: Option<(u64, u64)>,
+    completed: Option<(u64, u64)>,
+}
+/// Worker threads initialize their own trace; pass the scheduled generation explicitly.
+pub fn task(name: &'static str, generation: u64) -> TaskGuard {
+    initialize();
+    let started = TRACE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|_| (monotonic_us(), thread_cpu_ns()))
+    });
+    TaskGuard {
+        name,
+        generation,
+        started,
+        completed: None,
+    }
+}
+impl TaskGuard {
+    /// Stop timing before publishing a result; defer trace I/O until after publication.
+    pub fn finish(&mut self) {
+        if let Some((wall, cpu)) = self.started.take() {
+            self.completed = Some((
+                monotonic_us().saturating_sub(wall),
+                thread_cpu_ns().saturating_sub(cpu),
+            ));
+        }
+    }
+}
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.finish();
+        let Some(elapsed) = self.completed else {
+            return;
+        };
+        TRACE.with(|state| {
+            if let Some(t) = state.borrow_mut().as_mut() {
+                write_event(
+                    t,
+                    "task_completed",
+                    self.generation,
+                    Some((self.name, elapsed.0, elapsed.1)),
+                );
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    #[test]
+    fn completed_input_totals_exclude_idle_work_and_reset_on_next_input() {
+        let path = std::env::temp_dir().join(format!("allium-final-totals-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = phase(Phase::Input); }
+        selection(91, true);
+        begin_render();
+        count(Count::CaptureBytes, 128);
+        presented(91, false);
+        count(Count::RestoreBytes, 64);
+        presented(91, true);
+        let final_totals = probe_counts()["measurement"]["input"].clone();
+        count(Count::PlanBuilds, 17);
+        { let _phase = phase(Phase::Compose); }
+        { let _stage = stage(Stage::Raster); }
+        begin_render();
+        presented(90, true);
+        assert_eq!(probe_counts()["measurement"]["input"], final_totals);
+        assert_eq!(final_totals["counters"][19], 128);
+        assert_eq!(final_totals["counters"][20], 64);
+        { let _input = phase(Phase::Input); }
+        count(Count::PlanBuilds, 2);
+        assert_eq!(probe_counts()["measurement"]["input"]["counters"][15], 2);
+        TRACE.with(|state| *state.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn input_totals_span_frames_and_stale_completion_is_ignored() {
+        let path =
+            std::env::temp_dir().join(format!("allium-measurement-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        {
+            let _input = phase(Phase::Input);
+        }
+        {
+            let _selection = stage(Stage::Selection);
+            selection(42, true);
+        }
+        assert!(
+            probe_counts()["stages"]["phases"]["selection"]["end_monotonic_us"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        lifecycle(LAUNCHER_ENTRY);
+        begin_render();
+        count(Count::PlanBuilds, 2);
+        {
+            let _stage = stage(Stage::Raster);
+        }
+        first_feedback(42);
+        first_feedback(42);
+        final_content(41);
+        assert_eq!(
+            probe_counts()["measurement"]["final_content_monotonic_us"],
+            0
+        );
+        drawn_frame();
+        begin_render();
+        count(Count::PlanBuilds, 3);
+        {
+            let _task = task("worker_apply", 42);
+        }
+        final_content(42);
+        let row = probe_counts();
+        assert_eq!(row["measurement"]["frame"]["counters"][15], 3);
+        assert_eq!(row["measurement"]["input"]["counters"][15], 5);
+        assert!(row["measurement"]["first_feedback_us"].is_number());
+        drawn_frame();
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["event"] == "first_feedback")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["event"] == "final_content")
+                .count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r["event"] != "frame")
+                .all(|r| r["monotonic_us"].is_number() && r["thread_cpu_ns"].is_number())
+        );
+        {
+            let _input = phase(Phase::Input);
+        }
+        selection(43, false);
+        begin_render();
+        presented(43, true);
+        let both = probe_counts();
+        assert_eq!(
+            both["measurement"]["first_feedback_monotonic_us"],
+            both["measurement"]["final_content_monotonic_us"]
+        );
+        TRACE.with(|state| *state.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod task_publication_tests {
+    use super::*;
+    #[test]
+    fn task_finish_excludes_result_publication_and_preserves_request_generation() {
+        let path = std::env::temp_dir().join(format!("allium-task-publication-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        selection(12, false);
+        let mut task = task("artwork", 91);
+        task.finish();
+        let elapsed = task.completed.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        task.finish();
+        assert_eq!(task.completed, Some(elapsed));
+        drop(task);
+        let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["selection_generation"], 91);
+        assert_eq!(row["task"]["wall_us"], elapsed.0);
+        assert_eq!(row["task"]["cpu_ns"], elapsed.1);
+        TRACE.with(|state| *state.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
 }

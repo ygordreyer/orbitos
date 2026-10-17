@@ -24,6 +24,9 @@ fn theme_scheme(id: &str, scheme: &str) -> ThemeHandle {
     if !scheme.is_empty() {
         settings.insert("color_scheme".into(), scheme.into());
     }
+    if id == "compact" {
+        return ThemeHandle::prepare(ThemeSnapshot::builtin("compact").unwrap(), &bank, 1).unwrap();
+    }
     ThemeHandle::prepare(
         ThemeSnapshot::load_with_settings(
             &root
@@ -169,7 +172,7 @@ fn art() -> Vec<Arc<Pixmap>> {
 }
 
 #[test]
-#[ignore = "explicit host selection benchmark with original frame hashes"]
+#[ignore = "explicit two-selection cache-resident parity benchmark, not forward browsing"]
 fn ink_selection_benchmark() {
     let trace = std::env::temp_dir().join(format!("allium-selection-trace-{}", std::process::id()));
     crate::perf_trace::start_probe(trace.to_str().unwrap());
@@ -187,7 +190,7 @@ fn ink_selection_benchmark() {
                 for step in 0..12 {
                     let mut input = model(&theme, screen, 1 + step % 2, &arts);
                     let operation = if step < 8 {
-                        "selection"
+                        "two_selection_revisit"
                     } else if step < 10 {
                         "clock"
                     } else {
@@ -241,7 +244,10 @@ fn ink_selection_benchmark() {
                     );
                     assert_eq!(frame.targets, fresh.targets);
                     assert_eq!(frame.text_boxes, fresh.text_boxes);
-                    if operation == "selection" && step >= 2 && screen == ScreenId::Library {
+                    if operation == "two_selection_revisit"
+                        && step >= 2
+                        && screen == ScreenId::Library
+                    {
                         let budget = match base {
                             "orbit-hero" => 500_000,
                             "big-picture" => 700_000,
@@ -536,7 +542,10 @@ fn ink_hero_cache_matches_fresh_when_only_underlay_art_changes() {
         let fresh =
             ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input)).unwrap();
         let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, previous).unwrap();
-        assert!(frame.pixels.data() == fresh.pixels.data(), "underlay {step}");
+        assert!(
+            frame.pixels.data() == fresh.pixels.data(),
+            "underlay {step}"
+        );
         assert_eq!(frame.targets, fresh.targets);
         assert_eq!(frame.text_boxes, fresh.text_boxes);
         frame.paint_damage(&mut display);
@@ -588,4 +597,257 @@ fn ink_stationary_shelf_focus_limits_damage_and_replay() {
         assert_eq!(after.targets, fresh.targets);
         assert_eq!(after.text_boxes, fresh.text_boxes);
     }
+}
+
+fn latency_summary(samples: &[u64]) -> serde_json::Value {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    serde_json::json!({"presses": sorted.len(), "median_us": (sorted[(sorted.len()-1)/2] as f64 + sorted[sorted.len()/2] as f64) / 2.0,
+        "p95_us": sorted[(sorted.len()*95).div_ceil(100)-1], "max_us": sorted.last().unwrap()})
+}
+
+fn traversal_model(
+    theme: &ThemeHandle,
+    screen: ScreenId,
+    selected: usize,
+    arts: &[Arc<Pixmap>],
+) -> (FrameInputs, usize) {
+    let mut input = model(theme, screen, selected, arts);
+    let count = theme.pack().screens[&screen]
+        .components
+        .iter()
+        .find(|c| c.kind == Kind::Entries)
+        .map_or(3, |c| c.visible_count.unwrap_or(3)) as usize;
+    let first = selected.saturating_sub(count - 1);
+    input.art.next_cover = arts.get(first + count).cloned();
+    input.text.insert(
+        Binding::Pagination,
+        format!("{} / {}", selected + 1, arts.len()),
+    );
+    let rows = (first..(first + count).min(arts.len()))
+        .map(|i| Row {
+            id: i.to_string(),
+            label: format!("Game {i}: Racing the golden hour"),
+            subtitle: String::new(),
+            value: "PlayStation".into(),
+            enabled: true,
+        })
+        .collect();
+    input.rows.insert(Binding::Entries, rows);
+    input.focus.item = Some(selected.to_string());
+    input
+        .selected
+        .insert(Binding::Entries, selected.to_string());
+    input.art.entries = (first..(first + count).min(arts.len()))
+        .map(|i| (i.to_string(), arts[i].clone()))
+        .collect();
+    input.pagination = Some(crate::theme::frame::Pagination {
+        page: selected + 1,
+        total: arts.len(),
+    });
+    (input, first)
+}
+
+#[test]
+#[ignore = "explicit distinct-art forward/backward, viewport and action-focus benchmark"]
+fn ink_selection_benchmark_traversal() {
+    const GAMES: usize = 40;
+    let path = std::env::temp_dir().join(format!("allium-traversal-{}.trace", std::process::id()));
+    crate::perf_trace::start_probe(path.to_str().unwrap());
+    let arts: Vec<_> = (0..GAMES)
+        .map(|seed| {
+            let mut pixels = Pixmap::new(240, 240).unwrap();
+            for (i, p) in pixels.data_mut().chunks_exact_mut(4).enumerate() {
+                p.copy_from_slice(&[
+                    ((i + seed * 43) % 256) as u8,
+                    ((i / 240 + seed * 29) % 256) as u8,
+                    (seed * 5) as u8,
+                    255,
+                ]);
+            }
+            Arc::new(pixels)
+        })
+        .collect();
+    for id in [
+        "compact",
+        "orbit-hero",
+        "orbit-hero-tall",
+        "orbit-row",
+        "orbit-row-tall",
+        "compact-plus",
+        "compact-plus-tall",
+        "big-picture",
+        "big-picture-tall",
+    ] {
+        let theme = theme(id);
+        for screen in [ScreenId::Library, ScreenId::Recents, ScreenId::GameDetail] {
+            if screen == ScreenId::GameDetail && !theme.pack().ink() {
+                continue;
+            }
+            for scenario in if screen == ScreenId::GameDetail {
+                vec!["details_action_focus"]
+            } else {
+                vec![
+                    "forward_distinct_art",
+                    "backward_distinct_art",
+                    "deferred_art",
+                ]
+            } {
+                let initial_selected = if scenario == "backward_distinct_art" {
+                    GAMES - 1
+                } else {
+                    0
+                };
+                let (mut initial, initial_viewport) =
+                    traversal_model(&theme, screen, initial_selected, &arts);
+                if screen == ScreenId::GameDetail {
+                    set_detail_focus(&theme, &mut initial, "play");
+                }
+                let initial = PreparedFrame::prepare(theme.clone(), &initial).unwrap();
+                let mut previous = Some(initial);
+                let mut firsts = Vec::new();
+                let mut finals = Vec::new();
+                let mut viewport = initial_viewport;
+                let mut display = super::tests::TestDisplay(Pixmap::new(640, 480).unwrap());
+                previous.as_ref().unwrap().paint(&mut display);
+                let mut generation = 0;
+                for step in 0..GAMES - 1 {
+                    let selected = if scenario == "backward_distinct_art" {
+                        GAMES - 2 - step
+                    } else if screen == ScreenId::GameDetail {
+                        0
+                    } else {
+                        step + 1
+                    };
+                    let (mut input, first) = traversal_model(&theme, screen, selected, &arts);
+                    if screen == ScreenId::GameDetail {
+                        set_detail_focus(
+                            &theme,
+                            &mut input,
+                            if step % 2 == 0 { "back" } else { "play" },
+                        );
+                    }
+                    let full = input.clone();
+                    if scenario == "deferred_art" {
+                        input.art = Default::default();
+                    }
+                    let feedback_reference = (scenario == "deferred_art").then(|| {
+                        ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &input)).unwrap()
+                    });
+                    let start = Instant::now();
+                    {
+                        let _input = crate::perf_trace::phase(crate::perf_trace::Phase::Input);
+                    }
+                    generation += 1;
+                    crate::perf_trace::selection(generation, first != viewport);
+                    crate::perf_trace::begin_render();
+                    let frame =
+                        PreparedFrame::prepare_reusing(theme.clone(), &input, previous.take())
+                            .unwrap();
+                    frame.paint_damage(&mut display);
+                    firsts.push(start.elapsed().as_micros() as u64);
+                    crate::perf_trace::presented(generation, scenario != "deferred_art");
+                    let first_counts = crate::perf_trace::probe_counts();
+                    crate::perf_trace::drawn_frame();
+                    previous = Some(frame);
+                    if scenario == "deferred_art" {
+                        let fresh = feedback_reference.as_ref().unwrap();
+                        assert!(display.0.data() == fresh.pixels.data(),
+                            "deferred feedback {id} {screen:?} {step}");
+                        assert_eq!(previous.as_ref().unwrap().targets, fresh.targets,
+                            "deferred feedback targets {id} {screen:?} {step}");
+                        assert_eq!(previous.as_ref().unwrap().text_boxes, fresh.text_boxes,
+                            "deferred feedback text boxes {id} {screen:?} {step}");
+                        // One deferred frame, not a worker/IO latency measurement.
+                        crate::perf_trace::begin_render();
+                        let frame =
+                            PreparedFrame::prepare_reusing(theme.clone(), &full, previous.take())
+                                .unwrap();
+                        frame.paint_damage(&mut display);
+                        previous = Some(frame);
+                    }
+                    if scenario == "deferred_art" {
+                        finals.push(start.elapsed().as_micros() as u64);
+                        crate::perf_trace::presented(generation, true);
+                    } else {
+                        finals.push(*firsts.last().unwrap());
+                    }
+                    let counters = if scenario == "deferred_art" {
+                        let counters = crate::perf_trace::probe_counts();
+                        crate::perf_trace::drawn_frame();
+                        counters
+                    } else {
+                        first_counts
+                    };
+                    let fresh =
+                        ink_renderer::uncached(|| PreparedFrame::prepare(theme.clone(), &full))
+                            .unwrap();
+                    assert_eq!(
+                        display.0.data(),
+                        fresh.pixels.data(),
+                        "{id} {scenario} {step}"
+                    );
+                    assert_eq!(previous.as_ref().unwrap().targets, fresh.targets);
+                    assert_eq!(previous.as_ref().unwrap().text_boxes, fresh.text_boxes);
+                    println!(
+                        "TRAVERSAL_PRESS {}",
+                        serde_json::json!({"theme":id,"screen":format!("{screen:?}"),"scenario":scenario,"selected":selected,"viewport_start":first,"viewport_shift":first!=viewport,"first_feedback_us":firsts.last(),"final_content_us":finals.last(),"counts":counters})
+                    );
+                    viewport = first;
+                }
+                println!(
+                    "TRAVERSAL_SUMMARY {}",
+                    serde_json::json!({"theme":id,"screen":format!("{screen:?}"),"scenario":scenario,"first_feedback":latency_summary(&firsts),"final_content":latency_summary(&finals),"scope":"model-ready to mock paint; no device flush or worker wait"})
+                );
+            }
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "explicit disabled trace overhead measurement"]
+fn ink_selection_benchmark_disabled_trace() {
+    assert!(crate::perf_trace::probe_counts_if_enabled().is_null());
+    crate::perf_trace::enabled();
+    let start = Instant::now();
+    for generation in 0..1_000_000 {
+        let _input =
+            std::hint::black_box(crate::perf_trace::phase(crate::perf_trace::Phase::Input));
+        let _stage = std::hint::black_box(crate::perf_trace::stage(
+            crate::perf_trace::Stage::Selection,
+        ));
+        crate::perf_trace::selection(generation, false);
+        crate::perf_trace::count(crate::perf_trace::Count::PlanBuilds, 1);
+        crate::perf_trace::first_feedback(generation);
+        crate::perf_trace::final_content(generation);
+    }
+    println!(
+        "TRACE_DISABLED iterations=1000000 ns_per_input={:.3}",
+        start.elapsed().as_nanos() as f64 / 1_000_000.0
+    );
+    assert!(crate::perf_trace::probe_counts_if_enabled().is_null());
+}
+
+fn set_detail_focus(theme: &ThemeHandle, input: &mut FrameInputs, action: &str) {
+    input.rows.insert(
+        Binding::Actions,
+        ["play", "back"]
+            .into_iter()
+            .map(|id| Row {
+                id: id.into(),
+                label: id.into(),
+                subtitle: String::new(),
+                value: String::new(),
+                enabled: true,
+            })
+            .collect(),
+    );
+    let component = theme.pack().screens[&ScreenId::GameDetail]
+        .components
+        .iter()
+        .find(|c| c.binding == Some(Binding::Actions))
+        .unwrap();
+    input.focus.component = component.id.clone();
+    input.focus.item = Some(action.into());
 }

@@ -973,9 +973,15 @@ thread_local! {
 #[derive(Default)]
 struct LoopState {
     held: std::cell::Cell<bool>,
+    inputs: std::cell::Cell<usize>,
     polls: std::cell::Cell<usize>,
+    iterations: std::cell::Cell<usize>,
+    idle: std::cell::Cell<bool>,
     input: tokio::sync::Notify,
     settled: tokio::sync::Notify,
+    completion_generation: std::cell::Cell<u64>,
+    adopted_held: std::cell::Cell<bool>,
+    presented_held: tokio::sync::Notify,
 }
 pub(super) fn has_loop_input() -> bool {
     LOOP_INPUT.with(|input| input.borrow().is_some())
@@ -991,6 +997,8 @@ pub(super) fn loop_input(keys: &EnumMap<Key, bool>) {
     LOOP_STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
             state.held.set(keys[Key::Right]);
+            state.inputs.set(state.inputs.get() + 1);
+            state.idle.set(false);
             state.input.notify_one();
         }
     });
@@ -999,8 +1007,36 @@ pub(super) fn loop_media_poll(pending: bool) {
     LOOP_STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
             state.polls.set(state.polls.get() + 1);
+            let generation = crate::view::orbit::completion_generation();
+            if generation != state.completion_generation.replace(generation) && state.held.get() {
+                state.adopted_held.set(true);
+            }
             if !pending {
                 state.settled.notify_one();
+            }
+        }
+    });
+}
+pub(super) fn loop_iteration() {
+    LOOP_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.iterations.set(state.iterations.get() + 1);
+        }
+    });
+}
+pub(super) fn loop_idle() {
+    LOOP_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.idle.set(true);
+            state.settled.notify_one();
+        }
+    });
+}
+pub(super) fn loop_present() {
+    LOOP_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            if state.held.get() && state.adopted_held.get() {
+                state.presented_held.notify_one();
             }
         }
     });
@@ -1015,7 +1051,7 @@ impl Drop for LoopReset {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "explicit disposable event loop fixture"]
-async fn release_and_settled_media_event_loop() -> Result<()> {
+async fn held_completion_release_and_settled_media_event_loop() -> Result<()> {
     let _cleanup = fixture()?;
     let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
     let mut overlay = false;
@@ -1023,6 +1059,9 @@ async fn release_and_settled_media_event_loop() -> Result<()> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     LOOP_INPUT.with(|input| *input.borrow_mut() = Some(receiver));
     let state = std::rc::Rc::new(LoopState::default());
+    state
+        .completion_generation
+        .set(crate::view::orbit::completion_generation());
     LOOP_STATE.with(|slot| *slot.borrow_mut() = Some(state.clone()));
     let _reset = LoopReset;
     sender.send(KeyEvent::Pressed(Key::Right))?;
@@ -1030,25 +1069,51 @@ async fn release_and_settled_media_event_loop() -> Result<()> {
         state.input.notified().await;
         ensure!(state.held.get(), "event loop did not record held key");
         let polls = state.polls.get();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        loop {
+            tokio::select! {
+                _ = state.presented_held.notified() => break,
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {
+                    sender.send(KeyEvent::Autorepeat(Key::Right))?;
+                }
+            }
+        }
         ensure!(
-            state.polls.get() == polls,
-            "media polled while a key was held"
+            state.inputs.get() > 1,
+            "test did not exercise queued repeats"
+        );
+        ensure!(
+            state.held.get(),
+            "completion was not presented until release"
+        );
+        ensure!(
+            state.polls.get() > polls,
+            "held key blocked completion adoption"
         );
         perf::take();
         sender.send(KeyEvent::Released(Key::Right))?;
-        state.input.notified().await;
+        while state.held.get() {
+            state.input.notified().await;
+        }
         ensure!(!state.held.get(), "release failed to clear held state");
         ensure!(
             perf::take().frames == 0,
             "release prepared a frame in event loop"
         );
-        state.settled.notified().await;
+        while !state.idle.get() {
+            state.settled.notified().await;
+        }
         let polls = state.polls.get();
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        let iterations = state.iterations.get();
+        tokio::time::sleep(Duration::from_millis(600)).await;
         ensure!(state.polls.get() == polls, "settled media kept polling");
+        let settled_wakes = state.iterations.get() - iterations;
+        ensure!(
+            settled_wakes <= 2,
+            "settled frame timer kept waking: {settled_wakes}"
+        );
         println!(
-            "EVENT_LOOP_PROOF release_models=0 held_state_cleared=true settled_extra_polls=0 total_media_polls={polls}"
+            "EVENT_LOOP_PROOF inputs={} adopted_and_presented_before_release=true release_models=0 held_state_cleared=true settled_extra_polls=0 settled_wakes_600ms={settled_wakes} total_media_polls={polls}",
+            state.inputs.get()
         );
         Ok::<_, anyhow::Error>(())
     };
@@ -1161,6 +1226,141 @@ async fn perf_name_index_consumed_by_view_rearms_settled_media() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     ensure!(media_work > 0, "replacement list never loaded artwork");
+    app.view.stop_workers();
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn queued_navigation_repeats_present_once_and_preserve_boundaries() -> Result<()> {
+    let root = ALLIUM_GAMES_DIR.join("PS/.loop-repeat-regression");
+    fs::create_dir_all(&root)?;
+    let _cleanup = Cleanup(root.clone());
+    for i in 0..10 {
+        fs::write(root.join(format!("Loop {i:02}.chd")), [])?;
+    }
+    let mut app = AlliumLauncher::new(DefaultPlatform::new()?)?;
+    crate::theme_adapter::choose(&app.res, Some("orbit"))?;
+    app.view.proof_games_directory(root.clone());
+    app.display.save()?;
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await?;
+    app.display.record_presentations();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let mut keys = EnumMap::default();
+    let mut pending = PendingInput::default();
+    for _ in 0..4 {
+        ensure!(
+            app.apply_input_batch(
+                KeyEvent::Pressed(Key::Right),
+                &mut pending,
+                &mut keys,
+                &tx,
+                &rx
+            )
+            .await?
+                == 1
+        );
+        app.present_frame(false, &mut overlay).await?;
+    }
+    let separate_selection = app.view.proof_game_theme_inputs()[0].focus.item.clone();
+    let separate_presents = app.display.take_presented_frames().len();
+    ensure!(
+        separate_presents == 4,
+        "separate presses: {separate_presents}"
+    );
+    app.view.proof_games_directory(root.clone());
+    app.present_frame(false, &mut overlay).await?;
+    app.display.take_presented_frames();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    LOOP_INPUT.with(|input| *input.borrow_mut() = Some(receiver));
+    let _reset = LoopReset;
+    for _ in 0..4 {
+        sender.send(KeyEvent::Autorepeat(Key::Right))?;
+    }
+    sender.send(KeyEvent::Released(Key::Right))?;
+    sender.send(KeyEvent::Pressed(Key::A))?;
+    sender.send(KeyEvent::Autorepeat(Key::Right))?;
+    let first = pending.take(&mut app.platform).unwrap();
+    ensure!(
+        app.apply_input_batch(first, &mut pending, &mut keys, &tx, &rx)
+            .await?
+            == 4
+    );
+    app.present_frame(false, &mut overlay).await?;
+    let batch_selection = app.view.proof_game_theme_inputs()[0].focus.item.clone();
+    ensure!(
+        batch_selection == separate_selection,
+        "coalescing changed selection"
+    );
+    let batch_presents = app.display.take_presented_frames().len();
+    ensure!(batch_presents == 1, "batch presents: {batch_presents}");
+    ensure!(
+        pending.0 == Some(KeyEvent::Released(Key::Right)),
+        "crossed release boundary"
+    );
+    let release = pending.take(&mut app.platform).unwrap();
+    ensure!(
+        app.apply_input_batch(release, &mut pending, &mut keys, &tx, &rx)
+            .await?
+            == 1
+    );
+    ensure!(!keys[Key::Right]);
+    let action = pending.take(&mut app.platform).unwrap();
+    ensure!(action == KeyEvent::Pressed(Key::A));
+    ensure!(
+        app.apply_input_batch(action, &mut pending, &mut keys, &tx, &rx)
+            .await?
+            == 1
+    );
+    ensure!(
+        app.view.proof_game_theme_inputs()[0].focus.item == batch_selection,
+        "crossed action boundary"
+    );
+    let command = rx.try_recv()?;
+    let Command::Exec(command) = command else {
+        anyhow::bail!("launch did not produce Exec: {command:?}");
+    };
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    ensure!(
+        args.iter().any(|arg| arg.ends_with("Loop 06.chd")),
+        "launch target changed: {args:?}"
+    );
+    ensure!(
+        pending.is_ready(&mut app.platform),
+        "readiness query lost event"
+    );
+    ensure!(
+        pending.is_ready(&mut app.platform),
+        "readiness query consumed event"
+    );
+    ensure!(pending.take(&mut app.platform) == Some(KeyEvent::Autorepeat(Key::Right)));
+    for boundary in [
+        KeyEvent::Pressed(Key::B),
+        KeyEvent::Pressed(Key::Menu),
+        KeyEvent::Autorepeat(Key::Left),
+    ] {
+        sender.send(KeyEvent::Autorepeat(Key::Right))?;
+        sender.send(boundary)?;
+        sender.send(KeyEvent::Autorepeat(Key::Right))?;
+        let first = pending.take(&mut app.platform).unwrap();
+        ensure!(
+            app.apply_input_batch(first, &mut pending, &mut keys, &tx, &rx)
+                .await?
+                == 1
+        );
+        ensure!(
+            pending.take(&mut app.platform) == Some(boundary),
+            "crossed {boundary:?}"
+        );
+        ensure!(pending.take(&mut app.platform) == Some(KeyEvent::Autorepeat(Key::Right)));
+    }
+    println!(
+        "REPEAT_PROOF separate_presents={separate_presents} batch_presents={batch_presents} applied_steps=4 launch_target=Loop_06 release_action_menu_direction_boundaries=preserved"
+    );
     app.view.stop_workers();
     Ok(())
 }
