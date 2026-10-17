@@ -8,6 +8,7 @@ pub struct Counts {
     pub art_resizes: u64,
     pub fits: u64,
     pub frames: u64,
+    pub neighbor_matches: u64,
     pub ram_hits: u64,
     pub disk_hits: u64,
 }
@@ -19,6 +20,7 @@ pub enum Op {
     ArtResize,
     Fit,
     Frame,
+    NeighborMatch,
     RamHit,
     DiskHit,
 }
@@ -37,6 +39,7 @@ pub fn hit(op: Op) {
             Op::ArtResize => c.art_resizes += 1,
             Op::Fit => c.fits += 1,
             Op::Frame => c.frames += 1,
+            Op::NeighborMatch => c.neighbor_matches += 1,
             Op::RamHit => c.ram_hits += 1,
             Op::DiskHit => c.disk_hits += 1,
         }

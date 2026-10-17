@@ -383,3 +383,237 @@ async fn prepack2_details_round_trip_and_early_neighbor_present() {
         settle(&mut app, &mut probe).await;
     }
 }
+
+#[cfg(feature = "perf-bench")]
+#[test]
+fn nbr_reuses_eligibility_in_both_slots_and_directions_with_identical_presentation() {
+    for name in ["compact", "compact-plus"] {
+        let theme = theme_named(name);
+        for selected in [1, 5] {
+            for slot in [0, 1] {
+                let mut results = vec![];
+                for reuse in [false, true] {
+                    let base = PreparedFrame::prepare(theme.clone(), &input(&theme, 0)).unwrap();
+                    let displayed = base.navigation_stamp();
+                    let models = vec![input(&theme, selected)];
+                    let other = if selected == 1 { 5 } else { 1 };
+                    let mut neighbors = vec![neighbor(&base, &models[0]), neighbor(&base, &input(&theme, other))];
+                    neighbors.swap(0, slot);
+                    let mut probe = common::platform::PresenterProbe::new(640, 480);
+                    base.paint(probe.display());
+                    probe.display().flush().unwrap();
+                    while pack_neighbors(&mut neighbors, probe.display()).unwrap() {}
+                    let previous = vec![base];
+                    common::perf::take();
+                    let matched = MatchedNeighbor::find(&theme, &models, &previous, &neighbors, Some(&displayed)).unwrap();
+                    assert_eq!(matched.index, slot);
+                    let mut graveyard = NeighborGraveyard::default();
+                    let mut adopted = false;
+                    let mut frames = prepare_theme_frames_matched(&theme, &models, previous, &mut None,
+                        &mut neighbors, &mut graveyard, Some(&displayed), &mut adopted, reuse.then_some(matched)).unwrap();
+                    let comparisons = common::perf::take().neighbor_matches;
+                    assert_eq!(comparisons, (slot as u64 + 1) * if reuse { 1 } else { 2 });
+                    assert!(adopted);
+                    identical(&frames[0], &theme, &models[0]);
+                    let packed = graveyard.packed[graveyard.adopted_pack.unwrap()].as_ref().unwrap();
+                    let packed_hit = probe.display().packed_base_matches(packed);
+                    assert!(packed_hit);
+                    let damage = frames[0].adopt_neighbor_damage(probe.display()).unwrap();
+                    probe.display().flush_packed_rects(&damage, packed).unwrap();
+                    probe.assert_visible();
+                    results.push((probe.display().pixmap().data().to_vec(), frames[0].targets.clone(),
+                        frames[0].text_boxes.clone(), theme_content_pending_reasons(&models, &theme),
+                        graveyard.adopted_diagnostic.unwrap().reason, damage, packed_hit));
+                }
+                assert_eq!(results[0], results[1], "{name} selected={selected} slot={slot}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[test]
+fn nbr_changed_dependencies_drop_the_proof_and_preserve_slow_path_results() {
+    let theme = theme();
+    for case in ["miss", "status", "artwork", "miss readiness", "base", "displayed", "theme", "layout",
+        "overlay", "candidate replaced", "candidate prepared again", "candidate moved", "equal model replacement"]
+    {
+        let mut results = vec![];
+        for reuse in [false, true] {
+            let base = PreparedFrame::prepare(theme.clone(), &input(&theme, 0)).unwrap();
+            let displayed = base.navigation_stamp();
+            let models = vec![input(&theme, 1)];
+            let mut neighbors = vec![neighbor(&base, &models[0])];
+            let mut previous = vec![base];
+            let matched = MatchedNeighbor::find(&theme, &models, &previous, &neighbors, Some(&displayed));
+            assert!(matched.is_some());
+            let mut changed = models.clone();
+            let mut handle = theme.clone();
+            let mut stamp = Some(&displayed);
+            match case {
+                "miss" => changed[0] = input(&theme, 3),
+                "status" => changed[0].status.battery = Some(17),
+                "artwork" => changed[0].art.selected_cover = Some(std::sync::Arc::new(tiny_skia::Pixmap::new(8, 8).unwrap())),
+                "miss readiness" => changed[0].art.completed_misses.selected_logo = true,
+                "base" => previous[0] = PreparedFrame::prepare(theme.clone(), &input(&theme, 2)).unwrap(),
+                "displayed" => stamp = None,
+                "theme" => handle = theme_named("compact-plus"),
+                "layout" => handle = theme_named("compact"),
+                "overlay" => changed.push(FrameInputs::new(ScreenId::ContextMenu)),
+                "candidate replaced" => neighbors[0] = neighbor(&previous[0], &input(&theme, 3)),
+                "candidate prepared again" => {
+                    let mut candidate = neighbors.remove(0);
+                    candidate.frame = PreparedFrame::prepare_reusing(theme.clone(), &input(&theme, 3), Some(candidate.frame)).unwrap();
+                    neighbors.push(candidate);
+                }
+                "candidate moved" => { neighbors.insert(0, neighbor(&previous[0], &input(&theme, 3))); }
+                "equal model replacement" => {},
+                _ => unreachable!(),
+            }
+            let original_models = matches!(case, "base" | "displayed" | "candidate replaced" | "candidate prepared again" | "candidate moved");
+            let actual_models = if original_models { &models } else { &changed };
+            let actual_handle = if matches!(case, "theme" | "layout") { &handle } else { &theme };
+            assert_eq!(MatchedNeighbor::find(actual_handle, actual_models, &previous, &neighbors, stamp).is_some(),
+                matches!(case, "candidate moved" | "equal model replacement"), "eligibility: {case}");
+            common::perf::take();
+            let mut adopted = false;
+            let mut graveyard = NeighborGraveyard::default();
+            let frames = prepare_theme_frames_matched(actual_handle, actual_models, previous, &mut None,
+                &mut neighbors, &mut graveyard, stamp, &mut adopted, if reuse { matched } else { None }).unwrap();
+            let comparisons = common::perf::take().neighbor_matches;
+            assert_eq!(adopted, matches!(case, "candidate moved" | "equal model replacement"), "{case}");
+            if !matches!(case, "base" | "displayed" | "overlay") { assert!(comparisons > 0, "{case} skipped slow path"); }
+            let mut display = <common::platform::DefaultPlatform as common::platform::Platform>::Display::default();
+            for frame in &frames { frame.paint(&mut display); }
+            results.push((display.pixmap().data().to_vec(), adopted, comparisons,
+                theme_content_pending_reasons(visible_theme_models(actual_models, &frames), actual_handle), graveyard.packed_reason));
+        }
+        assert_eq!(results[0], results[1], "{case}");
+    }
+}
+
+#[cfg(all(feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn nbr_real_presses_reuse_once_and_queued_media_invalidates_before_matching() {
+    use common::{database::Database, platform::{DefaultPlatform, Platform}};
+    use std::time::{Duration, Instant};
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+    let root = common::constants::ALLIUM_GAMES_DIR.join("integration-nbr");
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let database = Database::in_memory().unwrap();
+    for index in 0..6 {
+        let path = root.join(format!("Game {index:02}.chd"));
+        std::fs::write(&path, []).unwrap();
+        let game: common::database::NewGame = crate::entry::game::Game::new(path).into();
+        database.update_games(&[game.clone()]).unwrap();
+        database.increment_play_count(&game).unwrap();
+    }
+    let mut styles = Stylesheet::new();
+    styles.load_fonts().unwrap();
+    styles.recents.use_recents_carousel = false;
+    let mut map = type_map::TypeMap::new();
+    map.insert(styles);
+    map.insert(Locale::new("en-US"));
+    map.insert(crate::consoles::ConsoleMapper::new());
+    map.insert(common::geom::Size::new(640, 480));
+    map.insert(database);
+    let res = Resources::new(map);
+    let handle = theme();
+    res.insert(Some(handle.clone()));
+    let rect = Rect::new(0, 54, 640, 376);
+    let views = (
+        Recents::load_or_new(rect, res.clone(), None).unwrap(),
+        Games::load_or_new(rect, res.clone(), None).unwrap(),
+        Apps::load_or_new(rect, res.clone(), None).unwrap(),
+        Settings::new(rect, res.clone(), Default::default()).unwrap(),
+    );
+    let mut app = App::new(Rect::new(0, 0, 640, 480), res, views, 0,
+        DefaultPlatform::new().unwrap().battery().unwrap()).unwrap();
+    let mut probe = common::platform::PresenterProbe::new(640, 480);
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    fn present(app: &mut App<<DefaultPlatform as Platform>::Battery>, probe: &mut common::platform::PresenterProbe) {
+        if app.should_draw() { app.prepare_theme().unwrap(); }
+        flush(app, probe);
+    }
+    fn flush(app: &mut App<<DefaultPlatform as Platform>::Battery>, probe: &mut common::platform::PresenterProbe) {
+        if app.draw_prepared_theme(probe.display()).unwrap() == Some(true) {
+            if let Some(damage) = app.take_present_damage() {
+                app.flush_prepared_damage(probe.display(), &damage).unwrap();
+            } else { probe.display().flush().unwrap(); }
+        }
+    }
+    async fn warm(app: &mut App<<DefaultPlatform as Platform>::Battery>, probe: &mut common::platform::PresenterProbe) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.idle_media_step() {
+            present(app, probe);
+            assert!(Instant::now() < deadline, "media did not settle");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        present(app, probe);
+        let mut work = None;
+        let direction = app.navigation_direction;
+        while !app.prewarm_navigation_step(&mut work, direction).unwrap() {
+            assert!(Instant::now() < deadline, "neighbors did not warm");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(app.neighbors.len(), 2);
+    }
+    for key in [Key::Down, Key::Up] {
+        warm(&mut app, &mut probe).await;
+        app.handle_key_event(KeyEvent::Pressed(key), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        assert!(app.defer_media_step());
+        let mut models = app.theme_models(&handle).unwrap().unwrap();
+        app.normalize_theme_inputs(&handle, &mut models);
+        let slot = app.neighbors.iter().position(|candidate| candidate.frame.input_matches(&models[0])).unwrap();
+        common::perf::take();
+        app.prepare_theme().unwrap();
+        assert_eq!(common::perf::take().neighbor_matches, slot as u64 + 1, "{key:?}");
+        assert!(app.neighbor_adopted);
+        assert!(app.media_deferred);
+        assert_eq!(app.proof_navigation_scene().0, app.proof_fresh_navigation_pixels());
+        assert_eq!(app.content_complete(), theme_content_complete(&models[0], &handle));
+        flush(&mut app, &mut probe);
+        probe.assert_visible();
+    }
+    warm(&mut app, &mut probe).await;
+    assert!(app.defer_media_step());
+    app.views.0.release_theme_art();
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    super::super::orbit::proof_art_gate(Some(gate.clone()));
+    let requests = super::super::orbit::test_art_requests();
+    assert!(app.idle_media_step());
+    assert!(super::super::orbit::test_art_requests() > requests);
+    assert!(!super::super::orbit::art_result_queued());
+    assert!(!app.neighbors.is_empty());
+    gate.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !super::super::orbit::art_result_queued() {
+        assert!(Instant::now() < deadline, "worker did not queue its result");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    super::super::orbit::proof_art_completion();
+    common::perf::take();
+    app.prepare_theme().unwrap();
+    assert!(super::super::orbit::proof_art_completion().is_some(), "queued result was not adopted");
+    assert_eq!(common::perf::take().neighbor_matches, 0, "queued completion must retire candidates before matching");
+    assert!(!app.neighbor_adopted);
+    assert!(!app.media_deferred);
+    assert!(app.neighbors.is_empty());
+    let mut models = app.theme_models(&handle).unwrap().unwrap();
+    app.normalize_theme_inputs(&handle, &mut models);
+    assert_eq!(app.proof_navigation_scene().0, app.proof_fresh_navigation_pixels());
+    assert_eq!(app.content_complete(), theme_content_complete(&models[0], &handle));
+    flush(&mut app, &mut probe);
+    probe.assert_visible();
+    while app.idle_media_step() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}

@@ -232,6 +232,8 @@ impl PreparedFrame {
         display.pack_spans(&self.pixels.0, &damage, available, diagnostic)
     }
     pub fn neighbor_matches(&self, theme: &ThemeHandle, input: &FrameInputs) -> bool {
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::NeighborMatch);
         if !self.navigation_theme_matches(theme) || self.theme.digest() != theme.digest()
             || !Self::neighbor_input(input) || !self.input_matches(input) { return false; }
         let _stage = crate::perf_trace::stage(crate::perf_trace::Stage::NeighborMisses);

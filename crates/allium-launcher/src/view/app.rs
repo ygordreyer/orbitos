@@ -176,6 +176,40 @@ impl std::fmt::Debug for PreparedNeighbor {
     }
 }
 
+struct MatchedNeighbor<'a> {
+    index: usize,
+    frame: common::theme::render::NavigationStamp,
+    handle: &'a common::theme::ThemeHandle,
+    input: &'a common::theme::frame::FrameInputs,
+}
+impl<'a> MatchedNeighbor<'a> {
+    fn find(
+        handle: &'a common::theme::ThemeHandle,
+        models: &'a [common::theme::frame::FrameInputs],
+        previous: &[common::theme::render::PreparedFrame],
+        neighbors: &[PreparedNeighbor],
+        displayed: Option<&common::theme::render::NavigationStamp>,
+    ) -> Option<Self> {
+        if models.len() != 1 || previous.len() != 1
+            || !displayed.is_some_and(|stamp| previous[0].navigation_is_current(stamp))
+        { return None; }
+        neighbors.iter().enumerate().find_map(|(index, candidate)| {
+            (previous[0].navigation_is_current(&candidate.base)
+                && candidate.frame.neighbor_matches(handle, &models[0]))
+                .then(|| Self { index, frame: candidate.frame.navigation_stamp(), handle, input: &models[0] })
+        })
+    }
+    fn is_current(&self, candidate: &PreparedNeighbor, handle: &common::theme::ThemeHandle,
+        input: &common::theme::frame::FrameInputs) -> bool
+    {
+        // The borrows pin the exact immutable model/theme and its strong artwork owners.
+        // A frame prepared again dissociates its weak navigation stamp.
+        std::ptr::eq(self.handle, handle) && std::ptr::eq(self.input, input)
+            && candidate.frame.navigation_is_current(&self.frame)
+    }
+}
+
+#[cfg(test)]
 fn prepare_theme_frames(
     handle: &common::theme::ThemeHandle,
     models: &[common::theme::frame::FrameInputs],
@@ -185,6 +219,20 @@ fn prepare_theme_frames(
     graveyard: &mut NeighborGraveyard,
     displayed: Option<&common::theme::render::NavigationStamp>,
     adopted: &mut bool,
+) -> Result<Vec<common::theme::render::PreparedFrame>> {
+    prepare_theme_frames_matched(handle, models, previous, parked, neighbors, graveyard, displayed, adopted, None)
+}
+
+fn prepare_theme_frames_matched(
+    handle: &common::theme::ThemeHandle,
+    models: &[common::theme::frame::FrameInputs],
+    previous: Vec<common::theme::render::PreparedFrame>,
+    parked: &mut Option<ParkedDetails>,
+    neighbors: &mut Vec<PreparedNeighbor>,
+    graveyard: &mut NeighborGraveyard,
+    displayed: Option<&common::theme::render::NavigationStamp>,
+    adopted: &mut bool,
+    matched: Option<MatchedNeighbor<'_>>,
 ) -> Result<Vec<common::theme::render::PreparedFrame>> {
     use common::theme::pack::ScreenId;
     use common::theme::render::PreparedFrame;
@@ -225,15 +273,20 @@ fn prepare_theme_frames(
         else if !can_park { "network_blocked" } else { "no_candidate" };
     let search = common::perf_trace::stage(common::perf_trace::Stage::NeighborSearch);
     let candidate = if models.len() == 1 && can_park {
-        neighbors.iter().position(|candidate| {
+        let carried = matched.filter(|proof| neighbors.get(proof.index)
+            .is_some_and(|candidate| proof.is_current(candidate, handle, top))).map(|proof| proof.index);
+        let mut accepts = |index, candidate: &PreparedNeighbor| {
             let Some(base) = &old else { rejection = "no_base"; return false; };
             if !displayed.is_some_and(|stamp| base.navigation_is_current(stamp))
                 || !base.navigation_is_current(&candidate.base)
             { rejection = "base_mismatch"; return false; }
-            if candidate.frame.neighbor_matches(handle, top) { return true; }
+            if carried == Some(index) || candidate.frame.neighbor_matches(handle, top) { return true; }
             if tracing { rejection = candidate.frame.neighbor_rejection_reason(handle, top); }
             false
-        }).map(|index| neighbors.swap_remove(index))
+        };
+        carried.filter(|index| accepts(*index, &neighbors[*index]))
+            .or_else(|| neighbors.iter().enumerate().position(|(index, candidate)| accepts(index, candidate)))
+            .map(|index| neighbors.swap_remove(index))
     } else { None };
     drop(search);
     if tracing && top.screen == ScreenId::Recents {
@@ -1447,22 +1500,18 @@ where
             if self.dirty || self.selected != 0 || self.search_results.is_some() || self.search_view.is_active()
                 || self.rect.w != 640 || self.rect.h != 480 || !self.views.0.navigation_warm_ready()
             { self.invalidate_neighbors(); }
-            if self.media_deferred {
-                let eligible = models.len() == 1 && self.theme_scene.as_ref().is_some_and(|scene| {
-                    scene.frames.len() == 1 && self.neighbor_base.as_ref().is_some_and(|stamp|
-                        scene.frames[0].navigation_is_current(stamp))
-                        && self.neighbors.iter().any(|candidate|
-                            scene.frames[0].navigation_is_current(&candidate.base)
-                                && candidate.frame.neighbor_matches(&handle, &models[0]))
-                });
-                if !eligible {
+            let matched = if self.media_deferred {
+                let matched = self.theme_scene.as_ref().and_then(|scene|
+                    MatchedNeighbor::find(&handle, &models, &scene.frames, &self.neighbors, self.neighbor_base.as_ref()));
+                if matched.is_none() {
                     self.idle_media_step();
                     return self.prepare_theme();
                 }
-            }
+                matched
+            } else { None };
             let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
-            let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details,
-                &mut self.neighbors, &mut self.neighbor_graveyard, self.neighbor_base.as_ref(), &mut self.neighbor_adopted)?;
+            let frames = prepare_theme_frames_matched(&handle, &models, previous, &mut self.parked_details,
+                &mut self.neighbors, &mut self.neighbor_graveyard, self.neighbor_base.as_ref(), &mut self.neighbor_adopted, matched)?;
             let _readiness = common::perf_trace::stage(common::perf_trace::Stage::FrameReadiness);
             let visible = visible_theme_models(&models, &frames);
             self.content_complete = visible.iter().all(|input| theme_content_complete(input, &handle));
