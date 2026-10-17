@@ -2371,7 +2371,8 @@
           "max_lines": 2,
           "overflow": "wrap",
           "align": "left",
-          "logo": true
+          "logo": true,
+          "logo_when_no_cover": true
         },
         {
           "id": "cover-frame",

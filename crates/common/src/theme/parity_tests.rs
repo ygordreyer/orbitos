@@ -502,6 +502,7 @@ fn parity_d_retained_logos_follow_art_changes_on_text_slots() {
     )
     .unwrap();
     let mut input = frame(ScreenId::Library);
+    input.art = Default::default();
     let mut red = tiny_skia::Pixmap::new(96, 24).unwrap();
     red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
     input.art.selected_logo = Some(Arc::new(red));

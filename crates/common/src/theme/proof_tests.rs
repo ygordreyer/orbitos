@@ -1793,7 +1793,7 @@ fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
         for screen in ScreenId::ALL {
             let slots:Vec<_>=theme.pack().screens[&screen].components.iter().filter(|c|c.logo||c.binding==Some(Binding::SelectedLogo)).collect();
             if slots.is_empty(){continue;}
-            let mut input=frame(screen);input.focus=Focus::default();
+            let mut input=frame(screen);input.art=Default::default();input.focus=Focus::default();
             let text=PreparedFrame::prepare(theme.clone(),&input).unwrap();
             input.art.selected_logo=Some(logo.clone());let image=PreparedFrame::prepare(theme.clone(),&input).unwrap();
             for slot in slots {
@@ -1828,12 +1828,15 @@ fn media_big_picture_recents_renders_selected_game_art_on_right() {
         input.text.insert(Binding::SelectedTitle,String::new());let no_title=PreparedFrame::prepare(theme.clone(),&input).unwrap();
         assert!((120..168).any(|y|(432..608).any(|x|rendered.pixels().pixel(x,y)!=no_title.pixels().pixel(x,y))));
         input.art.selected_logo=crate::media::load_logo(&fixture.join("Complete.sfc"));
-        let logo=PreparedFrame::prepare(theme,&input).unwrap();assert_ne!(logo.pixels().pixel(500,144),no_title.pixels().pixel(500,144));
+        let logo=PreparedFrame::prepare(theme.clone(),&input).unwrap();assert_eq!(logo.pixels().data(),no_title.pixels().data());
+        input.art.selected_cover=None;let fallback=PreparedFrame::prepare(theme,&input).unwrap();assert_ne!(fallback.pixels().pixel(500,144),logo.pixels().pixel(500,144));
     }
 }
 
 #[path = "parity_a_tests.rs"]
 mod parity_a;
+#[path = "logo_cover_tests.rs"]
+mod logo_cover;
 #[path = "parity_c_tests.rs"]
 mod parity_c_tests;
 #[path = "parity_tests.rs"]

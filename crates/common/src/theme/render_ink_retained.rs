@@ -125,6 +125,15 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
     if c.logo || c.binding == Some(Binding::SelectedLogo) {
         out.art.selected_logo = input.art.selected_logo.clone();
     }
+    if c.logo_when_no_cover {
+        out.art.selected_cover = input.art.selected_cover.clone();
+        if let Some(id) = input.selected.get(&Binding::Entries) {
+            out.selected.insert(Binding::Entries, id.clone());
+            if let Some(cover) = input.art.entries.get(id) {
+                out.art.entries.insert(id.clone(), cover.clone());
+            }
+        }
+    }
     match c.kind {
         Kind::Text => {
             let binding = match c.binding.unwrap() {

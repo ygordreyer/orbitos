@@ -218,6 +218,8 @@ impl Rect {
 pub struct Component {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub logo: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logo_when_no_cover: bool,
     pub id: String,
     pub kind: Kind,
     pub rect: Rect,
@@ -726,6 +728,7 @@ impl Pack {
     }
     fn validate_component_screen(&self, screen: ScreenId, c: &Component) -> Result<()> {
         ensure!(!c.logo || c.kind == Kind::Text && matches!(c.binding, Some(Binding::Title | Binding::SelectedTitle)), "Logo opt-in requires title text");
+        ensure!(!c.logo_when_no_cover || c.logo || c.kind == Kind::Image && c.binding == Some(Binding::SelectedLogo), "Cover-aware logo requires a logo slot");
         let allowed = match c.kind {
             Kind::Background | Kind::Panel | Kind::Text | Kind::AssetImage => true,
             Kind::Overlay => self.ink(),
@@ -855,8 +858,8 @@ impl Pack {
             fields.remove(field);
         }
         let extras: &[&str] = match c.kind {
-            Kind::Text => &["layout", "gap", "radius", "logo"],
-            Kind::Image => &["role", "color", "blur_radius"],
+            Kind::Text => &["layout", "gap", "radius", "logo", "logo_when_no_cover"],
+            Kind::Image => &["role", "color", "blur_radius", "logo_when_no_cover"],
             Kind::Entries | Kind::SettingsRows | Kind::Navigation | Kind::Keyboard => &["color"],
             Kind::Status | Kind::DialogActions => &["align", "radius", "color"],
             Kind::Hints => &["max_lines", "presentation", "radius"],
@@ -1162,6 +1165,7 @@ impl Pack {
         };
         let mut object = v.as_object().unwrap().clone();
         object.remove("logo");
+        object.remove("logo_when_no_cover");
         for extension in ["blur_radius", "mask_asset_id", "clip_shape"] {
             if object.remove(extension).is_some() {
                 ensure!(

@@ -5,7 +5,7 @@ const source=path.resolve(process.argv[2]||'../miyoo-ui-sim');
 const output=path.resolve(process.argv[3]||'themes');
 const L=require(path.join(source,'dist/theme-layout.js'));
 L.setSchema(JSON.parse(fs.readFileSync(path.join(source,'dist/themes/theme.schema.json'))));
-const old=new Set('id kind rect asset_id binding role color radius max_lines overflow align fit layout visible_count item_extent gap padding art_size caption_height caption_lines frame_color focus_color focus_style focus_width glow_radius group max_items fade_edge clip_shape fade_width battery_style blur_radius mask_asset_id presentation'.split(' '));
+const old=new Set('id kind rect asset_id binding role color radius max_lines overflow align fit layout visible_count item_extent gap padding art_size caption_height caption_lines frame_color focus_color focus_style focus_width glow_radius group max_items fade_edge clip_shape fade_width battery_style blur_radius mask_asset_id presentation logo logo_when_no_cover'.split(' '));
 const typeKeys=['font','size','line_height','weight','letter_spacing','transform','color'];
 const report=[],styleRefs=new Map();
 function exportVariant(original,shape,selected={}){
@@ -33,6 +33,9 @@ function exportVariant(original,shape,selected={}){
     if(c.kind==='keyboard')paint.keyboard_layout='qwerty';
     out.paint=paint;return out;
    });
+   if(spec.components.some(c=>c.binding==='selected_cover')){
+    for(const c of spec.components)if(c.logo||c.binding==='selected_logo')c.logo_when_no_cover=true;
+   }
   }
   pack.ink_typography=Object.fromEntries(Object.entries(original.tokens.typography).map(([k,t])=>[k,Object.fromEntries(typeKeys.filter(key=>t[key]!==undefined).map(key=>[key,t[key]]))]));
   pack.tokens.typography=Object.fromEntries(Object.entries(pack.tokens.typography).map(([k,t])=>[k,{font:t.font,size:t.size,line_height:t.line_height}]));

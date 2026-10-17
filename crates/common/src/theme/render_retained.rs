@@ -60,6 +60,7 @@ pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
                 .cloned()
                 .map(|mut c| {
                     c.logo = false;
+                    c.logo_when_no_cover = false;
                     c
                 })
                 .collect::<Vec<_>>()
@@ -176,6 +177,15 @@ fn same_art(a: Option<&Weak<Pixmap>>, b: Option<&Arc<Pixmap>>) -> bool {
 }
 fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool {
     let a = &previous.model;
+    if c.logo_when_no_cover
+        && (previous.art.cover.is_some() != b.art.selected_cover.is_some()
+            || a.selected.get(&Binding::Entries)
+                .is_some_and(|id| previous.art.entries.contains_key(id))
+                != b.selected.get(&Binding::Entries)
+                    .is_some_and(|id| b.art.entries.contains_key(id)))
+    {
+        return true;
+    }
     match c.kind {
         Kind::Text => {
             (c.logo && !same_art(previous.art.logo.as_ref(), b.art.selected_logo.as_ref()))

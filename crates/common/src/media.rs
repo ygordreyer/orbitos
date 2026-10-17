@@ -1782,11 +1782,12 @@ mod tests {
             }
             assert!(!cache.suppress_new_sources);
         });
-        set_metadata_budget(16 * 1024);
+        let reduced_budget = source_bytes(&root.join("Skipped0/gamelist.xml")) * 16;
+        set_metadata_budget(reduced_budget);
         CACHE.with(|c| {
             let mut cache = c.borrow_mut();
             assert!(cache.suppress_new_sources);
-            assert!(cache.bytes <= 16 * 1024);
+            assert!(cache.bytes <= reduced_budget);
             load_source(&cold, &mut cache);
             assert!(!cache.sources.contains_key(&cold));
         });

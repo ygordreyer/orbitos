@@ -30,7 +30,7 @@ All device images are pre-sized by the scraper or the PC manager. The launcher n
 
 - Square cover: `media/covers`, then `media/box2dfront` (Skraper), then `Imgs/<stem>.png` (legacy Allium).
 - Tall cover: `media/covers-tall`. When it is missing, the theme draws the Square cover inside the tall frame (fit, never stretch).
-- Logo: `media/logos`, then `media/marquees` (ES-DE name), then `media/wheel` (Batocera name). When none exists, the theme draws the title text.
+- Logo: `media/logos`, then `media/marquees` (ES-DE name), then `media/wheel` (Batocera name). When none exists, the theme draws the title text. A logo slot with `logo_when_no_cover: true` also falls back to text while the selected game has cover art, including its shelf card. Hero-only layouts can omit this rule.
 - Background: `media/backgrounds`, then `media/fanart`. When none exists, the theme draws its own background.
 - A `gamelist.xml` media tag (`<image>`, `<thumbnail>`, `<marquee>`, `<fanart>`) with a relative path overrides the folder lookup for that kind.
 
