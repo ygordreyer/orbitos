@@ -148,6 +148,12 @@ pub trait Display: Sized {
         false
     }
 
+    /// Exchange complete frames without releasing either buffer. Return false without
+    /// changing either owner if unsupported; writes retain set_shared_pixmap's contract.
+    fn swap_shared_pixmap(&mut self, _pixels: &mut Arc<tiny_skia::Pixmap>) -> bool {
+        false
+    }
+
     /// Set the diagnostic on every successful return, including declined admission.
     fn pack_spans(&mut self, _pixels: &Arc<tiny_skia::Pixmap>, _areas: &[Rect], _available: usize, diagnostic: &mut packed::PackDiagnostic) -> Result<Option<packed::PackedSpans>> {
         *diagnostic = packed::PackDiagnostic::new("pack_unsupported_display");

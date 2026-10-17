@@ -44,6 +44,7 @@ pub struct PreparedFrame {
     pixels_valid: bool,
     presented_pixels: Option<(std::sync::Weak<Pixmap>, std::cell::OnceCell<Option<Pixmap>>)>,
     recycled_pixels: Option<crate::display::SharedPixmap>,
+    retired_pixels: Option<crate::display::SharedPixmap>,
     pixel_repair: Vec<Rect>,
     opaque: bool,
     blit: super::blit::BlitMap,
@@ -61,6 +62,7 @@ pub struct PreparedFrame {
 /// Owned retirement payload without a strong reference to the displayed pixmap.
 pub struct RetiredFrame {
     _theme: ThemeHandle,
+    _pixels: Option<crate::display::SharedPixmap>,
     _presented: Option<(std::sync::Weak<Pixmap>, std::cell::OnceCell<Option<Pixmap>>)>,
     _components: Option<(ScreenId, bool, std::sync::Arc<Vec<Component>>)>,
     _epoch: std::sync::Arc<()>,
@@ -200,6 +202,7 @@ impl PreparedFrame {
             theme: self.theme.clone(), screen: self.screen,
             pixels: pixels.as_ref().to_owned().into(), opaque: self.opaque,
             pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
+            retired_pixels: None,
             blit: Default::default(), previous_input: self.previous_input.clone(),
             component_metadata: self.component_metadata.clone(), retained_layout: self.retained_layout,
             tiles: Default::default(), ink_cache: self.ink_cache.fork_navigation(input),
@@ -478,6 +481,7 @@ impl PreparedFrame {
             screen,
             pixels: Pixmap::new(640, 480).unwrap().into(),
             pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
+            retired_pixels: None,
             opaque: false,
             blit: Default::default(),
             previous_input: None,
@@ -577,7 +581,7 @@ impl PreparedFrame {
         self.pixel_repair.extend_from_slice(&self.damage);
         if self.pixel_repair.len() > 4096 { self.pixel_repair = vec![Rect(0, 0, 640, 480)]; }
         self.recycled_pixels = Some(base.pixels);
-        RetiredFrame { _theme: base.theme, _presented: base.presented_pixels,
+        RetiredFrame { _theme: base.theme, _pixels: base.retired_pixels, _presented: base.presented_pixels,
             _components: base.ink_components, _epoch: base.navigation_epoch, _blit: base.blit,
             _input: base.previous_input, _metadata: base.component_metadata,
             _tiles: base.tiles, _ink: base.ink_cache, _targets: base.targets,
@@ -587,12 +591,20 @@ impl PreparedFrame {
     pub fn adopt_neighbor_damage(&mut self, display: &mut impl Display) -> Option<Vec<DrawRect>> {
         if !self.pixels_usable() { return None; }
         if self.presented_pixels.is_none() && self.opaque && display.width() == 640 && display.height() == 480
-            && self.recycled_pixels.is_some() && display.set_shared_pixmap(&self.pixels.0)
+            && self.recycled_pixels.is_some() && self.retired_pixels.is_none()
         {
-            self.presented_pixels = Some((std::sync::Arc::downgrade(&self.pixels.0), Default::default()));
-            self.pixels = self.recycled_pixels.take().unwrap();
-            crate::perf_trace::count(crate::perf_trace::Count::NeighborPointerAdopt, 1);
-            return Some(self.damage.iter().map(|r| DrawRect::new(r.0 as i32, r.1 as i32, r.2, r.3)).collect());
+            let _stage = crate::perf_trace::recording()
+                .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::NeighborPresentSwap));
+            let source = std::sync::Arc::downgrade(&self.pixels.0);
+            let swapped = display.swap_shared_pixmap(&mut self.pixels.0);
+            if swapped || display.set_shared_pixmap(&self.pixels.0) {
+                self.presented_pixels = Some((source, Default::default()));
+                let previous = std::mem::replace(&mut self.pixels, self.recycled_pixels.take().unwrap());
+                // Defer freeing a distinct outgoing display buffer until idle.
+                if swapped && !std::sync::Arc::ptr_eq(&previous.0, &self.pixels.0) { self.retired_pixels = Some(previous); }
+                crate::perf_trace::count(crate::perf_trace::Count::NeighborPointerAdopt, 1);
+                return Some(self.damage.iter().map(|r| DrawRect::new(r.0 as i32, r.1 as i32, r.2, r.3)).collect());
+            }
         }
         self.recycled_pixels = None;
         self.pixel_repair.clear();
@@ -620,6 +632,10 @@ impl PreparedFrame {
             }
         }
         self.pixel_repair.clear();
+    }
+    /// Release the outgoing display buffer only from idle retirement work.
+    pub fn release_retired_pixels(&mut self) {
+        self.retired_pixels = None;
     }
     /// The destination must contain the preceding frame, without external overlays.
     pub fn paint_damage(&self, display: &mut impl Display) -> Option<Vec<DrawRect>> {
@@ -2141,6 +2157,7 @@ mod tests {
             screen: ScreenId::Library,
             pixels: pixels.into(),
             pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
+            retired_pixels: None,
             opaque: true,
             blit: Default::default(),
             previous_input: None,

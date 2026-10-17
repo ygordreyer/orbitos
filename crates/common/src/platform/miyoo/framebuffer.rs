@@ -538,6 +538,14 @@ impl Display for FramebufferDisplay {
         true
     }
 
+    fn swap_shared_pixmap(&mut self, pixels: &mut Arc<Pixmap>) -> bool {
+        if pixels.width() != self.width() || pixels.height() != self.height() {
+            return false;
+        }
+        std::mem::swap(&mut self.pixmap.0, pixels);
+        true
+    }
+
     fn pack_spans(&mut self, pixels: &Arc<Pixmap>, areas: &[Rect], available: usize, diagnostic: &mut PackDiagnostic) -> Result<Option<PackedSpans>> {
         self.refresh_present_layout()?;
         let v = &self.iface.var_screen_info;

@@ -1030,6 +1030,9 @@ where
 
     pub(crate) fn idle_retire_neighbors(&mut self) {
         self.neighbor_graveyard.clear();
+        if let Some(scene) = &mut self.theme_scene {
+            for frame in &mut scene.frames { frame.release_retired_pixels(); }
+        }
     }
 
     pub(crate) fn defer_media_step(&mut self) -> bool {

@@ -523,6 +523,181 @@ fn fpdiag_composition_revision_ignores_page_repair_but_tracks_external_reads_and
 }
 
 #[test]
+fn compose2_swap_rejects_size_without_mutation_and_preserves_shared_owners() {
+    use super::*;
+    let mut display = test_display(32, 24);
+    display.clear(Color::new(17, 53, 91)).unwrap();
+    display.flush().unwrap();
+    let revision = display.composition_revision().unwrap();
+    let original = display.pixmap.0.clone();
+    let mut wrong = Arc::new(Pixmap::new(31, 24).unwrap());
+    let wrong_pointer = Arc::as_ptr(&wrong);
+    assert!(!display.swap_shared_pixmap(&mut wrong));
+    assert_eq!(Arc::as_ptr(&wrong), wrong_pointer);
+    assert!(Arc::ptr_eq(&original, &display.pixmap.0));
+    let mut next = Pixmap::new(32, 24).unwrap();
+    next.fill(tiny_skia::Color::from_rgba8(93, 71, 39, 255));
+    let shared = Arc::new(next);
+    let mut incoming = shared.clone();
+    assert!(display.swap_shared_pixmap(&mut incoming));
+    assert!(Arc::ptr_eq(&incoming, &original));
+    assert!(Arc::ptr_eq(&shared, &display.pixmap.0));
+    assert_eq!(display.composition_revision().unwrap(), revision);
+    display.flush().unwrap();
+    assert_visible(&display, 0, "swap pixels");
+    display.clear(Color::new(1, 2, 3)).unwrap();
+    assert_eq!(shared.pixel(0, 0).unwrap().red(), 93);
+    assert_eq!(original.pixel(0, 0).unwrap().red(), 17);
+}
+
+#[test]
+fn compose2_neighbor_defers_unique_outgoing_release_until_idle() {
+    use super::*;
+    use crate::theme::{render::{PreparedFrame, neighbor_test_arts as arts,
+        neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let theme = theme("compact-plus", "square");
+    let arts = arts();
+    let mut base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+    let mut display = test_display(640, 480);
+    base.paint(&mut display);
+    display.flush().unwrap();
+    for (step, selected) in [1, 0, 7, 0].into_iter().enumerate() {
+        base.release_retired_pixels();
+        base.restore_pixel_storage();
+        let next = model(&theme, ScreenId::Recents, selected, &arts);
+        let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
+        let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+        let packed = candidate.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut Default::default()).unwrap().unwrap();
+        let outgoing = Arc::downgrade(&display.pixmap.0);
+        let retired = candidate.recycle_neighbor_base(base);
+        let damage = candidate.adopt_neighbor_damage(&mut display).unwrap();
+        assert!(outgoing.upgrade().is_some(), "outgoing allocation released on press");
+        assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+        assert_eq!(display.pixmap().data(), reference.pixels().data());
+        assert_eq!(candidate.targets, reference.targets);
+        assert_eq!(candidate.text_boxes, reference.text_boxes);
+        display.flush_packed_rects(&damage, &packed).unwrap();
+        assert_visible(&display, 0, "deferred outgoing");
+        drop(retired);
+        let outgoing = (step != 0).then_some(outgoing);
+        candidate.release_retired_pixels();
+        candidate.restore_pixel_storage();
+        if let Some(outgoing) = outgoing { assert_eq!(outgoing.strong_count(), 0); }
+        assert_eq!(candidate.pixels().data(), reference.pixels().data());
+        assert_eq!(display.pixmap().data(), reference.pixels().data());
+        base = candidate;
+    }
+}
+
+#[test]
+fn compose2_neighbor_hit_after_full_paint_then_miss_repairs_in_place() {
+    use super::*;
+    use crate::theme::{render::{PreparedFrame, neighbor_test_arts as arts,
+        neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let theme = theme("compact-plus", "square");
+    let arts = arts();
+    let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+    let storage = base.pixels().data().as_ptr();
+    let mut display = test_display(640, 480);
+    base.paint(&mut display);
+    display.flush().unwrap();
+    assert_eq!(display.pixmap().data().as_ptr(), storage);
+    assert_eq!(Arc::strong_count(&display.pixmap.0), 2);
+    let next = model(&theme, ScreenId::Recents, 1, &arts);
+    let (mut hit, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+    let retired = hit.recycle_neighbor_base(base);
+    let damage = hit.adopt_neighbor_damage(&mut display).unwrap();
+    display.flush_rects(&damage).unwrap();
+    drop(retired);
+    let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
+    assert_eq!(display.pixmap().data(), reference.pixels().data());
+    let displayed = display.pixmap().data().to_vec();
+    let mut missed = model(&theme, ScreenId::Recents, 2, &arts);
+    missed.status.clock = Some("15:21".into());
+    assert!(!hit.neighbor_matches(&theme, &missed));
+    let frame = PreparedFrame::prepare_reusing(theme.clone(), &missed, Some(hit)).unwrap();
+    assert_eq!(frame.pixels().data().as_ptr(), storage, "immediate miss rebuilt aliased storage");
+    assert_eq!(display.pixmap().data(), displayed);
+    let reference = crate::theme::render::navigation_reference(theme.clone(), &missed).unwrap();
+    assert_eq!(frame.pixels().data(), reference.pixels().data());
+    assert_eq!(frame.targets, reference.targets);
+    assert_eq!(frame.text_boxes, reference.text_boxes);
+    let damage = frame.paint_damage(&mut display).unwrap();
+    assert_eq!(display.pixmap().data(), reference.pixels().data());
+    display.flush_rects(&damage).unwrap();
+    assert_visible(&display, 0, "immediate miss after aliased outgoing hit");
+}
+
+#[test]
+fn compose2_neighbor_hit_then_miss_preserves_outgoing_until_idle_or_retire() {
+    use super::*;
+    use crate::theme::{render::{PreparedFrame, neighbor_test_arts as arts,
+        neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let theme = theme("compact-plus", "square");
+    let arts = arts();
+    for release in ["idle", "next_hit", "reused_candidate"] {
+        let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        let mut display = test_display(640, 480);
+        base.paint(&mut display);
+        // Detach without changing bytes so the outgoing display allocation has one owner.
+        drop(display.pixmap_mut());
+        assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+        let outgoing = Arc::downgrade(&display.pixmap.0);
+        let next = model(&theme, ScreenId::Recents, 1, &arts);
+        let (mut hit, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+        let retired = hit.recycle_neighbor_base(base);
+        hit.adopt_neighbor_damage(&mut display).unwrap();
+        drop(retired);
+        assert_eq!(outgoing.strong_count(), 1);
+        let displayed = display.pixmap().data().to_vec();
+        let mut missed = model(&theme, ScreenId::Recents, 2, &arts);
+        missed.status.clock = Some("15:21".into());
+        assert!(!hit.neighbor_matches(&theme, &missed));
+        let mut frame = PreparedFrame::prepare_reusing(theme.clone(), &missed, Some(hit)).unwrap();
+        assert_eq!(outgoing.strong_count(), 1, "miss released outgoing storage: {release}");
+        assert_eq!(display.pixmap().data(), displayed);
+        let reference = crate::theme::render::navigation_reference(theme.clone(), &missed).unwrap();
+        assert_eq!(frame.pixels().data(), reference.pixels().data());
+        assert_eq!(frame.targets, reference.targets);
+        assert_eq!(frame.text_boxes, reference.text_boxes);
+        frame.paint_damage(&mut display).unwrap();
+        assert_eq!(display.pixmap().data(), reference.pixels().data());
+        if release == "next_hit" {
+            let mut next = model(&theme, ScreenId::Recents, 3, &arts);
+            next.status = missed.status.clone();
+            let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
+            let (mut candidate, _) = frame.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+            let retired = candidate.recycle_neighbor_base(frame);
+            let newer = Arc::downgrade(&display.pixmap.0);
+            candidate.adopt_neighbor_damage(&mut display).unwrap();
+            assert_eq!(outgoing.strong_count(), 1, "later hit released older storage");
+            assert_eq!(newer.strong_count(), 1);
+            assert_eq!(display.pixmap().data(), reference.pixels().data());
+            drop(retired);
+            assert_eq!(outgoing.strong_count(), 0, "graveyard did not release older storage");
+            candidate.release_retired_pixels();
+            assert_eq!(newer.strong_count(), 0);
+            candidate.restore_pixel_storage();
+            assert_eq!(candidate.pixels().data(), reference.pixels().data());
+        } else {
+            if release == "reused_candidate" {
+                let base = PreparedFrame::prepare(theme.clone(), &missed).unwrap();
+                let retired = frame.recycle_neighbor_base(base);
+                frame.adopt_neighbor_damage(&mut display).unwrap();
+                drop(retired);
+                assert_eq!(outgoing.strong_count(), 1, "reused candidate overwrote retained storage");
+                assert_eq!(display.pixmap().data(), reference.pixels().data());
+            }
+            frame.restore_pixel_storage();
+            assert_eq!(outgoing.strong_count(), 1, "pixel repair released outgoing storage");
+            frame.release_retired_pixels();
+            assert_eq!(outgoing.strong_count(), 0, "idle did not release outgoing storage");
+            assert_eq!(frame.pixels().data(), reference.pixels().data());
+        }
+    }
+}
+
+#[test]
 fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
     use super::*;
     use crate::theme::{render::PreparedFrame, render::{neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
@@ -627,6 +802,7 @@ fn frameptr_idle_repair_reuses_retired_buffer_and_preserves_retained_data() {
     candidate.recycle_neighbor_base(base);
     candidate.adopt_neighbor_damage(&mut display);
     assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+    candidate.release_retired_pixels();
     candidate.restore_pixel_storage();
     assert_eq!(candidate.pixels().data().as_ptr(), retired);
     assert_eq!(candidate.pixels().data(), expected);
@@ -924,6 +1100,41 @@ fn present_compact_plus_neighbor_geometry_and_direct_copy_match_full_frame() {
         println!("PRESENT_GEOMETRY from={from} to={to} logical={damage:?} rows={} bytes={} rectangles={} full_width_rows={}",
             packed.rows.len(), packed.bytes.len(), packed.coverage_rects,
             packed.rows.iter().filter(|r| r.x0 == 0 && r.x1 == 640).count());
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[test]
+#[ignore = "cached-memory microbenchmark, not device framebuffer timing"]
+fn benchmark_compose2_neighbor_adoption() {
+    use crate::theme::{render::{PreparedFrame, neighbor_test_arts as arts,
+        neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    use std::{hint::black_box, time::Instant};
+    let theme = theme("compact-plus", "square");
+    let arts = arts();
+    let mut base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+    let mut display = test_display(640, 480);
+    base.paint(&mut display);
+    for keep_outgoing in [false, true, false, true] {
+        let mut samples = Vec::new();
+        for selected in (0..100).map(|n| (n + 1) % 2) {
+            base.release_retired_pixels();
+            base.restore_pixel_storage();
+            let next = model(&theme, ScreenId::Recents, selected, &arts);
+            let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+            let retired = candidate.recycle_neighbor_base(base);
+            let outgoing = keep_outgoing.then(|| display.pixmap.0.clone());
+            let start = Instant::now();
+            black_box(candidate.adopt_neighbor_damage(black_box(&mut display)).unwrap());
+            samples.push(start.elapsed().as_nanos());
+            black_box(&outgoing);
+            drop(outgoing);
+            drop(retired);
+            base = candidate;
+        }
+        samples.sort_unstable();
+        println!("COMPOSE2_BENCH keep_outgoing={keep_outgoing} iterations={} median_ns={} p95_ns={}",
+            samples.len(), samples[50], samples[95]);
     }
 }
 
