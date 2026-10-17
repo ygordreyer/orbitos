@@ -286,12 +286,9 @@ async fn artwork_precedes_incomplete_shadows_after_selection_restarts() {
     }
 }
 
-#[cfg(feature = "perf-bench")]
-#[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(orbit_fixture)]
-async fn fpdiag_page_repair_preserves_neighbors_but_remap_rejects_them() {
+fn recents_fixture() -> (Reset, AlliumLauncher<DefaultPlatform>) {
     use crate::view::{Recents, Games, Apps, Settings};
-    let (_reset, mut app) = launcher_fixture();
+    let (reset, mut app) = launcher_fixture();
     let database = Database::in_memory().unwrap();
     for i in 0..12 {
         let game: common::database::NewGame = Game::new(
@@ -315,6 +312,48 @@ async fn fpdiag_page_repair_preserves_neighbors_but_remap_rejects_them() {
     );
     app.view = App::new(common::geom::Rect::new(0, 0, 640, 480), app.res.clone(), views, 0,
         app.platform.battery().unwrap()).unwrap();
+    (reset, app)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn adopted_graveyard_drains_on_non_warmable_tabs_only_after_input_is_idle() {
+    for tab in [2, 3] {
+        let (_reset, mut app) = recents_fixture();
+        let mut overlay = false;
+        app.present_frame(false, &mut overlay).await.unwrap();
+        let mut work = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.view.prewarm_navigation_step(&mut work, 1).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let (tx, _rx) = mpsc::channel(100);
+        app.view.handle_key_event(KeyEvent::Pressed(Key::Down), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        app.present_frame(false, &mut overlay).await.unwrap();
+        assert!(app.view.proof_retired_neighbors(), "the press must adopt a neighbor");
+        for _ in 0..tab {
+            app.view.handle_key_event(KeyEvent::Pressed(Key::R), tx.clone(), &mut VecDeque::new()).await.unwrap();
+        }
+        app.present_frame(false, &mut overlay).await.unwrap();
+        assert!(!app.navigation_warm_allowed(), "tab {tab} allows navigation warming");
+        assert!(app.view.proof_retired_neighbors(), "tab switch destroyed retired data on the press path");
+        let (sender, receiver) = mpsc::unbounded_channel();
+        INPUT.with(|input| *input.borrow_mut() = Some(receiver));
+        sender.send(KeyEvent::Pressed(Key::Down)).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), app.run_event_loop()).await.is_err());
+        assert!(app.view.proof_retired_neighbors(), "held input must defer destruction");
+        sender.send(KeyEvent::Released(Key::Down)).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(1200), app.run_event_loop()).await.is_err());
+        assert!(!app.view.proof_retired_neighbors(), "idle on non-warmable tab {tab} retained the graveyard");
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn fpdiag_page_repair_preserves_neighbors_but_remap_rejects_them() {
+    let (_reset, mut app) = recents_fixture();
     app.display.presenter();
     let path = std::env::temp_dir().join(format!("allium-fpdiag-pages-{}.log", std::process::id()));
     common::perf_trace::start_probe(path.to_str().unwrap());

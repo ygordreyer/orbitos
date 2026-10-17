@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use fluent_templates::{
-    ArcLoader, LanguageIdentifier, Loader, fluent_bundle::FluentValue, loader::langid,
+    ArcLoader, Loader, fluent_bundle::FluentValue, loader::langid,
 };
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::{ALLIUM_LOCALE_SETTINGS, ALLIUM_LOCALES_DIR, ALLIUM_THEMES_DIR};
 use crate::stylesheet::Theme;
 
+pub use fluent_templates::LanguageIdentifier;
 pub use fluent_templates::fluent_bundle::FluentValue as LocaleFluentValue;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

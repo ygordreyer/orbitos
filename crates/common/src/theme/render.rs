@@ -58,6 +58,21 @@ pub struct PreparedFrame {
     pub targets: Vec<Target>,
     pub text_boxes: Vec<(String, Rect)>,
 }
+/// Owned retirement payload without a strong reference to the displayed pixmap.
+pub struct RetiredFrame {
+    _theme: ThemeHandle,
+    _presented: Option<(std::sync::Weak<Pixmap>, std::cell::OnceCell<Option<Pixmap>>)>,
+    _components: Option<(ScreenId, bool, std::sync::Arc<Vec<Component>>)>,
+    _epoch: std::sync::Arc<()>,
+    _blit: super::blit::BlitMap,
+    _input: Option<retained::Inputs>,
+    _metadata: Vec<retained::Metadata>,
+    _tiles: tiles::Cache,
+    _ink: ink_renderer::retained::Cache,
+    _targets: Vec<Target>,
+    _text_boxes: Vec<(String, Rect)>,
+    _damage: Vec<Rect>,
+}
 fn pixel_word(bytes: &[u8]) -> u32 {
     u32::from_ne_bytes(bytes[..4].try_into().unwrap())
 }
@@ -200,10 +215,11 @@ impl PreparedFrame {
         Ok(Some((frame, charge)))
     }
     pub fn neighbor_matches(&self, theme: &ThemeHandle, input: &FrameInputs) -> bool {
-        self.navigation_theme_matches(theme) && self.theme.digest() == theme.digest()
-            && Self::neighbor_input(input) && self.input_matches(input)
-            && self.previous_input.as_ref().is_some_and(|saved|
-                saved.model.art.completed_misses == input.art.completed_misses)
+        if !self.navigation_theme_matches(theme) || self.theme.digest() != theme.digest()
+            || !Self::neighbor_input(input) || !self.input_matches(input) { return false; }
+        let _stage = crate::perf_trace::stage(crate::perf_trace::Stage::NeighborMisses);
+        self.previous_input.as_ref().is_some_and(|saved|
+            saved.model.art.completed_misses == input.art.completed_misses)
     }
     /// Diagnostic only; acceptance still uses neighbor_matches and its live artwork proof.
     pub fn neighbor_rejection_reason(&self, theme: &ThemeHandle, input: &FrameInputs) -> &'static str {
@@ -541,11 +557,17 @@ impl PreparedFrame {
         Ok(result)
     }
     /// Keep the retired base buffer, including any repairs deferred by earlier hits.
-    pub fn recycle_neighbor_base(&mut self, base: Self) {
+    pub fn recycle_neighbor_base(&mut self, base: Self) -> RetiredFrame {
+        let _stage = crate::perf_trace::stage(crate::perf_trace::Stage::FrameRetire);
         self.pixel_repair = base.pixel_repair;
         self.pixel_repair.extend_from_slice(&self.damage);
         if self.pixel_repair.len() > 4096 { self.pixel_repair = vec![Rect(0, 0, 640, 480)]; }
         self.recycled_pixels = Some(base.pixels);
+        RetiredFrame { _theme: base.theme, _presented: base.presented_pixels,
+            _components: base.ink_components, _epoch: base.navigation_epoch, _blit: base.blit,
+            _input: base.previous_input, _metadata: base.component_metadata,
+            _tiles: base.tiles, _ink: base.ink_cache, _targets: base.targets,
+            _text_boxes: base.text_boxes, _damage: base.damage }
     }
     /// Transfer the candidate's only strong pixel reference after the display accepts it.
     pub fn adopt_neighbor_damage(&mut self, display: &mut impl Display) -> Option<Vec<DrawRect>> {

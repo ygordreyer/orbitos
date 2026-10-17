@@ -1523,6 +1523,8 @@ impl PreparedFrame {
         } else {
             "ink_initial"
         });
+        // Reconstruction includes full panel replays even when presentation is narrowed.
+        let mut replay_damage = self.damage.clone();
         for (index, op) in operations.iter().enumerate() {
             let c = &op.component;
             let row_input;
@@ -1560,7 +1562,7 @@ impl PreparedFrame {
             }
             let changed =
                 !incremental || !retained::matches(&cache.entries[index].dependencies, &deps);
-            let affected = changed || self.damage.iter().any(|d| overlap(*d, r));
+            let affected = changed || replay_damage.iter().any(|d| overlap(*d, r));
             if !affected {
                 self.targets
                     .extend(cache.entries[index].targets.iter().cloned());
@@ -1568,8 +1570,18 @@ impl PreparedFrame {
                     .extend(cache.entries[index].text.iter().cloned());
                 continue;
             }
-            let covered = self.damage.iter().any(|d| inside(*d, r));
-            let has_overlap = self.damage.iter().any(|d| overlap(*d, r));
+            let covered = replay_damage.iter().any(|d| inside(*d, r));
+            let has_overlap = replay_damage.iter().any(|d| overlap(*d, r));
+            // Panel replay still covers the whole group. With a stable model and
+            // underlay, only children whose artwork changed can change final pixels.
+            let panel_damage = if incremental && changed && !has_overlap {
+                if let Paint::Panel { group, .. } = &op.paint {
+                    let previous = &cache.entries[index].dependencies;
+                    retained::same_model(&previous.model, &deps).then(|| group.iter()
+                        .filter(|c| retained::changed(c, previous, &deps))
+                        .map(effects::paint_bounds).collect::<Vec<_>>())
+                } else { None }
+            } else { None };
             let panel_input = if let Paint::Panel { key, .. } = &op.paint {
                 Some((PanelKey::new(key, input), panel_sources(input)))
             } else { None };
@@ -1581,7 +1593,9 @@ impl PreparedFrame {
                         entry.dependencies = Rc::new(retained::capture(&deps));
                         entry.text = self.text_boxes[text..].to_vec();
                         self.targets.extend(entry.targets.iter().cloned());
-                        self.damage.push(r);
+                        if let Some(damage) = panel_damage { self.damage.extend(damage); }
+                        else { self.damage.push(r); }
+                        replay_damage.push(r);
                         continue;
                     }
                 }
@@ -1594,7 +1608,7 @@ impl PreparedFrame {
             if incremental && !covered {
                 restore(&mut self.pixels, r, &cache.entries[index].before);
                 if let Some(old_final) = &old_final {
-                    transfer(&mut self.pixels, r, old_final, &self.damage, true);
+                    transfer(&mut self.pixels, r, old_final, &replay_damage, true);
                 }
             }
             let before = if index == 0 && c.kind == Kind::Background {
@@ -1612,7 +1626,7 @@ impl PreparedFrame {
             };
             let targets = self.targets.len();
             let text = self.text_boxes.len();
-            let clip = (incremental && !changed && !covered).then(|| replay_clip(r, &self.damage));
+            let clip = (incremental && !changed && !covered).then(|| replay_clip(r, &replay_damage));
             with_replay_clip(clip, || -> Result<()> {
                 if let Paint::Panel { group, .. } = &op.paint {
                     let (key, sources) = panel_input.unwrap();
@@ -1635,7 +1649,7 @@ impl PreparedFrame {
                     &mut self.pixels,
                     r,
                     old_final.as_ref().unwrap(),
-                    &self.damage,
+                    &replay_damage,
                     false,
                 );
             }
@@ -1654,7 +1668,11 @@ impl PreparedFrame {
                 cache.entries.push(entry);
             }
             if incremental && changed && !self.damage.iter().any(|d| inside(*d, r)) {
-                self.damage.push(r);
+                if let Some(damage) = panel_damage { self.damage.extend(damage); }
+                else { self.damage.push(r); }
+            }
+            if incremental && changed && !covered {
+                replay_damage.push(r);
             }
         }
         cache.screen = Some(input.screen);

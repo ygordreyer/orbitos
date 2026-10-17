@@ -390,6 +390,10 @@ impl AlliumLauncher<DefaultPlatform> {
                         Duration::from_secs(1).saturating_sub(media_poll.elapsed())
                     }
                 }), if rx.is_empty() => {
+                    if pending_input.is_ready(&mut self.platform) { continue; }
+                    if rx.is_empty() && keys.values().all(|pressed| !pressed) {
+                        self.view.idle_retire_neighbors();
+                    }
                     if media_pending {
                         self.poll_media_step(&mut media_pending);
                         last_media_step = Instant::now();

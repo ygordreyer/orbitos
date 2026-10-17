@@ -1,4 +1,4 @@
-use super::prepare_theme_frames;
+use super::{prepare_theme_frames, NeighborGraveyard};
 use common::theme::{
     fonts::FontBank,
     frame::{DetailLine, FrameInputs, Pagination, Row},
@@ -45,14 +45,14 @@ fn details_slot_reopens_with_less_capture_and_allocation_work_and_current_depend
     let lower = FrameInputs::new(ScreenId::Recents);
     let mut input = details(&theme);
     let mut parked = None;
-    let mut frames = prepare_theme_frames(&theme, &[lower.clone(), input.clone()], vec![], &mut parked, &mut vec![], None, &mut false).unwrap();
+    let mut frames = prepare_theme_frames(&theme, &[lower.clone(), input.clone()], vec![], &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
     let original = frames[1].pixels().data().as_ptr();
     #[cfg(feature = "perf-bench")]
     let trace = std::env::temp_dir().join(format!("details-slot-{:?}.log", std::thread::current().id()));
     #[cfg(feature = "perf-bench")]
     common::perf_trace::start_probe(trace.to_str().unwrap());
     for change in 0..5 {
-        frames = prepare_theme_frames(&theme, std::slice::from_ref(&lower), frames, &mut parked, &mut vec![], None, &mut false).unwrap();
+        frames = prepare_theme_frames(&theme, std::slice::from_ref(&lower), frames, &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
         assert!(parked.is_some());
         match change {
             1 => {
@@ -81,7 +81,7 @@ fn details_slot_reopens_with_less_capture_and_allocation_work_and_current_depend
         }
         #[cfg(feature = "perf-bench")]
         common::perf_trace::begin_render();
-        frames = prepare_theme_frames(&theme, &[lower.clone(), input.clone()], frames, &mut parked, &mut vec![], None, &mut false).unwrap();
+        frames = prepare_theme_frames(&theme, &[lower.clone(), input.clone()], frames, &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
         assert!(parked.is_none());
         assert_eq!(frames[1].pixels().data().as_ptr(), original);
         #[cfg(feature = "perf-bench")]
@@ -110,8 +110,8 @@ fn details_slot_releases_on_theme_identity_lower_screen_and_stack_changes() {
         let lower = FrameInputs::new(ScreenId::Recents);
         let input = details(&theme);
         let mut parked = None;
-        let frames = prepare_theme_frames(&theme, &[lower.clone(), input], vec![], &mut parked, &mut vec![], None, &mut false).unwrap();
-        let frames = prepare_theme_frames(&theme, std::slice::from_ref(&lower), frames, &mut parked, &mut vec![], None, &mut false).unwrap();
+        let frames = prepare_theme_frames(&theme, &[lower.clone(), input], vec![], &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
+        let frames = prepare_theme_frames(&theme, std::slice::from_ref(&lower), frames, &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
         assert!(parked.is_some());
         let mut models = vec![lower];
         let next = match change {
@@ -121,7 +121,7 @@ fn details_slot_releases_on_theme_identity_lower_screen_and_stack_changes() {
             3 => { models.push(FrameInputs::new(ScreenId::ContextMenu)); theme }
             _ => { models.clear(); theme }
         };
-        let _frames = prepare_theme_frames(&next, &models, frames, &mut parked, &mut vec![], None, &mut false).unwrap();
+        let _frames = prepare_theme_frames(&next, &models, frames, &mut parked, &mut vec![], &mut NeighborGraveyard::default(), None, &mut false).unwrap();
         assert!(parked.is_none(), "change {change}");
     }
 }

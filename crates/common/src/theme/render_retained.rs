@@ -174,6 +174,21 @@ pub(super) fn allocation_bytes(input: &FrameInputs) -> usize {
 }
 
 pub(super) fn matches(saved: &Inputs, input: &FrameInputs) -> bool {
+    let _stage = crate::perf_trace::stage(crate::perf_trace::Stage::RetainedCompare);
+    same_model(&saved.model, input)
+        && same_art(saved.art.logo.as_ref(), input.art.selected_logo.as_ref())
+        && same_art(saved.art.hero.as_ref(), input.art.selected_hero.as_ref())
+        && same_art(saved.art.cover.as_ref(), input.art.selected_cover.as_ref())
+        && same_art(saved.art.next_cover.as_ref(), input.art.next_cover.as_ref())
+        && saved.art.entries.len() == input.art.entries.len()
+        && input
+            .art
+            .entries
+            .iter()
+            .all(|(id, image)| same_art(saved.art.entries.get(id), Some(image)))
+}
+#[cfg(test)]
+pub(super) fn matches_cloned(saved: &Inputs, input: &FrameInputs) -> bool {
     let mut model = input.clone();
     model.art = Default::default();
     model.art.next_cover_expected = input.art.next_cover_expected;
@@ -188,6 +203,60 @@ pub(super) fn matches(saved: &Inputs, input: &FrameInputs) -> bool {
             .entries
             .iter()
             .all(|(id, image)| same_art(saved.art.entries.get(id), Some(image)))
+}
+fn same_text(a: &str, b: &str) -> bool {
+    super::equal_words(a.as_bytes(), b.as_bytes())
+}
+fn same_optional_text(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => same_text(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+fn same_slice<T>(a: &[T], b: &[T], same: impl Fn(&T, &T) -> bool) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
+}
+fn same_map<K: PartialEq, V>(a: &BTreeMap<K, V>, b: &BTreeMap<K, V>, same: impl Fn(&V, &V) -> bool) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|((ka, a), (kb, b))| ka == kb && same(a, b))
+}
+fn same_rows(a: &Vec<Row>, b: &Vec<Row>) -> bool {
+    same_slice(a, b, |a, b| {
+        let Row { id, label, subtitle, value, enabled } = b;
+        a.enabled == *enabled && same_text(&a.id, id) && same_text(&a.label, label)
+            && same_text(&a.subtitle, subtitle) && same_text(&a.value, value)
+    })
+}
+pub(super) fn same_model(a: &FrameInputs, b: &FrameInputs) -> bool {
+    use super::super::frame::{DetailLine, Focus, Hint, Status};
+    // Exhaustive patterns make every new model field an explicit proof decision.
+    let FrameInputs { screen, raster_revision, text, rows, selected, pagination, detail_lines,
+        metadata, facts, navigation, focus, hints, suppress_hints, status, progress,
+        keyboard, keyboard_cursor, art } = b;
+    let Focus { component, item } = focus;
+    let Status { clock, battery, charging, network } = status;
+    a.screen == *screen
+        && same_map(&a.selected, selected, |a, b| same_text(a, b))
+        && same_text(&a.focus.component, component) && same_optional_text(&a.focus.item, item)
+        && a.pagination == *pagination && a.suppress_hints == *suppress_hints
+        && a.progress == *progress && a.keyboard_cursor == *keyboard_cursor
+        && a.status.battery == *battery && a.status.charging == *charging
+        && a.art.next_cover_expected == art.next_cover_expected
+        && same_optional_text(&a.raster_revision, raster_revision)
+        && same_optional_text(&a.status.clock, clock) && same_optional_text(&a.status.network, network)
+        && same_map(&a.text, text, |a, b| same_text(a, b))
+        && same_map(&a.rows, rows, same_rows) && same_map(&a.navigation, navigation, same_rows)
+        && same_slice(&a.detail_lines, detail_lines, |a, b| {
+            let DetailLine { text, heading, gap_before } = b;
+            a.heading == *heading && a.gap_before == *gap_before && same_text(&a.text, text)
+        })
+        && [(&a.metadata, metadata), (&a.facts, facts)].into_iter().all(|(a, b)|
+            same_slice(a, b, |(ak, av), (bk, bv)| same_text(ak, bk) && same_text(av, bv)))
+        && same_slice(&a.hints, hints, |a, b| {
+            let Hint { button, label } = b;
+            same_text(&a.button, button) && same_text(&a.label, label)
+        })
+        && same_slice(&a.keyboard, keyboard, |a, b| same_text(a, b))
 }
 fn eligible_screen(screen: ScreenId) -> bool {
     matches!(
@@ -215,13 +284,14 @@ fn same_art(a: Option<&Weak<Pixmap>>, b: Option<&Arc<Pixmap>>) -> bool {
         _ => false,
     }
 }
-fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool {
+pub(super) fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool {
     let a = &previous.model;
     if c.logo_when_no_cover
-        && (previous.art.cover.is_some() != b.art.selected_cover.is_some()
+        && (previous.art.cover.is_some()
             || a.selected.get(&Binding::Entries)
-                .is_some_and(|id| previous.art.entries.contains_key(id))
-                != b.selected.get(&Binding::Entries)
+                .is_some_and(|id| previous.art.entries.contains_key(id)))
+            != (b.art.selected_cover.is_some()
+                || b.selected.get(&Binding::Entries)
                     .is_some_and(|id| b.art.entries.contains_key(id)))
     {
         return true;

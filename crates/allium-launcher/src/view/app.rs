@@ -86,18 +86,45 @@ impl std::fmt::Debug for ParkedDetails {
 const NEIGHBOR_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
-struct NeighborGeneration {
+struct NeighborGeneration<L = common::locale::LanguageIdentifier> {
     media: u64, names: u64, metadata: u64, adoption: u64, artwork: u64,
-    locale: u64, consoles: u64, language: String,
+    locale: u64, consoles: u64, language: L,
 }
-impl NeighborGeneration {
-    fn current(res: &Resources) -> Self {
+impl<L> NeighborGeneration<L> {
+    fn current(res: &Resources, language: L) -> Self {
         Self { media: common::media::generation(), names: common::media::name_generation(),
             metadata: super::details::metadata_generation(), adoption: super::orbit::metadata_completion_generation(),
             artwork: super::orbit::art_cache_revision(), locale: res.revision::<Locale>(),
-            consoles: res.revision::<crate::consoles::ConsoleMapper>(), language: res.get::<Locale>().language() }
+            consoles: res.revision::<crate::consoles::ConsoleMapper>(), language }
     }
 }
+impl NeighborGeneration {
+    fn borrowed(&self) -> NeighborGeneration<&common::locale::LanguageIdentifier> {
+        let Self { media, names, metadata, adoption, artwork, locale, consoles, language } = self;
+        NeighborGeneration { media: *media, names: *names, metadata: *metadata, adoption: *adoption,
+            artwork: *artwork, locale: *locale, consoles: *consoles, language }
+    }
+}
+
+#[derive(Default)]
+struct NeighborGraveyard {
+    base: Option<common::theme::render::RetiredFrame>,
+    siblings: Vec<PreparedNeighbor>,
+}
+impl NeighborGraveyard {
+    fn clear(&mut self) {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameRetire);
+        self.base = None;
+        self.siblings.clear();
+    }
+}
+impl std::fmt::Debug for NeighborGraveyard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NeighborGraveyard").field("base", &self.base.is_some())
+            .field("siblings", &self.siblings.len()).finish()
+    }
+}
+
 struct PreparedNeighbor {
     base: common::theme::render::NavigationStamp,
     generation: NeighborGeneration,
@@ -116,6 +143,7 @@ fn prepare_theme_frames(
     previous: Vec<common::theme::render::PreparedFrame>,
     parked: &mut Option<ParkedDetails>,
     neighbors: &mut Vec<PreparedNeighbor>,
+    graveyard: &mut NeighborGraveyard,
     displayed: Option<&common::theme::render::NavigationStamp>,
     adopted: &mut bool,
 ) -> Result<Vec<common::theme::render::PreparedFrame>> {
@@ -156,6 +184,7 @@ fn prepare_theme_frames(
     let tracing = common::perf_trace::recording();
     let mut rejection = if models.len() != 1 { "overlay_stack" }
         else if !can_park { "network_blocked" } else { "no_candidate" };
+    let search = common::perf_trace::stage(common::perf_trace::Stage::NeighborSearch);
     let candidate = if models.len() == 1 && can_park {
         neighbors.iter().position(|candidate| {
             let Some(base) = &old else { rejection = "no_base"; return false; };
@@ -167,15 +196,23 @@ fn prepare_theme_frames(
             false
         }).map(|index| neighbors.swap_remove(index).frame)
     } else { None };
+    drop(search);
     if tracing && top.screen == ScreenId::Recents {
         common::perf_trace::neighbor_adopt(if candidate.is_some() { "hit" } else { rejection });
     }
     if tracing && candidate.is_none() && !neighbors.is_empty() {
         common::perf_trace::neighbor_build("invalidated:prepare_mismatch");
     }
-    neighbors.clear();
+    {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::NeighborClear);
+        if candidate.is_some() {
+            // No new candidates can be built until idle has drained the graveyard.
+            debug_assert!(graveyard.base.is_none() && graveyard.siblings.is_empty());
+            std::mem::swap(neighbors, &mut graveyard.siblings);
+        } else { neighbors.clear(); }
+    }
     let top = if let Some(mut candidate) = candidate {
-        candidate.recycle_neighbor_base(old.unwrap());
+        graveyard.base = Some(candidate.recycle_neighbor_base(old.unwrap()));
         *adopted = true;
         common::perf_trace::count(common::perf_trace::Count::NeighborHit, 1);
         candidate
@@ -359,6 +396,7 @@ where
     // At most one closed Details frame: ~3.56 MB of framebuffer and operation underlays.
     parked_details: Option<ParkedDetails>,
     neighbors: Vec<PreparedNeighbor>,
+    neighbor_graveyard: NeighborGraveyard,
     neighbor_base: Option<common::theme::render::NavigationStamp>,
     neighbor_adopted: bool,
     present_damage: Option<Vec<Rect>>,
@@ -479,6 +517,7 @@ where
             theme_scene: None,
             parked_details: None,
             neighbors: Vec::with_capacity(2),
+            neighbor_graveyard: NeighborGraveyard { base: None, siblings: Vec::with_capacity(2) },
             neighbor_base: None,
             neighbor_adopted: false,
             present_damage: None,
@@ -554,6 +593,11 @@ where
     #[cfg(test)]
     pub(crate) fn proof_detail_shadow_warming(&self, work: &Option<NavigationWarm>) -> bool {
         work.is_some() && self.detail_shadows.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proof_retired_neighbors(&self) -> bool {
+        self.neighbor_graveyard.base.is_some() || !self.neighbor_graveyard.siblings.is_empty()
     }
 
     #[cfg(test)]
@@ -840,6 +884,10 @@ where
         self.content_complete
     }
 
+    pub(crate) fn idle_retire_neighbors(&mut self) {
+        self.neighbor_graveyard.clear();
+    }
+
     pub(crate) fn idle_media_step(&mut self) -> bool {
         let _task = common::perf_trace::task("media_adopt", common::perf_trace::generation());
         let completion = super::orbit::completion_generation();
@@ -913,6 +961,7 @@ where
             if common::perf_trace::recording() { common::perf_trace::neighbor_warm("pending_input"); }
             return Ok(false);
         }
+        self.idle_retire_neighbors();
         if direction != self.navigation_direction {
             *work = None;
             return Ok(true);
@@ -925,10 +974,12 @@ where
             *work = None;
             return Ok(true);
         };
-        let generation = NeighborGeneration::current(&self.res);
+        let locale = self.res.get::<Locale>();
+        let generation = NeighborGeneration::current(&self.res, &locale.lang);
         let resident = self.neighbors.len();
-        self.neighbors.retain(|candidate| candidate.generation == generation
+        self.neighbors.retain(|candidate| candidate.generation.borrowed() == generation
             && candidate.frame.navigation_theme_matches(&handle));
+        drop(locale);
         if common::perf_trace::recording() && self.neighbors.len() != resident {
             common::perf_trace::neighbor_build("invalidated:generation_or_theme");
         }
@@ -1045,7 +1096,7 @@ where
                         let available = NEIGHBOR_LIMIT - self.neighbors.iter().map(|c| c.charge).sum::<usize>();
                         if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available)? {
                             self.neighbors.push(PreparedNeighbor { base: frame.navigation_stamp(),
-                                generation: NeighborGeneration::current(&self.res), frame: candidate, charge });
+                                generation: NeighborGeneration::current(&self.res, self.res.get::<Locale>().lang.clone()), frame: candidate, charge });
                         }
                     } else if common::perf_trace::recording() {
                         common::perf_trace::neighbor_build("not_eligible:no_target");
@@ -1169,13 +1220,27 @@ where
             return Ok(());
         };
         self.had_theme = true;
-        let models = self.theme_models(&handle)?;
+        let models = {
+            let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameModel);
+            self.theme_models(&handle)?
+        };
         self.theme_scene = if let Some(mut models) = models {
-            self.normalize_theme_inputs(&handle, &mut models);
+            {
+                let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameNormalize);
+                self.normalize_theme_inputs(&handle, &mut models);
+            }
             let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
-            let generation = NeighborGeneration::current(&self.res);
+            let locale = self.res.get::<Locale>();
+            let generation = {
+                let _stage = common::perf_trace::stage(common::perf_trace::Stage::NeighborGeneration);
+                NeighborGeneration::current(&self.res, &locale.lang)
+            };
             let resident = self.neighbors.len();
-            self.neighbors.retain(|candidate| candidate.generation == generation);
+            {
+                let _stage = common::perf_trace::stage(common::perf_trace::Stage::NeighborFilter);
+                self.neighbors.retain(|candidate| candidate.generation.borrowed() == generation);
+            }
+            drop(locale);
             if common::perf_trace::recording() && self.neighbors.len() != resident {
                 common::perf_trace::neighbor_build("invalidated:generation");
             }
@@ -1183,7 +1248,8 @@ where
                 || self.rect.w != 640 || self.rect.h != 480 || !self.views.0.navigation_warm_ready()
             { self.invalidate_neighbors(); }
             let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details,
-                &mut self.neighbors, self.neighbor_base.as_ref(), &mut self.neighbor_adopted)?;
+                &mut self.neighbors, &mut self.neighbor_graveyard, self.neighbor_base.as_ref(), &mut self.neighbor_adopted)?;
+            let _readiness = common::perf_trace::stage(common::perf_trace::Stage::FrameReadiness);
             let visible = visible_theme_models(&models, &frames);
             self.content_complete = visible.iter().all(|input| theme_content_complete(input, &handle));
             if common::perf_trace::recording() {
@@ -1945,7 +2011,7 @@ mod tests {
         models[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
         models[1].text.insert(Binding::SelectedTitle, "Selected game".into());
         prepare_theme_inputs(&mut models, &resources(), 0, &Status::default());
-        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None, &mut vec![], None, &mut false).unwrap();
+        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None, &mut vec![], &mut super::NeighborGraveyard::default(), None, &mut false).unwrap();
         assert!(frames.last().unwrap().is_opaque());
         let visible = super::visible_theme_models(&models, &frames);
         assert_eq!(visible.len(), 1);
@@ -1999,7 +2065,7 @@ mod tests {
                 models.push(top);
             }
             let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
-            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked, &mut vec![], None, &mut false).unwrap();
+            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked, &mut vec![], &mut super::NeighborGraveyard::default(), None, &mut false).unwrap();
             if top_screen.is_some() {
                 let mut pending = models.clone();
                 pending[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
@@ -2402,12 +2468,16 @@ mod integration_navigation_tests {
                 let selected = app.theme_models(&handle).unwrap().unwrap()[0]
                     .selected.get(&common::theme::pack::Binding::Entries).cloned();
                 let mut work = None;
+                let retired = app.neighbor_graveyard.base.is_some();
                 assert!(
                     !app.prewarm_navigation_step_with_pending(&mut work, 1, || true)
                         .unwrap()
                 );
                 assert!(work.is_none(), "pending input must prevent planning");
+                assert_eq!(app.neighbor_graveyard.base.is_some(), retired, "pending input must defer destruction");
                 assert!(!app.prewarm_navigation_step(&mut work, 1).unwrap());
+                assert!(app.neighbor_graveyard.base.is_none() && app.neighbor_graveyard.siblings.is_empty(),
+                    "idle must retire heavy data before building any neighbors");
                 assert!(
                     work.is_some(),
                     "Recents must produce a real navigation plan"
@@ -2471,6 +2541,8 @@ mod integration_navigation_tests {
                 if *id == "compact-plus" {
                     assert!(app.theme_scene.as_ref().unwrap().frames[0].navigation_is_current(predicted.as_ref().unwrap()),
                         "matching press must adopt the full frame");
+                    assert!(app.neighbor_graveyard.base.is_some());
+                    assert_eq!(app.neighbor_graveyard.siblings.len(), 1);
                 }
                 let warmed = app.proof_navigation_scene();
                 let mut models = app.theme_models(&handle).unwrap().unwrap();

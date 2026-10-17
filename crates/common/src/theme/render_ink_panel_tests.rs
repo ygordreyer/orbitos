@@ -30,6 +30,59 @@ fn input(theme: &ThemeHandle, selected: usize, arts: &[Arc<Pixmap>]) -> FrameInp
 }
 
 #[test]
+fn panelcache_artwork_damage_covers_every_changed_pixel_and_replays_on_display() {
+    let arts = arts();
+    for id in ["compact-plus", "big-picture"] {
+        for shape in ["square", "tall"] {
+            let theme = theme(id, shape);
+            for entry_cover in [false, true] {
+                let mut input = input(&theme, 0, &arts);
+                input.art.selected_cover = None;
+                input.art.selected_logo = Some(arts[1].clone());
+                if !entry_cover { input.art.entries.clear(); }
+                let mut frame = draw(&theme, &input, None);
+                let mut display = crate::theme::render::tests::TestDisplay(frame.pixels.as_ref().to_owned());
+                for binding in [Binding::SelectedCover, Binding::SelectedCover, Binding::SelectedCover,
+                    Binding::SelectedLogo, Binding::SelectedHero] {
+                    let before = frame.pixels.data().to_vec();
+                    match binding {
+                        Binding::SelectedCover => input.art.selected_cover = match &input.art.selected_cover {
+                            None => Some(arts[0].clone()),
+                            Some(cover) if Arc::ptr_eq(cover, &arts[0]) => Some(arts[2].clone()),
+                            _ => None,
+                        },
+                        Binding::SelectedLogo => input.art.selected_logo = Some(arts[2].clone()),
+                        _ => input.art.selected_hero = Some(arts[2].clone()),
+                    }
+                    frame = draw(&theme, &input, Some(frame));
+                    identical(&frame, &input);
+                    for (index, (old, new)) in before.chunks_exact(4).zip(frame.pixels.data().chunks_exact(4)).enumerate() {
+                        let (x, y) = (index as u32 % 640, index as u32 / 640);
+                        assert!(old == new || frame.damage.iter().any(|r|
+                            x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3),
+                            "{id} {shape} entry_cover={entry_cover} {binding:?}: uncovered change at {x},{y}: {:?}", frame.damage);
+                    }
+                    frame.paint_damage(&mut display);
+                    assert_eq!(display.0.data(), frame.pixels.data(), "{id} {shape} {binding:?}");
+                    if binding == Binding::SelectedCover && entry_cover {
+                        let cover = theme.pack().screens[&ScreenId::Recents].components.iter()
+                            .find(|c| c.binding == Some(Binding::SelectedCover)).unwrap();
+                        assert_eq!(frame.damage, vec![effects::paint_bounds(cover)]);
+                    }
+                }
+                input.art.selected_cover = Some(arts[0].clone());
+                input.art.selected_logo = Some(arts[1].clone());
+                input.text.insert(Binding::SelectedTitle, "Simultaneous title and artwork change".into());
+                frame = draw(&theme, &input, Some(frame));
+                identical(&frame, &input);
+                frame.paint_damage(&mut display);
+                assert_eq!(display.0.data(), frame.pixels.data());
+            }
+        }
+    }
+}
+
+#[test]
 fn panelcache_down_up_matches_full_cold_frame_and_skips_layers() {
     probe(|| {
         let arts = arts();
@@ -145,6 +198,51 @@ fn altered_theme(change: impl FnOnce(&mut Vec<Component>)) -> ThemeHandle {
     let mut snapshot = ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap();
     change(&mut Arc::get_mut(&mut snapshot.0).unwrap().pack.screens.get_mut(&ScreenId::Recents).unwrap().components);
     ThemeHandle::prepare(snapshot, &bank, 92).unwrap()
+}
+
+#[test]
+fn panelcache_cover_damage_reconstructs_later_static_decoration() {
+    probe(|| {
+        let decoration = Rect(448, 300, 20, 20);
+        let theme = altered_theme(|cs| {
+            let mut panel = cs.iter().find(|c| c.kind == Kind::Panel).unwrap().clone();
+            panel.id = "later-decoration".into();
+            panel.binding = None;
+            panel.rect = decoration;
+            panel.radius = Some(0);
+            cs.push(panel);
+        });
+        let arts = arts();
+        let mut input = input(&theme, 0, &arts);
+        let cover = theme.pack().screens[&ScreenId::Recents].components.iter()
+            .find(|c| c.binding == Some(Binding::SelectedCover)).unwrap();
+        let cover_bounds = effects::paint_bounds(cover);
+        assert!(!overlap(cover_bounds, decoration));
+        let mut frame = draw(&theme, &input, None);
+        let operations = &frame.ink_cache.plan.as_ref().unwrap().operations;
+        let group = operations.iter().position(|op| matches!(op.paint, Paint::Panel { .. })).unwrap();
+        let later = operations.iter().position(|op| op.component.id == "later-decoration").unwrap();
+        assert!(later > group && inside(operations[group].bounds, decoration));
+        identical(&frame, &input);
+        let mut display = crate::theme::render::tests::TestDisplay(frame.pixels.as_ref().to_owned());
+        for (art, hit) in [(2, false), (0, true), (2, true)] {
+            let before = frame.pixels.data().to_vec();
+            input.art.selected_cover = Some(arts[art].clone());
+            frame = draw(&theme, &input, Some(frame));
+            assert_eq!(count(Count::PanelHit), u64::from(hit));
+            identical(&frame, &input);
+            assert_eq!(frame.damage, vec![cover_bounds]);
+            assert_ne!(before, frame.pixels.data(), "replacement must change visible pixels");
+            for (index, (old, new)) in before.chunks_exact(4).zip(frame.pixels.data().chunks_exact(4)).enumerate() {
+                let (x, y) = (index as u32 % 640, index as u32 / 640);
+                assert!(old == new || frame.damage.iter().any(|r|
+                    x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3),
+                    "uncovered change at {x},{y}: {:?}", frame.damage);
+            }
+            frame.paint_damage(&mut display);
+            assert_eq!(display.0.data(), frame.pixels.data());
+        }
+    });
 }
 
 #[test]

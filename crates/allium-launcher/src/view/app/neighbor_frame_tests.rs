@@ -19,7 +19,7 @@ fn input(theme: &common::theme::ThemeHandle, selected: usize) -> FrameInputs {
 fn neighbor(base: &PreparedFrame, input: &FrameInputs) -> PreparedNeighbor {
     let (frame, charge) = base.prepare_neighbor(input, NEIGHBOR_LIMIT).unwrap().unwrap();
     PreparedNeighbor { base: base.navigation_stamp(), frame, charge, generation: NeighborGeneration {
-        media: 0, names: 0, metadata: 0, adoption: 0, artwork: 0, locale: 0, consoles: 0, language: String::new(),
+        media: 0, names: 0, metadata: 0, adoption: 0, artwork: 0, locale: 0, consoles: 0, language: "en-US".parse().unwrap(),
     } }
 }
 fn identical(frame: &PreparedFrame, theme: &common::theme::ThemeHandle, input: &FrameInputs) {
@@ -43,11 +43,16 @@ fn frameprep_adopts_only_the_clean_displayed_base_and_discards_sibling_damage() 
     let sibling = neighbor(&base, &input(&theme, 5));
     let mut slots = vec![candidate, sibling];
     let mut adopted = false;
+    let mut graveyard = NeighborGraveyard::default();
     let frames = prepare_theme_frames(&theme, std::slice::from_ref(&next), vec![base], &mut None,
-        &mut slots, Some(&displayed), &mut adopted).unwrap();
+        &mut slots, &mut graveyard, Some(&displayed), &mut adopted).unwrap();
     assert!(adopted);
     assert!(frames[0].navigation_is_current(&adopted_stamp));
     assert!(slots.is_empty());
+    assert!(graveyard.base.is_some());
+    assert_eq!(graveyard.siblings.len(), 1);
+    graveyard.clear();
+    assert!(graveyard.base.is_none() && graveyard.siblings.is_empty());
     identical(&frames[0], &theme, &next);
     assert!(!frames[0].navigation_is_current(&displayed));
 }
@@ -75,7 +80,7 @@ fn frameprep_wrong_base_repairs_repeat_batches_and_overlay_stacks_fall_back() {
             _ => unreachable!(),
         }
         let mut adopted = true;
-        let frames = prepare_theme_frames(&theme, &models, vec![base], &mut None, &mut slots, displayed, &mut adopted).unwrap();
+        let frames = prepare_theme_frames(&theme, &models, vec![base], &mut None, &mut slots, &mut NeighborGraveyard::default(), displayed, &mut adopted).unwrap();
         assert!(!adopted, "{case} retained adoption flag");
         assert!(!frames[0].navigation_is_current(&candidate_stamp), "{case}");
         assert!(slots.is_empty(), "{case}");
@@ -107,23 +112,24 @@ fn frameprep_eager_generation_checks_reject_equal_visible_value_changes() {
     map.insert(crate::consoles::ConsoleMapper::new());
     let res = Resources::new(map);
     for change in ["media", "metadata", "locale revision", "console revision", "language"] {
-        let before = NeighborGeneration::current(&res);
+        let before = NeighborGeneration::current(&res, res.get::<Locale>().lang.clone());
+        assert_eq!(before.borrowed(), NeighborGeneration::current(&res, &res.get::<Locale>().lang));
         match change {
             "media" => common::media::invalidate(),
             "metadata" => super::super::details::invalidate_metadata(),
             "locale revision" => res.insert(Locale::new("en-US")),
             "console revision" => res.insert(crate::consoles::ConsoleMapper::new()),
-            "language" => res.insert(Locale::new("pt-BR")),
+            "language" => res.0.borrow_mut().get_mut::<Locale>().unwrap().lang = "pt-BR".parse().unwrap(),
             _ => unreachable!(),
         }
-        assert_ne!(before, NeighborGeneration::current(&res), "{change}");
+        assert_ne!(before, NeighborGeneration::current(&res, res.get::<Locale>().lang.clone()), "{change}");
     }
 }
 
 #[test]
 fn frameptr_empty_preparation_resets_presentation_flag() {
     let mut adopted = true;
-    let frames = prepare_theme_frames(&theme(), &[], vec![], &mut None, &mut vec![], None, &mut adopted).unwrap();
+    let frames = prepare_theme_frames(&theme(), &[], vec![], &mut None, &mut vec![], &mut NeighborGraveyard::default(), None, &mut adopted).unwrap();
     assert!(frames.is_empty());
     assert!(!adopted);
 }

@@ -7,9 +7,10 @@ use std::{
 };
 
 const COUNT_LEN: usize = 43;
-const STAGE_NAMES: [&str; 15] = [
+const STAGE_NAMES: [&str; 25] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
+    "frame_model", "frame_normalize", "neighbor_generation", "neighbor_filter", "neighbor_search", "retained_compare", "neighbor_misses", "neighbor_clear", "frame_retire", "frame_readiness",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1037,6 +1038,16 @@ pub enum Stage {
     SnapshotCapture,
     SnapshotRestore,
     SemanticModel,
+    FrameModel,
+    FrameNormalize,
+    NeighborGeneration,
+    NeighborFilter,
+    NeighborSearch,
+    RetainedCompare,
+    NeighborMisses,
+    NeighborClear,
+    FrameRetire,
+    FrameReadiness,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -1137,6 +1148,16 @@ mod latency_stage_tests {
             Stage::ArtworkLookup,
             Stage::Layout,
             Stage::SemanticModel,
+            Stage::FrameModel,
+            Stage::FrameNormalize,
+            Stage::NeighborGeneration,
+            Stage::NeighborFilter,
+            Stage::NeighborSearch,
+            Stage::RetainedCompare,
+            Stage::NeighborMisses,
+            Stage::NeighborClear,
+            Stage::FrameRetire,
+            Stage::FrameReadiness,
             Stage::Raster,
             Stage::Present,
             Stage::ShadowGaussian,
@@ -1165,6 +1186,16 @@ mod latency_stage_tests {
             "artwork_lookup",
             "layout",
             "semantic_model",
+            "frame_model",
+            "frame_normalize",
+            "neighbor_generation",
+            "neighbor_filter",
+            "neighbor_search",
+            "retained_compare",
+            "neighbor_misses",
+            "neighbor_clear",
+            "frame_retire",
+            "frame_readiness",
             "raster",
             "present",
         ] {

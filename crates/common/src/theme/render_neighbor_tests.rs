@@ -219,3 +219,83 @@ fn retained_model_requires_every_original_artwork_object() {
         assert!(retained::restore_model(&saved).is_none(), "{expired}");
     }
 }
+
+#[test]
+fn proofcut_borrowed_comparison_equals_clone_for_every_frame_input_field() {
+    use crate::theme::frame::{DetailLine, Hint, Pagination};
+    let input = FrameInputs::new(ScreenId::Recents);
+    let saved = retained::capture(&input);
+    assert!(retained::matches(&saved, &input));
+    assert!(retained::matches_cloned(&saved, &input));
+    let row = || Row { id: "id".into(), label: "label".into(), subtitle: "sub".into(),
+        value: "value".into(), enabled: true };
+    let changes: &[(&str, fn(&mut FrameInputs))] = &[
+        ("screen", |m| m.screen = ScreenId::Library),
+        ("raster_revision", |m| m.raster_revision = Some("revision".into())),
+        ("text", |m| { m.text.insert(Binding::Title, "title".into()); }),
+        ("rows", |m| { m.rows.insert(Binding::Entries, vec![]); }),
+        ("selected", |m| { m.selected.insert(Binding::Entries, "id".into()); }),
+        ("pagination", |m| m.pagination = Some(Pagination { page: 1, total: 2 })),
+        ("detail_lines", |m| m.detail_lines.push(DetailLine { text: "text".into(), heading: true, gap_before: 2 })),
+        ("metadata", |m| m.metadata.push(("key".into(), "value".into()))),
+        ("facts", |m| m.facts.push(("key".into(), "value".into()))),
+        ("navigation", |m| { m.navigation.insert(crate::theme::pack::NavGroup::Primary, vec![]); }),
+        ("focus", |m| m.focus.component = "entries".into()),
+        ("hints", |m| m.hints.push(Hint { button: "A".into(), label: "Play".into() })),
+        ("suppress_hints", |m| m.suppress_hints = true),
+        ("status", |m| m.status.clock = Some("12:34".into())),
+        ("progress", |m| m.progress = Some(0.5)),
+        ("keyboard", |m| m.keyboard.push("key".into())),
+        ("keyboard_cursor", |m| m.keyboard_cursor = (1, 0)),
+        ("art", |m| m.art.next_cover_expected = true),
+    ];
+    for (name, change) in changes {
+        let mut actual = input.clone();
+        change(&mut actual);
+        assert!(!retained::matches(&saved, &actual), "{name}");
+        assert_eq!(retained::matches(&saved, &actual), retained::matches_cloned(&saved, &actual), "{name}");
+    }
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    let mut populated = model(&theme, ScreenId::Recents, 1, &arts);
+    populated.detail_lines.push(DetailLine { text: "detail".into(), heading: false, gap_before: 1 });
+    populated.metadata.push(("label".into(), "value".into()));
+    populated.facts = populated.metadata.clone();
+    populated.keyboard.push("key".into());
+    populated.hints = vec![Hint { button: "A".into(), label: "Play".into() }];
+    populated.navigation.insert(crate::theme::pack::NavGroup::Primary, vec![row()]);
+    let saved = retained::capture(&populated);
+    assert!(retained::matches(&saved, &populated));
+    let changes: &[(&str, fn(&mut FrameInputs))] = &[
+        ("row id", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].id.push('x')),
+        ("row label", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].label.push('x')),
+        ("row subtitle", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].subtitle.push('x')),
+        ("row value", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].value.push('x')),
+        ("row enabled", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].enabled = false),
+        ("navigation row", |m| m.navigation.get_mut(&crate::theme::pack::NavGroup::Primary).unwrap()[0].label.push('x')),
+        ("focus item", |m| m.focus.item = Some("other".into())),
+        ("battery", |m| m.status.battery = Some(1)),
+        ("charging", |m| m.status.charging = true),
+        ("network", |m| m.status.network = Some("network".into())),
+        ("detail text", |m| m.detail_lines[0].text.push('x')),
+        ("detail heading", |m| m.detail_lines[0].heading = true),
+        ("detail gap", |m| m.detail_lines[0].gap_before += 1),
+        ("metadata label", |m| m.metadata[0].0.push('x')),
+        ("metadata value", |m| m.metadata[0].1.push('x')),
+        ("facts label", |m| m.facts[0].0.push('x')),
+        ("facts value", |m| m.facts[0].1.push('x')),
+        ("hint button", |m| m.hints[0].button.push('x')),
+        ("hint label", |m| m.hints[0].label.push('x')),
+        ("keyboard text", |m| m.keyboard[0].push('x')),
+        ("art identity", |m| m.art.selected_cover = Some(std::sync::Arc::new(Pixmap::new(1, 1).unwrap()))),
+    ];
+    for (name, change) in changes {
+        let mut actual = populated.clone();
+        change(&mut actual);
+        assert!(!retained::matches(&saved, &actual), "{name}");
+        assert_eq!(retained::matches(&saved, &actual), retained::matches_cloned(&saved, &actual), "{name}");
+    }
+    populated.art.completed_misses.selected_logo = !populated.art.completed_misses.selected_logo;
+    assert!(retained::matches(&saved, &populated), "misses are checked separately by neighbor_matches");
+    assert!(retained::matches_cloned(&saved, &populated));
+}

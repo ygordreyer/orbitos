@@ -529,13 +529,14 @@ fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
         base.paint(&mut display);
         display.flush().unwrap();
         let revision = display.composition_revision().unwrap();
+        let mut graveyard = Vec::new();
         // Include direction reversal, a viewport shift, and hits without intervening idle work.
         for (step, selected) in [1, 0, 7, 8, 3, 12, 1].into_iter().enumerate() {
             let next = model(&theme, ScreenId::Recents, selected, &arts);
             let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
             let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
             let prepared_pointer = candidate.pixels().data().as_ptr();
-            candidate.recycle_neighbor_base(base);
+            graveyard.push(candidate.recycle_neighbor_base(base));
             // Pan after preparation. Repair must still use the complete logical candidate base.
             let page = (step % 2) as u32;
             OBSERVED.with(|state| state.borrow_mut().0.yoffset = page * 480);
@@ -570,7 +571,7 @@ fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
             let next = model(&theme, ScreenId::Recents, 2, &arts);
             let (mut hit, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap()
                 .unwrap_or_else(|| panic!("{name} {change}: {:?}, {}", base.neighbor_charge(&next), base.neighbor_ineligible_reason()));
-            hit.recycle_neighbor_base(base);
+            let _retired = hit.recycle_neighbor_base(base);
             let damage = hit.adopt_neighbor_damage(&mut display).unwrap();
             display.flush_rects(&damage).unwrap();
             current = next;
