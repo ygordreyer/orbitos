@@ -16,7 +16,8 @@ const MAGIC: &[u8; 8] = b"ALORART\0";
 const TRANSFORM_VERSION: u32 = 3;
 const HEADER_BYTES: usize = 84;
 const DISK_BYTES: u64 = 16 * 1024 * 1024;
-use crate::network_library::RESERVE_BYTES;
+// Art writes only need room to keep the card usable, not the network-library ROM reserve.
+const ART_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const WRITE_MARGIN: u64 = 1024 * 1024;
 static WRITER: Mutex<()> = Mutex::new(());
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -260,7 +261,7 @@ fn admitted(available: u64, incoming: u64, block: u64) -> bool {
         .and_then(|n| n.checked_mul(block))
         .and_then(|n| n.checked_add(WRITE_MARGIN))
         .and_then(|n| available.checked_sub(n))
-        .is_some_and(|remaining| remaining >= RESERVE_BYTES)
+        .is_some_and(|remaining| remaining >= ART_RESERVE_BYTES)
 }
 #[cfg(test)]
 thread_local! { static INVENTORY_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -272,6 +273,7 @@ fn prepare_write(
     let now = SystemTime::now();
     let mut total = 0u64;
     let mut candidates = Vec::new();
+    let mut evictable = 0u64;
     #[cfg(test)]
     INVENTORY_PASSES.with(|n| n.set(n.get() + 1));
     for entry in fs::read_dir(dir)? {
@@ -282,23 +284,30 @@ fn prepare_write(
         }
         let metadata = entry.metadata()?;
         let modified = metadata.modified()?;
-        if temp_file(&path) && now.duration_since(modified).is_ok_and(|age| age > Duration::from_secs(60)) {
-            fs::remove_file(path)?;
-            continue;
-        }
+        let stale = temp_file(&path) && now.duration_since(modified).is_ok_and(|age| age > Duration::from_secs(60));
         total = total.saturating_add(metadata.len());
-        if cache_file(&path) { candidates.push((modified, path, metadata.len())); }
+        if cache_file(&path) || stale {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = metadata.blocks().saturating_mul(512);
+            evictable = evictable.saturating_add(allocated);
+            candidates.push((!stale, modified, path, metadata.len(), allocated));
+        }
     }
-    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
     let mut candidates = candidates.into_iter();
     loop {
         let Some((available, block)) = space() else { return Ok(false); };
-        if total.saturating_add(incoming) <= DISK_BYTES && admitted(available, incoming, block) {
+        if !admitted(available.saturating_add(evictable), incoming, block) {
+            return Ok(false);
+        }
+        if total.saturating_add(incoming) <= DISK_BYTES && admitted(available, incoming, block)
+            && candidates.as_slice().first().is_none_or(|candidate| candidate.0) {
             return Ok(true);
         }
-        let Some((_, path, bytes)) = candidates.next() else { return Ok(false); };
+        let Some((_, _, path, bytes, allocated)) = candidates.next() else { return Ok(false); };
         fs::remove_file(path)?;
         total = total.saturating_sub(bytes);
+        evictable = evictable.saturating_sub(allocated);
     }
 }
 
@@ -413,12 +422,38 @@ mod tests {
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]
+    fn wave2_low_space_preserves_cache_entries() {
+        let dir = Fixture::new();
+        let entry = dir.0.join(format!("{:064x}.rgba", 0));
+        fs::write(&entry, b"cached pixels").unwrap();
+        let stale = dir.0.join(".stale.tmp");
+        fs::write(&stale, b"stale pixels").unwrap();
+        File::options().write(true).open(&stale).unwrap().set_times(
+            fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(61)),
+        ).unwrap();
+        assert!(!prepare_write(&dir.0, 100, || Some((128 * 1024 * 1024, 4096))).unwrap());
+        assert_eq!(fs::read(&entry).unwrap(), b"cached pixels");
+        assert_eq!(fs::read(&stale).unwrap(), b"stale pixels");
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn wave2_space_between_art_and_network_reserves_admits_publication() {
+        let dir = Fixture::new();
+        let key = dir.key(b"source");
+        let image = Pixmap::new(3, 2).unwrap();
+        let available = 512 * 1024 * 1024;
+        assert!(available < crate::network_library::RESERVE_BYTES);
+        key.publish_with_space(&dir.0, &image, |_| Some((available, 4096))).unwrap();
+        assert_eq!(key.load(&dir.0).unwrap().data(), image.data());
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
     fn reserve_admission_rounds_allocation_and_fails_closed() {
         let incoming = 4097;
-        let exact = RESERVE_BYTES + WRITE_MARGIN + 8192;
+        let exact = ART_RESERVE_BYTES + WRITE_MARGIN + 8192;
         assert!(admitted(exact, incoming, 4096));
         assert!(!admitted(exact - 1, incoming, 4096));
-        assert!(!admitted(RESERVE_BYTES, incoming, 4096));
+        assert!(!admitted(ART_RESERVE_BYTES, incoming, 4096));
         assert!(!admitted(u64::MAX, incoming, 0));
         assert!(!admitted(u64::MAX, u64::MAX, 4096));
         let dir = Fixture::new();
@@ -432,7 +467,7 @@ mod tests {
         let dir = Fixture::new();
         let key = dir.key(b"source");
         let image = Pixmap::new(3, 2).unwrap();
-        key.publish_with_space(&dir.0, &image, |_| Some((RESERVE_BYTES, 4096)))
+        key.publish_with_space(&dir.0, &image, |_| Some((ART_RESERVE_BYTES, 4096)))
             .unwrap();
         key.publish_with_space(&dir.0, &image, |_| None).unwrap();
         assert!(!key.path(&dir.0).exists());
@@ -449,7 +484,7 @@ mod tests {
         let key = fixture.key(b"source");
         let dir = fixture.0.join("missing/cache");
         key.publish_with_space(&dir, &Pixmap::new(3, 2).unwrap(), |_| {
-            Some((RESERVE_BYTES, 4096))
+            Some((ART_RESERVE_BYTES, 4096))
         })
         .unwrap();
         assert!(!dir.join(".cache.lock").exists());
@@ -472,7 +507,7 @@ mod tests {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
         let dir = fixture.0.join("missing/cache");
-        let exact = RESERVE_BYTES + WRITE_MARGIN + 3 * 4096;
+        let exact = ART_RESERVE_BYTES + WRITE_MARGIN + 3 * 4096;
         key.publish_with_space(&dir, &Pixmap::new(3, 2).unwrap(), |_| {
             Some((exact - 1, 4096))
         })
@@ -496,7 +531,7 @@ mod tests {
         let fixture = Fixture::new();
         let key = fixture.key(b"source");
         let image = Pixmap::new(3, 2).unwrap();
-        let exact = RESERVE_BYTES + WRITE_MARGIN + 4096;
+        let exact = ART_RESERVE_BYTES + WRITE_MARGIN + 4096;
         key.publish_with_space(&fixture.0, &image, |_| Some((exact - 1, 4096)))
             .unwrap();
         assert!(!fixture.0.join(".cache.lock").exists());
@@ -653,7 +688,7 @@ mod tests {
         fs::write(&entry, vec![0; 8192]).unwrap();
         let image = Pixmap::new(32, 32).unwrap();
         let incoming = HEADER_BYTES as u64 + image.data().len() as u64;
-        let available = RESERVE_BYTES + WRITE_MARGIN;
+        let available = ART_RESERVE_BYTES + WRITE_MARGIN;
         assert!(!admitted(available, incoming, 4096));
         assert!(admitted(available + 8192, incoming, 4096));
         let mut checks = 0;
@@ -672,16 +707,16 @@ mod tests {
     fn reserve_pressure_evicts_then_rechecks_actual_free_space() {
         let dir = Fixture::new();
         let entry = dir.0.join(format!("{}.rgba", "0".repeat(64)));
-        fs::write(&entry, b"old").unwrap();
+        fs::write(&entry, vec![0; (WRITE_MARGIN + 4096) as usize]).unwrap();
         let mut checks = 0;
         assert!(
             prepare_write(&dir.0, 100, || {
                 checks += 1;
                 Some((
                     if entry.exists() {
-                        RESERVE_BYTES
+                        ART_RESERVE_BYTES
                     } else {
-                        RESERVE_BYTES + WRITE_MARGIN + 4096
+                        ART_RESERVE_BYTES + WRITE_MARGIN + 4096
                     },
                     4096,
                 ))
@@ -794,7 +829,7 @@ mod tests {
                     checks += 1;
                     Some((
                         if checks == denied_check {
-                            2_162_688 * 1024
+                            ART_RESERVE_BYTES
                         } else {
                             u64::MAX
                         },
@@ -827,7 +862,7 @@ mod dl8_tests {
     use super::*;
     #[test]
     fn dl8_art_floor_boundary() {
-        let floor = 2_162_688 * 1024;
+        let floor = ART_RESERVE_BYTES;
         let cost = WRITE_MARGIN + 4096;
         assert!(!admitted(floor - 1, 1, 4096));
         assert!(!admitted(floor, 1, 4096));

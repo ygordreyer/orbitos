@@ -8,6 +8,7 @@ use std::{
 
 const COUNT_LEN: usize = 23;
 const LOG_LIMIT: u64 = 256 * 1024;
+static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy)]
 pub enum Phase {
     Input,
@@ -85,6 +86,9 @@ struct Trace {
     damage_pixels: u64,
     render_reason: &'static str,
     present_reason: &'static str,
+    content_pending_reason: &'static str,
+    next_cover_expected: bool,
+    missing_content_rows: usize,
 }
 thread_local! {
     static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
@@ -137,6 +141,9 @@ fn install(path: &str) -> std::io::Result<()> {
             damage_pixels: 0,
             render_reason: "none",
             present_reason: "none",
+            content_pending_reason: "ready",
+            next_cover_expected: false,
+            missing_content_rows: 0,
         })
     });
     Ok(())
@@ -329,8 +336,13 @@ fn append_bounded(file: &mut File, line: &[u8]) -> std::io::Result<()> {
     append_line(file, line, true)
 }
 fn append_line(file: &mut File, line: &[u8], rolling: bool) -> std::io::Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            DROPPED_TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        return Err(error);
     }
     let result = (|| {
         if file.metadata()?.len().saturating_add(line.len() as u64) > LOG_LIMIT {
@@ -383,6 +395,38 @@ pub fn network_event(event: &'static str, cause: &'static str, active: Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wave2_contended_append_drops_whole_record_and_later_frame_reports_it() {
+        let path = std::env::temp_dir().join(format!("allium-wave2-lock-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        let before = probe_counts()["measurement"]["dropped_trace_lines"].as_u64().unwrap_or(0);
+        let holder = OpenOptions::new().append(true).open(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let (ready, wait) = std::sync::mpsc::channel();
+        let target = path.clone();
+        let worker = std::thread::spawn(move || {
+            let mut file = OpenOptions::new().append(true).open(target).unwrap();
+            ready.send(()).unwrap();
+            let start = Instant::now();
+            append_line(&mut file, b"{\"event\":\"must_drop\"}\n", true).unwrap();
+            start.elapsed()
+        });
+        wait.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let while_locked = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let elapsed = worker.join().unwrap();
+        let after_append = std::fs::read_to_string(&path).unwrap();
+        drawn_frame();
+        let data = std::fs::read_to_string(&path).unwrap();
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+        assert!(elapsed < std::time::Duration::from_millis(100), "contended append waited {elapsed:?}");
+        assert!(while_locked.is_empty());
+        assert!(after_append.is_empty(), "a dropped record must not publish any bytes");
+        let row: serde_json::Value = serde_json::from_str(data.trim()).unwrap();
+        assert!(row["measurement"]["dropped_trace_lines"].as_u64().unwrap() > before);
+    }
     #[test]
     fn dl12_render_wall_excludes_input_wait_and_each_attempt_resets() {
         let path =
@@ -946,6 +990,10 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
     let input = t.completed_input.unwrap_or_else(|| input_totals(t));
     serde_json::json!({
         "selection_generation": t.generation, "viewport_shift": t.viewport_shift,
+        "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
+        "content_pending_reason": t.content_pending_reason,
+        "next_cover_expected": t.next_cover_expected,
+        "missing_content_rows": t.missing_content_rows,
         "first_feedback_monotonic_us": t.first_feedback_us,
         "final_content_monotonic_us": t.final_content_us,
         "first_feedback_us": (t.first_feedback_us != 0).then(|| t.first_feedback_us.saturating_sub(t.input_us)),
@@ -960,6 +1008,16 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
 
 fn input_totals(t: &Trace) -> InputTotals {
     InputTotals { stages: t.stages, cpu: t.input_cpu, counts: t.input_counts }
+}
+
+pub fn content_readiness(reason: &'static str, next_cover_expected: bool, missing_rows: usize) {
+    TRACE.with(|state| {
+        if let Some(t) = state.borrow_mut().as_mut() {
+            t.content_pending_reason = reason;
+            t.next_cover_expected = next_cover_expected;
+            t.missing_content_rows = missing_rows;
+        }
+    });
 }
 
 /// The current input sequence is shared by controller selection and foreground tasks.

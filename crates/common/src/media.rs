@@ -617,6 +617,21 @@ fn load_source(path: &Path, cache: &mut Cache) {
 
 // A single worker and a bounded queue keep both outstanding XML and completion payloads bounded.
 const INDEX_WORKER_BUDGET: usize = 1024 * 1024;
+#[cfg(test)]
+static INDEX_PRIORITY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn index_background_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+            log::warn!("Cannot lower media index worker priority: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(test)]
+    {
+        assert_eq!(std::thread::current().name(), Some("media-names"));
+        INDEX_PRIORITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 type IndexJob = (PathBuf, usize, u64, Option<Fingerprint>);
 type IndexDone = (PathBuf, Option<NameIndex>, u64);
 struct IndexWorker {
@@ -640,6 +655,7 @@ impl IndexWorker {
         std::thread::Builder::new()
             .name("media-names".into())
             .spawn(move || {
+                index_background_priority();
                 while let Ok((path, budget, epoch, previous)) = jobs.recv() {
                     let current = stat(&path)
                         .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
@@ -1088,6 +1104,14 @@ mod tests {
                 fs::copy(e.path(), to.join(e.file_name())).unwrap();
             }
         }
+    }
+    #[test]
+    fn wave2_metadata_worker_lowers_priority_before_processing() {
+        let before = INDEX_PRIORITY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let worker = IndexWorker::new();
+        worker.send.send((PathBuf::from("/missing-wave2-name-index.xml"), 4096, 0, None)).unwrap();
+        worker.recv.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(INDEX_PRIORITY_CALLS.load(std::sync::atomic::Ordering::Relaxed) > before);
     }
     #[test]
     fn adopted_game_paths_obey_resolve_cache_limit() {

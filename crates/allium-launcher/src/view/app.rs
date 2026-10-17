@@ -52,33 +52,39 @@ pub(super) fn theme_content_complete(
     input: &common::theme::frame::FrameInputs,
     handle: &common::theme::ThemeHandle,
 ) -> bool {
+    theme_content_pending::<false>(input, handle).is_none()
+}
+
+fn theme_content_pending<const DIAGNOSE_ROWS: bool>(
+    input: &common::theme::frame::FrameInputs,
+    handle: &common::theme::ThemeHandle,
+) -> Option<(&'static str, usize)> {
     use common::theme::pack::{Arrangement, Binding, Kind};
     let has_rows = input.rows.values().any(|rows| !rows.is_empty());
     if !has_rows && input.selected.is_empty() {
-        return true;
+        return None;
     }
     handle.pack().screens[&input.screen]
         .components
         .iter()
-        .all(|c| {
+        .find_map(|c| {
             if c.layout == Some(Arrangement::Hidden) {
-                return true;
+                return None;
             }
             let logo_suppressed = common::theme::logo_suppressed_by_cover(c, input);
             if c.logo && !logo_suppressed && input.art.selected_logo.is_none() && !input.art.completed_misses.selected_logo {
-                return false;
+                return Some(("logo", 0));
             }
             if c.kind == Kind::Image {
-                match c.binding {
-                    Some(Binding::NextCover) => {
-                        return !input.art.next_cover_expected || input.art.next_cover.is_some()
-                            || input.art.completed_misses.next_cover;
-                    }
-                    Some(Binding::SelectedCover) => return input.art.selected_cover.is_some() || input.art.completed_misses.selected_cover,
-                    Some(Binding::SelectedHero) => return input.art.selected_hero.is_some() || input.art.completed_misses.selected_hero,
-                    Some(Binding::SelectedLogo) => return logo_suppressed || input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo,
-                    _ => {}
-                }
+                let (ready, reason) = match c.binding {
+                    Some(Binding::NextCover) => (!input.art.next_cover_expected || input.art.next_cover.is_some()
+                        || input.art.completed_misses.next_cover, "next_cover"),
+                    Some(Binding::SelectedCover) => (input.art.selected_cover.is_some() || input.art.completed_misses.selected_cover, "selected_cover"),
+                    Some(Binding::SelectedHero) => (input.art.selected_hero.is_some() || input.art.completed_misses.selected_hero, "selected_hero"),
+                    Some(Binding::SelectedLogo) => (logo_suppressed || input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo, "selected_logo"),
+                    _ => (true, ""),
+                };
+                return (!ready).then_some((reason, 0));
             }
             if c.kind == Kind::Entries
                 && c.layout == Some(Arrangement::Shelf)
@@ -87,21 +93,19 @@ pub(super) fn theme_content_complete(
                 && input.art.next_cover.is_none()
                 && !input.art.completed_misses.next_cover
             {
-                return false;
+                return Some(("peek", 0));
             }
             if c.kind == Kind::Entries
                 && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
             {
-                return c
-                    .binding
-                    .and_then(|binding| input.rows.get(&binding))
-                    .is_none_or(|rows| {
-                        rows.iter()
-                            .all(|row| input.art.entries.contains_key(&row.id)
-                                || input.art.completed_misses.entries.contains(&row.id))
-                    });
+                if let Some(rows) = c.binding.and_then(|binding| input.rows.get(&binding)) {
+                    let mut missing = rows.iter().filter(|row| !input.art.entries.contains_key(&row.id)
+                        && !input.art.completed_misses.entries.contains(&row.id));
+                    let count = if DIAGNOSE_ROWS { missing.count() } else { usize::from(missing.next().is_some()) };
+                    if count != 0 { return Some(("rows", count)); }
+                }
             }
-            true
+            None
         })
 }
 
@@ -767,6 +771,9 @@ where
         use common::theme::render::PreparedFrame;
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             self.content_complete = true;
+            if common::perf_trace::recording() {
+                common::perf_trace::content_readiness("ready", false, 0);
+            }
             if self.had_theme {
                 self.views.0.clear_theme()?;
                 self.views.1.clear_theme()?;
@@ -786,6 +793,14 @@ where
         self.content_complete = models.as_ref().is_none_or(|models| {
             models.iter().all(|input| theme_content_complete(input, &handle))
         });
+        if common::perf_trace::recording() {
+            let pending = models.as_ref().and_then(|models| models.iter()
+                .find_map(|input| theme_content_pending::<true>(input, &handle)));
+            let next_cover_expected = models.as_ref().is_some_and(|models| models.iter()
+                .any(|input| input.art.next_cover_expected));
+            common::perf_trace::content_readiness(pending.map_or("ready", |p| p.0),
+                next_cover_expected, pending.map_or(0, |p| p.1));
+        }
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
             let mut previous = self

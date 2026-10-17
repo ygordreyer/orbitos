@@ -471,7 +471,9 @@ impl AlliumLauncher<DefaultPlatform> {
         tx: &tokio::sync::mpsc::Sender<Command>,
         rx: &tokio::sync::mpsc::Receiver<Command>,
     ) -> Result<usize> {
-        let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
+        let _phase = (!matches!(first,
+            KeyEvent::Released(Key::L | Key::R | Key::Left | Key::Right | Key::Up | Key::Down)
+        )).then(|| common::perf_trace::phase(common::perf_trace::Phase::Input));
         let repeat_key = match first {
             KeyEvent::Autorepeat(_) => navigation_key(first),
             _ => None,

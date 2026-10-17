@@ -88,7 +88,8 @@ async fn completed_cover_and_logo_misses_record_final_content_without_presenting
     assert_eq!(
         finals.len(),
         1,
-        "completed cover and logo misses must settle final_content"
+        "completed cover and logo misses must settle final_content: {}",
+        common::perf_trace::probe_counts()["measurement"]
     );
     assert_eq!(finals[0]["selection_generation"], 41);
     assert!(
@@ -180,5 +181,60 @@ async fn compact_plus_three_warm_games_present_once_per_down_press() {
             app.present_frame(false, &mut false).await.unwrap();
             assert!(app.display.take_presented_frames().is_empty());
         }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn right_release_preserves_pending_press_measurement() {
+    let (dir, mut app) = missing_art_launcher();
+    let path = dir.0.join("release.trace");
+    trace_first_frame(&mut app, &path).await;
+    let before = common::perf_trace::probe_counts()["measurement"].clone();
+    assert!(before["first_feedback_monotonic_us"].as_u64().unwrap() > 0);
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let mut keys = EnumMap::default();
+    keys[Key::Right] = true;
+    for key in [Key::Right, Key::Left, Key::Up, Key::Down, Key::L, Key::R] {
+        app.apply_input_batch(KeyEvent::Released(key), &mut PendingInput::default(), &mut keys, &tx, &rx).await.unwrap();
+        let after = common::perf_trace::probe_counts()["measurement"].clone();
+        assert_eq!(after["selection_generation"], before["selection_generation"]);
+        assert_eq!(after["first_feedback_monotonic_us"], before["first_feedback_monotonic_us"]);
+        assert_eq!(after["final_content_monotonic_us"], 0);
+    }
+    assert!(!keys[Key::Right]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn wave2_pending_selected_cover_reports_readiness() {
+    let (dir, mut app) = missing_art_launcher();
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut pack: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repo.join("themes/orbit-hero/theme.json")).unwrap(),
+    ).unwrap();
+    let hero = pack["screens"]["library"]["components"].as_array_mut().unwrap()
+        .iter_mut().find(|c| c["id"] == "hero").unwrap();
+    hero["binding"] = "selected_cover".into();
+    let theme_dir = dir.0.join("pending-cover-theme");
+    std::fs::create_dir(&theme_dir).unwrap();
+    std::fs::create_dir(theme_dir.join("assets")).unwrap();
+    for entry in std::fs::read_dir(repo.join("themes/orbit-hero/assets")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), theme_dir.join("assets").join(entry.file_name())).unwrap();
+    }
+    std::fs::write(theme_dir.join("theme.json"), serde_json::to_vec(&pack).unwrap()).unwrap();
+    let bank = common::theme::fonts::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+    app.res.insert(Some(common::theme::ThemeHandle::prepare(
+        common::theme::runtime::ThemeSnapshot::load(&theme_dir).unwrap(), &bank, 2,
+    ).unwrap()));
+    let path = dir.0.join("readiness.trace");
+    trace_first_frame(&mut app, &path).await;
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    for event in ["first_feedback", "frame"] {
+        let row = rows.iter().find(|row| row["event"] == event).unwrap();
+        assert_eq!(row["measurement"]["content_pending_reason"], "selected_cover");
+        assert_eq!(row["measurement"]["next_cover_expected"], true);
     }
 }
