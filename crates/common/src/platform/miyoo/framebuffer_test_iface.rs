@@ -1427,3 +1427,231 @@ fn prepack_triple_buffer_pan_and_unused_alpha_pack_with_two_resident_frames() {
     }
     println!("PREPACK3 triple_buffer available={available} needed={} headroom={}", first.charge(), available - first.charge());
 }
+
+
+#[cfg(test)]
+fn legacy_present_rects(display: &mut super::FramebufferDisplay, areas: &[super::Rect],
+    packed: Option<&super::PackedSpans>) -> Result<()> {
+    use super::*;
+    display.refresh_present_layout()?;
+    let packed = packed.filter(|p| {
+        let mut layout = display.packed_layout();
+        // The models have separate mappings, so their allocation addresses differ.
+        layout[30] = p.layout[30];
+        p.layout == layout
+        && p.revision == display.composition_revision
+        && p.candidate == Arc::as_ptr(&display.pixmap.0) as usize && p.damage == areas
+    });
+    if display.page_history.as_ref().is_none_or(|h| !h.matches(&display.iface)) {
+        display.page_history = PageHistory::new(&display.iface);
+    }
+    let Some(history) = &mut display.page_history else { return display.flush(); };
+    let Some(page) = history.page(display.iface.var_screen_info.yoffset) else { return display.flush(); };
+    let direct = packed.is_some_and(|p| p.coverage_rects <= 4096)
+        && !history.legacy_needs_repair(page);
+    history.legacy_add(areas);
+    if direct {
+        let packed = packed.unwrap();
+        let width = display.pixmap.width() as usize;
+        let height = display.pixmap.height() as usize;
+        let location = display.iface.var_screen_info.yoffset as usize * width * 4;
+        for row in packed.rows.iter().rev() {
+            let at = location + ((height - 1 - row.y) * width + width - row.x1) * 4;
+            let len = (row.x1 - row.x0) * 4;
+            copy_packed_row(&mut display.iface.frame[at..at + len], &packed.bytes[row.start..row.start + len]);
+        }
+    } else {
+        let damage = history.legacy_damage(page);
+        for area in damage {
+            if let Some(packed) = packed { display.write_packed_rect(area, packed)?; }
+            else { display.write_rect(area)?; }
+        }
+    }
+    display.page_history.as_mut().unwrap().presented(page);
+    Ok(())
+}
+
+#[test]
+fn randomized_pending_history_matches_old_present_and_all_framebuffer_bytes() {
+    use super::*;
+    fn next(seed: &mut u32) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed
+    }
+    for initial_pages in 1..=3 {
+        let (w, h) = (73, 29);
+        let mut display = test_display(w, h);
+        let mut old = test_display(w, h);
+        let mut seed = 0x79ab12efu32 ^ initial_pages;
+        let mut pages = initial_pages;
+        for step in 0..480 {
+            if step % 61 == 0 { pages = 1 + next(&mut seed) % 3; }
+            let page = next(&mut seed) % pages;
+            OBSERVED.with(|state| {
+                let mut state = state.borrow_mut();
+                state.0.yres_virtual = pages * h;
+                state.0.yoffset = if step % 47 == 0 && pages > 1 { 1 } else { page * h };
+                if step % 37 == 0 { state.1.smem_start += 4096; }
+            });
+            for target in [&mut display, &mut old] {
+                let remap = OBSERVED.with(|s| s.borrow().1.smem_start != target.iface.fix_screen_info.smem_start
+                    || s.borrow().0.yres_virtual != target.iface.var_screen_info.yres_virtual);
+                if remap {
+                    NEW_BACKING.with(|b| *b.borrow_mut() = Some(vec![0xa5; (w * h * pages * 4) as usize + 64]));
+                }
+                target.refresh_present_layout().unwrap();
+                if step % 53 == 0 { target.read_rect(Rect::new(0, 0, 1, 1)).unwrap(); }
+                if step % 71 == 0 { target.flush_rect(Rect::new(0, 0, 1, 1)).unwrap(); }
+            }
+            let areas = match step % 8 {
+                0 => vec![],
+                1 => vec![Rect::new(-20, -20, 1, 1), Rect::new(3, 3, 0, 9)],
+                2 => vec![Rect::new(-3, -4, 12, 13), Rect::new(70, 27, 20, 20)],
+                3 => vec![Rect::new(0, 0, w, h)],
+                _ => (0..1 + next(&mut seed) % 7).map(|_| Rect::new(
+                    (next(&mut seed) % (w + 24)) as i32 - 12,
+                    (next(&mut seed) % (h + 24)) as i32 - 12,
+                    next(&mut seed) % (w + 1), next(&mut seed) % (h + 1))).collect(),
+            };
+            let mut candidate = display.pixmap.as_ref().to_owned();
+            for area in &areas {
+                crate::display::fill_rect(&mut candidate.as_mut(), *area,
+                    Color::rgba(next(&mut seed) as u8, next(&mut seed) as u8, next(&mut seed) as u8, 255));
+            }
+            let candidate = Arc::new(candidate);
+            let mut packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap();
+            if let Some(packed) = &mut packed {
+                if step % 9 == 0 { packed.coverage_rects = 4097; }
+                if step % 11 == 0 { packed.revision = packed.revision.wrapping_add(1); }
+            }
+            display.set_shared_pixmap(&candidate);
+            old.set_shared_pixmap(&candidate);
+            let packed = if step % 4 == 0 { None } else { packed.as_ref() };
+            let actual = display.present_rects(&areas, packed);
+            let expected = legacy_present_rects(&mut old, &areas, packed);
+            assert_eq!(actual.is_ok(), expected.is_ok(), "pages={initial_pages} step={step}");
+            actual.unwrap(); expected.unwrap();
+            assert_eq!(display.iface.frame, old.iface.frame, "pages={initial_pages} step={step}");
+            match (&display.page_history, &old.page_history) {
+                (Some(new), Some(old)) => new.assert_equivalent(old),
+                (None, None) => {},
+                _ => panic!("history presence differs at step {step}"),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[test]
+fn direct_present_marks_only_hidden_pages_and_repairs_them_after_pan() {
+    use super::*;
+    for pages in 1..=3 {
+        let mut display = test_display(32, 24);
+        OBSERVED.with(|s| {
+            let mut s = s.borrow_mut();
+            s.0.yres_virtual = pages * 24;
+            s.1.smem_start += 4096;
+        });
+        NEW_BACKING.with(|b| *b.borrow_mut() = Some(vec![0xa5; (32 * 24 * pages * 4) as usize + 64]));
+        display.flush().unwrap();
+        for page in 0..pages {
+            OBSERVED.with(|s| s.borrow_mut().0.yoffset = page * 24);
+            display.flush_rects(&[]).unwrap();
+        }
+        let areas = [Rect::new(3, 4, 7, 3)];
+        let mut candidate = display.pixmap.as_ref().to_owned();
+        crate::display::fill_rect(&mut candidate.as_mut(), areas[0], Color::new(130, 37, 213));
+        let candidate = Arc::new(candidate);
+        let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+        display.set_shared_pixmap(&candidate);
+        crate::perf::take();
+        display.flush_packed_rects(&areas, &packed).unwrap();
+        let counts = crate::perf::take();
+        assert_eq!(counts.page_history_scans, 0);
+        assert_eq!(counts.page_history_marks, u64::from(pages - 1));
+        for page in 0..pages - 1 {
+            assert!(display.page_history.as_ref().unwrap().needs_repair(page as usize));
+            OBSERVED.with(|s| s.borrow_mut().0.yoffset = page * 24);
+            display.flush_rects(&[]).unwrap();
+            assert_visible(&display, page as usize, "hidden damage repaired after pan");
+        }
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[test]
+fn interrupted_direct_and_repair_copies_keep_old_destination_damage() {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for repair in [false, true] {
+        for interrupted in [false, true] {
+            let mut display = test_display(32, 24);
+            let mut old = test_display(32, 24);
+            for target in [&mut display, &mut old] { target.flush().unwrap(); }
+            let areas = [Rect::new(0, 2, 8, 4)];
+            let mut candidate = display.pixmap.as_ref().to_owned();
+            crate::display::fill_rect(&mut candidate.as_mut(), areas[0], Color::new(130, 37, 213));
+            let candidate = Arc::new(candidate);
+            let mut packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+            if repair { packed.coverage_rects = 4097; }
+            if interrupted { packed.rows[1].start = packed.bytes.len() + 1; }
+            display.set_shared_pixmap(&candidate);
+            old.set_shared_pixmap(&candidate);
+            let before = display.iface.frame.clone();
+            crate::perf::take();
+            let actual = catch_unwind(AssertUnwindSafe(|| display.flush_packed_rects(&areas, &packed)));
+            let counts = crate::perf::take();
+            let expected = catch_unwind(AssertUnwindSafe(|| legacy_present_rects(&mut old, &areas, Some(&packed))));
+            assert_eq!(actual.is_err(), interrupted);
+            assert_eq!(expected.is_err(), interrupted);
+            assert_eq!(counts.page_history_marks, if repair || interrupted { 2 } else { 1 });
+            if !interrupted { actual.unwrap().unwrap(); expected.unwrap().unwrap(); }
+            else { assert_ne!(display.iface.frame, before, "copy stopped after writing some rows"); }
+            assert_eq!(display.iface.frame, old.iface.frame, "repair={repair} interrupted={interrupted}");
+            display.page_history.as_ref().unwrap().assert_equivalent(old.page_history.as_ref().unwrap());
+            if interrupted {
+                assert!(display.page_history.as_ref().unwrap().needs_repair(0));
+                display.flush_rects(&[]).unwrap();
+                assert_visible(&display, 0, "repair after interrupted copy");
+            }
+        }
+    }
+}
+
+
+#[test]
+fn fragmented_repair_fallback_matches_old_history_and_all_framebuffer_bytes() {
+    use super::*;
+    let mut display = test_display(640, 104);
+    let mut old = test_display(640, 104);
+    for target in [&mut display, &mut old] {
+        for page in 0..2 {
+            OBSERVED.with(|s| s.borrow_mut().0.yoffset = page * 104);
+            target.flush_rects(&[]).unwrap();
+        }
+    }
+    let areas: Vec<_> = (0..104).flat_map(|y| (0..80).filter_map(move |x| {
+        (x % 2 == y % 2).then_some(Rect::new(x * 8, y, 1, 1))
+    })).collect();
+    let mut candidate = display.pixmap.as_ref().to_owned();
+    for area in &areas {
+        crate::display::fill_rect(&mut candidate.as_mut(), *area, Color::new(130, 37, 213));
+    }
+    let candidate = Arc::new(candidate);
+    let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+    assert!(packed.coverage_rects > 4096);
+    display.set_shared_pixmap(&candidate);
+    old.set_shared_pixmap(&candidate);
+    display.flush_packed_rects(&areas, &packed).unwrap();
+    legacy_present_rects(&mut old, &areas, Some(&packed)).unwrap();
+    assert_eq!(display.present_damage, vec![display.bounding_box()]);
+    assert_eq!(display.iface.frame, old.iface.frame);
+    display.page_history.as_ref().unwrap().assert_equivalent(old.page_history.as_ref().unwrap());
+    OBSERVED.with(|s| s.borrow_mut().0.yoffset = 0);
+    display.flush_rects(&[]).unwrap();
+    legacy_present_rects(&mut old, &[], None).unwrap();
+    assert_eq!(display.iface.frame, old.iface.frame);
+    assert_visible(&display, 0, "fragmented hidden page repaired after pan");
+}

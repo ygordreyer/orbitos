@@ -11,6 +11,8 @@ pub struct Counts {
     pub neighbor_matches: u64,
     pub ram_hits: u64,
     pub disk_hits: u64,
+    pub page_history_scans: u64,
+    pub page_history_marks: u64,
 }
 
 pub enum Op {
@@ -23,6 +25,8 @@ pub enum Op {
     NeighborMatch,
     RamHit,
     DiskHit,
+    PageHistoryScan,
+    PageHistoryMark,
 }
 
 thread_local! {
@@ -42,6 +46,8 @@ pub fn hit(op: Op) {
             Op::NeighborMatch => c.neighbor_matches += 1,
             Op::RamHit => c.ram_hits += 1,
             Op::DiskHit => c.disk_hits += 1,
+            Op::PageHistoryScan => c.page_history_scans += 1,
+            Op::PageHistoryMark => c.page_history_marks += 1,
         }
         cell.set(c);
     });

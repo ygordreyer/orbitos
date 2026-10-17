@@ -345,10 +345,10 @@ impl FramebufferDisplay {
         let valid = history.is_valid(page);
         let direct = packed.is_some_and(|packed| packed.coverage_rects <= 4096)
             && !history.needs_repair(page);
-        history.add(areas);
         // A clean page needs exactly the packet's clipped, aligned union. Other pages
         // may need older damage or a full repair, including pixels outside the packet.
         if direct {
+            let pending = history.add_for_present(areas, page);
             drop(history_stage);
             let packed = packed.unwrap();
             crate::perf_trace::present_reason(if packed.bytes.len() == self.pixmap.data().len() {
@@ -359,8 +359,8 @@ impl FramebufferDisplay {
             }
             let _copy_stage = crate::perf_trace::recording()
                 .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::PresentCopy));
-            let width = self.width() as usize;
-            let height = self.height() as usize;
+            let width = self.pixmap.width() as usize;
+            let height = self.pixmap.height() as usize;
             let location = self.iface.var_screen_info.yoffset as usize * width * 4;
             for row in packed.rows.iter().rev() {
                 let at = location + ((height - 1 - row.y) * width + width - row.x1) * 4;
@@ -371,9 +371,10 @@ impl FramebufferDisplay {
                 crate::perf_trace::count(crate::perf_trace::Count::FlushedPixels, (packed.bytes.len() / 4) as u64);
                 crate::perf_trace::count(crate::perf_trace::Count::PackedSpanHit, 1);
             }
-            self.page_history.as_mut().unwrap().presented(page);
+            pending.presented();
             return Ok(());
         }
+        history.add(areas);
         let mut damage = std::mem::take(&mut self.present_damage);
         history.damage_into(page, &mut damage);
         drop(history_stage);

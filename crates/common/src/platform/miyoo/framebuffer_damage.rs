@@ -23,7 +23,27 @@ impl Layout {
 }
 struct Page {
     valid: bool,
+    // False proves rows are empty; invalid pages still require a full repair.
+    pending: bool,
     rows: Vec<u64>,
+}
+pub(super) struct PendingPresent<'a> {
+    history: &'a mut PageHistory,
+    areas: &'a [Rect],
+    page: Option<usize>,
+}
+impl PendingPresent<'_> {
+    pub fn presented(mut self) {
+        self.history.presented(self.page.take().unwrap());
+    }
+}
+impl Drop for PendingPresent<'_> {
+    fn drop(&mut self) {
+        if let Some(page) = self.page {
+            // An interrupted copy must retain the same damage as add() before copying.
+            self.history.add_to(self.areas, |index| index == page);
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct RowRun {
@@ -67,6 +87,7 @@ impl PageHistory {
             pages: (0..count)
                 .map(|_| Page {
                     valid: false,
+                    pending: true,
                     rows: vec![0; v.yres as usize * words],
                 })
                 .collect(),
@@ -83,9 +104,21 @@ impl PageHistory {
         self.pages[page].valid
     }
     pub fn needs_repair(&self, page: usize) -> bool {
-        !self.pages[page].valid || self.pages[page].rows.iter().any(|word| *word != 0)
+        let page = &self.pages[page];
+        if !page.valid { return true; }
+        if !page.pending { return false; }
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::PageHistoryScan);
+        page.rows.iter().any(|word| *word != 0)
     }
     pub fn add(&mut self, areas: &[Rect]) {
+        self.add_to(areas, |_| true);
+    }
+    pub fn add_for_present<'a>(&'a mut self, areas: &'a [Rect], page: usize) -> PendingPresent<'a> {
+        self.add_to(areas, |index| index != page);
+        PendingPresent { history: self, areas, page: Some(page) }
+    }
+    fn add_to(&mut self, areas: &[Rect], include: impl Fn(usize) -> bool) {
         for area in areas {
             let x0 = area.x.max(0).min(self.width as i32) as u32;
             let x1 = area.right().max(0).min(self.width as i32) as u32;
@@ -100,7 +133,11 @@ impl PageHistory {
                 let left = start.saturating_sub(index * 64);
                 let right = (end - index * 64).min(64);
                 let mask = (u64::MAX << left) & (u64::MAX >> (64 - right));
-                for page in &mut self.pages {
+                for (page_index, page) in self.pages.iter_mut().enumerate() {
+                    if !include(page_index) { continue; }
+                    page.pending = true;
+                    #[cfg(feature = "perf-bench")]
+                    crate::perf::hit(crate::perf::Op::PageHistoryMark);
                     for row in page.rows[y0 * self.words..y1 * self.words]
                         .chunks_exact_mut(self.words)
                     {
@@ -179,6 +216,30 @@ impl PageHistory {
     pub fn presented(&mut self, page: usize) {
         self.pages[page].valid = true;
         self.pages[page].rows.fill(0);
+        self.pages[page].pending = false;
+    }
+}
+#[cfg(test)]
+impl PageHistory {
+    pub(super) fn legacy_add(&mut self, areas: &[Rect]) {
+        tests::original_add(self, areas);
+    }
+    pub(super) fn legacy_needs_repair(&self, page: usize) -> bool {
+        !self.pages[page].valid || self.pages[page].rows.iter().any(|word| *word != 0)
+    }
+    pub(super) fn legacy_damage(&self, page: usize) -> Vec<Rect> {
+        tests::bitwise_damage(self, page)
+    }
+    pub(super) fn assert_equivalent(&self, old: &Self) {
+        assert!(self.layout == old.layout);
+        assert_eq!(self.pages.len(), old.pages.len());
+        for (index, (page, old_page)) in self.pages.iter().zip(&old.pages).enumerate() {
+            assert_eq!(page.valid, old_page.valid);
+            assert_eq!(page.rows, old_page.rows);
+            assert!(page.pending || page.rows.iter().all(|word| *word == 0));
+            assert_eq!(self.needs_repair(index), old.legacy_needs_repair(index));
+            assert_eq!(self.damage(index), old.legacy_damage(index));
+        }
     }
 }
 #[cfg(test)]
@@ -197,6 +258,7 @@ mod tests {
             pages: (0..3)
                 .map(|_| Page {
                     valid: false,
+                    pending: true,
                     rows: vec![0; height as usize * words],
                 })
                 .collect(),
@@ -211,7 +273,7 @@ mod tests {
         }
     }
 
-    fn original_add(history: &mut PageHistory, areas: &[Rect]) {
+    pub(super) fn original_add(history: &mut PageHistory, areas: &[Rect]) {
         for area in areas {
             let x0 = area.x.max(0).min(history.width as i32) as u32;
             let x1 = area.right().max(0).min(history.width as i32) as u32;
@@ -219,6 +281,7 @@ mod tests {
             let y1 = area.bottom().max(0).min(history.height as i32) as usize;
             if x0 >= x1 || y0 >= y1 { continue; }
             for page in &mut history.pages {
+                page.pending = true;
                 for y in y0..y1 {
                     let words = &mut page.rows[y * history.words..(y + 1) * history.words];
                     let start = (x0 / 8) as usize;
@@ -233,7 +296,7 @@ mod tests {
         }
     }
 
-    fn bitwise_damage(history: &PageHistory, page: usize) -> Vec<Rect> {
+    pub(super) fn bitwise_damage(history: &PageHistory, page: usize) -> Vec<Rect> {
         if !history.pages[page].valid {
             return vec![Rect::new(0, 0, history.width, history.height)];
         }
@@ -327,6 +390,43 @@ mod tests {
             previous = current;
         }
         areas
+    }
+
+    #[cfg(feature = "perf-bench")]
+    #[test]
+    fn pending_damage_skips_only_provably_empty_bitmap_scans() {
+        let mut h = history(640, 480);
+        crate::perf::take();
+        assert!(h.needs_repair(0));
+        h.presented(0);
+        for _ in 0..100 { assert!(!h.needs_repair(0)); }
+        h.add(&[Rect::new(-10, -10, 1, 1), Rect::new(1, 1, 0, 10)]);
+        assert!(!h.needs_repair(0));
+        assert_eq!(crate::perf::take().page_history_scans, 0);
+        h.add(&[Rect::new(639, 479, 1, 1)]);
+        assert!(h.needs_repair(0));
+        assert_eq!(crate::perf::take().page_history_scans, 1);
+        h.presented(0);
+        assert!(!h.needs_repair(0));
+        assert_eq!(crate::perf::take().page_history_scans, 0);
+        h.pages[0].pending = true;
+        assert!(!h.needs_repair(0));
+        assert_eq!(crate::perf::take().page_history_scans, 1);
+    }
+
+    #[test]
+    fn interrupted_present_restores_destination_damage_on_early_return() {
+        fn interrupted(h: &mut PageHistory, areas: &[Rect]) -> Result<(), ()> {
+            let _pending = h.add_for_present(areas, 0);
+            Err(())
+        }
+        let mut h = history(33, 25);
+        let mut old = history(33, 25);
+        for page in 0..3 { h.presented(page); old.presented(page); }
+        let areas = [Rect::new(-3, 1, 12, 7), Rect::new(32, 24, 20, 20)];
+        original_add(&mut old, &areas);
+        assert_eq!(interrupted(&mut h, &areas), Err(()));
+        h.assert_equivalent(&old);
     }
 
     #[test]
