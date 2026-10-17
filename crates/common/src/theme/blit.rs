@@ -15,73 +15,26 @@ enum RunKind {
     Mixed,
 }
 
-struct ConstantLut {
+struct ConstantScrim {
     source: [u8; 4],
-    channels: [[u8; 256]; 3],
 }
-impl ConstantLut {
+impl ConstantScrim {
     fn new(source: [u8; 4]) -> Self {
-        let mut foreground = Pixmap::new(256, 1).unwrap();
-        let mut background = Pixmap::new(256, 1).unwrap();
-        for (value, (src, dst)) in foreground
-            .data_mut()
-            .chunks_exact_mut(4)
-            .zip(background.data_mut().chunks_exact_mut(4))
-            .enumerate()
-        {
-            src.copy_from_slice(&source);
-            dst.copy_from_slice(&[value as u8, value as u8, value as u8, 255]);
-        }
-        // Sample the same pattern pipeline used by mixed spans, including its rounding. [code]
-        background.draw_pixmap(
-            0,
-            0,
-            foreground.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
-        let mut channels = [[0; 256]; 3];
-        for (value, pixel) in background.data().chunks_exact(4).enumerate() {
-            for channel in 0..3 {
-                channels[channel][value] = pixel[channel];
-            }
-        }
-        Self { source, channels }
+        Self { source }
     }
 
     fn draw(&self, dest: &mut PixmapMut<'_>, x: i32, y: i32, source: &[u8]) {
         let start = (y as usize * dest.width() as usize + x as usize) * 4;
-        let end = start + source.len();
-        let mut offset = 0;
-        while start + offset < end {
-            if dest.data_mut()[start + offset + 3] == 255 {
-                let pixel = &mut dest.data_mut()[start + offset..start + offset + 4];
-                for channel in 0..3 {
-                    pixel[channel] = self.channels[channel][pixel[channel] as usize];
-                }
-                offset += 4;
-            } else {
-                let first = offset;
-                while start + offset < end && dest.data_mut()[start + offset + 3] != 255 {
-                    offset += 4;
-                }
-                draw_mixed(dest, x + (first / 4) as i32, y, &source[first..offset]);
-            }
-        }
+        super::ink_blit_neon::constant_source_over(
+            &mut dest.data_mut()[start..start + source.len()],
+            self.source,
+        );
     }
 }
 
 fn draw_mixed(dest: &mut PixmapMut<'_>, x: i32, y: i32, source: &[u8]) {
-    let row = PixmapRef::from_bytes(source, (source.len() / 4) as u32, 1).unwrap();
-    dest.draw_pixmap(
-        x,
-        y,
-        row,
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
+    let start = (y as usize * dest.width() as usize + x as usize) * 4;
+    super::ink_blit_neon::source_over(&mut dest.data_mut()[start..start + source.len()], source);
 }
 
 #[derive(Clone, Copy)]
@@ -95,7 +48,7 @@ struct Run {
 pub(super) struct BlitMap {
     runs: Vec<Run>,
     fallback: bool,
-    constant: Option<Box<ConstantLut>>,
+    constant: Option<Box<ConstantScrim>>,
 }
 impl BlitMap {
     pub fn new(image: PixmapRef<'_>) -> Self {
@@ -104,10 +57,10 @@ impl BlitMap {
     pub fn with_constant_scrim(image: PixmapRef<'_>) -> Self {
         let source: [u8; 4] = image.data()[..4].try_into().unwrap();
         let constant =
-            (source[3] > 0 && source[3] < 255).then(|| Box::new(ConstantLut::new(source)));
+            (source[3] > 0 && source[3] < 255).then(|| Box::new(ConstantScrim::new(source)));
         Self::build(image, constant)
     }
-    fn build(image: PixmapRef<'_>, constant: Option<Box<ConstantLut>>) -> Self {
+    fn build(image: PixmapRef<'_>, constant: Option<Box<ConstantScrim>>) -> Self {
         crate::perf_trace::count(crate::perf_trace::Count::MapBuild, 1);
         let mut result = Self {
             constant,
@@ -178,7 +131,7 @@ impl BlitMap {
             + self
                 .constant
                 .as_ref()
-                .map_or(0, |_| std::mem::size_of::<ConstantLut>())
+                .map_or(0, |_| std::mem::size_of::<ConstantScrim>())
     }
     pub fn draw(
         &self,
@@ -232,7 +185,7 @@ impl BlitMap {
             let data = &source.data()[at..at + len * 4];
             if run.kind == RunKind::Opaque {
                 let at = (dy * dw + left) as usize * 4;
-                dest.data_mut()[at..at + len * 4].copy_from_slice(data);
+                super::ink_blit_neon::opaque_copy(&mut dest.data_mut()[at..at + len * 4], data);
             } else if run.kind == RunKind::Constant {
                 self.constant
                     .as_ref()
@@ -305,6 +258,33 @@ mod tests {
     }
 
     #[test]
+    fn blit_constant_scrim_all_alpha_nonopaque_destinations_match_pattern() {
+        for a in 1..255u8 {
+            let mut source = Pixmap::new(256, 1).unwrap();
+            for p in source.data_mut().chunks_exact_mut(4) {
+                p.copy_from_slice(&[a, a / 2, a / 3, a]);
+            }
+            let map = BlitMap::with_constant_scrim(source.as_ref());
+            let mut expected = Pixmap::new(256, 1).unwrap();
+            for (alpha, p) in expected.data_mut().chunks_exact_mut(4).enumerate() {
+                let alpha = alpha as u8;
+                p.copy_from_slice(&[alpha / 3, alpha, alpha / 2, alpha]);
+            }
+            let mut actual = expected.clone();
+            expected.draw_pixmap(
+                0,
+                0,
+                source.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+            map.draw(&mut actual.as_mut(), 0, 0, source.as_ref(), 1.0, None);
+            assert_eq!(actual.data(), expected.data(), "constant source alpha={a}");
+        }
+    }
+
+    #[test]
     fn perf9_randomized_scrim_lut_matches_reference_and_repeated_draws() {
         let mut seed = 881937u64;
         let mut random = || {
@@ -373,7 +353,7 @@ mod tests {
             }
             let map = BlitMap::with_constant_scrim(source.as_ref());
             assert!(map.constant.is_some());
-            assert!(std::mem::size_of::<ConstantLut>() < 1024);
+            assert_eq!(std::mem::size_of::<ConstantScrim>(), 4);
             assert!(map.runs.iter().all(|r| r.kind == RunKind::Constant));
             for capture in 0..4 {
                 let mut expected = Pixmap::new(256, 3).unwrap();

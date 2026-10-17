@@ -96,6 +96,16 @@ impl ImageCache {
     }
 
     pub fn get(&mut self, key: &ImageKey, source: &Arc<Pixmap>) -> Option<Arc<Pixmap>> {
+        if source.width() == key.width
+            && source.height() == key.height
+            && key.radius == 0
+            && key.blur == 0
+            && key.fade_edge.is_none()
+            && key.mask == 0
+            && key.background.is_none()
+        {
+            return Some(Arc::clone(source));
+        }
         let identity = source_identity(source);
         let index = self
             .entries
@@ -148,6 +158,34 @@ mod tests {
             mask: 0,
             background: None,
         }
+    }
+    #[test]
+    fn exact_size_without_effects_returns_the_source_arc() {
+        let mut cache = ImageCache::default();
+        let source = Arc::new(Pixmap::new(640, 400).unwrap());
+        let mut key = key(1);
+        key.radius = 0;
+        let fitted = cache.get(&key, &source).unwrap();
+        assert!(Arc::ptr_eq(&source, &fitted));
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.entries.is_empty());
+        key.radius = 1;
+        assert!(cache.get(&key, &source).is_none());
+        key.radius = 0;
+        key.blur = 1;
+        assert!(cache.get(&key, &source).is_none());
+        key.blur = 0;
+        key.fade_edge = Some(FadeEdge::Left);
+        assert!(cache.get(&key, &source).is_none());
+        key.fade_edge = None;
+        key.mask = 1;
+        assert!(cache.get(&key, &source).is_none());
+        key.mask = 0;
+        key.background = Some([0; 4]);
+        assert!(cache.get(&key, &source).is_none());
+        key.background = None;
+        key.width -= 1;
+        assert!(cache.get(&key, &source).is_none());
     }
     #[test]
     fn bounded_pixels_reuse_identical_content_without_retaining_sources() {

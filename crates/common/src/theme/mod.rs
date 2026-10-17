@@ -3,7 +3,9 @@ pub mod fonts;
 pub mod frame;
 pub mod pack;
 pub mod render;
+mod render_navigation;
 pub mod runtime;
+mod runtime_neon;
 pub mod selection;
 pub mod settings;
 pub mod session;
@@ -21,6 +23,7 @@ pub use choices::{ChoiceKind, ThemeChoice, ThemeChoices};
 mod image_cache;
 
 mod blit;
+mod ink_blit_neon;
 mod text_cache;
 
 pub mod ink;

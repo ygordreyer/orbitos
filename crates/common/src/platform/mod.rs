@@ -4,6 +4,7 @@ pub mod cpu_tuning;
 
 #[cfg(any(test, feature = "miyoo", feature = "perf-bench"))]
 mod framebuffer_pixels;
+mod framebuffer_pixels_neon;
 
 #[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
 #[path = "miyoo/framebuffer.rs"]
@@ -117,3 +118,12 @@ pub enum Key {
 
 #[cfg(all(feature = "perf-bench", not(feature = "miyoo")))]
 pub use framebuffer_host_tests::PresenterProbe;
+
+#[cfg(feature = "perf-bench")]
+#[doc(hidden)]
+pub fn benchmark_write_rotated_bgra(
+    frame: &mut [u8], scratch: &mut [u8], pixels: tiny_skia::PixmapRef<'_>,
+    yoffset: usize, bytes_per_pixel: usize, area: (usize, usize, usize, usize),
+) {
+    framebuffer_pixels::write_rotated_bgra(frame, scratch, pixels, yoffset, bytes_per_pixel, area);
+}

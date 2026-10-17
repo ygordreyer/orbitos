@@ -33,6 +33,18 @@ pub(super) fn read_rotated_bgra(
 ) {
     let width = pixels.width() as usize;
     let height = pixels.height() as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    if bytes_per_pixel == 4 {
+        for y in y0..y1 {
+            let start = ((height - 1 - y) * width + width - x1) * 4;
+            let source = &frame[start..start + (x1 - x0) * 4];
+            let target = &mut pixels.data_mut()[(y * width + x0) * 4..(y * width + x1) * 4];
+            read_reversed_bgra(target, source);
+        }
+        return;
+    }
     for y in y0..y1 {
         for x in x0..x1 {
             let at = ((height - 1 - y) * width + width - 1 - x) * bytes_per_pixel;
@@ -78,6 +90,11 @@ pub(super) fn capture_rotated_bgra(
     for fb_y in height - y1..height - y0 {
         read_span(row, (fb_y * width + width - x1) * bytes_per_pixel);
         let y = height - 1 - fb_y;
+        if bytes_per_pixel == 4 {
+            let target = &mut pixels.data_mut()[(y * width + x0) * 4..(y * width + x1) * 4];
+            read_reversed_bgra(target, row);
+            continue;
+        }
         for (x, pixel) in (x0..x1).rev().zip(row.chunks_exact(bytes_per_pixel)) {
             pixels.pixels_mut()[y * width + x] =
                 crate::display::color::Color::rgba(pixel[2], pixel[1], pixel[0], pixel[3]).into();
@@ -160,6 +177,23 @@ pub(super) fn write_rotated_bgra(
 }
 
 fn write_reversed_bgra(target: &mut [u8], source: &[u8]) {
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        target_feature = "neon"
+    ))]
+    {
+        // The cfg guarantees NEON, and the safe wrapper checks equal whole-pixel spans.
+        unsafe { super::framebuffer_pixels_neon::write_reversed_bgra(target, source) };
+    }
+    #[cfg(not(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        target_feature = "neon"
+    )))]
+    write_reversed_bgra_scalar(target, source);
+}
+
+#[allow(dead_code)]
+fn write_reversed_bgra_scalar(target: &mut [u8], source: &[u8]) {
     if let (Ok(target), Ok(source)) = (
         bytemuck::try_cast_slice_mut::<u8, u32>(target),
         bytemuck::try_cast_slice::<u8, u32>(source),
@@ -172,6 +206,31 @@ fn write_reversed_bgra(target: &mut [u8], source: &[u8]) {
         for (dest, src) in target.chunks_exact_mut(4).zip(source.chunks_exact(4).rev()) {
             dest.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
         }
+    }
+}
+
+fn read_reversed_bgra(target: &mut [u8], source: &[u8]) {
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        target_feature = "neon"
+    ))]
+    {
+        // The cfg guarantees NEON, and the safe wrapper checks equal whole-pixel spans.
+        unsafe { super::framebuffer_pixels_neon::read_reversed_bgra(target, source) };
+    }
+    #[cfg(not(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        target_feature = "neon"
+    )))]
+    read_reversed_bgra_scalar(target, source);
+}
+
+#[allow(dead_code)]
+fn read_reversed_bgra_scalar(target: &mut [u8], source: &[u8]) {
+    for (dest, src) in target.chunks_exact_mut(4).zip(source.chunks_exact(4).rev()) {
+        let pixel: tiny_skia::PremultipliedColorU8 =
+            crate::display::color::Color::rgba(src[2], src[1], src[0], src[3]).into();
+        dest.copy_from_slice(bytemuck::bytes_of(&pixel));
     }
 }
 
@@ -549,6 +608,124 @@ mod dl16_tests {
                             .chain(&dest[dst_offset + length * 4..])
                             .all(|b| *b == 0xa5)
                     );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "arm", target_arch = "aarch64"),
+    target_feature = "neon"
+))]
+mod neon_tests {
+    use super::*;
+
+    #[test]
+    fn neon_rows_match_scalar_with_unaligned_spans_and_all_alphas() {
+        let mut seed = 0xc01dba5eu32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        for width in [0, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 63, 176, 639, 640, 641] {
+            for offset in 0..16 {
+                let source: Vec<u8> = (0..width * 4 + offset).map(|_| random()).collect();
+                let source = &source[offset..];
+                for capture in [false, true] {
+                    let mut expected = vec![0xa5; width * 4 + 32];
+                    let mut actual = expected.clone();
+                    let scalar = if capture {
+                        read_reversed_bgra_scalar
+                    } else {
+                        write_reversed_bgra_scalar
+                    };
+                    let neon = if capture {
+                        read_reversed_bgra
+                    } else {
+                        write_reversed_bgra
+                    };
+                    scalar(&mut expected[15 - offset..15 - offset + width * 4], source);
+                    neon(&mut actual[15 - offset..15 - offset + width * 4], source);
+                    assert_eq!(
+                        actual, expected,
+                        "width={width} offset={offset} capture={capture}"
+                    );
+                }
+            }
+        }
+        // Exhaust all channel/alpha products, including 0, 1, 127, 128, 254 and 255.
+        let source: Vec<u8> = (0..=255u8)
+            .flat_map(|a| (0..=255u8).flat_map(move |c| [c, c.wrapping_add(1), 255 - c, a]))
+            .collect();
+        let mut expected = vec![0; source.len()];
+        let mut actual = expected.clone();
+        read_reversed_bgra_scalar(&mut expected, &source);
+        read_reversed_bgra(&mut actual, &source);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn neon_partial_rectangles_match_scalar_at_all_edges_and_2560_stride() {
+        for (width, height) in [(17usize, 19usize), (73, 51), (640, 480)] {
+            let mut pixels = tiny_skia::Pixmap::new(width as u32, height as u32).unwrap();
+            for (i, byte) in pixels.data_mut().iter_mut().enumerate() {
+                *byte = (i.wrapping_mul(37) ^ (i >> 7)) as u8;
+            }
+            for rw in [1, 3, 4, 7, 8, 15, 16, 17, width] {
+                let rw = rw.min(width);
+                for (x0, y0, x1, y1) in [
+                    (0, 0, rw, height),
+                    (width - rw, 0, width, height),
+                    (0, 0, width, 1),
+                    (0, height - 1, width, height),
+                    (0, 0, rw, 1),
+                    (width - rw, height - 1, width, height),
+                    (1, 1, rw.max(2), height - 1),
+                ] {
+                    for location in [0, 1, width * height * 4 + 12] {
+                        let mut expected = vec![0xa5; location + width * height * 4 + 16];
+                        let mut actual = expected.clone();
+                        for y in y0..y1 {
+                            let start = location + ((height - 1 - y) * width + width - x1) * 4;
+                            write_reversed_bgra_scalar(
+                                &mut expected[start..start + (x1 - x0) * 4],
+                                &pixels.data()[(y * width + x0) * 4..(y * width + x1) * 4],
+                            );
+                        }
+                        write_rotated_bgra(
+                            &mut actual,
+                            &mut [],
+                            pixels.as_ref(),
+                            location,
+                            4,
+                            (x0, y0, x1, y1),
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "{width}x{height} rect={x0},{y0},{x1},{y1} location={location}"
+                        );
+                        let mut expected_pixels = pixels.clone();
+                        let mut actual_pixels = pixels.clone();
+                        for y in y0..y1 {
+                            let start = location + ((height - 1 - y) * width + width - x1) * 4;
+                            read_reversed_bgra_scalar(
+                                &mut expected_pixels.data_mut()
+                                    [(y * width + x0) * 4..(y * width + x1) * 4],
+                                &expected[start..start + (x1 - x0) * 4],
+                            );
+                        }
+                        read_rotated_bgra(
+                            &actual[location..],
+                            &mut actual_pixels,
+                            4,
+                            (x0, y0, x1, y1),
+                        );
+                        assert_eq!(actual_pixels.data(), expected_pixels.data());
+                    }
                 }
             }
         }

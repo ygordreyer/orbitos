@@ -41,7 +41,86 @@ pub(super) fn paint_bounds(c: &Component) -> Rect {
     )
 }
 
-thread_local! { static SHADOWS: RefCell<VecDeque<CachedText>> = const { RefCell::new(VecDeque::new()) }; }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShadowKey {
+    size: (u32, u32),
+    tile: (u32, u32),
+    radius: u32,
+    blur: u32,
+    color: [u8; 4],
+    alpha: u32,
+    shape_origin: (i32, i32),
+    cutout_origin: (i32, i32),
+}
+impl ShadowKey {
+    fn new(
+        rect: Rect,
+        radius: u32,
+        shadow: &Shadow,
+        left: i32,
+        top: i32,
+        w: u32,
+        h: u32,
+        color: [u8; 4],
+    ) -> Self {
+        Self {
+            size: (rect.2, rect.3),
+            tile: (w, h),
+            radius: radius.min(rect.2 / 2).min(rect.3 / 2),
+            blur: shadow.blur,
+            color,
+            alpha: shadow.alpha.to_bits(),
+            shape_origin: (
+                rect.0 as i32 + shadow.x - left,
+                rect.1 as i32 + shadow.y - top,
+            ),
+            cutout_origin: (rect.0 as i32 - left, rect.1 as i32 - top),
+        }
+    }
+}
+struct CachedShadow {
+    theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
+    key: ShadowKey,
+    pixels: Arc<Pixmap>,
+}
+thread_local! { static SHADOWS: RefCell<VecDeque<CachedShadow>> = const { RefCell::new(VecDeque::new()) }; }
+
+// Keep the original floating-point convolution: its final rounded alpha is
+// covered by exact frame parity tests. Translation-independent tile caching
+// amortizes it without quantizing the Gaussian or changing clipped edges.
+fn gaussian_alpha(alpha: &mut [f32], w: u32, h: u32, blur: u32) {
+    if blur == 0 {
+        return;
+    }
+    let sigma = blur as f32 / 2.0;
+    let reach = (sigma * 3.0).ceil() as i32;
+    let mut kernel: Vec<f32> = (-reach..=reach)
+        .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    for k in &mut kernel {
+        *k /= sum;
+    }
+    let mut scratch = vec![0.0; alpha.len()];
+    for yy in 0..h as i32 {
+        for xx in 0..w as i32 {
+            scratch[(yy * w as i32 + xx) as usize] = (-reach..=reach)
+                .filter(|d| (0..w as i32).contains(&(xx + d)))
+                .map(|d| alpha[(yy * w as i32 + xx + d) as usize] * kernel[(d + reach) as usize])
+                .sum();
+        }
+    }
+    for yy in 0..h as i32 {
+        for xx in 0..w as i32 {
+            alpha[(yy * w as i32 + xx) as usize] = (-reach..=reach)
+                .filter(|d| (0..h as i32).contains(&(yy + d)))
+                .map(|d| {
+                    scratch[((yy + d) * w as i32 + xx) as usize] * kernel[(d + reach) as usize]
+                })
+                .sum();
+        }
+    }
+}
 
 impl PreparedFrame {
     pub(super) fn ink_shadow(&mut self, rect: Rect, radius: u32, shadow: &Shadow) {
@@ -60,7 +139,17 @@ impl PreparedFrame {
         }
         let w = (right - left) as u32;
         let h = (bottom - top) as u32;
-        let key = format!("{rect:?}:{radius}:{shadow:?}:{left}:{top}:{w}:{h}");
+        let color = self.color(shadow.color);
+        let key = ShadowKey::new(
+            rect,
+            radius,
+            shadow,
+            left,
+            top,
+            w,
+            h,
+            [color.r(), color.g(), color.b(), color.a()],
+        );
         let weak = self.theme.weak();
         let found = SHADOWS.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -73,6 +162,7 @@ impl PreparedFrame {
             Some(pixels)
         });
         let pixels = found.unwrap_or_else(|| {
+            crate::perf_trace::count(crate::perf_trace::Count::ShadowMisses, 1);
             let mut pix = ink_pixmap(w, h).unwrap();
             let path = crate::display::build_rounded_rect_path(
                 draw_rect(Rect(0, 0, rect.2, rect.3)),
@@ -98,42 +188,7 @@ impl PreparedFrame {
                 .iter()
                 .map(|p| p.alpha() as f32 / 255.0)
                 .collect();
-            if shadow.blur > 0 {
-                // CSS blur radius is twice the Gaussian standard deviation.
-                let sigma = shadow.blur as f32 / 2.0;
-                let reach = (sigma * 3.0).ceil() as i32;
-                let mut kernel: Vec<f32> = (-reach..=reach)
-                    .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
-                    .collect();
-                let sum: f32 = kernel.iter().sum();
-                for k in &mut kernel {
-                    *k /= sum;
-                }
-                let mut scratch = vec![0.0; alpha.len()];
-                for yy in 0..h as i32 {
-                    for xx in 0..w as i32 {
-                        scratch[(yy * w as i32 + xx) as usize] = (-reach..=reach)
-                            .filter(|d| (0..w as i32).contains(&(xx + d)))
-                            .map(|d| {
-                                alpha[(yy * w as i32 + xx + d) as usize]
-                                    * kernel[(d + reach) as usize]
-                            })
-                            .sum();
-                    }
-                }
-                for yy in 0..h as i32 {
-                    for xx in 0..w as i32 {
-                        alpha[(yy * w as i32 + xx) as usize] = (-reach..=reach)
-                            .filter(|d| (0..h as i32).contains(&(yy + d)))
-                            .map(|d| {
-                                scratch[((yy + d) * w as i32 + xx) as usize]
-                                    * kernel[(d + reach) as usize]
-                            })
-                            .sum();
-                    }
-                }
-            }
-            let color = self.color(shadow.color);
+            gaussian_alpha(&mut alpha, w, h, shadow.blur);
             for (pixel, a) in pix.data_mut().chunks_exact_mut(4).zip(alpha) {
                 let a = (a * shadow.alpha * color.a() as f32).round() as u32;
                 pixel.copy_from_slice(&[
@@ -167,11 +222,13 @@ impl PreparedFrame {
                 {
                     cache.pop_back();
                 }
-                cache.push_front(CachedText {
-                    theme: weak,
-                    key,
-                    pixels: pixels.clone(),
-                });
+                if pixels.data().len() <= 2 * 1024 * 1024 {
+                    cache.push_front(CachedShadow {
+                        theme: weak,
+                        key,
+                        pixels: pixels.clone(),
+                    });
+                }
             });
             pixels
         });
@@ -179,6 +236,7 @@ impl PreparedFrame {
     }
 
     pub(super) fn ink_glow(&mut self, r: Rect, c: &Component) {
+        crate::perf_trace::count(crate::perf_trace::Count::GlowMisses, 1);
         let color = self.color(c.focus_color.unwrap_or(ColorRole::Focus));
         for glow in (1..=c.glow_radius.unwrap_or(0)).rev() {
             let path = crate::display::build_rounded_rect_path(
@@ -310,4 +368,203 @@ impl PreparedFrame {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn frame() -> PreparedFrame {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(
+            ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(),
+            &bank,
+            1,
+        )
+        .unwrap();
+        let mut frame =
+            PreparedFrame::prepare(theme, &FrameInputs::new(ScreenId::Library)).unwrap();
+        frame.pixels.data_mut().fill(0);
+        SHADOWS.with(|cache| cache.borrow_mut().clear());
+        frame
+    }
+    fn shadow() -> Shadow {
+        Shadow {
+            x: 3,
+            y: 4,
+            blur: 12,
+            color: ColorRole::Focus,
+            alpha: 0.53,
+        }
+    }
+    #[test]
+    fn shadow_tiles_reuse_translations_and_preserve_clipped_pixels() {
+        let mut frame = frame();
+        let shadow = shadow();
+        frame.ink_shadow(Rect(80, 80, 160, 160), 8, &shadow);
+        let first = SHADOWS.with(|cache| cache.borrow()[0].pixels.clone());
+        frame.pixels.data_mut().fill(0);
+        frame.ink_shadow(Rect(300, 100, 160, 160), 8, &shadow);
+        SHADOWS.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 1);
+            assert!(Arc::ptr_eq(&first, &cache[0].pixels));
+        });
+        let warm = frame.pixels.clone();
+        SHADOWS.with(|cache| cache.borrow_mut().clear());
+        frame.pixels.data_mut().fill(0);
+        frame.ink_shadow(Rect(300, 100, 160, 160), 8, &shadow);
+        assert_eq!(warm.data(), frame.pixels.data());
+        for rect in [
+            Rect(0, 0, 160, 160),
+            Rect(470, 0, 160, 160),
+            Rect(0, 310, 160, 160),
+            Rect(470, 310, 160, 160),
+            Rect(17, 19, 160, 160),
+        ] {
+            frame.pixels.data_mut().fill(0);
+            frame.ink_shadow(rect, 8, &shadow);
+            let warm = frame.pixels.clone();
+            SHADOWS.with(|cache| cache.borrow_mut().clear());
+            frame.pixels.data_mut().fill(0);
+            frame.ink_shadow(rect, 8, &shadow);
+            assert_eq!(warm.data(), frame.pixels.data(), "{rect:?}");
+        }
+        SHADOWS.with(|cache| {
+            let cache = cache.borrow();
+            assert!(cache.len() <= 64);
+            assert!(cache.iter().map(|e| e.pixels.data().len()).sum::<usize>() <= 2 * 1024 * 1024);
+        });
+    }
+    #[test]
+    fn shadow_tiles_distinguish_equal_sized_clips_and_reuse_identical_clips() {
+        let mut frame = frame();
+        let shadow = shadow();
+        let left_clipped = Rect(15, 80, 160, 160);
+        let right_clipped = Rect(459, 80, 160, 160);
+
+        // Both clips produce 197x198 tiles, but their shape and cutout origins differ.
+        frame.ink_shadow(left_clipped, 8, &shadow);
+        let first = SHADOWS.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 1);
+            cache[0].pixels.clone()
+        });
+        assert_eq!((first.width(), first.height()), (197, 198));
+
+        frame.pixels.data_mut().fill(0);
+        frame.ink_shadow(right_clipped, 8, &shadow);
+        let second = SHADOWS.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 2, "different clip origins must not alias");
+            assert!(Arc::ptr_eq(&first, &cache[1].pixels));
+            assert!(!Arc::ptr_eq(&first, &cache[0].pixels));
+            cache[0].pixels.clone()
+        });
+        assert_eq!((second.width(), second.height()), (197, 198));
+        assert!(first.data() != second.data());
+        let warm = frame.pixels.clone();
+
+        frame.pixels.data_mut().fill(0);
+        frame.ink_shadow(right_clipped, 8, &shadow);
+        SHADOWS.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 2);
+            assert!(Arc::ptr_eq(&second, &cache[0].pixels));
+        });
+        assert_eq!(warm.data(), frame.pixels.data(), "identical clipped hit");
+
+        SHADOWS.with(|cache| cache.borrow_mut().clear());
+        frame.pixels.data_mut().fill(0);
+        frame.ink_shadow(right_clipped, 8, &shadow);
+        assert_eq!(SHADOWS.with(|cache| cache.borrow().len()), 1);
+        assert_eq!(warm.data(), frame.pixels.data(), "warm versus cold clip");
+    }
+    #[test]
+    fn shadow_key_includes_color_alpha_and_clip_geometry() {
+        let shadow = shadow();
+        let rect = Rect(80, 80, 160, 160);
+        let key = ShadowKey::new(rect, 8, &shadow, 64, 65, 198, 198, [0, 0, 0, 255]);
+        assert_eq!(
+            key,
+            ShadowKey::new(
+                Rect(180, 180, 160, 160),
+                8,
+                &shadow,
+                164,
+                165,
+                198,
+                198,
+                [0, 0, 0, 255]
+            )
+        );
+        for other in [
+            ShadowKey::new(rect, 8, &shadow, 64, 65, 198, 198, [1, 0, 0, 255]),
+            ShadowKey::new(
+                rect,
+                8,
+                &Shadow {
+                    alpha: 0.54,
+                    ..shadow.clone()
+                },
+                64,
+                65,
+                198,
+                198,
+                [0, 0, 0, 255],
+            ),
+            ShadowKey::new(
+                rect,
+                8,
+                &Shadow {
+                    blur: 13,
+                    ..shadow.clone()
+                },
+                64,
+                65,
+                198,
+                198,
+                [0, 0, 0, 255],
+            ),
+            ShadowKey::new(rect, 9, &shadow, 64, 65, 198, 198, [0, 0, 0, 255]),
+            ShadowKey::new(rect, 8, &shadow, 65, 65, 197, 198, [0, 0, 0, 255]),
+        ] {
+            assert_ne!(key, other);
+        }
+    }
+    #[test]
+    #[ignore = "offline host microbenchmark; run with --release --ignored --nocapture"]
+    fn resize_bench_shadow_tile() {
+        use std::{hint::black_box, time::Instant};
+        let mut frame = frame();
+        let shadow = shadow();
+        let count = 40;
+        let start = Instant::now();
+        for i in 0..count {
+            SHADOWS.with(|cache| cache.borrow_mut().clear());
+            frame.pixels.data_mut().fill(0);
+            frame.ink_shadow(Rect(80 + i, 80, 160, 160), 8, black_box(&shadow));
+            black_box(&frame.pixels);
+        }
+        let before = start.elapsed().as_secs_f64() * 1000.0 / count as f64;
+        let start = Instant::now();
+        for i in 0..count {
+            frame.pixels.data_mut().fill(0);
+            frame.ink_shadow(Rect(80 + i, 80, 160, 160), 8, black_box(&shadow));
+            black_box(&frame.pixels);
+        }
+        let after = start.elapsed().as_secs_f64() * 1000.0 / count as f64;
+        eprintln!(
+            "shadow tile 160x160 radius=8 blur=12 (198x198 padded, translated): before={before:.6} ms after={after:.6} ms; unchanged cold Gaussian"
+        );
+        assert_eq!(SHADOWS.with(|cache| cache.borrow().len()), 1);
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+pub(super) fn benchmark_clear_shadows() {
+    SHADOWS.with(|cache| cache.borrow_mut().clear());
 }

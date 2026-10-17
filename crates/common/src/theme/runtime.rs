@@ -61,32 +61,56 @@ pub(super) fn blur(image: &mut Pixmap, radius: u32) -> Result<()> {
     let w = image.width() as usize;
     let h = image.height() as usize;
     let r = radius as usize;
+    let stride = w * 4;
     let mut scratch = vec![0u8; image.data().len()];
-    for y in 0..h {
-        for x in 0..w {
-            for channel in 0..4 {
-                let lo = x.saturating_sub(r);
-                let hi = (x + r).min(w - 1);
-                let sum: u32 = (lo..=hi)
-                    .map(|xx| image.data()[(y * w + xx) * 4 + channel] as u32)
-                    .sum();
-                scratch[(y * w + x) * 4 + channel] =
-                    ((sum + (hi - lo + 1) as u32 / 2) / (hi - lo + 1) as u32) as u8;
+    for (input, output) in image
+        .data()
+        .chunks_exact(stride)
+        .zip(scratch.chunks_exact_mut(stride))
+    {
+        let mut sums = [0u16; 4];
+        for pixel in input.chunks_exact(4).take(r + 1) {
+            for (sum, value) in sums.iter_mut().zip(pixel) {
+                *sum += u16::from(*value);
+            }
+        }
+        for (x, pixel) in output.chunks_exact_mut(4).enumerate() {
+            let count = ((x + r).min(w - 1) - x.saturating_sub(r) + 1) as u16;
+            let reciprocal = super::runtime_neon::BLUR_RECIPROCAL[count as usize];
+            for (value, sum) in pixel.iter_mut().zip(sums) {
+                *value = ((u32::from(sum + count / 2) * reciprocal) >> 16) as u8;
+            }
+            if x >= r {
+                for (sum, value) in sums.iter_mut().zip(&input[(x - r) * 4..][..4]) {
+                    *sum -= u16::from(*value);
+                }
+            }
+            if x + r + 1 < w {
+                for (sum, value) in sums.iter_mut().zip(&input[(x + r + 1) * 4..][..4]) {
+                    *sum += u16::from(*value);
+                }
             }
         }
     }
-    for y in 0..h {
-        for x in 0..w {
-            for channel in 0..4 {
-                let lo = y.saturating_sub(r);
-                let hi = (y + r).min(h - 1);
-                let sum: u32 = (lo..=hi)
-                    .map(|yy| scratch[(yy * w + x) * 4 + channel] as u32)
-                    .sum();
-                image.data_mut()[(y * w + x) * 4 + channel] =
-                    ((sum + (hi - lo + 1) as u32 / 2) / (hi - lo + 1) as u32) as u8;
-            }
+    let mut sums = vec![0u16; stride];
+    for row in scratch.chunks_exact(stride).take(r + 1) {
+        for (sum, value) in sums.iter_mut().zip(row) {
+            *sum += u16::from(*value);
         }
+    }
+    for (y, output) in image.data_mut().chunks_exact_mut(stride).enumerate() {
+        let add = if y > 0 && y + r < h {
+            &scratch[(y + r) * stride..][..stride]
+        } else {
+            &[]
+        };
+        let remove = if y > r {
+            &scratch[(y - r - 1) * stride..][..stride]
+        } else {
+            &[]
+        };
+        let count = ((y + r).min(h - 1) - y.saturating_sub(r) + 1) as u16;
+        super::runtime_neon::blur_row(&mut sums, add, remove, count, output);
     }
     Ok(())
 }
@@ -376,14 +400,68 @@ fn sample_axis(length: u32, source: u32, offset: f64, ratio: f64) -> Vec<Option<
         })
         .collect()
 }
+#[derive(Clone, Copy)]
+struct FixedSample {
+    low: u32,
+    high: u32,
+    weight: u32,
+    original: f64,
+    error: u32,
+}
+fn fixed_axis(length: u32, source: u32, offset: f64, ratio: f64) -> Vec<Option<FixedSample>> {
+    use super::runtime_neon::{WEIGHT_BITS, WEIGHT_ONE};
+    sample_axis(length, source, offset, ratio)
+        .into_iter()
+        .map(|sample| {
+            sample.map(|(low, high, original)| {
+                let weight = (original * f64::from(WEIGHT_ONE)).round() as u32;
+                // Bilinear interpolation is 255-Lipschitz in each weight. Include
+                // a margin for the oracle's floating-point arithmetic at half ties.
+                let error = ((original - f64::from(weight) / f64::from(WEIGHT_ONE)).abs()
+                    * 255.0
+                    * f64::from(1u32 << (2 * WEIGHT_BITS)))
+                .ceil() as u32
+                    + 4;
+                FixedSample {
+                    low,
+                    high,
+                    weight,
+                    original,
+                    error,
+                }
+            })
+        })
+        .collect()
+}
+fn horizontal_row(source: &[u8], columns: &[Option<FixedSample>], output: &mut [u32]) {
+    use super::runtime_neon::WEIGHT_ONE;
+    for (column, pixel) in columns.iter().zip(output.chunks_exact_mut(4)) {
+        if let Some(column) = column {
+            let a = &source[column.low as usize * 4..][..4];
+            let b = &source[column.high as usize * 4..][..4];
+            for ((out, a), b) in pixel.iter_mut().zip(a).zip(b) {
+                *out = u32::from(*a) * (WEIGHT_ONE - column.weight) + u32::from(*b) * column.weight;
+            }
+        }
+    }
+}
+fn exact_sample(source: &Pixmap, column: FixedSample, row: FixedSample, channel: usize) -> u8 {
+    let sample = |x, y| source.data()[((y * source.width() + x) * 4) as usize + channel] as f64;
+    let top = sample(column.low, row.low) * (1.0 - column.original)
+        + sample(column.high, row.low) * column.original;
+    let bottom = sample(column.low, row.high) * (1.0 - column.original)
+        + sample(column.high, row.high) * column.original;
+    (top * (1.0 - row.original) + bottom * row.original).round() as u8
+}
 pub(super) fn fit_image(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Result<Pixmap> {
+    use super::runtime_neon::WEIGHT_BITS;
     #[cfg(feature = "perf-bench")]
     crate::perf::hit(crate::perf::Op::Fit);
     if source.width() == w && source.height() == h {
+        // Owned API compatibility. Arc callers bypass this copy in ImageCache::get.
+        crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
         return Ok(source.clone());
     }
-    // Direct bounded bilinear sampling: no source copy or oversized aspect-ratio intermediate.
-    // Source is premultiplied; sample channels together to preserve that invariant.
     let ratio = if fit == Fit::Cover {
         (w as f64 / source.width() as f64).max(h as f64 / source.height() as f64)
     } else {
@@ -391,25 +469,56 @@ pub(super) fn fit_image(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Result<Pix
     };
     let mut out =
         Pixmap::new(w, h).ok_or_else(|| anyhow::anyhow!("Invalid prepared asset size"))?;
+    crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+    crate::perf_trace::count(crate::perf_trace::Count::ResizePixels, w as u64 * h as u64);
     let ox = (w as f64 - source.width() as f64 * ratio) / 2.0;
     let oy = (h as f64 - source.height() as f64 * ratio) / 2.0;
-    let columns = sample_axis(w, source.width(), ox, ratio);
-    let rows = sample_axis(h, source.height(), oy, ratio);
-    for (y, row) in rows.into_iter().enumerate() {
-        let Some((y0, y1, wy)) = row else {
+    let columns = fixed_axis(w, source.width(), ox, ratio);
+    let rows = fixed_axis(h, source.height(), oy, ratio);
+    let mut top = vec![0u32; w as usize * 4];
+    let mut bottom = top.clone();
+    let mut sums = top.clone();
+    let stride = source.width() as usize * 4;
+    let mut previous = None;
+    let half = 1 << (2 * WEIGHT_BITS - 1);
+    let mask = (1 << (2 * WEIGHT_BITS)) - 1;
+    for (row, output) in rows
+        .into_iter()
+        .zip(out.data_mut().chunks_exact_mut(w as usize * 4))
+    {
+        let Some(row) = row else {
             continue;
         };
-        for (x, column) in columns.iter().enumerate() {
-            if let Some((x0, x1, wx)) = *column {
-                let at = (y * w as usize + x) * 4;
-                for channel in 0..4 {
-                    let sample = |xx, yy| {
-                        source.data()[((yy * source.width() + xx) * 4) as usize + channel] as f64
-                    };
-                    let top = sample(x0, y0) * (1.0 - wx) + sample(x1, y0) * wx;
-                    let bottom = sample(x0, y1) * (1.0 - wx) + sample(x1, y1) * wx;
-                    out.data_mut()[at + channel] = (top * (1.0 - wy) + bottom * wy).round() as u8;
-                }
+        if previous != Some((row.low, row.high)) {
+            horizontal_row(
+                &source.data()[row.low as usize * stride..][..stride],
+                &columns,
+                &mut top,
+            );
+            horizontal_row(
+                &source.data()[row.high as usize * stride..][..stride],
+                &columns,
+                &mut bottom,
+            );
+            previous = Some((row.low, row.high));
+        }
+        super::runtime_neon::bilinear_row(&top, &bottom, row.weight, &mut sums);
+        for ((column, pixel), sums) in columns
+            .iter()
+            .zip(output.chunks_exact_mut(4))
+            .zip(sums.chunks_exact(4))
+        {
+            let Some(column) = *column else {
+                continue;
+            };
+            for (channel, (out, sum)) in pixel.iter_mut().zip(sums).enumerate() {
+                // Away from half ties, the error bound proves integer and f64
+                // rounding agree. Only ambiguous bytes use the original formula.
+                *out = if (sum & mask).abs_diff(half) <= column.error + row.error {
+                    exact_sample(source, column, row, channel)
+                } else {
+                    ((sum + half) >> (2 * WEIGHT_BITS)) as u8
+                };
             }
         }
     }
@@ -917,4 +1026,371 @@ mod dl17_sampling_tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    fn legacy_fit_image(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Result<Pixmap> {
+        #[cfg(feature = "perf-bench")]
+        crate::perf::hit(crate::perf::Op::Fit);
+        if source.width() == w && source.height() == h {
+            return Ok(source.clone());
+        }
+        // Direct bounded bilinear sampling: no source copy or oversized aspect-ratio intermediate.
+        // Source is premultiplied; sample channels together to preserve that invariant.
+        let ratio = if fit == Fit::Cover {
+            (w as f64 / source.width() as f64).max(h as f64 / source.height() as f64)
+        } else {
+            (w as f64 / source.width() as f64).min(h as f64 / source.height() as f64)
+        };
+        let mut out =
+            Pixmap::new(w, h).ok_or_else(|| anyhow::anyhow!("Invalid prepared asset size"))?;
+        let ox = (w as f64 - source.width() as f64 * ratio) / 2.0;
+        let oy = (h as f64 - source.height() as f64 * ratio) / 2.0;
+        let columns = sample_axis(w, source.width(), ox, ratio);
+        let rows = sample_axis(h, source.height(), oy, ratio);
+        for (y, row) in rows.into_iter().enumerate() {
+            let Some((y0, y1, wy)) = row else {
+                continue;
+            };
+            for (x, column) in columns.iter().enumerate() {
+                if let Some((x0, x1, wx)) = *column {
+                    let at = (y * w as usize + x) * 4;
+                    for channel in 0..4 {
+                        let sample = |xx, yy| {
+                            source.data()[((yy * source.width() + xx) * 4) as usize + channel]
+                                as f64
+                        };
+                        let top = sample(x0, y0) * (1.0 - wx) + sample(x1, y0) * wx;
+                        let bottom = sample(x0, y1) * (1.0 - wx) + sample(x1, y1) * wx;
+                        out.data_mut()[at + channel] =
+                            (top * (1.0 - wy) + bottom * wy).round() as u8;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+    fn legacy_blur(image: &mut Pixmap, radius: u32) -> Result<()> {
+        ensure!(
+            radius <= 4 && image.width() <= 640 && image.height() <= 480,
+            "Blur bounds exceeded"
+        );
+        if radius == 0 {
+            return Ok(());
+        }
+        let w = image.width() as usize;
+        let h = image.height() as usize;
+        let r = radius as usize;
+        let mut scratch = vec![0u8; image.data().len()];
+        for y in 0..h {
+            for x in 0..w {
+                for channel in 0..4 {
+                    let lo = x.saturating_sub(r);
+                    let hi = (x + r).min(w - 1);
+                    let sum: u32 = (lo..=hi)
+                        .map(|xx| image.data()[(y * w + xx) * 4 + channel] as u32)
+                        .sum();
+                    scratch[(y * w + x) * 4 + channel] =
+                        ((sum + (hi - lo + 1) as u32 / 2) / (hi - lo + 1) as u32) as u8;
+                }
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                for channel in 0..4 {
+                    let lo = y.saturating_sub(r);
+                    let hi = (y + r).min(h - 1);
+                    let sum: u32 = (lo..=hi)
+                        .map(|yy| scratch[(yy * w + x) * 4 + channel] as u32)
+                        .sum();
+                    image.data_mut()[(y * w + x) * 4 + channel] =
+                        ((sum + (hi - lo + 1) as u32 / 2) / (hi - lo + 1) as u32) as u8;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn source(w: u32, h: u32, mut seed: u32) -> Pixmap {
+        let mut image = Pixmap::new(w, h).unwrap();
+        for (i, pixel) in image.data_mut().chunks_exact_mut(4).enumerate() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let alpha = [0, 1, 127, 128, 254, 255, (seed >> 24) as u8][i % 7];
+            pixel.copy_from_slice(&[
+                (seed as u8).min(alpha),
+                ((seed >> 8) as u8).min(alpha),
+                ((seed >> 16) as u8).min(alpha),
+                alpha,
+            ]);
+        }
+        image
+    }
+    fn raw_fixed(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Pixmap {
+        use super::super::runtime_neon::WEIGHT_BITS;
+        let ratio = if fit == Fit::Cover {
+            (w as f64 / source.width() as f64).max(h as f64 / source.height() as f64)
+        } else {
+            (w as f64 / source.width() as f64).min(h as f64 / source.height() as f64)
+        };
+        let columns = fixed_axis(
+            w,
+            source.width(),
+            (w as f64 - source.width() as f64 * ratio) / 2.0,
+            ratio,
+        );
+        let rows = fixed_axis(
+            h,
+            source.height(),
+            (h as f64 - source.height() as f64 * ratio) / 2.0,
+            ratio,
+        );
+        let mut image = Pixmap::new(w, h).unwrap();
+        let mut top = vec![0; w as usize * 4];
+        let mut bottom = top.clone();
+        let mut sums = top.clone();
+        let stride = source.width() as usize * 4;
+        for (row, output) in rows
+            .into_iter()
+            .zip(image.data_mut().chunks_exact_mut(w as usize * 4))
+        {
+            let Some(row) = row else {
+                continue;
+            };
+            horizontal_row(
+                &source.data()[row.low as usize * stride..][..stride],
+                &columns,
+                &mut top,
+            );
+            horizontal_row(
+                &source.data()[row.high as usize * stride..][..stride],
+                &columns,
+                &mut bottom,
+            );
+            super::super::runtime_neon::bilinear_row(&top, &bottom, row.weight, &mut sums);
+            for (out, sum) in output.iter_mut().zip(&sums) {
+                *out = ((sum + (1 << (2 * WEIGHT_BITS - 1))) >> (2 * WEIGHT_BITS)) as u8;
+            }
+        }
+        image
+    }
+    // Area averaging changes the established bilinear output. Keep this integer
+    // candidate test-only until the renderer's pixel contract explicitly changes.
+    fn area_average(source: &Pixmap, w: u32, h: u32) -> Pixmap {
+        let sw = source.width();
+        let sh = source.height();
+        assert!(sw >= 2 * w && sh >= 2 * h);
+        let footprints = |source: u32, target: u32| -> Vec<Vec<(u32, u32)>> {
+            (0..target)
+                .map(|i| {
+                    let low = i * source;
+                    let high = (i + 1) * source;
+                    (low / target..high.div_ceil(target))
+                        .map(|s| (s, high.min((s + 1) * target) - low.max(s * target)))
+                        .collect()
+                })
+                .collect()
+        };
+        let columns = footprints(sw, w);
+        let rows = footprints(sh, h);
+        let divisor = u64::from(sw) * u64::from(sh);
+        let mut image = Pixmap::new(w, h).unwrap();
+        for (row, output) in rows
+            .iter()
+            .zip(image.data_mut().chunks_exact_mut(w as usize * 4))
+        {
+            for (column, pixel) in columns.iter().zip(output.chunks_exact_mut(4)) {
+                let mut sums = [0u64; 4];
+                for &(y, wy) in row {
+                    for &(x, wx) in column {
+                        let sample = &source.data()[((y * sw + x) * 4) as usize..][..4];
+                        for (sum, value) in sums.iter_mut().zip(sample) {
+                            *sum += u64::from(*value) * u64::from(wx) * u64::from(wy);
+                        }
+                    }
+                }
+                for (out, sum) in pixel.iter_mut().zip(sums) {
+                    *out = ((sum + divisor / 2) / divisor) as u8;
+                }
+            }
+        }
+        image
+    }
+    fn max_difference(a: &Pixmap, b: &Pixmap) -> u8 {
+        a.data()
+            .iter()
+            .zip(b.data())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap()
+    }
+    fn slots() -> Vec<(u32, u32, u32, u32)> {
+        vec![
+            (480, 480, 176, 176),
+            (640, 480, 592, 176),
+            (320, 480, 104, 156),
+            (320, 480, 176, 224),
+            (320, 480, 168, 252),
+            (320, 480, 176, 264),
+            (640, 480, 640, 200),
+            (640, 480, 640, 240),
+            (640, 480, 192, 408),
+            (1, 480, 640, 1),
+            (480, 1, 1, 480),
+            (1, 1, 17, 31),
+        ]
+    }
+    #[test]
+    fn resize_exact_bytes_and_candidate_differences() {
+        let mut cases = slots();
+        let mut seed = 19u32;
+        for _ in 0..160 {
+            let mut next = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed
+            };
+            cases.push((
+                next() % 65 + 1,
+                next() % 65 + 1,
+                next() % 79 + 1,
+                next() % 79 + 1,
+            ));
+        }
+        let mut raw_max = 0;
+        for (sw, sh, w, h) in cases {
+            let source = source(sw, sh, 17);
+            for fit in [Fit::Cover, Fit::Contain] {
+                let expected = legacy_fit_image(&source, w, h, fit).unwrap();
+                let actual = fit_image(&source, w, h, fit).unwrap();
+                assert_eq!(
+                    max_difference(&actual, &expected),
+                    0,
+                    "{sw}x{sh} to {w}x{h} {fit:?}"
+                );
+                raw_max = raw_max.max(max_difference(&raw_fixed(&source, w, h, fit), &expected));
+                for pixel in actual.data().chunks_exact(4) {
+                    assert!(pixel[..3].iter().all(|v| *v <= pixel[3]));
+                }
+            }
+        }
+        assert!(raw_max <= 1);
+        let input = source(480, 480, 17);
+        let area = area_average(&input, 176, 176);
+        let expected = legacy_fit_image(&input, 176, 176, Fit::Cover).unwrap();
+        let area_max = max_difference(&area, &expected);
+        assert!(area_max > 1);
+        let constant = {
+            let mut p = Pixmap::new(480, 480).unwrap();
+            p.fill(tiny_skia::Color::from_rgba8(51, 94, 137, 255));
+            p
+        };
+        assert_eq!(
+            max_difference(
+                &area_average(&constant, 176, 176),
+                &legacy_fit_image(&constant, 176, 176, Fit::Cover).unwrap()
+            ),
+            0
+        );
+        eprintln!(
+            "Q12 max per-channel difference={raw_max}; corrected production=0; area-average max per-channel difference={area_max} (seed=17 premultiplied noise, 480x480 to 176x176)"
+        );
+    }
+    #[test]
+    fn sliding_blur_exact_bytes_at_edges_and_all_radii() {
+        for (w, h) in [
+            (1, 1),
+            (1, 17),
+            (17, 1),
+            (7, 8),
+            (8, 7),
+            (15, 16),
+            (16, 15),
+            (17, 31),
+            (192, 408),
+        ] {
+            for radius in 0..=4 {
+                let mut actual = source(w, h, 29);
+                let mut expected = actual.clone();
+                blur(&mut actual, radius).unwrap();
+                legacy_blur(&mut expected, radius).unwrap();
+                assert_eq!(actual.data(), expected.data(), "{w}x{h} radius={radius}");
+            }
+        }
+        assert!(blur(&mut source(17, 17, 1), 5).is_err());
+        assert!(blur(&mut source(641, 1, 1), 1).is_err());
+    }
+    fn milliseconds(mut run: impl FnMut(), count: usize) -> f64 {
+        for _ in 0..3 {
+            run();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..count {
+            run();
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / count as f64
+    }
+    #[test]
+    #[ignore = "offline host microbenchmark; run with --release --ignored --nocapture"]
+    fn resize_bench() {
+        use std::hint::black_box;
+        for (sw, sh, w, h) in slots().into_iter().take(6) {
+            let source = source(sw, sh, 17);
+            for fit in [Fit::Cover, Fit::Contain] {
+                let before = milliseconds(
+                    || {
+                        black_box(legacy_fit_image(black_box(&source), w, h, fit).unwrap());
+                    },
+                    80,
+                );
+                let after = milliseconds(
+                    || {
+                        black_box(fit_image(black_box(&source), w, h, fit).unwrap());
+                    },
+                    80,
+                );
+                eprintln!(
+                    "resize {sw}x{sh} to {w}x{h} {fit:?}: before={before:.6} ms after={after:.6} ms"
+                );
+            }
+        }
+        let input = source(480, 480, 17);
+        let area = milliseconds(
+            || {
+                black_box(area_average(black_box(&input), 176, 176));
+            },
+            80,
+        );
+        eprintln!("test-only area-average 480x480 to 176x176: {area:.6} ms");
+        let input = source(192, 408, 17);
+        let before = milliseconds(
+            || {
+                let mut p = input.clone();
+                legacy_blur(black_box(&mut p), 2).unwrap();
+                black_box(p);
+            },
+            80,
+        );
+        let after = milliseconds(
+            || {
+                let mut p = input.clone();
+                blur(black_box(&mut p), 2).unwrap();
+                black_box(p);
+            },
+            80,
+        );
+        eprintln!(
+            "blur 192x408 radius=2 (includes identical input clone): before={before:.6} ms after={after:.6} ms"
+        );
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[doc(hidden)]
+pub fn benchmark_fit(source: &Pixmap, w: u32, h: u32) -> Result<Pixmap> {
+    fit_image(source, w, h, Fit::Cover)
+}
+#[cfg(feature = "perf-bench")]
+#[doc(hidden)]
+pub fn benchmark_blur(image: &mut Pixmap, radius: u32) -> Result<()> {
+    blur(image, radius)
 }
