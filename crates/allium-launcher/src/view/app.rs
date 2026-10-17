@@ -1257,6 +1257,10 @@ where
                             *work = Some(current); return Ok(false); }
                         let available = NEIGHBOR_LIMIT - self.neighbors.iter().map(|c| c.charge).sum::<usize>();
                         if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available.saturating_sub(std::mem::size_of::<PreparedNeighbor>()))? {
+                            if let Recents::List(list) = &mut self.views.0
+                                && let Some(key) = list.normalized_recents_key(&handle, Some(target_direction), &status) {
+                                list.remember_normalized_recents(key, vec![input]);
+                            }
                             self.neighbors.push(PreparedNeighbor { base: frame.navigation_stamp(),
                                 generation: NeighborGeneration::current(&self.res, self.res.get::<Locale>().lang.clone()), frame: candidate, charge: charge + std::mem::size_of::<PreparedNeighbor>(), packed: None, pack_diagnostic: Default::default() });
                         }
@@ -1346,7 +1350,12 @@ where
         handle: &common::theme::ThemeHandle,
         models: &mut [common::theme::frame::FrameInputs],
     ) {
-        let status = if self
+        let status = self.theme_status();
+        normalize_theme_models(handle, models, &self.res, self.selected, &status);
+    }
+
+    fn theme_status(&self) -> common::theme::frame::Status {
+        if self
             .res
             .get::<Stylesheet>()
             .status_bar
@@ -1355,8 +1364,7 @@ where
             common::theme::frame::Status::default()
         } else {
             self.status_bar.theme_inputs()
-        };
-        normalize_theme_models(handle, models, &self.res, self.selected, &status);
+        }
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
@@ -1386,14 +1394,32 @@ where
             return Ok(());
         };
         self.had_theme = true;
-        let models = {
+        let status = self.theme_status();
+        let (reuse_key, reused, models) = {
             let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameModel);
-            self.theme_models(&handle)?
+            let reuse_key = if !self.dirty && self.selected == 0 && self.search_results.is_none()
+                && !self.search_view.is_active() && self.rect == Rect::new(0, 0, 640, 480)
+                && !crate::network_runtime::blocks_navigation_warm()
+                && self.theme_scene.as_ref().is_some_and(|scene| scene.frames.len() == 1
+                    && scene.frames[0].navigation_theme_matches(&handle) && scene.frames[0].can_prepare_neighbor()) {
+                match &self.views.0 {
+                    Recents::List(list) => list.normalized_recents_key(&handle, None, &status),
+                    _ => None,
+                }
+            } else { None };
+            let models = if let (Some(key), Recents::List(list)) = (&reuse_key, &mut self.views.0) {
+                list.take_normalized_recents(key, &handle)?
+            } else { None };
+            let reused = models.is_some();
+            let models = if reused { models } else {
+                self.theme_models(&handle)?
+            };
+            (reuse_key, reused, models)
         };
         self.theme_scene = if let Some(mut models) = models {
-            {
+            if !reused {
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::FrameNormalize);
-                self.normalize_theme_inputs(&handle, &mut models);
+                normalize_theme_models(&handle, &mut models, &self.res, self.selected, &status);
             }
             let locale = self.res.get::<Locale>();
             let generation = {
@@ -1441,6 +1467,9 @@ where
                 let pending = theme_content_pending_reasons(visible, &handle);
                 let next_cover_expected = visible.iter().any(|input| input.art.next_cover_expected);
                 common::perf_trace::content_readiness_reasons(pending, next_cover_expected);
+            }
+            if let (Some(key), Recents::List(list)) = (reuse_key, &mut self.views.0) {
+                list.remember_normalized_recents(key, models);
             }
             Some(crate::theme_adapter::ThemeScene { frames })
         } else {
@@ -2680,8 +2709,11 @@ mod integration_navigation_tests {
                 .unwrap();
                 let plans = super::super::entry_list::MEDIA_PLANS.with(std::cell::Cell::get);
                 if *id == "compact-plus" { assert!(app.defer_media_step()); }
+                let model_builds = THEME_MODEL_BUILDS.with(std::cell::Cell::get);
                 app.prepare_theme().unwrap();
                 if *id == "compact-plus" {
+                    assert_eq!(THEME_MODEL_BUILDS.with(std::cell::Cell::get), model_builds,
+                        "prepared press must reuse its normalized model");
                     assert!(app.media_deferred, "no-result prepared hit must defer media planning");
                     assert_eq!(super::super::entry_list::MEDIA_PLANS.with(std::cell::Cell::get), plans,
                         "no-result press ran selection planning before presentation");

@@ -115,6 +115,26 @@ struct RecentsRevisions {
     screen: common::theme::pack::ScreenId,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NormalizedRecentsKey {
+    semantic: RecentsSemanticKey,
+    artwork: u64,
+    completion: u64,
+    stylesheet: u64,
+    theme: u64,
+    size: u64,
+    rect: Rect,
+    status: common::theme::frame::Status,
+}
+
+#[derive(Default)]
+struct NormalizedRecentsCache(VecDeque<(NormalizedRecentsKey, Vec<common::theme::frame::FrameInputs>)>);
+impl std::fmt::Debug for NormalizedRecentsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NormalizedRecentsCache").field("len", &self.0.len()).finish()
+    }
+}
+
 const RECENTS_MODEL_LIMIT: usize = 8;
 // ScrollList accepts at most 64 visible rows, so retain two maximum windows.
 const RECENTS_ROW_LIMIT: usize = 128;
@@ -205,6 +225,7 @@ where
     list_revision: u64,
     recents_semantic: VecDeque<RecentsSemantic>,
     recents_rows: Option<RecentsRows>,
+    normalized_recents: NormalizedRecentsCache,
     sort: S,
     list: ScrollList,
     image: Image,
@@ -324,6 +345,7 @@ where
             list_revision: 0,
             recents_semantic: VecDeque::new(),
             recents_rows: None,
+            normalized_recents: NormalizedRecentsCache::default(),
             sort,
             list,
             image,
@@ -887,6 +909,74 @@ where
         input
     }
 
+    fn recents_semantic_key(&self, screen: common::theme::pack::ScreenId,
+        handle: &common::theme::ThemeHandle, selected: usize, first: usize, count: usize,
+    ) -> RecentsSemanticKey {
+        let revisions = RecentsRevisions {
+            list_revision: self.list_revision,
+            media_generation: common::media::generation(),
+            name_generation: common::media::name_generation(),
+            metadata_generation: crate::view::details::metadata_generation(),
+            adoption_generation: super::orbit::metadata_completion_generation(),
+            locale_revision: self.res.revision::<Locale>(),
+            console_revision: self.res.revision::<ConsoleMapper>(),
+            language: self.res.get::<Locale>().language(),
+            theme_generation: handle.generation(),
+            theme_digest: handle.digest().to_owned(),
+            screen,
+        };
+        RecentsSemanticKey {
+            selected,
+            path: self.entries.get(selected).map(|entry| entry.path().to_path_buf()),
+            first, count, image_focus: self.image_focus.clone(),
+            cloud_rows: self.entries.iter().skip(first).take(count)
+                .map(|entry| crate::network_runtime::download_id(entry.path()).is_some()).collect(),
+            revisions,
+        }
+    }
+
+    pub(crate) fn normalized_recents_key(&self, handle: &common::theme::ThemeHandle,
+        direction: Option<isize>, status: &common::theme::frame::Status,
+    ) -> Option<NormalizedRecentsKey> {
+        use common::theme::pack::{Binding, ScreenId};
+        if !self.root_tab_navigation_ready() || self.core.is_some()
+            || self.theme_screen != Some(ScreenId::Recents) { return None; }
+        let (selected, first) = match direction {
+            Some(direction) => self.list.navigation_selection(direction)?,
+            None => (self.list.selected(), self.list.window_start()),
+        };
+        Some(NormalizedRecentsKey {
+            semantic: self.recents_semantic_key(ScreenId::Recents, handle, selected, first,
+                crate::theme_adapter::capacity(handle, ScreenId::Recents, Binding::Entries)),
+            artwork: super::orbit::art_cache_revision(), completion: super::orbit::completion_generation(),
+            stylesheet: self.res.revision::<Stylesheet>(), theme: self.res.revision::<Option<common::theme::ThemeHandle>>(),
+            size: self.res.revision::<common::geom::Size>(), rect: self.rect, status: status.clone(),
+        })
+    }
+
+    pub(crate) fn take_normalized_recents(&mut self, key: &NormalizedRecentsKey,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        let Some(index) = self.normalized_recents.0.iter().position(|(cached, _)| cached == key) else { return Ok(None); };
+        let (_, mut models) = self.normalized_recents.0.remove(index).unwrap();
+        self.apply_theme_art(handle, &mut models[0])?;
+        // Artwork refresh can invalidate the proof even without a queued worker result.
+        if key.artwork != super::orbit::art_cache_revision()
+            || key.completion != super::orbit::completion_generation() { return Ok(None); }
+        Ok(Some(models))
+    }
+
+    pub(crate) fn remember_normalized_recents(&mut self, key: NormalizedRecentsKey,
+        mut models: Vec<common::theme::frame::FrameInputs>,
+    ) {
+        // Retain no source pixels: eviction, weak artwork proofs and the art budget stay unchanged.
+        if models.len() != 1 { return; }
+        models[0].art = Default::default();
+        self.normalized_recents.0.retain(|(cached, _)| cached != &key);
+        self.normalized_recents.0.push_back((key, models));
+        while self.normalized_recents.0.len() > 2 { self.normalized_recents.0.pop_front(); }
+    }
+
     fn recents_theme_model(
         &mut self,
         screen: common::theme::pack::ScreenId,
@@ -902,19 +992,8 @@ where
         }
         // Modal underlays still bypass both caches. Cache only raw semantics;
         // artwork and normalization (including live status) run after this call.
-        let revisions = RecentsRevisions {
-            list_revision: self.list_revision,
-            media_generation: common::media::generation(),
-            name_generation: common::media::name_generation(),
-            metadata_generation: crate::view::details::metadata_generation(),
-            adoption_generation: super::orbit::metadata_completion_generation(),
-            locale_revision: self.res.revision::<Locale>(),
-            console_revision: self.res.revision::<ConsoleMapper>(),
-            language: self.res.get::<Locale>().language(),
-            theme_generation: handle.generation(),
-            theme_digest: handle.digest().to_owned(),
-            screen,
-        };
+        let key = self.recents_semantic_key(screen, handle, selected, first, count);
+        let revisions = key.revisions.clone();
         if self.menu.is_some() || self.disc_picker.is_some() {
             let mut input = self.base_theme_model(screen, handle, selected, first, count);
             input.raster_revision = Some(format!("{:?}", revisions));
@@ -922,14 +1001,6 @@ where
         }
         let _semantic = common::perf_trace::recording()
             .then(|| common::perf_trace::stage(common::perf_trace::Stage::SemanticModel));
-        let key = RecentsSemanticKey {
-            selected,
-            path: self.entries.get(selected).map(|entry| entry.path().to_path_buf()),
-            first, count, image_focus: self.image_focus.clone(),
-            cloud_rows: self.entries.iter().skip(first).take(count)
-                .map(|entry| crate::network_runtime::download_id(entry.path()).is_some()).collect(),
-            revisions: revisions.clone(),
-        };
         if let Some(index) = self.recents_semantic.iter().position(|cached| cached.key == key) {
             let cached = self.recents_semantic.remove(index).unwrap();
             let input = cached.input.clone();
@@ -972,24 +1043,11 @@ where
         self.theme_models_covered(screen, handle, false)
     }
 
-    pub(crate) fn theme_models_covered(
-        &mut self,
-        screen: common::theme::pack::ScreenId,
-        handle: &common::theme::ThemeHandle,
-        _covered: bool,
-    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
-        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Layout);
-        use common::theme::{
-            frame::{Focus, FrameInputs, Hint, Row},
-            pack::{Binding, ScreenId},
-        };
-        if let Some(child) = self.child.as_mut() {
-            self.semantic_info = None;
-            if let Some(orbit) = self.orbit.as_mut() {
-                orbit.release_art();
-            }
-            return child.theme_models(screen, handle);
-        }
+    fn apply_theme_art(&mut self, handle: &common::theme::ThemeHandle,
+        input: &mut common::theme::frame::FrameInputs,
+    ) -> Result<()> {
+        use common::theme::pack::ScreenId;
+        let screen = input.screen;
         let config = self.media_configuration(handle, screen);
         let (count, ink, tall, targets, lower_targets) = (config.count, config.ink, config.tall,
             config.targets, if config.stack[0] == Some(ScreenId::GameDetail) { config.lower_targets } else { config.targets });
@@ -998,7 +1056,6 @@ where
         let selected = self.list.selected();
         if self.theme_screen != Some(screen) {self.image_focus=None;}
         self.theme_screen=Some(screen);
-        let mut input = self.recents_theme_model(screen, handle, selected, first, count);
         let needs_art = self.details.is_some()
             || self.menu.is_some()
             || handle.pack().screens[&screen].components.iter().any(|c| {
@@ -1021,6 +1078,36 @@ where
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets);
         }
+        Ok(())
+    }
+
+    pub(crate) fn theme_models_covered(
+        &mut self,
+        screen: common::theme::pack::ScreenId,
+        handle: &common::theme::ThemeHandle,
+        _covered: bool,
+    ) -> Result<Vec<common::theme::frame::FrameInputs>> {
+        let _stage = common::perf_trace::stage(common::perf_trace::Stage::Layout);
+        use common::theme::{
+            frame::{Focus, FrameInputs, Hint, Row},
+            pack::{Binding, ScreenId},
+        };
+        if let Some(child) = self.child.as_mut() {
+            self.semantic_info = None;
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.release_art();
+            }
+            return child.theme_models(screen, handle);
+        }
+        let count = self.media_configuration(handle, screen).count;
+        self.list.set_visible_count_override(Some(count))?;
+        let first = self.list.window_start();
+        let selected = self.list.selected();
+        if self.theme_screen != Some(screen) { self.image_focus = None; }
+        self.theme_screen = Some(screen);
+        let mut input = self.recents_theme_model(screen, handle, selected, first, count);
+        self.apply_theme_art(handle, &mut input)?;
+        let orbit = self.orbit.as_mut().unwrap();
         let mut models = vec![input];
         if let Some(details) = &self.details {
             let focus = if handle.pack().ink() {
@@ -1186,6 +1273,7 @@ where
         self.details = None;
         self.semantic_info = None;
         self.recents_semantic.clear();
+        self.normalized_recents.0.clear();
         self.recents_rows = None;
         self.image_focus = None;
         self.orbit = None;
@@ -1310,6 +1398,7 @@ where
     fn load_entries(&mut self) -> Result<()> {
         self.list_revision = self.list_revision.wrapping_add(1);
         self.recents_semantic.clear();
+        self.normalized_recents.0.clear();
         self.recents_rows = None;
         self.idle_media_key = None;
         self.idle_media_work.clear();
@@ -2900,6 +2989,145 @@ pub(crate) mod ux4_tests {
             assert_eq!(RECENTS_SEMANTIC_BUILDS.with(std::cell::Cell::get), before);
             list.release_theme_art();
         }
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn normalized_recents_reuses_allocations_and_invalidates_every_key_field() {
+        use common::theme::{fonts::FontBank, frame::Status, pack::{Binding, ScreenId},
+            render::PreparedFrame, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 861).unwrap();
+        let res = resources();
+        res.insert(Some(theme.clone()));
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res.clone(),
+            PathsSort { paths: (0..12).map(|i| repo.join(format!("rank6-missing-{i}.gba"))).collect() }).unwrap();
+        let status = Status { clock: Some("12:34".into()), battery: Some(80), ..Default::default() };
+        let fresh = |list: &mut EntryList<PathsSort>, status: &Status| {
+            let mut models = list.theme_models(ScreenId::Recents, &theme).unwrap();
+            super::super::app::normalize_theme_models(&theme, &mut models, &res, 0, status);
+            models
+        };
+        let models = fresh(&mut list, &status);
+        let rows = models[0].rows[&Binding::Entries].as_ptr();
+        let key = list.normalized_recents_key(&theme, None, &status).unwrap();
+        list.remember_normalized_recents(key.clone(), models);
+        let models = list.take_normalized_recents(&key, &theme).unwrap().unwrap();
+        assert_eq!(rows, models[0].rows[&Binding::Entries].as_ptr(), "repeat must move, not clone, normalized rows");
+        let rebuilt = fresh(&mut list, &status);
+        assert!(models == rebuilt);
+        assert_eq!(PreparedFrame::prepare(theme.clone(), &models[0]).unwrap().pixels().data(),
+            PreparedFrame::prepare(theme.clone(), &rebuilt[0]).unwrap().pixels().data());
+        list.remember_normalized_recents(key.clone(), models);
+        let mut changes = Vec::new();
+        macro_rules! changed {
+            ($name:literal, $($field:ident).+, $value:expr) => {{
+                let mut other = key.clone(); other.$($field).+ = $value;
+                changes.push(($name, other));
+            }};
+        }
+        changed!("selection", semantic.selected, 1);
+        changed!("selected path", semantic.path, Some(repo.join("other.gba")));
+        changed!("window", semantic.first, 1);
+        changed!("capacity", semantic.count, key.semantic.count + 1);
+        changed!("image focus", semantic.image_focus, Some(Default::default()));
+        let mut cloud = key.semantic.cloud_rows.clone(); cloud[0] = !cloud[0];
+        changed!("cloud availability", semantic.cloud_rows, cloud);
+        changed!("list", semantic.revisions.list_revision, key.semantic.revisions.list_revision + 1);
+        changed!("media", semantic.revisions.media_generation, key.semantic.revisions.media_generation + 1);
+        changed!("names", semantic.revisions.name_generation, key.semantic.revisions.name_generation + 1);
+        changed!("metadata", semantic.revisions.metadata_generation, key.semantic.revisions.metadata_generation + 1);
+        changed!("metadata adoption", semantic.revisions.adoption_generation, key.semantic.revisions.adoption_generation + 1);
+        changed!("locale", semantic.revisions.locale_revision, key.semantic.revisions.locale_revision + 1);
+        changed!("consoles", semantic.revisions.console_revision, key.semantic.revisions.console_revision + 1);
+        changed!("language", semantic.revisions.language, "fr-FR".into());
+        changed!("theme generation", semantic.revisions.theme_generation, key.semantic.revisions.theme_generation + 1);
+        changed!("theme digest", semantic.revisions.theme_digest, "different".into());
+        changed!("screen", semantic.revisions.screen, ScreenId::Library);
+        changed!("artwork", artwork, key.artwork + 1);
+        changed!("art completion", completion, key.completion + 1);
+        changed!("stylesheet", stylesheet, key.stylesheet + 1);
+        changed!("theme resource", theme, key.theme + 1);
+        changed!("size resource", size, key.size + 1);
+        changed!("geometry", rect, Rect::new(1, 54, 640, 376));
+        changed!("clock", status.clock, Some("12:35".into()));
+        changed!("battery", status.battery, Some(79));
+        changed!("charging", status.charging, true);
+        changed!("network", status.network, Some("Wi-Fi".into()));
+        for (cause, changed) in changes {
+            assert!(list.take_normalized_recents(&changed, &theme).unwrap().is_none(), "{cause}");
+            let rebuilt = fresh(&mut list, &changed.status);
+            assert!(rebuilt[0].status == changed.status, "{cause} fallback normalization");
+        }
+        // Exercise actual producer changes as well as every field of the exact key.
+        for cause in ["status", "selection", "list", "media", "metadata", "locale", "consoles", "style", "size", "artwork", "completion"] {
+            let models = fresh(&mut list, &status);
+            let old = list.normalized_recents_key(&theme, None, &status).unwrap();
+            list.remember_normalized_recents(old.clone(), models);
+            let mut live_status = status.clone();
+            match cause {
+                "status" => live_status.clock = Some("23:59".into()),
+                "selection" => list.select(1),
+                "list" => list.list_revision += 1,
+                "media" => common::media::invalidate(),
+                "metadata" => crate::view::details::invalidate_metadata(),
+                "locale" => res.insert(Locale::new("fr-FR")),
+                "consoles" => res.insert(ConsoleMapper::new()),
+                "style" => { let style = res.get::<Stylesheet>().clone(); res.insert(style); },
+                "size" => res.insert(common::geom::Size::new(640, 480)),
+                "artwork" => super::super::orbit::invalidate_art(),
+                "completion" => super::super::orbit::visible_completion(),
+                _ => unreachable!(),
+            }
+            let current = list.normalized_recents_key(&theme, None, &live_status).unwrap();
+            assert!(current != old, "{cause} producer did not invalidate");
+            assert!(list.take_normalized_recents(&current, &theme).unwrap().is_none(), "{cause} reused");
+            let rebuilt = fresh(&mut list, &live_status);
+            assert!(rebuilt[0].status == live_status);
+        }
+        list.open_menu().unwrap();
+        assert!(list.normalized_recents_key(&theme, None, &status).is_none(), "overlay");
+        list.menu = None;
+        list.core = Some(CoreSelection { core: 0, cores: Vec::new() });
+        assert!(list.normalized_recents_key(&theme, None, &status).is_none(), "core overlay");
+        list.release_theme_art();
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[cfg(feature = "perf-bench")]
+    #[ignore = "explicit normalized Recents host microbenchmark"]
+    #[serial_test::serial(orbit_fixture)]
+    fn normalized_recents_model_bench() {
+        use common::theme::{fonts::FontBank, frame::Status, pack::ScreenId, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 862).unwrap();
+        let res = resources();
+        res.insert(Some(theme.clone()));
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res.clone(),
+            PathsSort { paths: (0..12).map(|i| repo.join(format!("rank6-bench-missing-{i}.gba"))).collect() }).unwrap();
+        let status = Status { clock: Some("12:34".into()), battery: Some(80), ..Default::default() };
+        let mut times = [Vec::new(), Vec::new()];
+        for _ in 0..101 {
+            let start = std::time::Instant::now();
+            let mut models = list.theme_models(ScreenId::Recents, &theme).unwrap();
+            super::super::app::normalize_theme_models(&theme, &mut models, &res, 0, &status);
+            times[0].push(start.elapsed().as_nanos());
+            let key = list.normalized_recents_key(&theme, None, &status).unwrap();
+            list.remember_normalized_recents(key, models);
+            let start = std::time::Instant::now();
+            let key = list.normalized_recents_key(&theme, None, &status).unwrap();
+            let models = list.take_normalized_recents(&key, &theme).unwrap().unwrap();
+            times[1].push(start.elapsed().as_nanos());
+            std::hint::black_box(&models);
+            list.remember_normalized_recents(key, models);
+        }
+        for values in &mut times { values.sort_unstable(); }
+        println!("NORMALIZED_RECENTS host_debug_samples=101 rebuild_median_ns={} reuse_median_ns={}", times[0][50], times[1][50]);
+        list.release_theme_art();
         common::media::invalidate();
     }
 

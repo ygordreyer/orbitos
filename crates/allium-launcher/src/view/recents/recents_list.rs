@@ -32,6 +32,24 @@ pub struct RecentsList {
 }
 
 impl RecentsList {
+    pub(crate) fn normalized_recents_key(&self, handle: &common::theme::ThemeHandle,
+        direction: Option<isize>, status: &common::theme::frame::Status,
+    ) -> Option<super::super::entry_list::NormalizedRecentsKey> {
+        self.list.normalized_recents_key(handle, direction, status)
+    }
+
+    pub(crate) fn take_normalized_recents(&mut self, key: &super::super::entry_list::NormalizedRecentsKey,
+        handle: &common::theme::ThemeHandle,
+    ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        self.list.take_normalized_recents(key, handle)
+    }
+
+    pub(crate) fn remember_normalized_recents(&mut self, key: super::super::entry_list::NormalizedRecentsKey,
+        models: Vec<common::theme::frame::FrameInputs>,
+    ) {
+        self.list.remember_normalized_recents(key, models);
+    }
+
     pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {
         self.list
             .idle_media_step(handle, common::theme::pack::ScreenId::Recents)
