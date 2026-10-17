@@ -128,7 +128,7 @@ pub(crate) struct NormalizedRecentsKey {
 }
 
 #[derive(Default)]
-struct NormalizedRecentsCache(VecDeque<(NormalizedRecentsKey, Vec<common::theme::frame::FrameInputs>)>);
+struct NormalizedRecentsCache(VecDeque<(NormalizedRecentsKey, Vec<common::theme::frame::FrameInputs>, Option<super::orbit::ArtSnapshot>)>);
 impl std::fmt::Debug for NormalizedRecentsCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NormalizedRecentsCache").field("len", &self.0.len()).finish()
@@ -970,15 +970,16 @@ where
     pub(crate) fn take_normalized_recents(&mut self, key: &NormalizedRecentsKey,
         handle: &common::theme::ThemeHandle,
     ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
-        let mut models = {
+        let (mut models, artwork) = {
             let _stage = common::perf_trace::recording()
                 .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameModelLookup));
-            let Some(index) = self.normalized_recents.0.iter().position(|(cached, _)| cached == key) else { return Ok(None); };
-            self.normalized_recents.0.remove(index).unwrap().1
+            let Some(index) = self.normalized_recents.0.iter().position(|(cached, _, _)| cached == key) else { return Ok(None); };
+            let (_, models, artwork) = self.normalized_recents.0.remove(index).unwrap();
+            (models, artwork)
         };
         let _stage = common::perf_trace::recording()
             .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameModelArtwork));
-        self.apply_theme_art(handle, &mut models[0])?;
+        self.apply_theme_art_snapshot(handle, &mut models[0], artwork.as_ref())?;
         // Artwork refresh can invalidate the proof even without a queued worker result.
         if key.artwork != super::orbit::art_cache_revision()
             || key.completion != super::orbit::completion_generation() { return Ok(None); }
@@ -986,13 +987,14 @@ where
     }
 
     pub(crate) fn remember_normalized_recents(&mut self, key: NormalizedRecentsKey,
-        mut models: Vec<common::theme::frame::FrameInputs>,
+        mut models: Vec<common::theme::frame::FrameInputs>, handle: &common::theme::ThemeHandle,
     ) {
         // Retain no source pixels: eviction, weak artwork proofs and the art budget stay unchanged.
         if models.len() != 1 { return; }
+        let artwork = self.orbit.as_ref().map(|orbit| orbit.art_snapshot(handle, &models[0].art));
         models[0].art = Default::default();
-        self.normalized_recents.0.retain(|(cached, _)| cached != &key);
-        self.normalized_recents.0.push_back((key, models));
+        self.normalized_recents.0.retain(|(cached, _, _)| cached != &key);
+        self.normalized_recents.0.push_back((key, models, artwork));
         while self.normalized_recents.0.len() > 2 { self.normalized_recents.0.pop_front(); }
     }
 
@@ -1066,6 +1068,12 @@ where
     fn apply_theme_art(&mut self, handle: &common::theme::ThemeHandle,
         input: &mut common::theme::frame::FrameInputs,
     ) -> Result<()> {
+        self.apply_theme_art_snapshot(handle, input, None)
+    }
+
+    fn apply_theme_art_snapshot(&mut self, handle: &common::theme::ThemeHandle,
+        input: &mut common::theme::frame::FrameInputs, artwork: Option<&super::orbit::ArtSnapshot>,
+    ) -> Result<()> {
         use common::theme::pack::ScreenId;
         let config_stage = common::perf_trace::recording()
             .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameArtConfig));
@@ -1102,7 +1110,8 @@ where
         drop(protection_stage);
         if needs_art {
             orbit.prepare_window(&self.entries, selected, first, count);
-            input.art = orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets);
+            input.art = artwork.and_then(|snapshot| snapshot.restore(orbit, handle, lower_targets))
+                .unwrap_or_else(|| orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets));
         }
         Ok(())
     }
@@ -3042,7 +3051,7 @@ pub(crate) mod ux4_tests {
         let weak_art = std::sync::Arc::downgrade(&stale_art);
         models[0].art.selected_logo = Some(stale_art);
         let key = list.normalized_recents_key(&theme, None, &status).unwrap();
-        list.remember_normalized_recents(key.clone(), models);
+        list.remember_normalized_recents(key.clone(), models, &theme);
         assert!(weak_art.upgrade().is_none(), "remembered models must not retain source pixels");
         let again = list.normalized_recents_key(&theme, None, &status).unwrap();
         assert!(std::sync::Arc::ptr_eq(&key.semantic.revisions.theme_digest,
@@ -3054,7 +3063,7 @@ pub(crate) mod ux4_tests {
         assert!(models == rebuilt);
         assert_eq!(PreparedFrame::prepare(theme.clone(), &models[0]).unwrap().pixels().data(),
             PreparedFrame::prepare(theme.clone(), &rebuilt[0]).unwrap().pixels().data());
-        list.remember_normalized_recents(key.clone(), models);
+        list.remember_normalized_recents(key.clone(), models, &theme);
         let mut changes = Vec::new();
         macro_rules! changed {
             ($name:literal, $($field:ident).+, $value:expr) => {{
@@ -3106,7 +3115,7 @@ pub(crate) mod ux4_tests {
         for cause in ["status", "selection", "list", "media", "metadata", "locale", "consoles", "style", "size", "artwork", "completion"] {
             let models = fresh(&mut list, &status);
             let old = list.normalized_recents_key(&theme, None, &status).unwrap();
-            list.remember_normalized_recents(old.clone(), models);
+            list.remember_normalized_recents(old.clone(), models, &theme);
             let mut live_status = status.clone();
             match cause {
                 "status" => live_status.clock = Some("23:59".into()),
@@ -3131,7 +3140,7 @@ pub(crate) mod ux4_tests {
         list.select(0);
         let models = fresh(&mut list, &status);
         let old = list.normalized_recents_key(&theme, None, &status).unwrap();
-        list.remember_normalized_recents(old.clone(), models);
+        list.remember_normalized_recents(old.clone(), models, &theme);
         let path = list.entries[0].path().to_owned();
         list.sort(PathsSort { paths: vec![repo.join("replacement.gba")] }).unwrap();
         let current = list.normalized_recents_key(&theme, None, &status).unwrap();
@@ -3146,6 +3155,65 @@ pub(crate) mod ux4_tests {
         assert!(list.normalized_recents_key(&theme, None, &status).is_none(), "core overlay");
         list.release_theme_art();
         common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn normalized_recents_art_snapshot_hits_and_falls_back_to_identical_pixels() {
+        use common::theme::{fonts::FontBank, frame::Status, pack::ScreenId,
+            render::PreparedFrame, runtime::ThemeSnapshot, ThemeHandle};
+        let root = std::env::temp_dir().join(format!("allium-normalized-snapshot-{}", std::process::id()));
+        assert!(!root.exists());
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let mut pixels = tiny_skia::Pixmap::new(8, 8).unwrap();
+        pixels.fill(tiny_skia::Color::from_rgba8(90, 140, 30, 255));
+        for i in 0..12 { pixels.save_png(root.join(format!("Imgs/Game{i}.png"))).unwrap(); }
+        common::media::invalidate();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let load = || ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap();
+        let theme = ThemeHandle::prepare(load(), &bank, 906).unwrap();
+        let other = ThemeHandle::prepare(load(), &bank, theme.generation()).unwrap();
+        let res = resources();
+        res.insert(Some(theme.clone()));
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res.clone(),
+            PathsSort { paths: (0..12).map(|i| root.join(format!("Game{i}.gba"))).collect() }).unwrap();
+        let status = Status::default();
+        list.theme_models(ScreenId::Recents, &theme).unwrap();
+        list.orbit.as_mut().unwrap().prepare_loaded_window(&list.entries, 0, 0, 12);
+        let mut predicted = list.navigation_frame_model(&theme, 1).unwrap();
+        super::super::app::normalize_theme_models(&theme, std::slice::from_mut(&mut predicted), &res, 0, &status);
+        assert!(predicted.art.selected_cover.is_some() && !predicted.art.entries.is_empty());
+        let key = list.normalized_recents_key(&theme, Some(1), &status).unwrap();
+        list.remember_normalized_recents(key.clone(), vec![predicted.clone()], &theme);
+        list.select(1);
+        let assert_protection = super::super::orbit::refresh_tests::expect_selection_protection(
+            list.orbit.as_mut().unwrap(), &list.entries[0], &list.entries[1]);
+        let hits = || super::super::orbit::ART_SNAPSHOT_HITS.with(std::cell::Cell::get);
+        let before = hits();
+        let models = list.take_normalized_recents(&key, &theme).unwrap().unwrap();
+        assert_eq!(hits(), before + 1, "snapshot must be reused");
+        assert_protection(list.orbit.as_ref().unwrap());
+        assert!(models[0] == predicted);
+        for (cause, handle) in [("hit", &theme), ("paths", &theme), ("theme handle", &other)] {
+            let mut expected = list.theme_models(ScreenId::Recents, &theme).unwrap();
+            super::super::app::normalize_theme_models(&theme, &mut expected, &res, 0, &status);
+            let key = list.normalized_recents_key(&theme, None, &status).unwrap();
+            list.remember_normalized_recents(key.clone(), expected, &theme);
+            if cause == "paths" { common::media::clear_prepared_paths(); }
+            let before = hits();
+            let actual = list.take_normalized_recents(&key, handle).unwrap().unwrap();
+            assert_eq!(hits() - before, usize::from(cause == "hit"), "{cause}");
+            let mut expected = list.theme_models(ScreenId::Recents, handle).unwrap();
+            super::super::app::normalize_theme_models(handle, &mut expected, &res, 0, &status);
+            assert!(actual == expected, "{cause}: artwork map and source identity");
+            assert!(actual[0].art.completed_misses == expected[0].art.completed_misses, "{cause}: completed misses");
+            assert_eq!(PreparedFrame::prepare(handle.clone(), &actual[0]).unwrap().pixels().data(),
+                PreparedFrame::prepare(handle.clone(), &expected[0]).unwrap().pixels().data(), "{cause}: pixels");
+        }
+        list.release_theme_art();
+        common::media::invalidate();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3169,13 +3237,13 @@ pub(crate) mod ux4_tests {
             super::super::app::normalize_theme_models(&theme, &mut models, &res, 0, &status);
             times[0].push(start.elapsed().as_nanos());
             let key = list.normalized_recents_key(&theme, None, &status).unwrap();
-            list.remember_normalized_recents(key, models);
+            list.remember_normalized_recents(key, models, &theme);
             let start = std::time::Instant::now();
             let key = list.normalized_recents_key(&theme, None, &status).unwrap();
             let models = list.take_normalized_recents(&key, &theme).unwrap().unwrap();
             times[1].push(start.elapsed().as_nanos());
             std::hint::black_box(&models);
-            list.remember_normalized_recents(key, models);
+            list.remember_normalized_recents(key, models, &theme);
         }
         for values in &mut times { values.sort_unstable(); }
         println!("NORMALIZED_RECENTS host_debug_samples=101 rebuild_median_ns={} reuse_median_ns={}", times[0][50], times[1][50]);
@@ -3290,7 +3358,7 @@ pub(crate) mod ux4_tests {
                 assert!(list.take_normalized_recents(&key, &theme).unwrap().is_none());
             }
             list.normalized_recents.0.clear();
-            list.remember_normalized_recents(key.clone(), vec![model]);
+            list.remember_normalized_recents(key.clone(), vec![model], &theme);
             previous = Some(key);
         }
         list.release_theme_art();

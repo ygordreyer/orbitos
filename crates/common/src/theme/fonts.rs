@@ -100,6 +100,13 @@ impl FontBank {
 }
 #[derive(Clone)]
 pub struct ThemeHandle(Arc<PreparedTheme>);
+#[derive(Clone)]
+pub struct WeakThemeHandle(std::sync::Weak<PreparedTheme>);
+impl WeakThemeHandle {
+    pub fn matches(&self, handle: &ThemeHandle) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(&handle.0))
+    }
+}
 pub(super) struct PreparedTheme {
     base: ThemeSnapshot,
     fonts: BTreeMap<Role, Font<'static>>,
@@ -108,6 +115,9 @@ pub(super) struct PreparedTheme {
     generation: u64,
 }
 impl ThemeHandle {
+    pub fn downgrade(&self) -> WeakThemeHandle {
+        WeakThemeHandle(self.weak())
+    }
     pub(super) fn weak(&self) -> std::sync::Weak<PreparedTheme> {
         Arc::downgrade(&self.0)
     }

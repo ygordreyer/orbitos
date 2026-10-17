@@ -45,9 +45,9 @@ impl RecentsList {
     }
 
     pub(crate) fn remember_normalized_recents(&mut self, key: super::super::entry_list::NormalizedRecentsKey,
-        models: Vec<common::theme::frame::FrameInputs>,
+        models: Vec<common::theme::frame::FrameInputs>, handle: &common::theme::ThemeHandle,
     ) {
-        self.list.remember_normalized_recents(key, models);
+        self.list.remember_normalized_recents(key, models, handle);
     }
 
     pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {

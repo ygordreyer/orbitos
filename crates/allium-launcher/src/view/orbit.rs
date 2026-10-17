@@ -65,6 +65,8 @@ thread_local! {
     static RESOLVED_PATH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     #[cfg(test)]
     static PROTECTION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    pub(crate) static ART_SNAPSHOT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_CACHE_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -140,6 +142,60 @@ impl PathRevision {
             network: crate::network_runtime::art_path_generation() }
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ArtStamp {
+    artwork: u64,
+    completion: u64,
+    path: PathRevision,
+    invalidation: (u64, u64, u64),
+    media_generation: u64,
+    owner: u64,
+    tall: bool,
+    ink: bool,
+    targets: ArtTargets,
+    recording: bool,
+}
+
+pub(super) struct ArtSnapshot {
+    theme: common::theme::fonts::WeakThemeHandle,
+    theme_generation: u64,
+    theme_digest: String,
+    stamp: ArtStamp,
+    selected_logo: Option<std::sync::Weak<Pixmap>>,
+    selected_cover: Option<std::sync::Weak<Pixmap>>,
+    selected_hero: Option<std::sync::Weak<Pixmap>>,
+    next_cover: Option<std::sync::Weak<Pixmap>>,
+    next_cover_expected: bool,
+    entries: Vec<(String, std::sync::Weak<Pixmap>)>,
+    completed_misses: common::theme::frame::ArtMisses,
+}
+impl ArtSnapshot {
+    pub(super) fn restore(&self, orbit: &Orbit, handle: &common::theme::ThemeHandle,
+        targets: ArtTargets,
+    ) -> Option<common::theme::frame::Art> {
+        if !self.theme.matches(handle) || self.theme_generation != handle.generation()
+            || self.theme_digest != handle.digest() || self.stamp != orbit.art_stamp()
+            || self.stamp.targets != targets { return None; }
+        fn upgrade(source: &Option<std::sync::Weak<Pixmap>>) -> Option<Option<std::sync::Arc<Pixmap>>> {
+            match source { Some(source) => source.upgrade().map(Some), None => Some(None) }
+        }
+        let art = common::theme::frame::Art {
+            selected_logo: upgrade(&self.selected_logo)?,
+            selected_cover: upgrade(&self.selected_cover)?,
+            selected_hero: upgrade(&self.selected_hero)?,
+            next_cover: upgrade(&self.next_cover)?,
+            next_cover_expected: self.next_cover_expected,
+            entries: self.entries.iter().map(|(id, source)| Some((id.clone(), source.upgrade()?)))
+                .collect::<Option<_>>()?,
+            completed_misses: self.completed_misses.clone(),
+        };
+        #[cfg(test)]
+        ART_SNAPSHOT_HITS.with(|n| n.set(n.get() + 1));
+        Some(art)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ResolvedPaths {
     revision: Option<PathRevision>,
@@ -151,6 +207,7 @@ pub struct Orbit {
     cache: VecDeque<CachedArt>,
     source_account: std::rc::Rc<std::cell::Cell<usize>>,
     generation: u64,
+    art_epoch: u64,
     media_generation: u64,
     legacy_ready: bool,
     ink_art: bool,
@@ -180,6 +237,7 @@ impl Orbit {
             cache: VecDeque::new(),
             source_account: source_account(),
             generation: art_generation(),
+            art_epoch: 0,
             media_generation: common::media::generation(),
             legacy_ready: false,
             ink_art: false,
@@ -348,7 +406,7 @@ impl Orbit {
         self.refresh_art();
     }
     #[cfg(test)]
-    fn prepare_loaded_window(
+    pub(super) fn prepare_loaded_window(
         &mut self,
         entries: &[Entry],
         selected: usize,
@@ -499,6 +557,30 @@ impl Orbit {
         count: usize,
     ) -> common::theme::frame::Art {
         self.theme_art_for_targets(entries, selected, first, count, self.targets)
+    }
+    fn art_stamp(&self) -> ArtStamp {
+        ArtStamp {
+            artwork: art_cache_revision(), completion: completion_generation(), path: PathRevision::current(),
+            invalidation: (art_generation(), self.generation, self.art_epoch),
+            media_generation: self.media_generation, owner: self.worker_id,
+            tall: self.tall_art, ink: self.ink_art, targets: self.targets,
+            recording: common::perf_trace::recording(),
+        }
+    }
+    pub(super) fn art_snapshot(&self, handle: &common::theme::ThemeHandle,
+        art: &common::theme::frame::Art,
+    ) -> ArtSnapshot {
+        ArtSnapshot {
+            theme: handle.downgrade(), theme_generation: handle.generation(), theme_digest: handle.digest().into(),
+            stamp: self.art_stamp(),
+            selected_logo: art.selected_logo.as_ref().map(std::sync::Arc::downgrade),
+            selected_cover: art.selected_cover.as_ref().map(std::sync::Arc::downgrade),
+            selected_hero: art.selected_hero.as_ref().map(std::sync::Arc::downgrade),
+            next_cover: art.next_cover.as_ref().map(std::sync::Arc::downgrade),
+            next_cover_expected: art.next_cover_expected,
+            entries: art.entries.iter().map(|(id, source)| (id.clone(), std::sync::Arc::downgrade(source))).collect(),
+            completed_misses: art.completed_misses.clone(),
+        }
     }
     pub(crate) fn theme_art_for_targets(&self, entries: &[Entry], selected: usize, first: usize, count: usize, targets: ArtTargets) -> common::theme::frame::Art {
         let _stage = common::perf_trace::stage(common::perf_trace::Stage::ArtworkLookup);
@@ -769,6 +851,8 @@ impl Orbit {
     }
 
     pub fn release_art(&mut self) {
+        // External frame owners can keep pixels alive after this Orbit releases them.
+        self.art_epoch = self.art_epoch.wrapping_add(1);
         if !self.completed_tasks.is_empty() { art_cache_changed(); }
         self.cancel_selection();
         self.completed_tasks.clear();
@@ -1707,9 +1791,28 @@ mod next_cover_tests {
 }
 
 #[cfg(test)]
-mod refresh_tests {
+pub(super) mod refresh_tests {
     use super::*;
     use crate::entry::game::Game;
+
+    pub(in crate::view) fn expect_selection_protection(orbit: &mut Orbit, previous: &Entry,
+        selected: &Entry,
+    ) -> impl FnOnce(&Orbit) + use<> {
+        assert_ne!(previous.path(), selected.path());
+        orbit.protect_selected(previous);
+        orbit.pending_tasks.push_back(WarmArt::Cover(previous.clone()));
+        let epoch = orbit.worker_epoch;
+        assert_eq!(orbit.cancellation.load(std::sync::atomic::Ordering::Acquire), epoch);
+        let protected = vec![orbit.cover_path(selected), art_path(selected, "heroes"), art_path(selected, "logos")];
+        let selected = selected.path().to_owned();
+        move |orbit| {
+            assert_eq!(orbit.selected_path.as_deref(), Some(selected.as_path()));
+            assert_eq!(orbit.protected_paths, protected);
+            assert_eq!(orbit.worker_epoch, epoch.wrapping_add(1), "selection must cancel old work");
+            assert_eq!(orbit.cancellation.load(std::sync::atomic::Ordering::Acquire), orbit.worker_epoch);
+            assert!(orbit.pending_tasks.is_empty(), "selection must discard queued old work");
+        }
+    }
 
     fn write_art(path: &Path, width: u32, height: u32, red: u8) {
         let mut pixels = Pixmap::new(width, height).unwrap();
@@ -1884,6 +1987,233 @@ mod refresh_tests {
     }
 
     #[test]
+    #[cfg(feature = "perf-bench")]
+    #[serial_test::serial(orbit_fixture)]
+    fn art_snapshot_matches_rebuild_pixels_and_completed_misses() {
+        use common::theme::{fonts::FontBank, frame::FrameInputs, pack::ScreenId,
+            render::PreparedFrame, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 903).unwrap();
+        let trace = std::env::temp_dir().join(format!("allium-art-snapshot-{}.jsonl", std::process::id()));
+        common::perf_trace::start_probe(trace.to_str().unwrap());
+        common::media::invalidate();
+        let entries: Vec<_> = (0..4).map(|i| Entry::Game(Game::new(format!("/snapshot/Game{i}.chd").into()))).collect();
+        let mut orbit = Orbit::new();
+        orbit.set_art_theme(&theme);
+        for index in [0, 3] {
+            for kind in ["stock", "heroes"] {
+                let mut pixels = Pixmap::new(2, 2).unwrap();
+                pixels.fill(tiny_skia::Color::from_rgba8(40 + index as u8, 80, 120, 255));
+                assert!(orbit.insert_cached(CachedArt { target: None, path: art_path(&entries[index], kind),
+                    image: Some(std::sync::Arc::new(pixels)) }));
+            }
+        }
+        for entry in &entries {
+            for task in [WarmArt::Cover(entry.clone()), WarmArt::Hero(entry.clone()), WarmArt::Logo(entry.clone())] {
+                orbit.completed_tasks.push_back(CompletedTask { targets: orbit.targets, key: task.key(),
+                    admission_rejected: false, missing: true, metadata: None });
+            }
+        }
+        let baseline = orbit.theme_art(&entries, 0, 0, 2);
+        assert!(baseline.completed_misses.selected_logo && baseline.completed_misses.next_cover);
+        assert!(!baseline.completed_misses.entries.is_empty());
+        for (selected, first, count) in [(0, 0, 2), (3, 1, 2), (1, 0, 4)] {
+            let expected = orbit.theme_art(&entries, selected, first, count);
+            let snapshot = orbit.art_snapshot(&theme, &expected);
+            let actual = snapshot.restore(&orbit, &theme, orbit.targets).unwrap();
+            assert!(actual == expected);
+            assert!(actual.completed_misses == expected.completed_misses);
+            for (id, pixels) in &actual.entries { assert_eq!(pixels.data(), expected.entries[id].data()); }
+            let mut input = FrameInputs::new(ScreenId::Recents);
+            input.art = actual;
+            let pixels = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            input.art = expected;
+            assert_eq!(pixels.pixels().data(), PreparedFrame::prepare(theme.clone(), &input).unwrap().pixels().data());
+        }
+        let snapshot = orbit.art_snapshot(&theme, &baseline);
+        common::perf_trace::stop_probe();
+        assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_none(), "trace mode changes completed misses");
+        std::fs::remove_file(trace).unwrap();
+        orbit.release_art();
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn art_snapshot_weak_lifetime_and_stamp_fallbacks() {
+        use common::theme::{fonts::FontBank, frame::Art, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let load = || ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap();
+        let theme = ThemeHandle::prepare(load(), &bank, 904).unwrap();
+        let mut orbit = Orbit::new();
+        orbit.set_art_theme(&theme);
+        for field in 0..5 {
+            let source = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+            let mut art = Art::default();
+            match field {
+                0 => art.selected_logo = Some(source.clone()),
+                1 => art.selected_cover = Some(source.clone()),
+                2 => art.selected_hero = Some(source.clone()),
+                3 => art.next_cover = Some(source.clone()),
+                _ => { art.entries.insert("row".into(), source.clone()); },
+            }
+            let source_count = std::sync::Arc::strong_count(&source);
+            let theme_count = theme.strong_count();
+            let snapshot = orbit.art_snapshot(&theme, &art);
+            assert_eq!(theme.strong_count(), theme_count);
+            assert_eq!(std::sync::Arc::strong_count(&source), source_count);
+            assert_eq!(std::sync::Arc::weak_count(&source), 1);
+            assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_some());
+            drop(art);
+            drop(source);
+            assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_none(), "expired field {field}");
+        }
+        let snapshot = || orbit.art_snapshot(&theme, &Art::default());
+        let other = ThemeHandle::prepare(load(), &bank, theme.generation()).unwrap();
+        assert_eq!(theme.digest(), other.digest());
+        assert!(snapshot().restore(&orbit, &other, orbit.targets).is_none(), "distinct theme handle");
+        let saved = snapshot();
+        art_cache_changed();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "artwork cache revision");
+        let saved = snapshot();
+        visible_completion();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "completion generation");
+        let saved = snapshot();
+        crate::network_runtime::initialize(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "network paths");
+        let saved = snapshot();
+        invalidate_art();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "art invalidation before refresh");
+        orbit.refresh_art();
+        let saved = orbit.art_snapshot(&theme, &Art::default());
+        orbit.release_art();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "empty release still invalidates");
+        for field in 0..3 {
+            let saved = orbit.art_snapshot(&theme, &Art::default());
+            match field {
+                0 => orbit.set_cover_shape(!orbit.tall_art),
+                1 => orbit.set_ink_art(!orbit.ink_art),
+                _ => orbit.set_art_targets(ArtTargets { cover: Some(ArtTarget { width: 12, height: 16,
+                    fit: common::theme::pack::Fit::Cover, logo_box: false }), ..ArtTargets::default() }),
+            }
+            assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "configuration field {field}");
+        }
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn art_snapshot_rejects_each_isolated_stamp_input() {
+        use common::theme::{fonts::FontBank, frame::Art, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 907).unwrap();
+        let mut orbit = Orbit::new();
+        let pixels = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+        let art = Art { selected_cover: Some(pixels.clone()), ..Art::default() };
+        macro_rules! rejects {
+            ($name:literal, $($field:tt).+, $change:expr) => {{
+                let saved = orbit.art_snapshot(&theme, &art);
+                assert!(saved.restore(&orbit, &theme, orbit.targets).is_some(), "{} baseline", $name);
+                $change;
+                let current = orbit.art_stamp();
+                let mut expected = saved.stamp;
+                assert!(expected.$($field).+ != current.$($field).+, "{} did not change", $name);
+                expected.$($field).+ = current.$($field).+;
+                assert!(current == expected, "{} changed another stamp field", $name);
+                assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "{} reused", $name);
+            }};
+        }
+        // Media invalidation also changes prepared paths; isolate its stored proof instead.
+        let mut saved = orbit.art_snapshot(&theme, &art);
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_some());
+        saved.stamp.path.media = saved.stamp.path.media.wrapping_add(1);
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "media generation reused");
+        rejects!("prepared paths", path.paths, common::media::clear_prepared_paths());
+        rejects!("network paths", path.network,
+            crate::network_runtime::initialize(std::env::temp_dir().canonicalize().unwrap()).unwrap());
+        rejects!("artwork cache revision", artwork, art_cache_changed());
+        rejects!("completion generation", completion, visible_completion());
+        rejects!("artwork invalidation generation", invalidation.0,
+            ART_GENERATION.with(|g| g.set(g.get().wrapping_add(1))));
+        rejects!("observed artwork generation", invalidation.1, orbit.generation = orbit.generation.wrapping_add(1));
+        rejects!("release epoch", invalidation.2, orbit.release_art());
+        rejects!("observed media generation", media_generation, orbit.media_generation = orbit.media_generation.wrapping_add(1));
+        rejects!("cover shape", tall, orbit.tall_art = !orbit.tall_art);
+        rejects!("ink mode", ink, orbit.ink_art = !orbit.ink_art);
+        rejects!("configured targets", targets, orbit.targets.cover = Some(ArtTarget { width: 12, height: 16,
+            fit: common::theme::pack::Fit::Cover, logo_box: false }));
+        let saved = orbit.art_snapshot(&theme, &art);
+        let mut requested = orbit.targets;
+        requested.cover.as_mut().unwrap().width += 1;
+        assert!(saved.stamp == orbit.art_stamp());
+        assert!(saved.restore(&orbit, &theme, requested).is_none(), "requested targets reused");
+        assert_eq!(pixels.data(), art.selected_cover.as_ref().unwrap().data());
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn art_snapshot_rejects_isolated_theme_proof_and_owner_inputs() {
+        use common::theme::{fonts::FontBank, frame::Art, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let load = || ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap();
+        let theme = ThemeHandle::prepare(load(), &bank, 908).unwrap();
+        let other_theme = ThemeHandle::prepare(load(), &bank, theme.generation()).unwrap();
+        assert_eq!(theme.generation(), other_theme.generation());
+        assert_eq!(theme.digest(), other_theme.digest());
+        let orbit = Orbit::new();
+        let other_orbit = Orbit::new();
+        let pixels = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+        let art = Art { selected_cover: Some(pixels.clone()), ..Art::default() };
+        let snapshot = || orbit.art_snapshot(&theme, &art);
+        let saved = snapshot();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_some());
+        assert!(saved.restore(&orbit, &other_theme, orbit.targets).is_none(), "theme identity reused");
+        // Prepared themes are immutable; vary only the stored proof for these guards.
+        let mut saved = snapshot();
+        saved.theme_generation = saved.theme_generation.wrapping_add(1);
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "theme generation reused");
+        let mut saved = snapshot();
+        saved.theme_digest.push_str("-changed");
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "theme digest reused");
+        let saved = snapshot();
+        let mut expected = saved.stamp;
+        assert_ne!(expected.owner, other_orbit.worker_id);
+        expected.owner = other_orbit.worker_id;
+        assert!(expected == other_orbit.art_stamp(), "distinct Orbits must have equal counters and configuration");
+        assert!(saved.restore(&other_orbit, &theme, other_orbit.targets).is_none(), "distinct Orbit reused live pixels");
+        assert!(std::sync::Arc::ptr_eq(&pixels,
+            saved.restore(&orbit, &theme, orbit.targets).unwrap().selected_cover.as_ref().unwrap()));
+    }
+
+    #[test]
+    #[cfg(feature = "perf-bench")]
+    #[serial_test::serial(orbit_fixture)]
+    fn art_snapshot_rejects_isolated_trace_recording_change() {
+        use common::theme::{fonts::FontBank, frame::Art, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 909).unwrap();
+        let orbit = Orbit::new();
+        let saved = orbit.art_snapshot(&theme, &Art::default());
+        assert!(!saved.stamp.recording);
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_some());
+        let trace = std::env::temp_dir().join(format!("allium-isolated-snapshot-{}.jsonl", std::process::id()));
+        common::perf_trace::start_probe(trace.to_str().unwrap());
+        let mut expected = saved.stamp;
+        expected.recording = true;
+        assert!(orbit.art_stamp() == expected, "recording changed another stamp field");
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "trace recording reused");
+        common::perf_trace::stop_probe();
+        assert!(saved.restore(&orbit, &theme, orbit.targets).is_some());
+        std::fs::remove_file(trace).unwrap();
+    }
+
+    #[test]
     #[serial_test::serial(orbit_fixture)]
     fn resolved_art_path_can_change_without_model_key_revisions() {
         let root = std::env::temp_dir().canonicalize().unwrap()
@@ -1898,8 +2228,12 @@ mod refresh_tests {
         let mut orbit = Orbit::new();
         orbit.set_cover_shape(true);
         orbit.prepare_window(&entries, 0, 0, 1);
-        let fallback = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
-        let resolved = std::sync::Arc::new(Pixmap::new(1, 1).unwrap());
+        let mut fallback_pixels = Pixmap::new(1, 1).unwrap();
+        fallback_pixels.fill(tiny_skia::Color::from_rgba8(10, 0, 0, 255));
+        let fallback = std::sync::Arc::new(fallback_pixels);
+        let mut resolved_pixels = Pixmap::new(1, 1).unwrap();
+        resolved_pixels.fill(tiny_skia::Color::from_rgba8(90, 0, 0, 255));
+        let resolved = std::sync::Arc::new(resolved_pixels);
         assert!(orbit.insert_cached(CachedArt { target: None,
             path: art_path(&entries[0], "stock"), image: Some(fallback.clone()) }));
         assert!(orbit.insert_cached(CachedArt { target: None,
@@ -1907,12 +2241,35 @@ mod refresh_tests {
         let revisions = || (art_cache_revision(), completion_generation(),
             common::media::generation(), common::media::name_generation());
         let before = revisions();
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 905).unwrap();
         let old = orbit.theme_art(&entries, 0, 0, 1);
+        let snapshot = orbit.art_snapshot(&theme, &old);
+        assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_some());
         assert!(std::sync::Arc::ptr_eq(old.selected_cover.as_ref().unwrap(), &fallback));
         assert_eq!(common::media::resolve(entries[0].path(), common::media::Kind::TallCover), Some(tall));
         assert_eq!(revisions(), before, "path-cache hydration has no model-key revision");
+        assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_none(), "path hydration");
         let refreshed = orbit.theme_art(&entries, 0, 0, 1);
         assert!(std::sync::Arc::ptr_eq(refreshed.selected_cover.as_ref().unwrap(), &resolved));
+        assert_ne!(old.selected_cover.as_ref().unwrap().data(), refreshed.selected_cover.as_ref().unwrap().data());
+        let actual = snapshot.restore(&orbit, &theme, orbit.targets)
+            .unwrap_or_else(|| orbit.theme_art(&entries, 0, 0, 1));
+        assert!(actual == refreshed && actual.completed_misses == refreshed.completed_misses);
+        let snapshot = orbit.art_snapshot(&theme, &refreshed);
+        for i in 0..512 {
+            common::media::adopt_fallback_paths(Path::new(&format!("/snapshot/Evict{i}.chd")),
+                [(common::media::Kind::Cover, "other.png".into())]);
+        }
+        assert_eq!(revisions(), before, "path eviction has no model-key revision");
+        assert!(snapshot.restore(&orbit, &theme, orbit.targets).is_none(), "path eviction");
+        let rebuilt = orbit.theme_art(&entries, 0, 0, 1);
+        let actual = snapshot.restore(&orbit, &theme, orbit.targets)
+            .unwrap_or_else(|| orbit.theme_art(&entries, 0, 0, 1));
+        assert!(actual == rebuilt && actual.completed_misses == rebuilt.completed_misses);
+        assert_eq!(actual.selected_cover.as_ref().unwrap().data(), fallback.data());
         orbit.release_art();
         common::media::invalidate();
         std::fs::remove_dir_all(root).unwrap();

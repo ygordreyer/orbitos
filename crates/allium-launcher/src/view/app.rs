@@ -1262,7 +1262,7 @@ where
                         if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available.saturating_sub(std::mem::size_of::<PreparedNeighbor>()))? {
                             if let Recents::List(list) = &mut self.views.0
                                 && let Some(key) = list.normalized_recents_key(&handle, Some(target_direction), &status) {
-                                list.remember_normalized_recents(key, vec![input]);
+                                list.remember_normalized_recents(key, vec![input], &handle);
                             }
                             self.neighbors.push(PreparedNeighbor { base: frame.navigation_stamp(),
                                 generation: NeighborGeneration::current(&self.res, self.res.get::<Locale>().lang.clone()), frame: candidate, charge: charge + std::mem::size_of::<PreparedNeighbor>(), packed: None, pack_diagnostic: Default::default() });
@@ -1472,7 +1472,7 @@ where
                 common::perf_trace::content_readiness_reasons(pending, next_cover_expected);
             }
             if let (Some(key), Recents::List(list)) = (reuse_key, &mut self.views.0) {
-                list.remember_normalized_recents(key, models);
+                list.remember_normalized_recents(key, models, &handle);
             }
             Some(crate::theme_adapter::ThemeScene { frames })
         } else {
