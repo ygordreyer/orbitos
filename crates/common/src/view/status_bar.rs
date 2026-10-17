@@ -145,6 +145,13 @@ impl<B> View for StatusBar<B>
 where
     B: Battery,
 {
+    fn stop_workers(&mut self) {
+        self.row.stop_workers();
+        if let Some(wifi) = self.themed_wifi.as_mut() {
+            wifi.stop_workers();
+        }
+    }
+
     fn update(&mut self, dt: std::time::Duration) {
         self.row.update(dt);
         if let Some(wifi) = self.themed_wifi.as_mut() {
@@ -240,6 +247,26 @@ mod semantic_status_tests {
         fn charging(&self) -> bool { self.0.lock().unwrap().1 }
     }
 
+    fn await_status(
+        bar: &mut StatusBar<ChangingBattery>,
+        battery: Option<u8>,
+        network: Option<&str>,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            bar.update(Duration::ZERO);
+            let status = bar.theme_inputs();
+            if status.battery == battery && status.network.as_deref() == network {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "status worker stalled: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn real_boxed_status_bar_polls_battery_clock_and_network() {
         assert!(ALLIUM_SD_ROOT.starts_with(std::env::temp_dir().canonicalize().unwrap()), "owned TEMP fixture required");
@@ -266,6 +293,7 @@ mod semantic_status_tests {
         let mut bar = StatusBar::new_with_wifi_capability(
             res.clone(), Point::new(620, 8), battery.clone(), true,
         );
+        await_status(&mut bar, Some(82), None);
         let initial = bar.theme_inputs(); // Actual constructor Row<Box<dyn View>>.
         assert_eq!(initial.battery, Some(82));
         assert!(!initial.charging);
@@ -302,10 +330,11 @@ mod semantic_status_tests {
         let mut map = type_map::TypeMap::new();
         map.insert(styles.clone());
         let res = Resources::new(map);
-        let hidden = StatusBar::new_with_wifi_capability(
+        let mut hidden = StatusBar::new_with_wifi_capability(
             res.clone(), Point::new(620, 8), battery.clone(), true,
         );
         assert_eq!(hidden.row.children().len(), 2, "legacy row has no Wi-Fi icon or gap");
+        await_status(&mut hidden, Some(41), Some("offline"));
         assert_eq!(hidden.theme_inputs().network.as_deref(), Some("offline"));
 
         let unsupported = StatusBar::new_with_wifi_capability(
@@ -316,11 +345,12 @@ mod semantic_status_tests {
         styles.status_bar.show_wifi = true;
         let mut map = type_map::TypeMap::new();
         map.insert(styles);
-        let visible = StatusBar::new_with_wifi_capability(
+        let mut visible = StatusBar::new_with_wifi_capability(
             Resources::new(map), Point::new(620, 8), battery, true,
         );
         assert_eq!(visible.row.children().len(), 3);
         assert!(visible.themed_wifi.is_none(), "poll one Wi-Fi indicator");
+        await_status(&mut visible, Some(41), Some("offline"));
         assert_eq!(visible.theme_inputs().network.as_deref(), Some("offline"));
     }
 }
@@ -396,6 +426,10 @@ mod shutdown_forwarding_tests {
             Alignment::Right,
             0,
         );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while polls.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(polls.load(Ordering::Acquire), 1);
         std::thread::sleep(crate::constants::BATTERY_UPDATE_INTERVAL + Duration::from_millis(10));
         outer.update(Duration::ZERO);

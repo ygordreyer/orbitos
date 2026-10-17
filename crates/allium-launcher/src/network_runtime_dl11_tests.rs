@@ -4,6 +4,7 @@ fn dl11_verification_progress_requests_a_frame() {
     let f = StartupFixture::new("dl11-frame-progress");
     f.configured();
     initialize(f.root.clone()).unwrap();
+    settle();
     poll();
     let (tx, progress) = mpsc::sync_channel(2);
     let (_result_tx, result) = mpsc::sync_channel(1);
@@ -53,7 +54,7 @@ fn dl12_catalog_index_matches_scan_and_rebuilds_for_root_and_catalog() {
                 );
             }
         }
-        let mut duplicated = r.catalog.clone();
+        let mut duplicated = (*r.catalog).clone();
         let mut second = duplicated.games[0].clone();
         second.id = "second".into();
         duplicated.games.push(second);
@@ -222,5 +223,199 @@ async fn dl15b_runtime_network_overlay_dismissal_presents_launcher() {
                 "idle after runtime network overlay dismissal",
             );
         }
+    }
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_absent_profile_refresh_history_never_queries_database() {
+    let f = StartupFixture::new("boot-no-history");
+    initialize(f.root.clone()).unwrap();
+    // Default has no connection. Any database query would panic.
+    refresh_history(&common::database::Database::default()).unwrap();
+    assert!(!active());
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_unknown_status_is_asynchronous_and_does_not_authorize_launch() {
+    let f = StartupFixture::new("boot-unknown");
+    f.configured();
+    std::fs::remove_file(
+        f.root
+            .join(".allium/state/network-library/installed")
+            .join(format!("{}.json", f.game.id)),
+    )
+    .unwrap();
+    initialize(f.root.clone()).unwrap();
+    let path = f.root.join(&f.game.game_path);
+    assert_eq!(badge(&path).as_deref(), Some("Unknown"));
+    assert!(active(), "status completion must wake the event loop");
+    assert!(guard_launch(&path).is_err());
+    settle();
+    assert_eq!(badge(&path).as_deref(), Some("NAS"));
+    assert!(guard_launch(&path).is_err());
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_late_inventory_cannot_overwrite_foreground_status() {
+    let f = StartupFixture::new("boot-inventory-order");
+    f.configured();
+    initialize(f.root.clone()).unwrap();
+    settle();
+    let (tx, result) = mpsc::sync_channel(1);
+    with((), |r| {
+        r.inventory = Some(Inventory {
+            result,
+            cancel: Cancellation::default(),
+        });
+        r.status.insert(f.game.id.clone(), "Downloading".into());
+    });
+    tx.send(HashMap::from([(f.game.id.clone(), "NAS".into())]))
+        .unwrap();
+    poll();
+    assert_eq!(
+        badge(&f.root.join(&f.game.game_path)).as_deref(),
+        Some("Downloading")
+    );
+    assert!(!active());
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_missing_inventory_has_no_per_game_cache_probes() {
+    let f = StartupFixture::new("boot-probe-count");
+    f.configured();
+    let state = f.root.join(".allium/state/network-library");
+    std::fs::remove_file(state.join("installed").join(format!("{}.json", f.game.id))).unwrap();
+    let mut catalog: Catalog =
+        serde_json::from_slice(&std::fs::read(state.join("catalog.json")).unwrap()).unwrap();
+    catalog.games = (0..512)
+        .map(|at| {
+            let mut game = f.game.clone();
+            game.id = format!("missing-{at}");
+            game
+        })
+        .collect();
+    let fs = crate::network_fs::AnchoredFs::new(&f.root).unwrap();
+    let cache = Cache::new(CacheConfig::bind(f.root.clone(), None).unwrap()).unwrap();
+    let before = crate::network_fs::test_exists_probes();
+    let status = validate_installed(&fs, &state, &cache, &catalog).unwrap();
+    assert_eq!(
+        crate::network_fs::test_exists_probes() - before,
+        1,
+        "only the installed directory may be probed, with zero per-game probes"
+    );
+    assert!(status.is_empty());
+    let before = crate::network_fs::test_exists_probes();
+    for game in &catalog.games {
+        assert_eq!(cached_status(&cache, game).unwrap(), "NAS");
+    }
+    assert_eq!(crate::network_fs::test_exists_probes() - before, 512 * 5);
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_history_only_records_catalog_paths() {
+    let f = StartupFixture::new("boot-history-subset");
+    f.configured();
+    initialize(f.root.clone()).unwrap();
+    let database = common::database::Database::in_memory().unwrap();
+    let path = f.root.join(&f.game.game_path);
+    for path in [&path, &f.root.join("Roms/PS/Unrelated.chd")] {
+        database
+            .increment_play_count(&common::database::NewGame {
+                name: "Fixture".into(),
+                path: path.clone(),
+                image: None,
+                core: None,
+                rating: None,
+                release_date: None,
+                developer: None,
+                publisher: None,
+                genres: vec![],
+                favorite: false,
+            })
+            .unwrap();
+    }
+    refresh_history(&database).unwrap();
+    let expected = database.select_games(&[&path]).unwrap()[0]
+        .as_ref()
+        .unwrap()
+        .last_played;
+    with((), |r| {
+        assert_eq!(
+            r.last_played,
+            HashMap::from([(f.game.id.clone(), expected)])
+        )
+    });
+}
+
+#[test]
+#[serial_test::serial(orbit_fixture)]
+fn boot_history_skips_malformed_catalog_rows_and_keeps_valid_history() {
+    let f = StartupFixture::new("boot-history-malformed");
+    f.configured();
+    initialize(f.root.clone()).unwrap();
+    let database = common::database::Database::new().unwrap();
+    let mut paths = vec![f.root.join(&f.game.game_path)];
+    with((), |r| {
+        let mut catalog = (*r.catalog).clone();
+        for suffix in ["bad-date", "bad-rating"] {
+            let mut game = f.game.clone();
+            game.id = suffix.into();
+            game.game_path = format!("Roms/PS/{suffix}.chd");
+            game.cache_path = game.game_path.clone();
+            game.launch_path = game.game_path.clone();
+            paths.push(f.root.join(&game.game_path));
+            catalog.games.push(game);
+        }
+        r.catalog = Arc::new(catalog);
+        r.path_index = None;
+        r.last_played.insert("stale".into(), 999);
+    });
+    for path in &paths {
+        database
+            .increment_play_count(&common::database::NewGame {
+                name: "History fixture".into(),
+                path: path.clone(),
+                image: None,
+                core: None,
+                rating: None,
+                release_date: None,
+                developer: None,
+                publisher: None,
+                genres: vec![],
+                favorite: false,
+            })
+            .unwrap();
+    }
+    let expected = database
+        .select_game(&paths[0])
+        .unwrap()
+        .unwrap()
+        .last_played;
+    // Database exposes no raw connection API; corrupt the isolated host fixture
+    // through a second SQLite connection without adding a production API.
+    let status = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE games SET release_date = 'invalid' WHERE path = ?\", (sys.argv[2],)); c.execute('UPDATE games SET rating = 256 WHERE path = ?', (sys.argv[3],)); c.commit()")
+        .arg(common::constants::ALLIUM_DATABASE.as_path())
+        .arg(&paths[1])
+        .arg(&paths[2])
+        .status().unwrap();
+    assert!(status.success());
+    assert!(database.select_game(&paths[1]).is_err());
+    assert!(database.select_game(&paths[2]).is_err());
+    refresh_history(&database).unwrap();
+    with((), |r| {
+        assert_eq!(
+            r.last_played,
+            HashMap::from([(f.game.id.clone(), expected)])
+        )
+    });
+    for path in paths {
+        database.delete_game(&path).unwrap();
     }
 }

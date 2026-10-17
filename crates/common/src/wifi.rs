@@ -653,29 +653,244 @@ pub async fn wait_for_wifi() -> Result<()> {
 }
 
 pub fn ip_address() -> Option<String> {
+    sample_ip_address()
+        .ok()
+        .flatten()
+        .map(|address| address.to_string())
+}
+
+pub(crate) fn sample_ip_address() -> Result<Option<std::net::Ipv4Addr>> {
     #[cfg(feature = "miyoo")]
     {
-        let output = std::process::Command::new("ip")
+        // An interface address alone does not establish which route owns the
+        // limited broadcast destination used by the compatibility probe.
+        if wlan0_has_broadcast_route().unwrap_or(false) {
+            if let Ok(address) = interface_ip_address() {
+                return Ok(address);
+            }
+        }
+        let child = std::process::Command::new("ip")
             .args(["route", "get", "255.255.255.255"])
-            .output()
-            .ok()?;
-        let output = String::from_utf8(output.stdout).ok()?;
-        let ip_address = output.split_whitespace().last().map(|s| s.to_string());
-
-        ip_address.and_then(|addr| {
-            addr.split('.')
-                .all(|octet| octet.parse::<u8>().is_ok())
-                .then_some(addr)
-        })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        decode_route(bounded_output(
+            child,
+            std::time::Duration::from_millis(300),
+        )?)
     }
-
-    #[cfg(feature = "simulator")]
+    #[cfg(all(feature = "simulator", not(feature = "miyoo")))]
     {
-        Some("127.0.0.1".to_string())
+        Ok(Some(std::net::Ipv4Addr::LOCALHOST))
     }
-
     #[cfg(not(any(feature = "miyoo", feature = "simulator")))]
-    return None;
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "miyoo")]
+fn wlan0_has_broadcast_route() -> std::io::Result<bool> {
+    use std::io::Read;
+    const LIMIT: usize = 8192;
+    let mut bytes = Vec::with_capacity(1024);
+    std::fs::File::open("/proc/net/route")?
+        .take((LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes.len() <= LIMIT && std::str::from_utf8(&bytes).is_ok_and(proc_route_uses_wlan0))
+}
+
+#[cfg(any(feature = "miyoo", test))]
+fn proc_route_uses_wlan0(table: &str) -> bool {
+    fn parse(table: &str) -> Option<bool> {
+        let mut lines = table.lines();
+        if !lines.next()?.split_whitespace().eq([
+            "Iface",
+            "Destination",
+            "Gateway",
+            "Flags",
+            "RefCnt",
+            "Use",
+            "Metric",
+            "Mask",
+            "MTU",
+            "Window",
+            "IRTT",
+        ]) {
+            return None;
+        }
+        let mut best = None;
+        for line in lines.filter(|line| !line.trim().is_empty()) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 11 {
+                return None;
+            }
+            // /proc/net/route prints IPv4 words in host byte order.
+            let destination =
+                u32::from_be_bytes(u32::from_str_radix(fields[1], 16).ok()?.to_ne_bytes());
+            u32::from_str_radix(fields[2], 16).ok()?;
+            let flags = u32::from_str_radix(fields[3], 16).ok()?;
+            let metric = fields[6].parse::<u32>().ok()?;
+            for index in [4, 5, 8, 9, 10] {
+                fields[index].parse::<u32>().ok()?;
+            }
+            let mask = u32::from_be_bytes(u32::from_str_radix(fields[7], 16).ok()?.to_ne_bytes());
+            let prefix = mask.leading_ones();
+            if mask != u32::MAX.checked_shl(32 - prefix).unwrap_or(0) {
+                return None;
+            }
+            if flags & 0x1 == 0 || destination & mask != mask {
+                continue;
+            }
+            // Reject entries and equal-cost routes on another interface are
+            // deliberately ambiguous: let ip resolve them rather than guess.
+            let usable = fields[0] == "wlan0" && flags & 0x200 == 0;
+            match best {
+                Some((length, cost, _))
+                    if prefix < length || (prefix == length && metric > cost) => {}
+                Some((length, cost, previous)) if prefix == length && metric == cost => {
+                    best = Some((prefix, metric, previous && usable));
+                }
+                _ => best = Some((prefix, metric, usable)),
+            }
+        }
+        Some(best.is_some_and(|(_, _, usable)| usable))
+    }
+    parse(table).unwrap_or(false)
+}
+
+#[cfg(all(feature = "miyoo", target_os = "linux"))]
+fn interface_ip_address() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // OwnedFd closes the datagram socket on every return path. No traffic is sent.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // ifreq is a C POD. The kernel fills its union for each requested ioctl.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (dest, source) in request.ifr_name.iter_mut().zip(b"wlan0") {
+        *dest = *source as libc::c_char;
+    }
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request) } < 0 {
+        return missing_interface_or_error();
+    }
+    if unsafe { request.ifr_ifru.ifru_flags } as i32 & libc::IFF_UP == 0 {
+        return Ok(None);
+    }
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFADDR, &mut request) } < 0 {
+        return missing_interface_or_error();
+    }
+    // SIOCGIFADDR returns an AF_INET sockaddr in the aligned ifreq union.
+    let address = unsafe {
+        &*(&request.ifr_ifru.ifru_addr as *const libc::sockaddr).cast::<libc::sockaddr_in>()
+    };
+    Ok(decode_interface_address(address.sin_addr.s_addr))
+}
+
+#[cfg(all(feature = "miyoo", target_os = "linux"))]
+fn missing_interface_or_error() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODEV | libc::ENXIO | libc::EADDRNOTAVAIL) => Ok(None),
+        _ => Err(error),
+    }
+}
+
+#[cfg(all(feature = "miyoo", not(target_os = "linux")))]
+fn interface_ip_address() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(any(all(feature = "miyoo", target_os = "linux"), test))]
+fn decode_interface_address(network_order: u32) -> Option<std::net::Ipv4Addr> {
+    let address = std::net::Ipv4Addr::from(network_order.to_ne_bytes());
+    (!address.is_unspecified()).then_some(address)
+}
+
+#[cfg(any(feature = "miyoo", test))]
+pub(crate) fn bounded_output(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let result = collect_probe_output(&mut child, std::time::Instant::now() + timeout);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let output = result?;
+    anyhow::ensure!(status.success(), "route probe failed with {status}");
+    Ok(output)
+}
+
+#[cfg(any(feature = "miyoo", test))]
+fn collect_probe_output(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing probe stdout"))?;
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut output = Vec::with_capacity(512);
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "route probe timed out"
+        );
+        drain_probe_stdout(&mut stdout, &mut output)?;
+        if child.try_wait()?.is_some() {
+            drain_probe_stdout(&mut stdout, &mut output)?;
+            return Ok(output);
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(10)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+}
+
+#[cfg(any(feature = "miyoo", test))]
+fn drain_probe_stdout(
+    stdout: &mut std::process::ChildStdout,
+    output: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    use std::io::{ErrorKind, Read};
+    let mut buffer = [0; 512];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                anyhow::ensure!(output.len() + count <= 4096, "route probe output too large");
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(any(feature = "miyoo", test))]
+pub(crate) fn decode_route(output: Vec<u8>) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    let output = String::from_utf8(output)?;
+    let mut words = output.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "src" {
+            let address = words
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing source address"))?;
+            return Ok(Some(address.parse()?));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "miyoo")]
@@ -783,5 +998,101 @@ mod ssh_sequence_tests {
         )
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod status_address_tests {
+    use super::*;
+
+    const HEADER: &str = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n";
+
+    #[test]
+    fn proc_route_wlan0_default_accepts_ioctl() {
+        assert!(proc_route_uses_wlan0(&format!(
+            "{HEADER}wlan0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0\n"
+        )));
+    }
+
+    #[test]
+    fn proc_route_eth0_default_falls_back() {
+        assert!(!proc_route_uses_wlan0(&format!(
+            "{HEADER}eth0 00000000 0101A8C0 0003 0 0 0 00000000 0 0 0\n"
+        )));
+    }
+
+    #[test]
+    fn proc_route_no_broadcast_route_falls_back() {
+        for table in [
+            HEADER.to_owned(),
+            format!("{HEADER}wlan0 0001A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n"),
+        ] {
+            assert!(!proc_route_uses_wlan0(&table));
+        }
+    }
+
+    #[test]
+    fn proc_route_reject_and_down_routes_fall_back() {
+        for flags in ["0201", "0000"] {
+            assert!(!proc_route_uses_wlan0(&format!(
+                "{HEADER}wlan0 00000000 00000000 {flags} 0 0 0 00000000 0 0 0\n"
+            )));
+        }
+    }
+
+    #[test]
+    fn proc_route_longest_prefix_and_metric_choose_interface() {
+        let default = "wlan0 00000000 0101A8C0 0003 0 0 10 00000000 0 0 0\n";
+        let broadcast = "wlan0 FFFFFFFF 00000000 0001 0 0 0 FFFFFFFF 0 0 0\n";
+        assert!(proc_route_uses_wlan0(&format!(
+            "{HEADER}{default}{broadcast}"
+        )));
+        for specific in [
+            broadcast.replace("wlan0", "eth0"),
+            broadcast.replace("0001", "0201"),
+        ] {
+            for table in [
+                format!("{HEADER}{default}{specific}"),
+                format!("{HEADER}{specific}{default}"),
+            ] {
+                assert!(!proc_route_uses_wlan0(&table));
+            }
+        }
+        for metric in [0, 10] {
+            assert!(!proc_route_uses_wlan0(&format!(
+                "{HEADER}{default}eth0 00000000 0101A8C0 0003 0 0 {metric} 00000000 0 0 0\n"
+            )));
+        }
+        assert!(proc_route_uses_wlan0(&format!(
+            "{HEADER}{default}eth0 00000000 0101A8C0 0003 0 0 20 00000000 0 0 0\n"
+        )));
+    }
+
+    #[test]
+    fn proc_route_malformed_lines_fall_back_without_panicking() {
+        for malformed in [
+            "",
+            "wlan0",
+            "wlan0 zzz 0 1 0 0 0 00000000 0 0 0",
+            "wlan0 00000000 00000000 nope 0 0 0 00000000 0 0 0",
+            "wlan0 00000000 00000000 0001 0 0 nope 00000000 0 0 0",
+            "wlan0 00000000 00000000 0001 0 0 0 00FF00FF 0 0 0",
+            "wlan0 00000000 00000000 0001 bad 0 0 00000000 0 0 0",
+        ] {
+            assert!(!proc_route_uses_wlan0(malformed));
+            assert!(!proc_route_uses_wlan0(&format!("{HEADER}{malformed}")));
+        }
+        assert!(!proc_route_uses_wlan0(&format!(
+            "{HEADER}wlan0 00000000 00000000 0001 0 0 0 00000000 0 0 0\nbroken"
+        )));
+    }
+
+    #[test]
+    fn status_ioctl_address_preserves_network_byte_order_and_unspecified_is_offline() {
+        assert_eq!(
+            decode_interface_address(u32::from_ne_bytes([192, 168, 1, 23])),
+            Some("192.168.1.23".parse().unwrap())
+        );
+        assert_eq!(decode_interface_address(0), None);
     }
 }

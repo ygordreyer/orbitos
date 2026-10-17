@@ -123,7 +123,9 @@ struct GitTagObject {
 /// Check if an update is available for the given channel
 /// Returns the GitHubRelease if an update is available
 pub async fn check_for_update(channel: UpdateChannel) -> Result<Option<GitHubRelease>> {
-    let current_version = &*common::constants::ALLIUM_VERSION;
+    let current_version = tokio::task::spawn_blocking(|| common::constants::ALLIUM_VERSION.clone())
+        .await
+        .context("Version storage worker failed")?;
     info!("Current version: {}", current_version);
 
     let release = match channel {
@@ -133,7 +135,7 @@ pub async fn check_for_update(channel: UpdateChannel) -> Result<Option<GitHubRel
     let latest_version = get_release_version(&release).await;
     info!("Latest version: {}", latest_version);
 
-    if *current_version != latest_version {
+    if current_version != latest_version {
         Ok(Some(release))
     } else {
         Ok(None)
@@ -271,6 +273,46 @@ pub enum DownloadEvent {
     Error(String),
 }
 
+enum StorageMessage {
+    Chunk(Vec<u8>),
+    Finish,
+}
+
+// A bounded queue limits SD-card backpressure to two chunks. The worker also owns
+// the writer's drop, so cancellation cannot flush a BufWriter on the UI thread.
+fn spawn_storage_writer<W, F>(
+    create: F,
+) -> (
+    mpsc::Sender<StorageMessage>,
+    tokio::task::JoinHandle<Result<String>>,
+)
+where
+    W: Write + Send + 'static,
+    F: FnOnce() -> std::io::Result<W> + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel(2);
+    let task = tokio::task::spawn_blocking(move || {
+        let mut writer = create().context("Failed to create update file")?;
+        let mut hasher = Sha256::new();
+        while let Some(message) = rx.blocking_recv() {
+            match message {
+                StorageMessage::Chunk(chunk) => {
+                    writer
+                        .write_all(&chunk)
+                        .context("Failed to write to file")?;
+                    hasher.update(&chunk);
+                }
+                StorageMessage::Finish => {
+                    writer.flush().context("Failed to flush file")?;
+                    return Ok(hasher.finalize().encode_hex());
+                }
+            }
+        }
+        anyhow::bail!("Update download cancelled before completion")
+    });
+    (tx, task)
+}
+
 /// Download a release to /mnt/SDCARD/allium-ota.zip, reporting the progress to event_tx
 pub async fn download_update_with_progress(
     release: &GitHubRelease,
@@ -279,10 +321,14 @@ pub async fn download_update_with_progress(
     // Check if there's enough space (need 300MB)
     #[cfg(feature = "miyoo")]
     {
-        let output = std::process::Command::new("df")
-            .args(["-m", "/mnt/SDCARD"])
-            .output()
-            .context("Failed to check disk space")?;
+        let output = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("df")
+                .args(["-m", "/mnt/SDCARD"])
+                .output()
+        })
+        .await
+        .context("Disk space worker failed")?
+        .context("Failed to check disk space")?;
 
         let output_str = String::from_utf8_lossy(&output.stdout);
         let available_space: i32 = output_str
@@ -332,17 +378,22 @@ pub async fn download_update_with_progress(
 
     // Create file and hasher
     info!("Writing update to {}", UPDATE_FILE_PATH.display());
-    let file = File::create(&*UPDATE_FILE_PATH).context("Failed to create update file")?;
-    let mut writer = BufWriter::new(file);
-    let mut hasher = Sha256::new();
+    let (storage_tx, storage_task) =
+        spawn_storage_writer(|| File::create(&*UPDATE_FILE_PATH).map(BufWriter::new));
 
     // Stream download to file while calculating hash
     let mut last_progress_update = Instant::now();
     while let Some(chunk) = response.chunk().await.context("Failed to read chunk")? {
-        writer
-            .write_all(&chunk)
-            .context("Failed to write to file")?;
-        hasher.update(&chunk);
+        if storage_tx
+            .send(StorageMessage::Chunk(chunk.to_vec()))
+            .await
+            .is_err()
+        {
+            storage_task
+                .await
+                .context("Update storage worker failed")??;
+            anyhow::bail!("Update storage worker stopped early");
+        }
 
         downloaded += chunk.len() as u64;
 
@@ -353,7 +404,10 @@ pub async fn download_update_with_progress(
                 last_progress_update = now;
                 info!(
                     "Downloaded {}% ({}/{} bytes)",
-                    downloaded * 100 / total_size,
+                    downloaded
+                        .saturating_mul(100)
+                        .checked_div(total_size)
+                        .unwrap_or(0),
                     downloaded,
                     total_size
                 );
@@ -373,15 +427,17 @@ pub async fn download_update_with_progress(
         }));
     }
 
-    writer.flush().context("Failed to flush file")?;
+    // Always join the worker to preserve its filesystem error if its receiver closed.
+    let _ = storage_tx.send(StorageMessage::Finish).await;
+    let calculated_hash = storage_task
+        .await
+        .context("Update storage worker failed")??;
 
-    // Verify SHA256 checksum
     info!("Verifying SHA256 checksum...");
-    let calculated_hash = hasher.finalize().encode_hex();
 
     if calculated_hash != expected_hash {
         // Delete the file if verification fails
-        let _ = std::fs::remove_file(&*UPDATE_FILE_PATH);
+        let _ = tokio::task::spawn_blocking(|| fs::remove_file(&*UPDATE_FILE_PATH)).await;
         let error_msg = format!(
             "SHA256 checksum mismatch!\nExpected: {}\nCalculated: {}",
             expected_hash, calculated_hash
@@ -406,6 +462,139 @@ pub fn update_file_exists() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_download_storage_keeps_runtime_timers_responsive() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        struct SlowWriter {
+            entered: mpsc::UnboundedSender<usize>,
+            release: std::sync::mpsc::Receiver<()>,
+            completed: Arc<AtomicUsize>,
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.entered.send(1).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                self.completed.store(2, Ordering::SeqCst);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.entered.send(2).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                self.completed.store(3, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let worker_completed = Arc::clone(&completed);
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_bytes = Arc::clone(&bytes);
+        let (storage, task) = spawn_storage_writer(move || {
+            entered_tx.send(0).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker_completed.store(1, Ordering::SeqCst);
+            Ok(SlowWriter {
+                entered: entered_tx,
+                release: release_rx,
+                completed: worker_completed,
+                bytes: worker_bytes,
+            })
+        });
+        storage
+            .send(StorageMessage::Chunk(b"update bytes".to_vec()))
+            .await
+            .unwrap();
+        storage.send(StorageMessage::Finish).await.unwrap();
+        for stage in 0..3 {
+            assert_eq!(entered_rx.recv().await, Some(stage));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // The timer ran while create, write or flush was still blocked.
+            assert_eq!(completed.load(Ordering::SeqCst), stage);
+            release_tx.send(()).unwrap();
+        }
+        let hash = task.await.unwrap().unwrap();
+        assert_eq!(*bytes.lock().unwrap(), b"update bytes");
+        assert_eq!(hash, Sha256::digest(b"update bytes").encode_hex());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_storage_propagates_create_write_and_flush_errors() {
+        struct FailingWriter(bool);
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    Err(std::io::Error::other("write error"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush error"))
+            }
+        }
+        for failure in ["create", "write", "flush"] {
+            let (storage, task) = spawn_storage_writer(move || {
+                if failure == "create" {
+                    Err(std::io::Error::other("create error"))
+                } else {
+                    Ok(FailingWriter(failure == "write"))
+                }
+            });
+            let _ = storage.send(StorageMessage::Chunk(vec![1])).await;
+            let _ = storage.send(StorageMessage::Finish).await;
+            let error = task.await.unwrap().unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("{failure} error")),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_download_storage_drops_writer_on_worker() {
+        struct DropWriter {
+            dropped: Option<tokio::sync::oneshot::Sender<bool>>,
+            ui_thread: std::thread::ThreadId,
+        }
+        impl Write for DropWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for DropWriter {
+            fn drop(&mut self) {
+                let _ = self
+                    .dropped
+                    .take()
+                    .unwrap()
+                    .send(std::thread::current().id() != self.ui_thread);
+            }
+        }
+        let ui_thread = std::thread::current().id();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (storage, task) = spawn_storage_writer(move || {
+            Ok(DropWriter {
+                dropped: Some(dropped_tx),
+                ui_thread,
+            })
+        });
+        drop(storage);
+        assert!(task.await.unwrap().is_err());
+        assert!(dropped_rx.await.unwrap());
+    }
 
     fn make_stable_release(tag: &str) -> GitHubRelease {
         GitHubRelease {

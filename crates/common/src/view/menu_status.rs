@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 
 use crate::battery::Battery;
 
@@ -25,6 +29,7 @@ pub struct MenuStatusCache {
     snapshot: Arc<Mutex<MenuStatusSnapshot>>,
     requests: mpsc::SyncSender<()>,
     changed: Arc<tokio::sync::Notify>,
+    pending: Arc<AtomicBool>,
 }
 
 impl MenuStatusCache {
@@ -57,6 +62,8 @@ impl MenuStatusCache {
         let changed = Arc::new(tokio::sync::Notify::new());
         let notification = changed.clone();
         let (requests, receive) = mpsc::sync_channel(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        let outstanding = pending.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("menu-status".into())
             .stack_size(128 * 1024)
@@ -77,6 +84,7 @@ impl MenuStatusCache {
                             state.wifi = wifi;
                         }
                     }
+                    outstanding.store(false, Ordering::Release);
                     notification.notify_one();
                 }
             })
@@ -87,6 +95,7 @@ impl MenuStatusCache {
             snapshot,
             requests,
             changed,
+            pending,
         }
     }
 
@@ -95,7 +104,9 @@ impl MenuStatusCache {
     }
 
     pub fn request_refresh(&self) {
-        let _ = self.requests.try_send(());
+        if !self.pending.swap(true, Ordering::AcqRel) && self.requests.try_send(()).is_err() {
+            self.pending.store(false, Ordering::Release);
+        }
     }
 
     pub async fn changed(&self) {
@@ -103,7 +114,7 @@ impl MenuStatusCache {
     }
 }
 
-fn sample_wifi(
+pub(super) fn sample_wifi(
     enabled: bool,
     probe: impl FnOnce() -> anyhow::Result<Option<std::net::Ipv4Addr>>,
 ) -> Option<WifiSample> {
@@ -112,111 +123,59 @@ fn sample_wifi(
 }
 
 fn menu_ip_address() -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-    #[cfg(feature = "miyoo")]
-    {
-        let child = std::process::Command::new("ip")
-            .args(["route", "get", "255.255.255.255"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        decode_route(bounded_output(
-            child,
-            std::time::Duration::from_millis(300),
-        )?)
-    }
-    #[cfg(not(feature = "miyoo"))]
-    Ok(crate::wifi::ip_address().and_then(|address| address.parse().ok()))
-}
-
-#[cfg(any(feature = "miyoo", test))]
-fn bounded_output(
-    mut child: std::process::Child,
-    timeout: std::time::Duration,
-) -> anyhow::Result<Vec<u8>> {
-    let result = collect_probe_output(&mut child, std::time::Instant::now() + timeout);
-    if result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    let output = result?;
-    anyhow::ensure!(status.success(), "route probe failed with {status}");
-    Ok(output)
-}
-
-#[cfg(any(feature = "miyoo", test))]
-fn collect_probe_output(
-    child: &mut std::process::Child,
-    deadline: std::time::Instant,
-) -> anyhow::Result<Vec<u8>> {
-    use std::os::fd::AsRawFd;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing probe stdout"))?;
-    let fd = stdout.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mut output = Vec::with_capacity(512);
-    loop {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "route probe timed out"
-        );
-        drain_probe_stdout(&mut stdout, &mut output)?;
-        if child.try_wait()?.is_some() {
-            drain_probe_stdout(&mut stdout, &mut output)?;
-            return Ok(output);
-        }
-        std::thread::sleep(
-            std::time::Duration::from_millis(10)
-                .min(deadline.saturating_duration_since(std::time::Instant::now())),
-        );
-    }
-}
-
-#[cfg(any(feature = "miyoo", test))]
-fn drain_probe_stdout(
-    stdout: &mut std::process::ChildStdout,
-    output: &mut Vec<u8>,
-) -> anyhow::Result<()> {
-    use std::io::{ErrorKind, Read};
-    let mut buffer = [0; 512];
-    loop {
-        match stdout.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(count) => {
-                anyhow::ensure!(output.len() + count <= 4096, "route probe output too large");
-                output.extend_from_slice(&buffer[..count]);
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-#[cfg(any(feature = "miyoo", test))]
-fn decode_route(output: Vec<u8>) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-    let output = String::from_utf8(output)?;
-    let mut words = output.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == "src" {
-            let address = words
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing source address"))?;
-            return Ok(Some(address.parse()?));
-        }
-    }
-    Ok(None)
+    crate::wifi::sample_ip_address()
 }
 
 #[cfg(test)]
 #[cfg(not(any(feature = "miyoo", feature = "simulator")))]
 mod tests {
     use super::*;
+    use crate::wifi::{bounded_output, decode_route};
     use std::time::{Duration, Instant};
+
+    fn wait_idle(cache: &MenuStatusCache) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache.pending.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !cache.pending.load(Ordering::Acquire),
+            "menu status worker stalled"
+        );
+    }
+
+    #[test]
+    fn status_menu_refreshes_are_deduplicated_while_sampler_is_in_flight() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let samples = calls.clone();
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (resume, paused) = mpsc::sync_channel(1);
+        let cache = MenuStatusCache::with_samplers(
+            || None,
+            move || {
+                samples.fetch_add(1, Ordering::AcqRel);
+                entered.send(()).unwrap();
+                paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                Some(WifiSample {
+                    enabled: true,
+                    connected: true,
+                })
+            },
+        );
+        cache.request_refresh();
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..100 {
+            cache.request_refresh();
+        }
+        resume.send(()).unwrap();
+        wait_idle(&cache);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        cache.request_refresh();
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        resume.send(()).unwrap();
+        wait_idle(&cache);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
 
     fn wait_for_wifi_sample(cache: &MenuStatusCache, expected: Option<WifiSample>) {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -251,11 +210,14 @@ mod tests {
         });
         cache.request_refresh();
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_idle(&cache);
         wait_for_wifi_sample(&cache, real);
         cache.request_refresh();
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_idle(&cache);
         cache.request_refresh();
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_idle(&cache);
         assert_eq!(cache.snapshot().wifi, real);
     }
 
@@ -273,6 +235,7 @@ mod tests {
         for _ in 0..2 {
             cache.request_refresh();
             finished.recv_timeout(Duration::from_secs(2)).unwrap();
+            wait_idle(&cache);
         }
         assert_eq!(cache.snapshot().wifi, None);
     }
@@ -328,6 +291,7 @@ mod tests {
         assert_eq!(cache.snapshot().wifi, None);
         cache.request_refresh();
         finished.recv_timeout(Duration::from_millis(400)).unwrap();
+        wait_idle(&cache);
         wait_for_wifi_sample(
             &cache,
             Some(WifiSample {

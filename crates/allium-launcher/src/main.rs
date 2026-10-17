@@ -22,9 +22,12 @@ use allium_launcher::AlliumLauncher;
 use common::platform::{DefaultPlatform, Platform};
 use simple_logger::SimpleLogger;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     SimpleLogger::new().env().init().unwrap();
+
+    #[cfg(feature = "miyoo")]
+    let _boost_guard = common::platform::cpu_tuning::input_boost_guard();
 
     #[cfg(feature = "miyoo")]
     {
@@ -34,6 +37,8 @@ async fn main() -> Result<()> {
 
     let platform = DefaultPlatform::new()?;
     let mut app = AlliumLauncher::new(platform)?;
-    app.run_event_loop().await?;
-    Ok(())
+    let result = app.run_event_loop().await;
+    #[cfg(feature = "miyoo")]
+    common::platform::cpu_tuning::restore_input_boost();
+    result
 }

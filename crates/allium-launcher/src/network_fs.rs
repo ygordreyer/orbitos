@@ -18,6 +18,16 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+// Count the calling thread's probes across cache bindings without including
+// asynchronous inventory work performed on other threads.
+#[cfg(test)]
+thread_local! {
+    static EXISTS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn test_exists_probes() -> usize {
+    EXISTS_PROBES.with(std::cell::Cell::get)
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Identity {
     pub device: u64,
@@ -349,6 +359,8 @@ impl AnchoredFs {
         Ok(())
     }
     pub fn exists(&self, path: &Path) -> Result<bool> {
+        #[cfg(test)]
+        EXISTS_PROBES.with(|count| count.set(count.get() + 1));
         match self.parent(path) {
             Ok((parent, child)) => {
                 let m = stat_at(&parent, &child)?;

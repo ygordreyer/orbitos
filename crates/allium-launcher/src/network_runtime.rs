@@ -19,10 +19,13 @@ use common::{
 use serde::Deserialize;
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     thread,
 };
 thread_local! {
@@ -126,6 +129,90 @@ struct Job {
     result: Receiver<Result<Output>>,
     thread: Option<thread::JoinHandle<()>>,
 }
+struct Inventory {
+    result: Receiver<HashMap<String, String>>,
+    cancel: Cancellation,
+}
+impl Drop for Inventory {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+fn cached_status(cache: &Cache, game: &NetworkGame) -> Result<&'static str> {
+    Ok(if cache.has_index(game)? {
+        "Cached"
+    } else if cache.unloading(game)? {
+        "Unload interrupted"
+    } else {
+        "NAS"
+    })
+}
+fn validate_installed(
+    fs: &crate::network_fs::AnchoredFs,
+    state: &Path,
+    cache: &Cache,
+    catalog: &Catalog,
+) -> Result<HashMap<String, String>> {
+    let installed = state.join("installed");
+    let mut status = HashMap::new();
+    if !fs.exists(&installed)? {
+        return Ok(status);
+    }
+    // Validate present metadata before enabling the runtime. Missing entries
+    // need no per-game filesystem probes on the startup thread.
+    let entries = fs.entries(&installed).ok().map(|entries| {
+        entries
+            .into_iter()
+            .filter_map(|(path, _)| {
+                let name = path.file_name()?.to_str()?;
+                name.strip_suffix(".unloading.json")
+                    .or_else(|| name.strip_suffix(".unloading.new"))
+                    .or_else(|| name.strip_suffix(".json"))
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>()
+    });
+    for game in &catalog.games {
+        if entries
+            .as_ref()
+            .is_none_or(|entries| entries.contains(&game.id))
+        {
+            status.insert(game.id.clone(), cached_status(cache, game)?.into());
+        }
+    }
+    Ok(status)
+}
+fn start_inventory(
+    config: CacheConfig,
+    catalog: Arc<Catalog>,
+    known: HashSet<String>,
+) -> Result<Inventory> {
+    let (tx, result) = mpsc::sync_channel(1);
+    let cancel = Cancellation::default();
+    let worker_cancel = cancel.clone();
+    thread::Builder::new()
+        .name("network-status".into())
+        .spawn(move || {
+            let cache = Cache::new(config);
+            let mut status = HashMap::new();
+            for game in &catalog.games {
+                if known.contains(&game.id) {
+                    continue;
+                }
+                if worker_cancel.check().is_err() {
+                    return;
+                }
+                let value = cache
+                    .as_ref()
+                    .ok()
+                    .and_then(|cache| cached_status(cache, game).ok())
+                    .unwrap_or("Unavailable");
+                status.insert(game.id.clone(), value.into());
+            }
+            let _ = tx.send(status);
+        })?;
+    Ok(Inventory { result, cancel })
+}
 enum Modal {
     Working(String),
     Completed,
@@ -137,11 +224,12 @@ enum Modal {
 }
 struct Runtime {
     epoch: u64,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     path_index: Option<HashMap<PathBuf, usize>>,
     config: CacheConfig,
     endpoint: Endpoint,
     status: HashMap<String, String>,
+    inventory: Option<Inventory>,
     job: Option<Job>,
     modal: Option<Modal>,
     pending: Option<Pending>,
@@ -224,20 +312,17 @@ fn initialize_profile(root: PathBuf) -> Result<()> {
     let lease = None;
     let config = CacheConfig::bind(root, lease)?;
     let cache = Cache::new(config.clone())?;
-    let mut status = HashMap::new();
-    for game in &catalog.games {
-        status.insert(
-            game.id.clone(),
-            if cache.has_index(game)? {
-                "Cached"
-            } else if cache.unloading(game)? {
-                "Unload interrupted"
-            } else {
-                "NAS"
-            }
-            .into(),
-        );
-    }
+    let status = validate_installed(&fs, &state, &cache, &catalog)?;
+    let catalog = Arc::new(catalog);
+    let inventory = if status.len() < catalog.games.len() {
+        Some(start_inventory(
+            config.clone(),
+            catalog.clone(),
+            status.keys().cloned().collect(),
+        )?)
+    } else {
+        None
+    };
     common::media::set_game_containers(catalog.games.iter().filter_map(|game| {
         let identity = config.root.join(&game.game_path);
         let container = config.root.join(&game.cache_path);
@@ -254,6 +339,7 @@ fn initialize_profile(root: PathBuf) -> Result<()> {
             config,
             endpoint,
             status,
+            inventory,
             job: None,
             modal: None,
             pending: None,
@@ -352,7 +438,7 @@ impl Runtime {
         };
         let config = self.config.clone();
         let endpoint = self.endpoint.clone();
-        let catalog = self.catalog.clone();
+        let catalog = matches!(task, Task::Storage).then(|| self.catalog.clone());
         let cancel = Cancellation::default();
         let worker_cancel = cancel.clone();
         let (tx, progress) = mpsc::sync_channel(16);
@@ -393,7 +479,7 @@ impl Runtime {
                         Task::Storage => {
                             let resume = cache.resume_path()?;
                             let mut ids = Vec::new();
-                            for game in catalog.games {
+                            for game in &catalog.unwrap().games {
                                 worker_cancel.check()?;
                                 if (cache.has_index(&game)? || cache.unloading(&game)?)
                                     && !resume.as_ref().is_some_and(|path| {
@@ -410,7 +496,7 @@ impl Runtime {
                                             })
                                     })
                                 {
-                                    ids.push(game.id);
+                                    ids.push(game.id.clone());
                                 }
                             }
                             Ok(Output::Storage(ids))
@@ -478,6 +564,30 @@ impl Runtime {
         self.start(Task::Prefill(game))
     }
     fn poll(&mut self) {
+        if let Some(inventory) = &self.inventory {
+            match inventory.result.try_recv() {
+                Ok(status) => {
+                    // A foreground operation may have published a newer status.
+                    let before = self.status.len();
+                    for (id, status) in status {
+                        self.status.entry(id).or_insert(status);
+                    }
+                    self.inventory = None;
+                    self.dirty |= self.status.len() != before;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let before = self.status.len();
+                    for game in &self.catalog.games {
+                        self.status
+                            .entry(game.id.clone())
+                            .or_insert_with(|| "Unavailable".into());
+                    }
+                    self.inventory = None;
+                    self.dirty |= self.status.len() != before;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let Some(job) = self.job.as_mut() else {
             return;
         };
@@ -813,9 +923,13 @@ pub fn guard_launch(path: &Path) -> Result<()> {
 }
 pub fn badge(path: &Path) -> Option<String> {
     with(None, |runtime| {
-        runtime
-            .descriptor(path)
-            .and_then(|g| runtime.status.get(&g.id).cloned())
+        runtime.descriptor(path).map(|g| {
+            runtime
+                .status
+                .get(&g.id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown".into())
+        })
     })
 }
 pub fn art_path(path: &Path, kind: &str) -> Option<PathBuf> {
@@ -831,16 +945,33 @@ pub fn registered(path: &Path) -> bool {
     with(false, |r| r.descriptor(path).is_some())
 }
 pub fn refresh_history(database: &common::database::Database) -> Result<()> {
-    let rows = database.select_all_games()?;
-    with((), |r| {
-        for row in rows {
+    with(Ok(()), |r| {
+        let mut paths = Vec::new();
+        for game in &r.catalog.games {
+            paths.push(r.config.root.join(&game.game_path));
+            paths.extend(
+                game.targets()?
+                    .into_iter()
+                    .map(|path| r.config.root.join(path)),
+            );
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        r.last_played.clear();
+        for path in paths {
+            // Catalog metadata can be malformed independently of other history rows.
+            let Ok(Some(row)) = database.select_game(&path) else {
+                continue;
+            };
             if let Some(game) = r.descriptor(&row.path) {
-                r.last_played.insert(game.id, row.last_played);
+                let played = r.last_played.entry(game.id).or_insert(row.last_played);
+                *played = (*played).max(row.last_played);
             }
         }
-    });
-    Ok(())
+        Ok(())
+    })
 }
+
 pub fn finish_action() {
     with((), |r| r.permit = None);
 }
@@ -866,7 +997,7 @@ pub(crate) fn blocks_navigation_warm() -> bool {
 }
 
 pub fn active() -> bool {
-    with(false, |r| r.job.is_some())
+    with(false, |r| r.job.is_some() || r.inventory.is_some())
 }
 pub fn trace_wake(cause: &'static str) {
     common::perf_trace::wake();
@@ -1287,6 +1418,7 @@ mod tests {
         )
         .unwrap();
         initialize(root.clone()).unwrap();
+        settle();
         let game = Game::new(root.join(&descriptor.game_path));
         if check_download_offer {
             assert!(

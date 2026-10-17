@@ -209,6 +209,7 @@ impl Theme {
             fs::create_dir_all(parent)?;
         }
         File::create(ALLIUM_THEME_STATE.as_path())?.write_all(self.0.as_bytes())?;
+        crate::locale::invalidate_theme_loader();
         Ok(())
     }
 }

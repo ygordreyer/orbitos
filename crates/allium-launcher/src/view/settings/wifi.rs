@@ -287,7 +287,8 @@ impl View for Wifi {
                                 let commands = commands.clone();
                                 tokio::spawn(async move {
                                     if wifi::wait_for_wifi().await.is_ok()
-                                        && let Some(ip_address) = wifi::ip_address()
+                                        && let Ok(Some(ip_address)) =
+                                            tokio::task::spawn_blocking(wifi::ip_address).await
                                     {
                                         let url = format!("http://{ip_address}/");
                                         let Ok(code) = QrCode::new(url.as_bytes()) else {
@@ -323,7 +324,8 @@ impl View for Wifi {
                                 let commands = commands.clone();
                                 tokio::spawn(async move {
                                     if wifi::wait_for_wifi().await.is_ok()
-                                        && let Some(ip_address) = wifi::ip_address()
+                                        && let Ok(Some(ip_address)) =
+                                            tokio::task::spawn_blocking(wifi::ip_address).await
                                     {
                                         let url = format!("http://{ip_address}:2435/");
                                         let Ok(code) = QrCode::new(url.as_bytes()) else {
@@ -354,7 +356,8 @@ impl View for Wifi {
                                 let commands = commands.clone();
                                 tokio::spawn(async move {
                                     if wifi::wait_for_wifi().await.is_ok()
-                                        && let Some(ip_address) = wifi::ip_address()
+                                        && let Ok(Some(ip_address)) =
+                                            tokio::task::spawn_blocking(wifi::ip_address).await
                                     {
                                         let url = format!("http://{ip_address}:8384/");
                                         let Ok(code) = QrCode::new(url.as_bytes()) else {

@@ -4,6 +4,7 @@ fn dl17b_every_network_modal_and_pending_launch_blocks_warm() {
     let f = StartupFixture::new("warm-modal-guard");
     f.configured();
     initialize(f.root.clone()).unwrap();
+    settle();
     assert!(!blocks_navigation_warm());
     let game = Game::new(f.root.join(&f.game.game_path));
     for modal in [

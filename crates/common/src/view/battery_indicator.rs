@@ -33,27 +33,25 @@ enum PollRequest {
 }
 #[derive(Debug)]
 struct BatteryPolling {
-    snapshot: Arc<Mutex<BatteryState>>,
+    snapshot: Arc<Mutex<Option<BatteryState>>>,
     requests: SyncSender<PollRequest>,
     stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     finished: Receiver<()>,
 }
 impl BatteryPolling {
-    fn new<B: Battery + 'static>(battery: B) -> (Self, BatteryState) {
-        let fallback = battery_state(&battery);
-        let snapshot = Arc::new(Mutex::new(fallback.clone()));
+    fn new<B: Battery + 'static>(battery: B) -> (Self, Option<BatteryState>) {
+        let snapshot = Arc::new(Mutex::new(None));
         let published = snapshot.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = stopping.clone();
         let (requests, receive) = mpsc::sync_channel::<PollRequest>(1);
-        let (initial, first) = mpsc::sync_channel(1);
         let (complete, finished) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("battery-poll".into())
             .stack_size(128 * 1024)
             .spawn(move || {
-                run_battery_worker(battery, published, stop, receive, initial);
+                run_battery_worker(battery, published, stop, receive);
                 let _ = complete.send(());
             });
         let worker = match worker {
@@ -63,7 +61,6 @@ impl BatteryPolling {
                 None
             }
         };
-        let state = first.recv().unwrap_or(fallback);
         (
             Self {
                 snapshot,
@@ -72,7 +69,7 @@ impl BatteryPolling {
                 worker,
                 finished,
             },
-            state,
+            None,
         )
     }
     fn request(&self) {
@@ -80,7 +77,7 @@ impl BatteryPolling {
             let _ = self.requests.try_send(PollRequest::Poll(None));
         }
     }
-    fn snapshot(&self) -> BatteryState {
+    fn snapshot(&self) -> Option<BatteryState> {
         self.snapshot
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -125,43 +122,33 @@ impl Drop for BatteryPolling {
 }
 fn run_battery_worker(
     mut battery: impl Battery,
-    published: Arc<Mutex<BatteryState>>,
+    published: Arc<Mutex<Option<BatteryState>>>,
     stopping: Arc<AtomicBool>,
     requests: Receiver<PollRequest>,
-    initial: SyncSender<BatteryState>,
 ) {
-    if let Err(error) = battery.update() {
-        error!("Failed to update battery: {}", error);
-    }
-    let state = battery_state(&battery);
-    *published.lock().unwrap_or_else(|error| error.into_inner()) = state.clone();
-    if initial.send(state).is_err() {
-        return;
-    }
-    while let Ok(PollRequest::Poll(acknowledge)) = requests.recv() {
+    let mut acknowledge: Option<SyncSender<()>> = None;
+    loop {
         if stopping.load(Ordering::Acquire) {
             break;
         }
-        match poll_battery(&mut battery) {
-            Ok(state) => {
-                *published.lock().unwrap_or_else(|error| error.into_inner()) = state;
+        match battery.sample() {
+            Ok(Some((percentage, charging))) if (0..=100).contains(&percentage) => {
+                *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(BatteryState {
+                    percentage,
+                    charging,
+                });
             }
+            Ok(_) => (),
             Err(error) => error!("Failed to update battery: {}", error),
         }
-        if let Some(acknowledge) = acknowledge {
+        if let Some(acknowledge) = acknowledge.take() {
             let _ = acknowledge.send(());
         }
+        match requests.recv() {
+            Ok(PollRequest::Poll(ack)) => acknowledge = ack,
+            _ => break,
+        }
     }
-}
-fn battery_state(battery: &impl Battery) -> BatteryState {
-    BatteryState {
-        charging: battery.charging(),
-        percentage: battery.percentage(),
-    }
-}
-fn poll_battery(battery: &mut impl Battery) -> std::result::Result<BatteryState, String> {
-    battery.update().map_err(|error| error.to_string())?;
-    Ok(battery_state(battery))
 }
 
 #[derive(Debug)]
@@ -190,14 +177,7 @@ where
     pub fn new(res: Resources, point: Point, battery: B, show_percentage: bool) -> Self {
         let (polling, last_state) = BatteryPolling::new(battery);
 
-        Self::with_state(
-            res,
-            point,
-            show_percentage,
-            Some(polling),
-            None,
-            Some(last_state),
-        )
+        Self::with_state(res, point, show_percentage, Some(polling), None, last_state)
     }
 
     pub fn new_cached(
@@ -334,7 +314,10 @@ where
                 charging: sample.charging,
             }
         } else {
-            self.polling.as_ref().unwrap().snapshot()
+            let Some(state) = self.polling.as_ref().unwrap().snapshot() else {
+                return;
+            };
+            state
         };
         if state == self.last_state {
             return;
@@ -452,7 +435,6 @@ fn format_battery_percentage(charging: bool, percentage: i32) -> String {
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 mod semantic_battery_tests {
     use super::*;
-    use crate::display::Display;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -478,6 +460,8 @@ mod semantic_battery_tests {
         let state = Arc::new(Mutex::new((82, false, false)));
         let mut indicator =
             BatteryIndicator::new(res, Point::new(100, 10), PollBattery(state.clone()), false);
+        indicator.polling.as_ref().unwrap().request_and_wait();
+        indicator.update(Duration::ZERO);
         let mut platform = DefaultPlatform::new().unwrap();
         let mut display = platform.display().unwrap();
         indicator.draw(&mut display, &styles).unwrap();
@@ -543,7 +527,13 @@ mod worker_tests {
             entered,
             resume: paused,
         });
-        assert_eq!(initial.percentage, 82);
+        assert_eq!(initial, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while polling.snapshot().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let initial = polling.snapshot();
+        assert_eq!(initial.as_ref().unwrap().percentage, 82);
         let (acknowledge, finished) = std::sync::mpsc::sync_channel(1);
         polling
             .requests
@@ -555,10 +545,10 @@ mod worker_tests {
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
             polling.snapshot(),
-            BatteryState {
+            Some(BatteryState {
                 percentage: 41,
                 charging: true
-            }
+            })
         );
     }
 }
@@ -645,6 +635,37 @@ mod shutdown_tests {
         assert!(reaped.load(Ordering::Acquire));
         assert!(dropped.load(Ordering::Acquire));
     }
+    #[test]
+    fn status_battery_stop_during_first_sample_reaps_and_joins() {
+        struct FirstChildBattery(TimedBattery);
+        impl Battery for FirstChildBattery {
+            fn update(&mut self) -> Result<()> {
+                self.0.update()
+            }
+            fn percentage(&self) -> i32 {
+                self.0.percentage()
+            }
+            fn charging(&self) -> bool {
+                self.0.charging()
+            }
+        }
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let reaped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (mut polling, state) = BatteryPolling::new(FirstChildBattery(TimedBattery {
+            polls: 1,
+            entered,
+            reaped: reaped.clone(),
+            dropped: dropped.clone(),
+        }));
+        assert_eq!(state, None);
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        polling.stop();
+        assert!(polling.worker.is_none());
+        assert!(reaped.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
     struct FailedFirstRead(usize);
     impl Battery for FailedFirstRead {
         fn update(&mut self) -> Result<()> {
@@ -660,23 +681,126 @@ mod shutdown_tests {
         }
     }
     #[test]
-    fn failed_first_battery_read_keeps_device_state_and_retries() {
+    fn failed_first_battery_read_stays_unknown_and_retries() {
         let (polling, initial) = BatteryPolling::new(FailedFirstRead(0));
-        assert_eq!(
-            initial,
-            BatteryState {
-                charging: false,
-                percentage: 100
-            }
-        );
-        assert_eq!(polling.snapshot(), initial);
+        assert_eq!(initial, None);
         polling.request_and_wait();
         assert_eq!(
             polling.snapshot(),
-            BatteryState {
+            Some(BatteryState {
                 charging: true,
                 percentage: 41
-            }
+            })
         );
+    }
+}
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod asynchronous_first_sample_tests {
+    use super::*;
+
+    struct SlowBattery;
+    impl Battery for SlowBattery {
+        fn update(&mut self) -> Result<()> {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        }
+        fn percentage(&self) -> i32 {
+            37
+        }
+        fn charging(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn status_slow_first_battery_sample_never_delays_construction_update_or_input() {
+        let mut map = type_map::TypeMap::new();
+        let styles = Stylesheet::load().unwrap();
+        map.insert(styles.clone());
+        let start = Instant::now();
+        let mut indicator =
+            BatteryIndicator::new(Resources::new(map), Point::zero(), SlowBattery, true);
+        let construction = start.elapsed();
+        assert!(
+            construction < Duration::from_millis(80),
+            "construction: {construction:?}"
+        );
+        assert_eq!(indicator.theme_status().unwrap().battery, None);
+        assert!(!indicator.should_draw());
+        assert_eq!(indicator.bounding_box(&styles), Rect::zero());
+        let (commands, _receive) = tokio::sync::mpsc::channel(1);
+        let input = Instant::now();
+        indicator.update(Duration::ZERO);
+        assert!(
+            !indicator
+                .handle_key_event(
+                    KeyEvent::Pressed(crate::platform::Key::Right),
+                    commands,
+                    &mut VecDeque::new()
+                )
+                .await
+                .unwrap()
+        );
+        let input = input.elapsed();
+        assert!(input < Duration::from_millis(40), "input/update: {input:?}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while indicator.theme_status().unwrap().battery.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+            indicator.update(Duration::ZERO);
+        }
+        assert_eq!(indicator.theme_status().unwrap().battery, Some(37));
+        assert!(indicator.theme_status().unwrap().charging);
+        assert!(
+            indicator.should_draw(),
+            "first completion must invalidate the hidden indicator"
+        );
+        assert!(indicator.last_updated.elapsed() < BATTERY_UPDATE_INTERVAL);
+        let baseline = Instant::now();
+        SlowBattery.update().unwrap();
+        eprintln!(
+            "STATUS battery synchronous_sample={:?} async_construction={construction:?} update_and_input={input:?}",
+            baseline.elapsed()
+        );
+    }
+
+    struct UnknownBattery(usize);
+    impl Battery for UnknownBattery {
+        fn update(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn sample(&mut self) -> Result<Option<(i32, bool)>> {
+            self.0 += 1;
+            Ok(match self.0 {
+                1 | 2 => None,
+                3 => Some((37, true)),
+                4 => Some((101, false)),
+                _ => None,
+            })
+        }
+        fn percentage(&self) -> i32 {
+            panic!("unsampled getter must not invent 100%")
+        }
+        fn charging(&self) -> bool {
+            panic!("unsampled getter must not be read")
+        }
+    }
+
+    #[test]
+    fn status_unknown_and_invalid_battery_samples_never_replace_real_data() {
+        let (polling, initial) = BatteryPolling::new(UnknownBattery(0));
+        assert_eq!(initial, None);
+        polling.request_and_wait();
+        assert_eq!(polling.snapshot(), None);
+        polling.request_and_wait();
+        let real = Some(BatteryState {
+            percentage: 37,
+            charging: true,
+        });
+        assert_eq!(polling.snapshot(), real);
+        polling.request_and_wait();
+        assert_eq!(polling.snapshot(), real);
+        polling.request_and_wait();
+        assert_eq!(polling.snapshot(), real);
     }
 }

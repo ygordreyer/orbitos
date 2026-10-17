@@ -330,17 +330,21 @@ impl SystemUpdate {
                 ota::DownloadEvent::Completed => {
                     // Download completed successfully
                     info!("Download verification complete, rebooting to apply update");
-                    let _ = fs::remove_file("/tmp/stay_awake");
                     self.update_status = UpdateStatus::Ready;
                     self.update_status_label();
                     self.download_rx = None;
                     // Reboot to apply the update
-                    let _ = std::process::Command::new("shutdown").arg("-r").spawn();
+                    tokio::task::spawn_blocking(|| {
+                        let _ = fs::remove_file("/tmp/stay_awake");
+                        let _ = std::process::Command::new("shutdown").arg("-r").spawn();
+                });
                 }
                 ota::DownloadEvent::Error(msg) => {
                     // Download failed
                     error!("Download failed: {}", msg);
-                    let _ = fs::remove_file("/tmp/stay_awake");
+                    tokio::task::spawn_blocking(|| {
+                        let _ = fs::remove_file("/tmp/stay_awake");
+                    });
                     self.update_status = UpdateStatus::Error(msg);
                     self.update_status_label();
                     self.download_rx = None;
@@ -395,11 +399,6 @@ impl SystemUpdate {
                 info!("Downloading update v{}...", version);
                 let release = release.clone();
 
-                // Create stay_awake file to prevent sleep during download
-                if let Err(e) = fs::write("/tmp/stay_awake", "") {
-                    error!("Failed to create stay_awake file: {}", e);
-                }
-
                 // Create event channel
                 let (event_tx, event_rx) = mpsc::unbounded_channel();
                 self.download_rx = Some(event_rx);
@@ -410,6 +409,13 @@ impl SystemUpdate {
 
                 // Spawn download task
                 tokio::spawn(async move {
+                    if let Err(error) =
+                        tokio::task::spawn_blocking(|| fs::write("/tmp/stay_awake", ""))
+                            .await
+                            .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+                    {
+                        error!("Failed to create stay_awake file: {error}");
+                    }
                     let result =
                         ota::download_update_with_progress(&release, Some(event_tx.clone())).await;
                     if let Err(e) = result {
