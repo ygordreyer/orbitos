@@ -12,6 +12,15 @@ pub(super) struct Metadata {
     pub rows: Vec<Metadata>,
 }
 
+pub(super) fn metadata_bytes(metadata: &Metadata) -> usize {
+    metadata.targets.capacity() * std::mem::size_of::<Target>()
+        + metadata.targets.iter().map(|t| t.component.capacity() + t.item.capacity()).sum::<usize>()
+        + metadata.text_boxes.capacity() * std::mem::size_of::<(String, Rect)>()
+        + metadata.text_boxes.iter().map(|(s, _)| s.capacity()).sum::<usize>()
+        + metadata.rows.capacity() * std::mem::size_of::<Metadata>()
+        + metadata.rows.iter().map(metadata_bytes).sum::<usize>()
+}
+
 pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
     static COMPACT: std::sync::OnceLock<BTreeMap<ScreenId, Vec<Component>>> =
         std::sync::OnceLock::new();
@@ -90,7 +99,7 @@ pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
     };
     matches && theme.pack().tokens.colors[&ColorRole::Background].ends_with("ff")
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ArtworkIdentity {
     logo: Option<Weak<Pixmap>>,
     hero: Option<Weak<Pixmap>>,
@@ -98,6 +107,7 @@ struct ArtworkIdentity {
     next_cover: Option<Weak<Pixmap>>,
     entries: BTreeMap<String, Weak<Pixmap>>,
 }
+#[derive(Clone)]
 pub(super) struct Inputs {
     pub model: FrameInputs,
     art: ArtworkIdentity,
@@ -121,6 +131,7 @@ pub(super) fn capture(input: &FrameInputs) -> Inputs {
     let mut saved = input.clone();
     saved.art = Default::default();
     saved.art.next_cover_expected = input.art.next_cover_expected;
+    saved.art.completed_misses = input.art.completed_misses.clone();
     let mut art = ArtworkIdentity {
         logo: input.art.selected_logo.as_ref().map(Arc::downgrade),
         hero: input.art.selected_hero.as_ref().map(Arc::downgrade),
@@ -133,6 +144,32 @@ pub(super) fn capture(input: &FrameInputs) -> Inputs {
     }
     Inputs { model: saved, art }
 }
+#[cfg(test)]
+pub(super) fn storage_bytes(input: &Inputs) -> usize {
+    allocation_bytes(&input.model) + input.art.entries.keys().map(|id| 512 + id.capacity()).sum::<usize>()
+}
+pub(super) fn allocation_bytes(input: &FrameInputs) -> usize {
+    let rows = |rows: &Vec<Row>| rows.capacity() * std::mem::size_of::<Row>()
+        + rows.iter().map(|r| r.id.capacity() + r.label.capacity() + r.subtitle.capacity() + r.value.capacity()).sum::<usize>();
+    std::mem::size_of::<FrameInputs>() + input.raster_revision.as_ref().map_or(0, String::capacity)
+        + input.text.iter().chain(&input.selected).map(|(_, v)| 512 + v.capacity()).sum::<usize>()
+        + input.rows.iter().map(|(_, r)| 512 + rows(r)).sum::<usize>()
+        + input.navigation.iter().map(|(_, r)| 512 + rows(r)).sum::<usize>()
+        + input.detail_lines.capacity() * std::mem::size_of::<super::super::frame::DetailLine>()
+        + input.detail_lines.iter().map(|l| l.text.capacity()).sum::<usize>()
+        + [&input.metadata, &input.facts].iter().map(|v| v.capacity() * std::mem::size_of::<(String, String)>()
+            + v.iter().map(|(a, b)| a.capacity() + b.capacity()).sum::<usize>()).sum::<usize>()
+        + input.focus.component.capacity() + input.focus.item.as_ref().map_or(0, String::capacity)
+        + input.hints.capacity() * std::mem::size_of::<super::super::frame::Hint>()
+        + input.hints.iter().map(|h| h.button.capacity() + h.label.capacity()).sum::<usize>()
+        + input.keyboard.capacity() * std::mem::size_of::<String>()
+        + input.keyboard.iter().map(String::capacity).sum::<usize>()
+        + input.status.clock.as_ref().map_or(0, String::capacity)
+        + input.status.network.as_ref().map_or(0, String::capacity)
+        + input.art.entries.keys().map(|id| 512 + id.capacity()).sum::<usize>()
+        + input.art.completed_misses.entries.iter().map(|id| 512 + id.capacity()).sum::<usize>()
+}
+
 pub(super) fn matches(saved: &Inputs, input: &FrameInputs) -> bool {
     let mut model = input.clone();
     model.art = Default::default();

@@ -45,6 +45,11 @@ impl RecentsList {
         self.list.details_warm_model(handle, screen)
     }
 
+    pub(crate) fn navigation_frame_model(&mut self, handle: &common::theme::ThemeHandle, direction: isize)
+        -> Option<common::theme::frame::FrameInputs> {
+        self.list.navigation_frame_model(handle, direction)
+    }
+
     pub(crate) fn navigation_warm_model(
         &mut self,
         handle: &common::theme::ThemeHandle,

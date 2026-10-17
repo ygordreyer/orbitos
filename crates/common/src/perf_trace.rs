@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-const COUNT_LEN: usize = 37;
+const COUNT_LEN: usize = 40;
 const STAGE_NAMES: [&str; 15] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
@@ -72,6 +72,9 @@ pub enum Count {
     HeroPrewarmPublish,
     PanelHit,
     PanelMiss,
+    NeighborHit,
+    NeighborMiss,
+    NeighborBuilt,
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
@@ -112,6 +115,9 @@ struct Trace {
     damage_pixels: u64,
     render_reason: &'static str,
     present_reason: &'static str,
+    neighbor_build: &'static str,
+    neighbor_adopt: &'static str,
+    neighbor_warm: &'static str,
     content_pending_reason: &'static str,
     content_pending_reasons: Vec<(&'static str, usize)>,
     next_cover_expected: bool,
@@ -174,6 +180,9 @@ fn install(path: &str) -> std::io::Result<()> {
             damage_pixels: 0,
             render_reason: "none",
             present_reason: "none",
+            neighbor_build: "not_attempted",
+            neighbor_adopt: "not_attempted",
+            neighbor_warm: "not_evaluated",
             content_pending_reason: "not_evaluated",
             content_pending_reasons: Vec::new(),
             next_cover_expected: false,
@@ -236,6 +245,7 @@ fn phase_at(phase: Phase, input_start: Option<(u64, u64)>) -> PhaseGuard {
             trace.input_key = None;
             trace.input_edge = None;
             trace.content_pending_reason = "not_evaluated";
+            trace.neighbor_adopt = "not_attempted";
             trace.content_pending_reasons.clear();
             trace.viewport_shift = false;
             trace.first_feedback_us = 0;
@@ -950,6 +960,16 @@ pub fn present_reason(reason: &'static str) {
         }
     });
 }
+// Build/warm outcomes survive idle frames and input reset so the next press explains misses.
+pub fn neighbor_build(reason: &'static str) {
+    TRACE.with(|t| { if let Some(t) = t.borrow_mut().as_mut() { t.neighbor_build = reason; } });
+}
+pub fn neighbor_adopt(reason: &'static str) {
+    TRACE.with(|t| { if let Some(t) = t.borrow_mut().as_mut() { t.neighbor_adopt = reason; } });
+}
+pub fn neighbor_warm(reason: &'static str) {
+    TRACE.with(|t| { if let Some(t) = t.borrow_mut().as_mut() { t.neighbor_warm = reason; } });
+}
 pub fn damage(areas: &[crate::geom::Rect]) {
     TRACE.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
@@ -976,6 +996,7 @@ pub fn probe_counts() -> serde_json::Value {
             "art_fitted_hits":t.counts[30],"art_fitted_misses":t.counts[31],
             "hero_hits":t.counts[32],"hero_misses":t.counts[33],"hero_prewarm_publishes":t.counts[34],
             "panel_hits":t.counts[35],"panel_misses":t.counts[36],
+            "neighbor_hits":t.counts[37],"neighbor_misses":t.counts[38],"neighbor_built":t.counts[39],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
             "text_hits":t.counts[0],"text_misses":t.counts[1],"blit_map_builds":t.counts[3],
             "damage_rects":t.damage_rects,"damage_pixels":t.damage_pixels,
@@ -1162,6 +1183,8 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
         "input_received_monotonic_us": t.input_us,
         "boost_us": t.boost_us,
         "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
+        "neighbor_build": t.neighbor_build, "neighbor_adopt": t.neighbor_adopt,
+        "neighbor_warm": t.neighbor_warm,
         "content_pending_reason": t.content_pending_reason,
         "content_pending_reasons": t.content_pending_reasons.iter().map(|(reason, missing_rows)|
             serde_json::json!({"reason":reason,"missing_rows":missing_rows})).collect::<Vec<_>>(),
@@ -1176,7 +1199,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
             "presented_monotonic_us": t.presented_us,
             "stage_begin_monotonic_us": t.frame_stage_begin, "stage_end_monotonic_us": t.frame_stage_end},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts.as_slice()},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss"],
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built"],
         "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })
@@ -1653,8 +1676,8 @@ mod measurement_tests {
         drawn_frame();
         let legacy: LegacyFrame = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(legacy.event, "frame");
-        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss"]);
-        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34, 35, 36]);
+        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built"]);
+        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34, 35, 36, 0, 0, 0]);
         TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
@@ -1851,4 +1874,28 @@ mod task_publication_tests {
         TRACE.with(|state| *state.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn fpdiag_idle_build_reason_survives_into_press_final_content() {
+    let path = std::env::temp_dir().join(format!("allium-fpdiag-trace-{}.log", std::process::id()));
+    start_probe(path.to_str().unwrap());
+    neighbor_build("admission_rejected");
+    neighbor_warm("allowed");
+    begin_render();
+    { let _input = input(crate::platform::KeyEvent::Pressed(crate::platform::Key::Down)); }
+    begin_render();
+    assert_eq!(probe_counts()["measurement"]["neighbor_build"], "admission_rejected");
+    assert_eq!(probe_counts()["measurement"]["neighbor_adopt"], "not_attempted");
+    neighbor_adopt("no_candidate");
+    presented(generation(), true);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let final_row = rows.iter().find(|row| row["event"] == "final_content").unwrap();
+    assert_eq!(final_row["measurement"]["neighbor_build"], "admission_rejected");
+    assert_eq!(final_row["measurement"]["neighbor_adopt"], "no_candidate");
+    assert_eq!(final_row["measurement"]["neighbor_warm"], "allowed");
+    stop_probe();
+    std::fs::remove_file(path).unwrap();
 }

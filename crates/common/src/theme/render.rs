@@ -135,6 +135,84 @@ impl PreparedFrame {
     pub fn screen(&self) -> ScreenId {
         self.screen
     }
+    pub fn can_prepare_neighbor(&self) -> bool {
+        self.screen == ScreenId::Recents && self.opaque && self.can_prewarm_navigation()
+            && self.theme.pack().motion == "none"
+            && self.previous_input.as_ref().is_some_and(|saved| Self::neighbor_input(&saved.model))
+    }
+    pub fn neighbor_ineligible_reason(&self) -> &'static str {
+        if self.screen != ScreenId::Recents { "not_eligible:screen" }
+        else if !self.opaque { "not_eligible:opacity" }
+        else if self.theme.pack().motion != "none" { "not_eligible:motion" }
+        else if self.previous_input.is_none() { "not_eligible:no_retained_inputs" }
+        else if !self.can_prewarm_navigation() { "not_eligible:retained_layout" }
+        else if self.previous_input.as_ref().is_some_and(|saved| !saved.model.keyboard.is_empty()) { "not_eligible:keyboard" }
+        else if self.previous_input.as_ref().is_some_and(|saved| saved.model.progress.is_some()) { "not_eligible:progress" }
+        else { "not_eligible:inputs" }
+    }
+    fn neighbor_input(input: &FrameInputs) -> bool {
+        // Wi-Fi status is retained input; the controller excludes active network overlays/jobs.
+        input.screen == ScreenId::Recents && retained::eligible(input)
+            && input.keyboard.is_empty() && input.progress.is_none()
+    }
+    /// Upper bound reserved before the fork: pixels, retained copies, and transient metadata.
+    pub fn neighbor_charge(&self, input: &FrameInputs) -> Option<usize> {
+        if !self.can_prepare_neighbor() || !Self::neighbor_input(input) { return None; }
+        let saved = self.previous_input.as_ref()?;
+        let model_bytes = retained::allocation_bytes(input).max(retained::allocation_bytes(&saved.model));
+        if model_bytes > 16 * 1024 { return None; }
+        let (snapshots, metadata) = if self.theme.pack().ink() { self.ink_cache.navigation_charge(input)? }
+            else { (0, model_bytes * 6 + self.component_metadata.iter().map(retained::metadata_bytes).sum::<usize>() * 2) };
+        // Includes the temporary row/dependency models and retained interaction output.
+        if metadata + model_bytes * 4 > 128 * 1024 { return None; }
+        Some(640 * 480 * 4 + snapshots + 128 * 1024)
+    }
+    pub fn prepare_neighbor(&self, input: &FrameInputs, available: usize) -> Result<Option<(Self, usize)>> {
+        let Some(charge) = self.neighbor_charge(input).filter(|charge| *charge <= available) else {
+            if crate::perf_trace::recording() { crate::perf_trace::neighbor_build("admission_rejected"); }
+            return Ok(None);
+        };
+        let _task = crate::perf_trace::task("neighbor_build", crate::perf_trace::generation());
+        let fork = Self {
+            theme: self.theme.clone(), screen: self.screen,
+            pixels: self.pixels.as_ref().to_owned().into(), opaque: self.opaque,
+            blit: Default::default(), previous_input: self.previous_input.clone(),
+            component_metadata: self.component_metadata.clone(), retained_layout: self.retained_layout,
+            tiles: Default::default(), ink_cache: self.ink_cache.fork_navigation(input),
+            damage: self.damage.clone(), navigation_epoch: std::sync::Arc::new(()),
+            ink_components: self.ink_components.clone(), targets: vec![],
+            text_boxes: vec![],
+        };
+        let frame = Self::prepare_reusing(self.theme.clone(), input, Some(fork)).inspect_err(|_| {
+            if crate::perf_trace::recording() { crate::perf_trace::neighbor_build("build_failed"); }
+        })?;
+        crate::perf_trace::count(crate::perf_trace::Count::NeighborBuilt, 1);
+        if crate::perf_trace::recording() { crate::perf_trace::neighbor_build("built"); }
+        Ok(Some((frame, charge)))
+    }
+    pub fn neighbor_matches(&self, theme: &ThemeHandle, input: &FrameInputs) -> bool {
+        self.navigation_theme_matches(theme) && self.theme.digest() == theme.digest()
+            && Self::neighbor_input(input) && self.input_matches(input)
+            && self.previous_input.as_ref().is_some_and(|saved|
+                saved.model.art.completed_misses == input.art.completed_misses)
+    }
+    /// Diagnostic only; acceptance still uses neighbor_matches and its live artwork proof.
+    pub fn neighbor_rejection_reason(&self, theme: &ThemeHandle, input: &FrameInputs) -> &'static str {
+        if !self.navigation_theme_matches(theme) || self.theme.digest() != theme.digest() { return "theme_mismatch"; }
+        if !Self::neighbor_input(input) { return "inputs_mismatch:eligibility"; }
+        let Some(saved) = &self.previous_input else { return "inputs_mismatch:no_retained_inputs"; };
+        macro_rules! fields {
+            ($($field:ident),*) => { $(if saved.model.$field != input.$field {
+                return concat!("inputs_mismatch:", stringify!($field));
+            })* };
+        }
+        fields!(screen, raster_revision, text, rows, selected, pagination, detail_lines,
+            metadata, facts, navigation, focus, hints, suppress_hints, status, progress,
+            keyboard, keyboard_cursor);
+        if saved.model.art.next_cover_expected != input.art.next_cover_expected { return "inputs_mismatch:next_cover_expected"; }
+        if saved.model.art.completed_misses != input.art.completed_misses { return "inputs_mismatch:completed_misses"; }
+        "inputs_mismatch:artwork"
+    }
     pub fn can_prewarm_navigation(&self) -> bool {
         (self.retained_layout || self.theme.pack().ink())
             && matches!(self.screen, ScreenId::Library | ScreenId::Recents)
@@ -2313,3 +2391,7 @@ mod dense_damage_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "render_neighbor_tests.rs"]
+mod neighbor_tests;

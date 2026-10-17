@@ -124,13 +124,13 @@ fn panelcache_input_invalidations_miss_and_match_cold_pixels() {
             let switched = draw(&new_theme, &changed, Some(draw(&theme, &base, None)));
             assert_eq!(count(Count::PanelHit), 0);
             assert_eq!(count(Count::PanelMiss), 1);
-            assert_eq!(switched.ink_cache.panels.0.len(), 1, "theme change did not evict");
+            assert_eq!(switched.ink_cache.panels.borrow_mut().0.len(), 1, "theme change did not evict");
             identical(&switched, &changed);
         }
         // Corrupt only the saved underlay. Equal child inputs still cannot reuse those pixels.
-        let mut frame = frame;
-        frame.ink_cache.panels.0.front_mut().unwrap().before[0] ^= 1;
-        frame.ink_cache.panels.0.front_mut().unwrap().underlay = Rc::new(());
+        let frame = frame;
+        frame.ink_cache.panels.borrow_mut().0.front_mut().unwrap().before[0] ^= 1;
+        frame.ink_cache.panels.borrow_mut().0.front_mut().unwrap().underlay = Rc::new(());
         let frame = draw(&theme, &input(&theme, 1, &arts), Some(frame));
         let frame = draw(&theme, &base, Some(frame));
         assert_eq!(count(Count::PanelHit), 0);
@@ -172,7 +172,7 @@ fn panelcache_clock_is_live_and_overlap_bypasses_grouping() {
             let frame = draw(&theme, &next, None);
             next.status.clock = Some("13:01".into());
             let frame = draw(&theme, &next, Some(frame));
-            assert!(frame.ink_cache.panels.0.is_empty());
+            assert!(frame.ink_cache.panels.borrow_mut().0.is_empty());
             assert_eq!(count(Count::PanelHit) + count(Count::PanelMiss), 0);
             identical(&frame, &next);
         }
@@ -213,17 +213,17 @@ fn panelcache_byte_budget_evicts_lru_and_refuses_oversized_entries() {
         for selected in 1..10 {
             let next = input(&theme, selected, &arts);
             frame = draw(&theme, &next, Some(frame));
-            assert!(frame.ink_cache.panels.0.iter().map(Panel::bytes).sum::<usize>() <= PANEL_LIMIT);
+            assert!(frame.ink_cache.panels.borrow_mut().0.iter().map(Panel::bytes).sum::<usize>() <= PANEL_LIMIT);
         }
-        assert!(frame.ink_cache.panels.0.len() < 8, "test must hit byte budget before entry limit");
+        assert!(frame.ink_cache.panels.borrow_mut().0.len() < 8, "test must hit byte budget before entry limit");
         frame = draw(&theme, &input(&theme, 8, &arts), Some(frame));
         assert_eq!(count(Count::PanelHit), 1, "recent neighbour was evicted");
         frame = draw(&theme, &base, Some(frame));
         assert_eq!(count(Count::PanelMiss), 1, "oldest selection was not evicted");
         identical(&frame, &base);
-        let before = frame.ink_cache.panels.0.len();
-        assert!(!frame.ink_cache.panels.reserve(PANEL_LIMIT + 1));
-        assert_eq!(frame.ink_cache.panels.0.len(), before);
+        let before = frame.ink_cache.panels.borrow_mut().0.len();
+        assert!(!frame.ink_cache.panels.borrow_mut().reserve(PANEL_LIMIT + 1));
+        assert_eq!(frame.ink_cache.panels.borrow_mut().0.len(), before);
     });
 }
 
@@ -237,11 +237,13 @@ fn panelcache_underlay_identity_fallback_and_restore_work() {
         for fallback in [false, true] {
             let frame = draw(&theme, &base, None);
             let mut frame = draw(&theme, &next, Some(frame));
-            let panel = frame.ink_cache.panels.0.back_mut().unwrap();
+            let mut store = frame.ink_cache.panels.borrow_mut();
+            let panel = store.0.back_mut().unwrap();
             if fallback { panel.underlay = Rc::new(()); }
             let mut display = crate::theme::render::tests::TestDisplay(frame.pixels.as_ref().to_owned());
             let entry = frame.ink_cache.entries.iter().find(|e| e.bounds == Rect(425, 16, 206, 408)).unwrap();
             assert_eq!(Rc::ptr_eq(&panel.underlay, &entry.underlay), !fallback);
+            drop(store);
             frame = draw(&theme, &base, Some(frame));
             assert_eq!(count(Count::PanelHit), 1);
             assert_eq!(count(Count::RestoreBytes), 106496 + 336192,
@@ -326,7 +328,7 @@ fn panelcache_prior_overlap_restores_and_renews_underlay_before_hit() {
         let token = frame.ink_cache.entries[panel_index].underlay.clone();
         // Replay an equal static underlay to force prior overlapping damage.
         let entry = frame.ink_cache.entries.iter_mut().find(|e| e.component.id == "underlay-overlap").unwrap();
-        entry.dependencies.model.raster_revision = Some("force replay".into());
+        Rc::make_mut(&mut entry.dependencies).model.raster_revision = Some("force replay".into());
         frame = draw(&theme, &base, Some(frame));
         assert_eq!(count(Count::PanelHit), 1);
         assert!(!Rc::ptr_eq(&token, &frame.ink_cache.entries[panel_index].underlay));
@@ -361,15 +363,17 @@ fn panelcache_all_art_slots_and_expired_weak_sources_invalidate() {
         let descriptor = frame.ink_cache.plan.as_ref().unwrap().operations.iter().find_map(|op|
             if let Paint::Panel { key, .. } = &op.paint { Some(key.clone()) } else { None }).unwrap();
         let key = PanelKey::new(&descriptor, &base);
-        let panel = frame.ink_cache.panels.0.front_mut().unwrap();
+        let mut store = frame.ink_cache.panels.borrow_mut();
+        let panel = store.0.front_mut().unwrap();
         let transient = Arc::new((*arts[0]).clone());
         panel.sources[0] = Some(Arc::downgrade(&transient));
         let sources = panel.sources.clone();
         let before = panel.before.clone();
         let token = panel.underlay.clone();
         drop(transient);
-        let mut panels = std::mem::take(&mut frame.ink_cache.panels);
-        assert!(!frame.ink_panel_hit(&key, &sources, Rect(425, 16, 206, 408), &before, &token, &mut panels));
+        drop(store);
+        let panels = frame.ink_cache.panels.clone();
+        assert!(!frame.ink_panel_hit(&key, &sources, Rect(425, 16, 206, 408), &before, &token, &mut panels.borrow_mut()));
     });
 }
 

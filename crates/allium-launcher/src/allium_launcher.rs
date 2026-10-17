@@ -94,6 +94,7 @@ pub struct AlliumLauncher<P: Platform> {
     toast: Option<Toast>,
     toast_deadline: Option<Instant>,
     first_flush: bool,
+    display_revision: u64,
 }
 
 impl AlliumLauncher<DefaultPlatform> {
@@ -144,6 +145,7 @@ impl AlliumLauncher<DefaultPlatform> {
             toast: None,
             toast_deadline: None,
             first_flush: true,
+            display_revision: 0,
         })
     }
 
@@ -302,9 +304,23 @@ impl AlliumLauncher<DefaultPlatform> {
                 continue;
             }
             let warm_allowed = self.navigation_warm_allowed()
+                && !animation_active
                 && keys.values().all(|pressed| !pressed)
                 && rx.is_empty()
                 && !pending_input.is_ready(&mut self.platform);
+            if common::perf_trace::recording() {
+                common::perf_trace::neighbor_warm(if animation_active { "animation" }
+                    else if self.toast.is_some() { "toast" }
+                    else if crate::network_runtime::blocks_navigation_warm() { "network_blocked" }
+                    else if !self.view.navigation_warm_ready() { "view_not_ready" }
+                    else if keys.values().any(|pressed| *pressed) { "held_key" }
+                    else if !rx.is_empty() { "pending_command" }
+                    else if !warm_allowed { "pending_input" } else { "allowed" });
+            }
+            if animation_active || self.toast.is_some() || crate::network_runtime::blocks_navigation_warm() {
+                self.view.invalidate_neighbors_for(if animation_active { "invalidated:animation" }
+                    else if self.toast.is_some() { "invalidated:toast" } else { "invalidated:network_blocked" });
+            }
             if !warm_allowed {
                 warm_work = None;
                 warm_steps = 0;
@@ -542,6 +558,14 @@ impl AlliumLauncher<DefaultPlatform> {
         if self.toast.is_some() || network_dirty || *overlay_was_drawn {
             self.view.force_full_present();
         }
+        let revision = self.display.composition_revision()?;
+        if revision != self.display_revision {
+            self.view.force_full_present();
+            if common::perf_trace::recording() {
+                common::perf_trace::neighbor_build("invalidated:display_contents_or_layout");
+            }
+            self.display_revision = revision;
+        }
         common::perf_trace::begin_render();
         let component_phase = self
             .view
@@ -585,6 +609,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     .as_ref()
                     .is_none_or(|damage| !damage.is_empty()));
         let display_repair = !composition_changed && self.display.needs_present()?;
+        // Page-history repair copies the unchanged logical pixmap, preserving neighbor damage.
         if composition_changed || display_repair {
             let present_damage = if display_repair {
                 Some(present_damage.unwrap_or_default())

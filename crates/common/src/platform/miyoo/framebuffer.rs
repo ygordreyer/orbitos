@@ -35,6 +35,7 @@ use framebuffer_damage::PageHistory;
 
 pub struct FramebufferDisplay {
     page_history: Option<PageHistory>,
+    composition_revision: u64,
     pixmap: crate::display::SharedPixmap,
     iface: Framebuffer,
     scratch: Vec<u8>,
@@ -77,6 +78,7 @@ impl FramebufferDisplay {
         .ok();
         Ok(FramebufferDisplay {
             page_history: None,
+            composition_revision: 0,
             scratch: Vec::new(),
             capture_pread: std::env::var("ALLIUM_FB_CAPTURE").is_ok_and(|v| v == "pread"),
             pixmap: pixmap.into(),
@@ -90,6 +92,7 @@ impl FramebufferDisplay {
 
     /// Copies `rect` of the visible frame into the pixmap, unrotating it and BGRA to RGBA
     fn read_frame_rect(&mut self, rect: Rect) -> Result<()> {
+        self.composition_revision = self.composition_revision.wrapping_add(1);
         validate_layout(&self.iface, self.iface.var_screen_info.yoffset as usize)?;
         let width = self.pixmap.width() as usize;
         let height = self.pixmap.height() as usize;
@@ -194,6 +197,16 @@ impl FramebufferDisplay {
             var.xres == self.pixmap.width() && var.yres == self.pixmap.height(),
             "Framebuffer dimensions changed"
         );
+        let old = &self.iface.var_screen_info;
+        let old_fix = &self.iface.fix_screen_info;
+        // A pan changes the page to repair, not the logical pixmap or its damage base.
+        if var.xres_virtual != old.xres_virtual || var.yres_virtual != old.yres_virtual
+            || var.xoffset != old.xoffset || var.bits_per_pixel != old.bits_per_pixel
+            || fix.line_length != old_fix.line_length || fix.smem_start != old_fix.smem_start
+            || fix.smem_len != old_fix.smem_len
+        {
+            self.composition_revision = self.composition_revision.wrapping_add(1);
+        }
         // Screen-info refreshes cannot retarget the existing mmap to a new backing.
         let mapped_length = |fix: &FixScreeninfo, var: &VarScreeninfo| {
             u64::from(fix.line_length) * u64::from(var.yres_virtual)
@@ -421,6 +434,11 @@ impl Display for FramebufferDisplay {
             *pixel = f(color).into();
         }
         Ok(())
+    }
+
+    fn composition_revision(&mut self) -> Result<u64> {
+        self.refresh_present_layout()?;
+        Ok(self.composition_revision)
     }
 
     fn needs_present(&mut self) -> Result<bool> {

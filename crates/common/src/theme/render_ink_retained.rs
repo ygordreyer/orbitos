@@ -12,16 +12,78 @@ pub(in crate::theme::render) struct Cache {
     pub(in crate::theme::render) opaque_base: bool,
     parked: VecDeque<(ScreenId, crate::display::SharedPixmap, Vec<Entry>, bool)>,
     declined: Vec<ScreenId>,
-    plan: Option<OperationPlan>,
-    panels: Panels,
+    plan: Option<Rc<OperationPlan>>,
+    panels: Rc<std::cell::RefCell<Panels>>,
     #[cfg(test)]
     peak_active_bytes: usize,
     #[cfg(test)]
     peak_snapshot_bytes: usize,
 }
 impl Cache {
+    pub(in crate::theme::render) fn navigation_charge(&self, input: &FrameInputs) -> Option<(usize, usize)> {
+        let plan = self.plan.as_ref()?;
+        if self.screen != Some(ScreenId::Recents) || self.entries.len() != plan.operations.len()
+            || plan.components.iter().any(|c| c.layout == Some(Arrangement::Shelf)
+                || c.paint.as_ref().is_some_and(|p| p.fit_content || p.collapse_empty))
+            || plan.rows.iter().any(|(b, rows)| input.rows.get(b).map_or(0, Vec::len) != rows.len())
+        { return None; }
+        let mut copies = 0;
+        let mut scratch = 0;
+        let mut damage = Vec::with_capacity(self.entries.len());
+        let mut metadata = self.entries.capacity() * std::mem::size_of::<Entry>();
+        for (entry, op) in self.entries.iter().zip(plan.operations.iter()) {
+            let row = op.row.map(|i| row_model(&op.component, input, i));
+            let deps = if matches!(op.paint, Paint::Panel { .. }) { panel_dependencies(input) }
+                else { dependencies(&op.component, row.as_ref().unwrap_or(input)) };
+            metadata += retained::allocation_bytes(&deps) + component_bytes(&op.component)
+                + match &op.paint { Paint::Panel { group, .. } | Paint::Hero(group) =>
+                    group.iter().map(component_bytes).sum::<usize>(), _ => 0 }
+                + entry.targets.capacity() * std::mem::size_of::<Target>()
+                + entry.targets.iter().map(|t| t.component.capacity() + t.item.capacity()).sum::<usize>()
+                + entry.text.capacity() * std::mem::size_of::<(String, Rect)>()
+                + entry.text.iter().map(|(s, _)| s.capacity()).sum::<usize>();
+            let overlap = damage.iter().any(|r| overlap(*r, entry.bounds));
+            if !retained::matches(&entry.dependencies, &deps) || overlap {
+                if overlap { copies += entry.before.capacity(); }
+                scratch = scratch.max((entry.bounds.2 * entry.bounds.3 * 4) as usize);
+                damage.push(entry.bounds);
+            }
+        }
+        if self.snapshot_bytes() + 4 * 1024 * 1024 > SNAPSHOT_LIMIT { return None; }
+        Some((copies + scratch, metadata))
+    }
+    pub(in crate::theme::render) fn fork_navigation(&self, input: &FrameInputs) -> Self {
+        let plan = self.plan.as_ref().map(|plan| {
+            let mut plan = (**plan).clone();
+            for (binding, rows) in &mut plan.rows { *rows = input.rows.get(binding).cloned().unwrap_or_default(); }
+            Rc::new(plan)
+        });
+        Self { screen: self.screen, entries: self.entries.clone(), opaque_base: self.opaque_base,
+            plan, panels: self.panels.clone(), ..Default::default() }
+    }
+    #[cfg(test)]
+    pub(in crate::theme::render) fn navigation_unique_bytes(&self, base: &Self) -> usize {
+        assert!(self.parked.is_empty());
+        assert!(Rc::ptr_eq(&self.panels, &base.panels));
+        let mut bytes = self.entries.capacity() * std::mem::size_of::<Entry>();
+        for (e, old) in self.entries.iter().zip(&base.entries) {
+            if !Rc::ptr_eq(&e.before, &old.before) { bytes += e.before.capacity(); }
+            if !Rc::ptr_eq(&e.component, &old.component) { bytes += component_bytes(&e.component); }
+            if !Rc::ptr_eq(&e.dependencies, &old.dependencies) { bytes += retained::storage_bytes(&e.dependencies); }
+            bytes += e.targets.capacity() * std::mem::size_of::<Target>()
+                + e.targets.iter().map(|t| t.component.capacity() + t.item.capacity()).sum::<usize>()
+                + e.text.capacity() * std::mem::size_of::<(String, Rect)>()
+                + e.text.iter().map(|(s, _)| s.capacity()).sum::<usize>();
+        }
+        let plan = self.plan.as_ref().unwrap();
+        let old = base.plan.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&plan.components, &old.components));
+        assert!(Arc::ptr_eq(&plan.operations, &old.operations));
+        bytes + plan.rows.iter().map(|(_, rows)| rows.capacity() * std::mem::size_of::<Row>()
+            + rows.iter().map(|r| r.id.capacity() + r.label.capacity() + r.subtitle.capacity() + r.value.capacity()).sum::<usize>()).sum::<usize>()
+    }
     fn active_bytes(&self) -> usize {
-        self.entries.iter().map(|entry| entry.before.len()).sum()
+        self.entries.iter().map(|entry| entry.before.capacity()).sum()
     }
     fn snapshot_bytes(&self) -> usize {
         self.active_bytes()
@@ -32,7 +94,7 @@ impl Cache {
                     pixels.data().len()
                         + entries
                             .iter()
-                            .map(|entry| entry.before.len())
+                            .map(|entry| entry.before.capacity())
                             .sum::<usize>()
                 })
                 .sum::<usize>()
@@ -61,11 +123,12 @@ impl Cache {
         }
     }
 }
+#[derive(Clone)]
 struct Entry {
-    component: Component,
+    component: Rc<Component>,
     bounds: Rect,
-    dependencies: retained::Inputs,
-    before: Vec<u8>,
+    dependencies: Rc<retained::Inputs>,
+    before: Rc<Vec<u8>>,
     // A token is shared only by byte-identical, unmodified underlays.
     underlay: Rc<()>,
     targets: Vec<Target>,
@@ -84,9 +147,10 @@ struct Operation {
     bounds: Rect,
     paint: Paint,
 }
+#[derive(Clone)]
 struct OperationPlan {
     screen: ScreenId,
-    components: Vec<Component>,
+    components: Arc<Vec<Component>>,
     rows: Vec<(Binding, Vec<Row>)>,
     operations: Arc<Vec<Operation>>,
 }
@@ -154,6 +218,31 @@ impl PanelKey {
             + [&self.keyboard, &self.art_entries].iter().map(|ss| ss.capacity() * std::mem::size_of::<String>()
                 + ss.iter().map(String::capacity).sum::<usize>()).sum::<usize>()
     }
+}
+fn component_bytes(c: &Component) -> usize {
+    let string = |s: &Option<String>| s.as_ref().map_or(0, String::capacity);
+    let mut bytes = std::mem::size_of::<Component>() + c.id.capacity()
+        + string(&c.asset_id) + string(&c.mask_asset_id) + string(&c.paint_ref);
+    if let Some(p) = &c.paint {
+        bytes += std::mem::size_of::<crate::theme::ink::Paint>()
+            + [&p.keyboard_layout, &p.row_align, &p.when, &p.caption_mode, &p.active_marker,
+                &p.action_width, &p.action, &p.suffix].into_iter().map(string).sum::<usize>()
+            + p.icons.capacity() * std::mem::size_of::<String>()
+            + p.icons.iter().map(String::capacity).sum::<usize>();
+        for run in [&p.run, &p.focus_run, &p.subtitle, &p.label, &p.value, &p.section_style].into_iter().flatten() {
+            bytes += string(&run.transform);
+        }
+        if let Some(items) = &p.hint_items {
+            bytes += items.capacity() * std::mem::size_of::<crate::theme::ink::Item>()
+                + items.iter().map(|i| [&i.id, &i.icon, &i.button, &i.label].into_iter().map(string).sum::<usize>()).sum::<usize>();
+        }
+        if let Some(a) = &p.action_content { bytes += a.label.capacity() + string(&a.key); }
+        if let Some(g) = &p.gradient { bytes += g.stops.capacity() * std::mem::size_of::<crate::theme::ink::Stop>(); }
+        for surface in [&p.action_style, &p.primary_style, &p.action_focus_style].into_iter().flatten() {
+            if let Some(g) = &surface.gradient { bytes += g.stops.capacity() * std::mem::size_of::<crate::theme::ink::Stop>(); }
+        }
+    }
+    bytes
 }
 fn same_underlay(a: &Rc<()>, b: &Rc<()>, before: &[u8], other: &[u8]) -> bool {
     Rc::ptr_eq(a, b) || super::super::equal_words(before, other)
@@ -941,7 +1030,7 @@ impl PreparedFrame {
         let before = capture(&self.pixels, bounds);
         restore(&mut self.pixels, bounds, &saved);
         self.ink_cache.entries[index].bounds = bounds;
-        self.ink_cache.entries[index].before = before;
+        self.ink_cache.entries[index].before = Rc::new(before);
         self.ink_cache.entries[index].underlay = Rc::new(());
     }
     pub(in crate::theme::render) fn prewarm_ink_navigation(
@@ -1042,7 +1131,7 @@ impl PreparedFrame {
             .ink_cache
             .entries
             .iter()
-            .find(|entry| entry.component == *hero && inside(entry.bounds, bounds))
+            .find(|entry| *entry.component == *hero && inside(entry.bounds, bounds))
         else {
             return Ok(());
         };
@@ -1199,7 +1288,7 @@ impl PreparedFrame {
     fn ink_operations(&mut self, input: &FrameInputs, components: &[Component]) -> Arc<Vec<Operation>> {
         let plan_matches = self.ink_cache.plan.as_ref().is_some_and(|plan| {
             plan.screen == input.screen
-                && plan.components == components
+                && plan.components.as_slice() == components
                 && plan.rows.iter().all(|(binding, rows)| {
                     input.rows.get(binding).map(Vec::as_slice).unwrap_or(&[]) == rows
                 })
@@ -1301,9 +1390,9 @@ impl PreparedFrame {
                 }
             }
             let operations = Arc::new(operations);
-            self.ink_cache.plan = Some(OperationPlan {
+            self.ink_cache.plan = Some(Rc::new(OperationPlan {
                 screen: input.screen,
-                components: components.to_vec(),
+                components: Arc::new(components.to_vec()),
                 rows: components
                     .iter()
                     .filter(|c| matches!(c.kind, Kind::Entries | Kind::SettingsRows))
@@ -1311,7 +1400,7 @@ impl PreparedFrame {
                     .map(|b| (b, input.rows.get(&b).cloned().unwrap_or_default()))
                     .collect(),
                 operations: operations.clone(),
-            });
+            }));
             operations
         }
     }
@@ -1403,7 +1492,7 @@ impl PreparedFrame {
                 .entries
                 .iter()
                 .zip(operations.iter())
-                .all(|(a, op)| a.component == op.component && inside(a.bounds, op.bounds));
+                .all(|(a, op)| *a.component == op.component && inside(a.bounds, op.bounds));
         let scratch_bytes = if incremental {
             cache
                 .entries
@@ -1488,8 +1577,8 @@ impl PreparedFrame {
                 if let Some((key, sources)) = &panel_input {
                     let entry = &mut cache.entries[index];
                     let text = self.text_boxes.len();
-                    if self.ink_panel_hit(key, sources, r, &entry.before, &entry.underlay, &mut cache.panels) {
-                        entry.dependencies = retained::capture(&deps);
+                    if self.ink_panel_hit(key, sources, r, &entry.before, &entry.underlay, &mut cache.panels.borrow_mut()) {
+                        entry.dependencies = Rc::new(retained::capture(&deps));
                         entry.text = self.text_boxes[text..].to_vec();
                         self.targets.extend(entry.targets.iter().cloned());
                         self.damage.push(r);
@@ -1509,17 +1598,17 @@ impl PreparedFrame {
                 }
             }
             let before = if index == 0 && c.kind == Kind::Background {
-                Vec::new()
+                Rc::new(Vec::new())
             } else if incremental {
                 let mut before = std::mem::take(&mut cache.entries[index].before);
                 if has_overlap {
-                    capture_into(&self.pixels, r, &mut before);
+                    capture_into(&self.pixels, r, Rc::make_mut(&mut before));
                     underlay = Rc::new(());
                 }
                 before
             } else {
                 cache.admit_active((r.2 * r.3 * 4) as usize);
-                capture(&self.pixels, r)
+                Rc::new(capture(&self.pixels, r))
             };
             let targets = self.targets.len();
             let text = self.text_boxes.len();
@@ -1527,7 +1616,7 @@ impl PreparedFrame {
             with_replay_clip(clip, || -> Result<()> {
                 if let Paint::Panel { group, .. } = &op.paint {
                     let (key, sources) = panel_input.unwrap();
-                    self.ink_panel(group, key, sources, r, input, &before, &underlay, &mut cache.panels)?;
+                    self.ink_panel(group, key, sources, r, input, &before, &underlay, &mut cache.panels.borrow_mut())?;
                 } else {
                     self.ink_paint_operation(op, r, input)?;
                 }
@@ -1551,9 +1640,9 @@ impl PreparedFrame {
                 );
             }
             let entry = Entry {
-                component: c.clone(),
+                component: Rc::new(c.clone()),
                 bounds: r,
-                dependencies: retained::capture(&deps),
+                dependencies: Rc::new(retained::capture(&deps)),
                 before,
                 underlay,
                 targets: self.targets[targets..].to_vec(),

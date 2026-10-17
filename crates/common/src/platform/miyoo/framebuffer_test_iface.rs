@@ -174,6 +174,7 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
     NEW_BACKING.with(|backing| *backing.borrow_mut() = None);
     FramebufferDisplay {
         page_history: None,
+        composition_revision: 0,
         pixmap: Pixmap::new(w, h).unwrap().into(),
         iface: Framebuffer {
             device: File::open("/dev/null").unwrap(),
@@ -367,6 +368,10 @@ impl PresenterProbe {
             *backing.borrow_mut() = Some(vec![0xa5; self.0.iface.frame.len()]);
         });
     }
+    pub fn composition_revision(&mut self) -> Result<u64> {
+        use crate::display::Display;
+        self.0.composition_revision()
+    }
     pub fn needs_present(&mut self) -> Result<bool> {
         use crate::display::Display;
         self.0.needs_present()
@@ -483,4 +488,30 @@ fn framebuffer_backing_identity_and_mapping_size_remap_before_repair() {
         display.flush_rects(&[]).unwrap();
         assert_visible(&display, 1, "other replacement page requires full repaint");
     }
+}
+
+#[test]
+fn fpdiag_composition_revision_ignores_page_repair_but_tracks_external_reads_and_remap() {
+    use super::*;
+    let mut display = test_display(32, 24);
+    display.clear(Color::new(17, 33, 99)).unwrap();
+    let initial = display.composition_revision().unwrap();
+    display.flush_rects(&[display.bounding_box()]).unwrap();
+    OBSERVED.with(|state| state.borrow_mut().0.yoffset = 24);
+    assert!(display.needs_present().unwrap());
+    assert_eq!(display.composition_revision().unwrap(), initial);
+    display.flush_rects(&[]).unwrap();
+    assert_visible(&display, 1, "repair preserves logical base");
+    assert_eq!(display.composition_revision().unwrap(), initial);
+    display.flush_rect(display.bounding_box()).unwrap();
+    assert!(display.needs_present().unwrap());
+    assert_eq!(display.composition_revision().unwrap(), initial);
+    display.read_rect(display.bounding_box()).unwrap();
+    let read = display.composition_revision().unwrap();
+    assert_ne!(read, initial);
+    OBSERVED.with(|state| state.borrow_mut().1.smem_start += 4096);
+    NEW_BACKING.with(|backing| *backing.borrow_mut() = Some(vec![0xa5; display.iface.frame.len()]));
+    assert_ne!(display.composition_revision().unwrap(), read);
+    display.flush_rects(&[]).unwrap();
+    assert_visible(&display, 1, "remap conservatively invalidates base");
 }

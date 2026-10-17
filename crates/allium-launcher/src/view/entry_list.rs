@@ -661,75 +661,12 @@ where
             return Ok(None);
         }
         let count = crate::theme_adapter::capacity(handle, input.screen, Binding::Entries);
-        let selected = (self.list.selected() as isize + direction)
-            .rem_euclid(self.entries.len() as isize) as usize;
-        let first = self.list.window_start();
-        let first = if selected < first {
-            selected
-        } else if selected >= first + count {
-            selected + 1 - count
-        } else {
-            first
-        };
-        let rows = self
-            .entries
-            .iter()
-            .skip(first)
-            .take(count)
-            .map(|entry| common::theme::frame::Row {
-                subtitle: self.res.get::<ConsoleMapper>().get_console(entry.path()).map(|c| c.name.clone()).unwrap_or_default(),
-                id: crate::theme_adapter::entry_id(entry.path()),
-                label: entry.name().into(),
-                value: if crate::network_runtime::download_id(entry.path()).is_some() {
-                    "Cloud".into()
-                } else {
-                    String::new()
-                },
-                enabled: true,
-            })
-            .collect();
-        input.rows.insert(Binding::Entries, rows);
-        input.pagination = Some(common::theme::frame::Pagination {
-            page: selected / count.max(1) + 1,
-            total: self.entries.len().max(1).div_ceil(count.max(1)),
-        });
-        let entry = &self.entries[selected];
-        let id = crate::theme_adapter::entry_id(entry.path());
-        input.focus.item = Some(id.clone());
-        input.selected.insert(Binding::Entries, id);
-        input
-            .text
-            .insert(Binding::SelectedTitle, entry.name().into());
+        let Some((selected, first)) = self.list.navigation_selection(direction) else { return Ok(None); };
+        input = self.recents_theme_model(input.screen, handle, selected, first, count);
         let metadata = handle.pack().screens[&input.screen].components.iter().any(|c| {
             matches!(c.binding, Some(Binding::SelectedMetadata | Binding::SelectedBlurb))
         });
         let ink = handle.pack().ink();
-        input.metadata.clear();
-        if let Entry::Game(game) = entry
-            && metadata
-        {
-            let platform = self
-                .res
-                .get::<ConsoleMapper>()
-                .get_console(entry.path())
-                .map(|c| c.name.clone())
-                .unwrap_or_default();
-            let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
-            input
-                .text
-                .insert(Binding::SelectedMetadata, info.metadata.clone());
-            input
-                .text
-                .insert(Binding::SelectedBlurb, info.blurb.clone());
-            if ink {
-                input.metadata = info.metadata_runs.clone();
-            }
-        } else {
-            let platform = self.res.get::<ConsoleMapper>().get_console(entry.path())
-                .map(|c| c.name.clone()).unwrap_or_default();
-            input.text.insert(Binding::SelectedMetadata, platform.chars().take(480).collect());
-            input.text.insert(Binding::SelectedBlurb, String::new());
-        }
         let demand = super::art_queue::Demand::from_components(
             &handle.pack().screens[&input.screen].components,
             handle.pack().ink(),
@@ -756,6 +693,20 @@ where
             targets: None,
             details_text: None,
         }))
+    }
+
+    pub(crate) fn navigation_frame_model(
+        &mut self, handle: &common::theme::ThemeHandle, direction: isize,
+    ) -> Option<common::theme::frame::FrameInputs> {
+        use common::theme::pack::{Binding, ScreenId};
+        if !self.root_tab_navigation_ready() || self.entries.len() < 2 { return None; }
+        let (selected, first) = self.list.navigation_selection(direction)?;
+        let count = crate::theme_adapter::capacity(handle, ScreenId::Recents, Binding::Entries);
+        let mut input = self.recents_theme_model(ScreenId::Recents, handle, selected, first, count);
+        if let Some(orbit) = &self.orbit {
+            input.art = orbit.theme_art(&self.entries, selected, first, count);
+        }
+        Some(input)
     }
 
     fn base_theme_model(
@@ -2710,6 +2661,42 @@ pub(crate) mod ux4_tests {
         list.release_theme_art();
         assert_eq!(list.orbit_cache_counts(), (0, 0));
         std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn frameprep_prediction_uses_real_wrap_window_and_all_semantics_for_small_lists() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::ScreenId};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 992).unwrap();
+        for len in [0, 1, 2, 12] {
+            let paths = (0..len).map(|i| PathBuf::from(format!("frameprep-model/Game {i}.gba"))).collect();
+            let mut list = EntryList::new(Rect::new(0, 54, 640, 376), resources(), PathsSort { paths }).unwrap();
+            list.theme_models(ScreenId::Recents, &theme).unwrap();
+            if len < 2 {
+                assert!(list.navigation_frame_model(&theme, 1).is_none());
+                assert!(list.navigation_frame_model(&theme, -1).is_none());
+                continue;
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            for selected in 0..len {
+                for direction in [1, -1] {
+                    list.list.select(selected);
+                    list.theme_models(ScreenId::Recents, &theme).unwrap();
+                    let predicted_window = list.list.navigation_selection(direction).unwrap();
+                    let mut predicted = list.navigation_frame_model(&theme, direction).unwrap();
+                    list.list.handle_key_event(KeyEvent::Pressed(if direction == 1 { Key::Down } else { Key::Up }),
+                        tx.clone(), &mut VecDeque::new()).await.unwrap();
+                    assert_eq!((list.list.selected(), list.list.window_start()), predicted_window);
+                    let mut actual = list.theme_models(ScreenId::Recents, &theme).unwrap().remove(0);
+                    predicted.art = Default::default(); actual.art = Default::default();
+                    assert!(predicted == actual, "length {len}, selected {selected}, direction {direction}");
+                }
+            }
+            list.release_theme_art();
+        }
         common::media::invalidate();
     }
 

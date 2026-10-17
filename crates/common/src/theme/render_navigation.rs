@@ -6,7 +6,7 @@ use super::{
 use std::sync::{Arc, Weak};
 use tiny_skia::Pixmap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NavigationStamp(pub(super) Weak<()>);
 pub(super) enum NavigationRasterPart {
     Hero,

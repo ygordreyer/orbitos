@@ -120,7 +120,22 @@ impl ScrollList {
         self.dirty = true;
     }
 
-    pub fn select(&mut self, mut index: usize) {
+    fn selection_window(&self, index: usize) -> (usize, usize) {
+        if self.visible_count() == 0 { return (self.selected, self.top); }
+        let index = index.min(self.items.len() - 1);
+        let top = if index >= self.top + self.visible_count() {
+            (index - self.visible_count() + 1).min(self.items.len() - 1)
+        } else if index < self.top { index } else { self.top };
+        (index, top)
+    }
+
+    pub fn navigation_selection(&self, direction: isize) -> Option<(usize, usize)> {
+        if self.items.is_empty() { return None; }
+        Some(self.selection_window((self.selected as isize + direction)
+            .rem_euclid(self.items.len() as isize) as usize))
+    }
+
+    pub fn select(&mut self, index: usize) {
         if self.visible_count() == 0 {
             return;
         }
@@ -130,13 +145,7 @@ impl ScrollList {
             child.blur();
         }
 
-        index = index.clamp(0, self.items.len() - 1);
-        if index >= self.top + self.visible_count() {
-            self.top = (index - self.visible_count() + 1).min(self.items.len() - 1);
-        } else if index < self.top {
-            self.top = index;
-        }
-        self.selected = index;
+        (self.selected, self.top) = self.selection_window(index);
         self.update_children();
 
         if let Some(child) = self.children.get_mut(self.selected - self.top) {
@@ -280,14 +289,12 @@ impl View for ScrollList {
         if !self.items.is_empty() {
             match event {
                 KeyEvent::Pressed(Key::Up) | KeyEvent::Autorepeat(Key::Up) => {
-                    self.select(
-                        (self.selected as isize - 1).rem_euclid(self.items.len() as isize) as usize,
-                    );
+                    self.select(self.navigation_selection(-1).unwrap().0);
                     self.dirty = true;
                     Ok(true)
                 }
                 KeyEvent::Pressed(Key::Down) | KeyEvent::Autorepeat(Key::Down) => {
-                    self.select((self.selected + 1).rem_euclid(self.items.len()));
+                    self.select(self.navigation_selection(1).unwrap().0);
                     self.dirty = true;
                     Ok(true)
                 }

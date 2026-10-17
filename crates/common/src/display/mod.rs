@@ -156,6 +156,12 @@ pub trait Display: Sized {
         Ok(())
     }
 
+    /// Changes when external reads or framebuffer layout changes invalidate retained pixels.
+    /// Page repair and ordinary drawing do not change this revision.
+    fn composition_revision(&mut self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Whether the visible backing needs repair even when composition has no damage.
     fn needs_present(&mut self) -> Result<bool> {
         Ok(false)

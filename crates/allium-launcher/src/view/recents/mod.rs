@@ -57,6 +57,11 @@ impl Recents {
         match self { Self::List(list) => list.details_warm_model(handle, screen), Self::Carousel(_) => None }
     }
 
+    pub(crate) fn navigation_frame_model(&mut self, handle: &common::theme::ThemeHandle, direction: isize)
+        -> Option<common::theme::frame::FrameInputs> {
+        match self { Self::List(list) => list.navigation_frame_model(handle, direction), _ => None }
+    }
+
     pub(crate) fn navigation_warm_model(
         &mut self,
         handle: &common::theme::ThemeHandle,

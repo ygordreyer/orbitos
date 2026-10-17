@@ -61,11 +61,16 @@ pub fn enabled() -> bool {
 
 thread_local! {
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ART_CACHE_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static METADATA_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 pub(super) fn metadata_completion_generation() -> u64 {
     METADATA_COMPLETIONS.with(std::cell::Cell::get)
+}
+pub(crate) fn art_cache_revision() -> u64 { ART_CACHE_REVISION.with(std::cell::Cell::get) }
+fn art_cache_changed() {
+    ART_CACHE_REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
 }
 pub(crate) fn completion_generation() -> u64 {
     ART_COMPLETIONS.with(std::cell::Cell::get)
@@ -185,6 +190,7 @@ impl Orbit {
         if self.media_generation != media_generation {
             // Cold indexes can supply previously missing art. Successful paths remain reusable.
             self.cache.retain(|item| item.image.is_some());
+            if !self.completed_tasks.is_empty() { art_cache_changed(); }
             self.completed_tasks.clear();
             self.media_generation = media_generation;
         }
@@ -555,6 +561,7 @@ impl Orbit {
     }
 
     fn retire(&mut self, item: CachedArt) {
+        art_cache_changed();
         if let Some(image) = item
             .image
             .filter(|image| std::sync::Arc::strong_count(image) > 1)
@@ -597,6 +604,7 @@ impl Orbit {
             self.retire(old);
         }
         self.cache.push_front(item);
+        art_cache_changed();
         self.source_bytes();
         true
     }
@@ -692,6 +700,7 @@ impl Orbit {
     }
 
     pub(crate) fn cancel_selection(&mut self) {
+        if self.completed_tasks.iter().any(|task| task.admission_rejected) { art_cache_changed(); }
         self.completed_tasks.retain(|task| !task.admission_rejected);
         self.worker_epoch = self.worker_epoch.wrapping_add(1);
         self.cancellation
@@ -700,6 +709,7 @@ impl Orbit {
     }
 
     pub fn release_art(&mut self) {
+        if !self.completed_tasks.is_empty() { art_cache_changed(); }
         self.cancel_selection();
         self.completed_tasks.clear();
         self.protected_paths.clear();
@@ -2181,6 +2191,7 @@ impl Orbit {
                         if self.completed_tasks.len() >= 128 {
                             self.completed_tasks.pop_back();
                         }
+                        art_cache_changed();
                         self.completed_tasks
                             .push_front(CompletedTask {
                                 targets: result.targets, key, metadata, admission_rejected: rejected,

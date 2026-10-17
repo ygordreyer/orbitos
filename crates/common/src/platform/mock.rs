@@ -176,6 +176,14 @@ impl Display for MockDisplay {
         Ok(())
     }
 
+    fn composition_revision(&mut self) -> Result<u64> {
+        #[cfg(feature = "perf-bench")]
+        if let Some(presenter) = &mut self.presenter {
+            return presenter.composition_revision();
+        }
+        Ok(0)
+    }
+
     fn needs_present(&mut self) -> Result<bool> {
         #[cfg(feature = "perf-bench")]
         if let Some(presenter) = &mut self.presenter {

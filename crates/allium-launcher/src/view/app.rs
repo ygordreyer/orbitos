@@ -83,11 +83,40 @@ impl std::fmt::Debug for ParkedDetails {
     }
 }
 
+const NEIGHBOR_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+struct NeighborGeneration {
+    media: u64, names: u64, metadata: u64, adoption: u64, artwork: u64,
+    locale: u64, consoles: u64, language: String,
+}
+impl NeighborGeneration {
+    fn current(res: &Resources) -> Self {
+        Self { media: common::media::generation(), names: common::media::name_generation(),
+            metadata: super::details::metadata_generation(), adoption: super::orbit::metadata_completion_generation(),
+            artwork: super::orbit::art_cache_revision(), locale: res.revision::<Locale>(),
+            consoles: res.revision::<crate::consoles::ConsoleMapper>(), language: res.get::<Locale>().language() }
+    }
+}
+struct PreparedNeighbor {
+    base: common::theme::render::NavigationStamp,
+    generation: NeighborGeneration,
+    frame: common::theme::render::PreparedFrame,
+    charge: usize,
+}
+impl std::fmt::Debug for PreparedNeighbor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedNeighbor").field("charge", &self.charge).finish_non_exhaustive()
+    }
+}
+
 fn prepare_theme_frames(
     handle: &common::theme::ThemeHandle,
     models: &[common::theme::frame::FrameInputs],
     previous: Vec<common::theme::render::PreparedFrame>,
     parked: &mut Option<ParkedDetails>,
+    neighbors: &mut Vec<PreparedNeighbor>,
+    displayed: Option<&common::theme::render::NavigationStamp>,
 ) -> Result<Vec<common::theme::render::PreparedFrame>> {
     use common::theme::pack::ScreenId;
     use common::theme::render::PreparedFrame;
@@ -121,9 +150,37 @@ fn prepare_theme_frames(
             }
         }
     }
-    let top = PreparedFrame::prepare_reusing(
-        handle.clone(), top, previous.get_mut(lower.len()).and_then(Option::take),
-    )?;
+    let old = previous.get_mut(lower.len()).and_then(Option::take);
+    let tracing = common::perf_trace::recording();
+    let mut rejection = if models.len() != 1 { "overlay_stack" }
+        else if !can_park { "network_blocked" } else { "no_candidate" };
+    let candidate = if models.len() == 1 && can_park {
+        neighbors.iter().position(|candidate| {
+            let Some(base) = &old else { rejection = "no_base"; return false; };
+            if !displayed.is_some_and(|stamp| base.navigation_is_current(stamp))
+                || !base.navigation_is_current(&candidate.base)
+            { rejection = "base_mismatch"; return false; }
+            if candidate.frame.neighbor_matches(handle, top) { return true; }
+            if tracing { rejection = candidate.frame.neighbor_rejection_reason(handle, top); }
+            false
+        }).map(|index| neighbors.swap_remove(index).frame)
+    } else { None };
+    if tracing && top.screen == ScreenId::Recents {
+        common::perf_trace::neighbor_adopt(if candidate.is_some() { "hit" } else { rejection });
+    }
+    if tracing && candidate.is_none() && !neighbors.is_empty() {
+        common::perf_trace::neighbor_build("invalidated:prepare_mismatch");
+    }
+    neighbors.clear();
+    let top = if let Some(candidate) = candidate {
+        common::perf_trace::count(common::perf_trace::Count::NeighborHit, 1);
+        candidate
+    } else {
+        if top.screen == ScreenId::Recents {
+            common::perf_trace::count(common::perf_trace::Count::NeighborMiss, 1);
+        }
+        PreparedFrame::prepare_reusing(handle.clone(), top, old)?
+    };
     // PreparedFrame proves opacity across the entire 640 by 480 framebuffer.
     // Keep covered frames untouched; closing prepares them against current inputs.
     let covered = top.is_opaque() && lower.iter().enumerate().all(|(i, input)| {
@@ -252,6 +309,9 @@ enum NavigationWarmStage {
         VecDeque<common::theme::render::NavigationRasterWarm>,
     ),
     Rasters(VecDeque<common::theme::render::NavigationRasterWarm>),
+    NeighborArtwork(super::entry_list::NavigationWarm),
+    NeighborFrame(isize, bool),
+    DetailsPlan,
     DetailsArtwork(super::entry_list::NavigationWarm),
     DetailsImages(common::theme::render::DetailImageWarm, super::entry_list::NavigationWarm),
     DetailsText(common::theme::render::DetailTextWarm),
@@ -294,6 +354,8 @@ where
     theme_scene: Option<crate::theme_adapter::ThemeScene>,
     // At most one closed Details frame: ~3.56 MB of framebuffer and operation underlays.
     parked_details: Option<ParkedDetails>,
+    neighbors: Vec<PreparedNeighbor>,
+    neighbor_base: Option<common::theme::render::NavigationStamp>,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
     theme_presented_screen: Option<common::theme::pack::ScreenId>,
@@ -411,6 +473,8 @@ where
             content_complete: true,
             theme_scene: None,
             parked_details: None,
+            neighbors: Vec::with_capacity(2),
+            neighbor_base: None,
             present_damage: None,
             theme_was_layered: false,
             theme_presented_screen: None,
@@ -500,6 +564,14 @@ where
             frame.targets.clone(),
             frame.text_boxes.clone(),
         )
+    }
+
+    #[cfg(all(test, feature = "perf-bench"))]
+    pub(crate) fn proof_fresh_navigation_pixels(&mut self) -> Vec<u8> {
+        let handle = crate::theme_adapter::snapshot(&self.res).unwrap();
+        let mut models = self.theme_models(&handle).unwrap().unwrap();
+        self.normalize_theme_inputs(&handle, &mut models);
+        common::theme::render::PreparedFrame::prepare(handle, &models[0]).unwrap().pixels().data().to_vec()
     }
 
     #[cfg(test)]
@@ -702,6 +774,7 @@ where
     }
     pub(crate) fn release_details_frame(&mut self) {
         self.parked_details = None;
+        self.invalidate_neighbors_for("invalidated:release_details");
     }
     pub(crate) fn prepare_command(&mut self, command: &Command) {
         if matches!(command, Command::Exec(_) | Command::ReloadStylesheet(..)) {
@@ -713,7 +786,18 @@ where
         }
     }
     pub(crate) fn force_full_present(&mut self) {
+        self.invalidate_neighbors_for("invalidated:full_present");
         self.dirty = true;
+    }
+    pub(crate) fn invalidate_neighbors(&mut self) {
+        self.invalidate_neighbors_for("invalidated:view_state");
+    }
+    pub(crate) fn invalidate_neighbors_for(&mut self, reason: &'static str) {
+        if common::perf_trace::recording() && (self.neighbor_base.is_some() || !self.neighbors.is_empty()) {
+            common::perf_trace::neighbor_build(reason);
+        }
+        self.neighbors.clear();
+        self.neighbor_base = None;
     }
     pub(crate) fn take_present_damage(&mut self) -> Option<Vec<Rect>> {
         self.present_damage.take()
@@ -767,6 +851,7 @@ where
         };
         if completion != super::orbit::completion_generation() {
             self.theme_dirty = true;
+            self.invalidate_neighbors_for("invalidated:artwork_completion");
         }
         worked
     }
@@ -796,6 +881,9 @@ where
             Some(NavigationWarmStage::DetailShadows(_)) => "detail_shadow",
             Some(NavigationWarmStage::DetailsHero(_)) => "details_hero",
             Some(NavigationWarmStage::Rasters(_)) => "raster",
+            Some(NavigationWarmStage::NeighborArtwork(_)) => "neighbor_artwork",
+            Some(NavigationWarmStage::NeighborFrame(..)) => "neighbor_frame",
+            Some(NavigationWarmStage::DetailsPlan) => "details_plan",
         }
     }
 
@@ -815,6 +903,7 @@ where
         mut input_pending: impl FnMut() -> bool,
     ) -> Result<bool> {
         if input_pending() {
+            if common::perf_trace::recording() { common::perf_trace::neighbor_warm("pending_input"); }
             return Ok(false);
         }
         if direction != self.navigation_direction {
@@ -829,7 +918,20 @@ where
             *work = None;
             return Ok(true);
         };
+        let generation = NeighborGeneration::current(&self.res);
+        let resident = self.neighbors.len();
+        self.neighbors.retain(|candidate| candidate.generation == generation
+            && candidate.frame.navigation_theme_matches(&handle));
+        if common::perf_trace::recording() && self.neighbors.len() != resident {
+            common::perf_trace::neighbor_build("invalidated:generation_or_theme");
+        }
+        let status = if self.res.get::<Stylesheet>().status_bar.hide_status_in_launcher {
+            Default::default()
+        } else { self.status_bar.theme_inputs() };
         let frame = &mut self.theme_scene.as_mut().unwrap().frames[0];
+        if common::perf_trace::recording() && !frame.can_prepare_neighbor() {
+            common::perf_trace::neighbor_build(frame.neighbor_ineligible_reason());
+        }
         if !frame.navigation_theme_matches(&handle) {
             *work = None;
             return Ok(true);
@@ -882,6 +984,7 @@ where
                     _ => return Ok(true),
                 };
                 if ready {
+                    normalize_theme_models(&handle, std::slice::from_mut(&mut plan.input), &self.res, self.selected, &status);
                     NavigationWarmStage::Images(
                         frame.navigation_images(&plan.input),
                         frame.navigation_rasters(&plan.input),
@@ -902,18 +1005,63 @@ where
             }
             NavigationWarmStage::Rasters(mut rasters) => {
                 let Some(raster) = rasters.pop_front() else {
-                    let plan = match self.selected {
-                        0 => self.views.0.details_warm_model(&handle, frame.screen()),
-                        1 => self.views.1.details_warm_model(&handle, frame.screen()),
-                        _ => None,
-                    };
-                    current.stage = plan.map(NavigationWarmStage::DetailsArtwork)
-                        .unwrap_or(NavigationWarmStage::DetailShadows(None));
+                    current.stage = if self.selected == 0 && frame.can_prepare_neighbor() {
+                        self.views.0.navigation_warm_model(&handle, -self.navigation_direction, frame.navigation_model().unwrap())?
+                            .map(NavigationWarmStage::NeighborArtwork)
+                            .unwrap_or(NavigationWarmStage::NeighborFrame(self.navigation_direction, false))
+                    } else { NavigationWarmStage::DetailsPlan };
                     *work = Some(current);
                     return Ok(false);
                 };
                 frame.prewarm_navigation_raster(raster)?;
                 NavigationWarmStage::Rasters(rasters)
+            }
+            NavigationWarmStage::NeighborArtwork(mut plan) => {
+                if self.views.0.navigation_warm_art_step(&mut plan) {
+                    NavigationWarmStage::NeighborFrame(self.navigation_direction, false)
+                } else { NavigationWarmStage::NeighborArtwork(plan) }
+            }
+            NavigationWarmStage::NeighborFrame(target_direction, final_pass) => {
+                if self.selected == 0 && self.rect.w == 640 && self.rect.h == 480
+                    && self.neighbor_base.as_ref().is_some_and(|base| frame.navigation_is_current(base))
+                    && frame.can_prepare_neighbor() && self.neighbors.len() < 2
+                    && !crate::network_runtime::blocks_navigation_warm()
+                {
+                    if let Some(mut input) = self.views.0.navigation_frame_model(&handle, target_direction) {
+                        normalize_theme_models(&handle, std::slice::from_mut(&mut input), &self.res, self.selected, &status);
+                        let duplicate = self.neighbors.iter().any(|candidate| candidate.frame.input_matches(&input));
+                        if input_pending() { current.stage = NavigationWarmStage::NeighborFrame(target_direction, final_pass);
+                            *work = Some(current); return Ok(false); }
+                        let available = NEIGHBOR_LIMIT - self.neighbors.iter().map(|c| c.charge).sum::<usize>();
+                        if !duplicate && let Some((candidate, charge)) = frame.prepare_neighbor(&input, available)? {
+                            self.neighbors.push(PreparedNeighbor { base: frame.navigation_stamp(),
+                                generation: NeighborGeneration::current(&self.res), frame: candidate, charge });
+                        }
+                    } else if common::perf_trace::recording() {
+                        common::perf_trace::neighbor_build("not_eligible:no_target");
+                    }
+                } else if common::perf_trace::recording() && self.neighbors.len() < 2 {
+                    common::perf_trace::neighbor_build(if self.selected != 0 { "not_eligible:screen" }
+                        else if self.rect.w != 640 || self.rect.h != 480 { "not_eligible:size" }
+                        else if !frame.can_prepare_neighbor() { frame.neighbor_ineligible_reason() }
+                        else if crate::network_runtime::blocks_navigation_warm() { "not_eligible:network_blocked" }
+                        else { "not_eligible:no_displayed_base" });
+                }
+                if target_direction == self.navigation_direction && self.selected == 0 && frame.can_prepare_neighbor() {
+                    NavigationWarmStage::NeighborFrame(-target_direction, final_pass)
+                } else if final_pass {
+                    current.stage = NavigationWarmStage::NeighborFrame(target_direction, true);
+                    *work = Some(current);
+                    return Ok(true);
+                } else { NavigationWarmStage::DetailsPlan }
+            }
+            NavigationWarmStage::DetailsPlan => {
+                let plan = match self.selected {
+                    0 => self.views.0.details_warm_model(&handle, frame.screen()),
+                    1 => self.views.1.details_warm_model(&handle, frame.screen()),
+                    _ => None,
+                };
+                plan.map(NavigationWarmStage::DetailsArtwork).unwrap_or(NavigationWarmStage::DetailShadows(None))
             }
             NavigationWarmStage::DetailsArtwork(mut plan) => {
                 let ready = match self.selected {
@@ -949,12 +1097,20 @@ where
                     .unwrap_or(NavigationWarmStage::DetailShadows(None)) }
                     else { NavigationWarmStage::DetailShadows(hero) };
                 *work = Some(current);
+                if complete && self.selected == 0 && frame.can_prepare_neighbor() {
+                    work.as_mut().unwrap().stage = NavigationWarmStage::NeighborFrame(self.navigation_direction, true);
+                    return Ok(false);
+                }
                 return Ok(complete);
             }
             NavigationWarmStage::DetailsHero(mut hero) => {
                 let done = frame.prewarm_detail_hero_step(&mut hero)?;
                 current.stage = NavigationWarmStage::DetailsHero(hero);
                 *work = Some(current);
+                if done && self.selected == 0 && frame.can_prepare_neighbor() {
+                    work.as_mut().unwrap().stage = NavigationWarmStage::NeighborFrame(self.navigation_direction, true);
+                    return Ok(false);
+                }
                 return Ok(done);
             }
         };
@@ -1006,7 +1162,17 @@ where
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
             let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
-            let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details)?;
+            let generation = NeighborGeneration::current(&self.res);
+            let resident = self.neighbors.len();
+            self.neighbors.retain(|candidate| candidate.generation == generation);
+            if common::perf_trace::recording() && self.neighbors.len() != resident {
+                common::perf_trace::neighbor_build("invalidated:generation");
+            }
+            if self.dirty || self.selected != 0 || self.search_results.is_some() || self.search_view.is_active()
+                || self.rect.w != 640 || self.rect.h != 480 || !self.views.0.navigation_warm_ready()
+            { self.invalidate_neighbors(); }
+            let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details,
+                &mut self.neighbors, self.neighbor_base.as_ref())?;
             let visible = visible_theme_models(&models, &frames);
             self.content_complete = visible.iter().all(|input| theme_content_complete(input, &handle));
             if common::perf_trace::recording() {
@@ -1201,6 +1367,7 @@ where
         ) != (after.clock, after.battery, after.charging, after.network)
         {
             self.theme_dirty = true;
+            self.invalidate_neighbors_for("invalidated:status");
         }
     }
 
@@ -1228,6 +1395,12 @@ where
                         frame.paint(display);
                     }
                 }
+                if common::perf_trace::recording() && !self.neighbors.is_empty() {
+                    common::perf_trace::neighbor_build("invalidated:draw");
+                }
+                self.neighbors.clear();
+                self.neighbor_base = (scene.frames.len() == 1 && top.can_prepare_neighbor()
+                    && display.width() == 640 && display.height() == 480).then(|| top.navigation_stamp());
                 self.theme_presented_screen = Some(top.screen());
                 self.theme_was_layered = scene.frames.len() != 1;
                 self.theme_dirty = false;
@@ -1467,6 +1640,7 @@ where
     }
 
     fn set_should_draw(&mut self) {
+        self.invalidate_neighbors_for("invalidated:redraw");
         self.theme_dirty = true;
         self.dirty = true;
         self.status_bar.set_should_draw();
@@ -1501,6 +1675,8 @@ where
                 }
             }
             self.theme_dirty |= handled;
+            if self.selected != 0 || !self.views.0.navigation_warm_ready()
+                || crate::network_runtime::blocks_navigation_warm() { self.invalidate_neighbors(); }
             return Ok(handled);
         }
         if self.single_game_list()
@@ -1532,6 +1708,8 @@ where
         if crate::network_runtime::blocks_navigation_warm() {
             self.release_details_frame();
         }
+        if self.selected != 0 || !self.views.0.navigation_warm_ready()
+            || self.search_results.is_some() || self.search_view.is_active() { self.invalidate_neighbors(); }
         if let Some(handle) = handle {
             let same_theme = crate::theme_adapter::snapshot(&self.res).is_some_and(|current| {
                 current.generation() == handle.generation() && current.digest() == handle.digest()
@@ -1743,7 +1921,7 @@ mod tests {
         models[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
         models[1].text.insert(Binding::SelectedTitle, "Selected game".into());
         prepare_theme_inputs(&mut models, &resources(), 0, &Status::default());
-        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None).unwrap();
+        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None, &mut vec![], None).unwrap();
         assert!(frames.last().unwrap().is_opaque());
         let visible = super::visible_theme_models(&models, &frames);
         assert_eq!(visible.len(), 1);
@@ -1797,7 +1975,7 @@ mod tests {
                 models.push(top);
             }
             let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
-            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked).unwrap();
+            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked, &mut vec![], None).unwrap();
             if top_screen.is_some() {
                 let mut pending = models.clone();
                 pending[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
@@ -2239,6 +2417,10 @@ mod integration_navigation_tests {
                 );
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while !app.prewarm_navigation_step(&mut work, 1).unwrap() {
+                    let kind = app.navigation_warm_kind(&work);
+                    assert!(!app.prewarm_navigation_step_with_pending(&mut work, 1, || true).unwrap());
+                    assert_eq!(app.navigation_warm_kind(&work), kind);
+                    assert!(app.proof_navigation_scene() == scene, "pending input changed displayed frame");
                     assert!(std::time::Instant::now() < deadline, "{id} warm timeout");
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
@@ -2246,6 +2428,13 @@ mod integration_navigation_tests {
                     app.proof_navigation_scene() == scene,
                     "idle warm changed the displayed frame"
                 );
+                let predicted = app.neighbors.iter().find(|candidate| {
+                    candidate.frame.navigation_model().as_ref().is_some_and(|model|
+                        model.selected.get(&common::theme::pack::Binding::Entries)
+                            != app.theme_scene.as_ref().unwrap().frames[0].navigation_model().as_ref().unwrap()
+                                .selected.get(&common::theme::pack::Binding::Entries))
+                }).map(|candidate| candidate.frame.navigation_stamp());
+                if *id == "compact-plus" { assert_eq!(app.neighbors.len(), 2, "both directions must be resident"); }
                 app.handle_key_event(
                     KeyEvent::Pressed(Key::Down),
                     tx.clone(),
@@ -2254,6 +2443,10 @@ mod integration_navigation_tests {
                 .await
                 .unwrap();
                 app.prepare_theme().unwrap();
+                if *id == "compact-plus" {
+                    assert!(app.theme_scene.as_ref().unwrap().frames[0].navigation_is_current(predicted.as_ref().unwrap()),
+                        "matching press must adopt the full frame");
+                }
                 let warmed = app.proof_navigation_scene();
                 let mut models = app.theme_models(&handle).unwrap().unwrap();
                 app.normalize_theme_inputs(&handle, &mut models);
@@ -2445,3 +2638,6 @@ mod content_readiness_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod neighbor_frame_tests;
