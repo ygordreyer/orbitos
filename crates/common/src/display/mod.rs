@@ -26,6 +26,14 @@ impl From<tiny_skia::Pixmap> for SharedPixmap {
 }
 
 impl SharedPixmap {
+    pub(crate) fn clear(&mut self) {
+        if let Some(pixels) = Arc::get_mut(&mut self.0) {
+            pixels.data_mut().fill(0);
+        } else {
+            *self = tiny_skia::Pixmap::new(self.width(), self.height()).unwrap().into();
+        }
+    }
+
     pub(crate) fn into_pixmap(self) -> tiny_skia::Pixmap {
         Arc::unwrap_or_clone(self.0)
     }
@@ -541,6 +549,25 @@ pub(crate) fn pop_reusing_snapshot(
 
 #[cfg(test)]
 mod snapshot_tests {
+    #[test]
+    fn shared_pixmap_clear_reuses_unique_storage_and_preserves_shared_pixels() {
+        use super::SharedPixmap;
+        use std::sync::Arc;
+        let mut pixels: SharedPixmap = tiny_skia::Pixmap::new(8, 6).unwrap().into();
+        pixels.fill(tiny_skia::Color::WHITE);
+        let address = pixels.data().as_ptr();
+        pixels.clear();
+        assert_eq!(pixels.data().as_ptr(), address);
+        assert!(pixels.data().iter().all(|byte| *byte == 0));
+        pixels.fill(tiny_skia::Color::WHITE);
+        let presented = Arc::clone(&pixels.0);
+        pixels.clear();
+        assert!(!Arc::ptr_eq(&pixels.0, &presented));
+        assert_eq!((pixels.width(), pixels.height()), (8, 6));
+        assert!(pixels.data().iter().all(|byte| *byte == 0));
+        assert!(presented.data().iter().all(|byte| *byte == 255));
+    }
+
     #[test]
     fn ux4_identical_saves_share_pixels_and_changed_saves_stay_independent() {
         let mut pixels = tiny_skia::Pixmap::new(640, 480).unwrap();

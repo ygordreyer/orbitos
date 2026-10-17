@@ -9,7 +9,7 @@ pub(in crate::theme::render) struct Cache {
     screen: Option<ScreenId>,
     entries: Vec<Entry>,
     pub(in crate::theme::render) opaque_base: bool,
-    parked: VecDeque<(ScreenId, Pixmap, Vec<Entry>, bool)>,
+    parked: VecDeque<(ScreenId, crate::display::SharedPixmap, Vec<Entry>, bool)>,
     declined: Vec<ScreenId>,
     plan: Option<OperationPlan>,
     #[cfg(test)]
@@ -371,6 +371,32 @@ mod review_tests {
     use super::*;
     use crate::theme::fonts::FontBank;
     use std::path::Path;
+
+    #[test]
+    fn shared_same_screen_full_redraw_and_noop_prewarm_do_not_copy() {
+        let theme = synthetic_theme(false);
+        let input = FrameInputs::new(ScreenId::Library);
+        let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        let presented = Arc::clone(&frame.pixels.0);
+        let mut noop = theme.pack().screens[&ScreenId::Library].components[0].clone();
+        noop.id = "noop-prewarm".into();
+        noop.paint.as_mut().unwrap().opacity = Some(0.0);
+        frame.prewarm_ink_navigation(&noop, &input, &NavigationRasterPart::InkComponent).unwrap();
+        assert!(Arc::ptr_eq(&frame.pixels.0, &presented));
+        frame.ink_cache.entries.clear();
+        let trace = std::env::temp_dir().join(format!("same-screen-redraw-{}.jsonl", std::process::id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+        let copied = crate::perf_trace::probe_counts()["copied_pixels"].as_u64().unwrap();
+        crate::perf_trace::stop_probe();
+        std::fs::remove_file(trace).unwrap();
+        assert_eq!(copied, 0);
+        assert!(!Arc::ptr_eq(&frame.pixels.0, &presented));
+        assert_eq!(Arc::strong_count(&presented), 1);
+        assert_eq!(frame.pixels.data(), presented.data());
+        let reference = crate::theme::render::navigation_reference(theme, &input).unwrap();
+        assert_eq!(frame.pixels.data(), reference.pixels.data());
+    }
 
     #[test]
     fn compact_plus_covered_selection_settles_retained_operations() {
@@ -838,6 +864,8 @@ impl PreparedFrame {
             self.reserve_navigation_bounds(index, bounds);
         }
         let saved = capture(&self.pixels, bounds);
+        let shared = (Arc::strong_count(&self.pixels.0) > 1)
+            .then(|| Arc::as_ptr(&self.pixels.0));
         let targets = self.targets.len();
         let text = self.text_boxes.len();
         let result = match *part {
@@ -847,7 +875,10 @@ impl PreparedFrame {
             NavigationRasterPart::InkPeek => self.ink_shelf_peek(c, rows, input),
             _ => self.ink_paint_component(c, input),
         };
-        restore(&mut self.pixels, bounds, &saved);
+        // A prewarm that never wrote the shared frame needs no restore or detach.
+        if shared != Some(Arc::as_ptr(&self.pixels.0)) {
+            restore(&mut self.pixels, bounds, &saved);
+        }
         self.targets.truncate(targets);
         self.text_boxes.truncate(text);
         result
@@ -1139,7 +1170,7 @@ impl PreparedFrame {
             cache.admit(self.pixels.data().len());
             cache.parked.push_front((
                 previous,
-                self.pixels.clone(),
+                crate::display::SharedPixmap(Arc::clone(&self.pixels.0)),
                 std::mem::take(&mut cache.entries),
                 cache.opaque_base,
             ));
@@ -1151,7 +1182,7 @@ impl PreparedFrame {
                 .position(|(screen, _, _, _)| *screen == input.screen)
             {
                 let (_, pixels, entries, opaque_base) = cache.parked.remove(index).unwrap();
-                self.pixels = pixels.into();
+                self.pixels = pixels;
                 cache.entries = entries;
                 cache.opaque_base = opaque_base;
                 cache.screen = Some(input.screen);
@@ -1179,7 +1210,7 @@ impl PreparedFrame {
         self.text_boxes.clear();
         self.damage.clear();
         if !incremental {
-            self.pixels.data_mut().fill(0);
+            self.pixels.clear();
             cache.entries.clear();
             cache.opaque_base = false;
             self.damage.push(Rect(0, 0, 640, 480));

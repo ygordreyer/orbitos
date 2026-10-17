@@ -225,6 +225,32 @@ fn shared_prepared_transitions_preserve_pixels_reuse_and_page_history() {
         assert_visible(&display, 1, "repair other page from shared frame");
         OBSERVED.with(|state| state.borrow_mut().0.yoffset = 0);
     }
+    // Restoring a saved region after adoption must detach once and preserve the prepared frame.
+    display.clear(Color::new(17, 27, 37)).unwrap();
+    let saved = display.pixmap().data().to_vec();
+    display.save().unwrap();
+    recents.paint(&mut display);
+    display.load(Rect::new(3, 5, 0, 9)).unwrap();
+    assert_eq!(display.pixmap().data().as_ptr(), recents.pixels().data().as_ptr());
+    for area in [Rect::new(3, 5, 7, 9), Rect::new(636, 477, 8, 6), display.bounding_box()] {
+        recents.paint(&mut display);
+        display.load(area).unwrap();
+        let mut expected = original.clone();
+        for y in area.y as usize..(area.y as usize + area.h as usize).min(480) {
+            let at = (y * 640 + area.x as usize) * 4;
+            let end = (y * 640 + (area.x as usize + area.w as usize).min(640)) * 4;
+            expected[at..end].copy_from_slice(&saved[at..end]);
+        }
+        assert_eq!(display.pixmap().data(), expected);
+        assert_eq!(recents.pixels().data(), original);
+        assert_ne!(display.pixmap().data().as_ptr(), recents.pixels().data().as_ptr());
+        display.flush().unwrap();
+        assert_visible(&display, 0, "snapshot restore after shared adoption");
+    }
+    assert!(!display.pop());
+    assert!(display.saved.is_empty());
+    recents.paint(&mut display);
+    display.flush().unwrap();
     // A partial display write must not alter the reusable prepared frame.
     let area = Rect::new(3, 5, 7, 9);
     crate::display::fill_rect(&mut display.pixmap_mut(), area, Color::new(9, 19, 29));
@@ -250,6 +276,41 @@ fn shared_prepared_transitions_preserve_pixels_reuse_and_page_history() {
     OBSERVED.with(|state| state.borrow_mut().0.yoffset = 480);
     display.flush_rects(&[]).unwrap();
     assert_visible(&display, 1, "old page after partial redraw");
+}
+
+#[test]
+fn shared_full_redraw_clears_without_copying_and_parks_the_presented_arc() {
+    use super::*;
+    use crate::theme::{
+        FontBank, ThemeHandle, frame::FrameInputs, pack::ScreenId,
+        render::PreparedFrame, runtime::ThemeSnapshot,
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..").canonicalize().unwrap();
+    let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+    let theme = ThemeHandle::prepare(
+        ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(), &bank, 1,
+    ).unwrap();
+    let input = FrameInputs::new(ScreenId::Recents);
+    let frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+    let original = frame.pixels().data().to_vec();
+    let mut display = test_display(640, 480);
+    frame.paint(&mut display);
+    let presented = Arc::clone(&display.pixmap.0);
+    let trace = std::env::temp_dir().join(format!("shared-redraw-{}.jsonl", std::process::id()));
+    crate::perf_trace::start_probe(trace.to_str().unwrap());
+    let details = FrameInputs::new(ScreenId::GameDetail);
+    let frame = PreparedFrame::prepare_reusing(theme.clone(), &details, Some(frame)).unwrap();
+    let copied = crate::perf_trace::probe_counts()["copied_pixels"].as_u64().unwrap();
+    crate::perf_trace::stop_probe();
+    std::fs::remove_file(trace).unwrap();
+    assert_eq!(copied, 0, "a full clear must not copy the displayed buffer");
+    assert_eq!(display.pixmap().data(), original);
+    assert_eq!(frame.pixels().data(), PreparedFrame::prepare(theme.clone(), &details).unwrap().pixels().data());
+    let frame = PreparedFrame::prepare_reusing(theme, &input, Some(frame)).unwrap();
+    assert_eq!(frame.pixels().data(), original);
+    assert_eq!(frame.pixels().data().as_ptr(), presented.data().as_ptr(),
+        "parking and restoring an unchanged screen must preserve its Arc");
 }
 
 #[test]

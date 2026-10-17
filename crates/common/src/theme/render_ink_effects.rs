@@ -400,13 +400,16 @@ impl PreparedFrame {
     pub(super) fn ink_glow(&mut self, r: Rect, c: &Component) {
         crate::perf_trace::count(crate::perf_trace::Count::GlowMisses, 1);
         let color = self.color(c.focus_color.unwrap_or(ColorRole::Focus));
-        for glow in (1..=c.glow_radius.unwrap_or(0)).rev() {
+        let radius = c.glow_radius.unwrap_or(0);
+        if radius == 0 { return; }
+        let pixels = &mut *self.pixels;
+        for glow in (1..=radius).rev() {
             let path = crate::display::build_rounded_rect_path(
                 draw_rect(Rect(r.0 - glow, r.1 - glow, r.2 + 2 * glow, r.3 + 2 * glow)),
                 c.radius.unwrap_or(0) + glow,
             )
             .unwrap();
-            self.pixels.fill_path(
+            pixels.fill_path(
                 &path,
                 &tiny_skia::Paint {
                     shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(

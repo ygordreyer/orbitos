@@ -315,9 +315,10 @@ impl PreparedFrame {
             NavigationRasterPart::Peek => self.cover_peek(c, &work.input),
             _ => unreachable!(),
         };
+        let pixels = self.pixels.data_mut();
         for (row, y) in (rect.1..rect.1 + rect.3).enumerate() {
             let at = y as usize * stride + rect.0 as usize * 4;
-            self.pixels.data_mut()[at..at + row_bytes]
+            pixels[at..at + row_bytes]
                 .copy_from_slice(&saved[row * row_bytes..(row + 1) * row_bytes]);
         }
         self.targets.truncate(targets);

@@ -646,7 +646,7 @@ impl PreparedFrame {
             };
             let framebuffer = std::mem::replace(&mut self.pixels, local.into());
             self.ink_surface_raw(Rect(0, 0, rect.2, rect.3), c, fill, focused, style);
-            let pixels = Arc::new(std::mem::replace(&mut self.pixels, framebuffer).into_pixmap());
+            let pixels = std::mem::replace(&mut self.pixels, framebuffer).0;
             SURFACES.with(|cache| {
                 if HERO_SCRATCH.get() { return; }
                 let mut cache = cache.borrow_mut();
@@ -865,7 +865,7 @@ impl PreparedFrame {
         self.render_ink_retained(input, &components)
     }
     fn render_ink_uncached(&mut self, input: &FrameInputs, components: &[Component]) -> Result<()> {
-        self.pixels.data_mut().fill(0);
+        self.pixels.clear();
         self.targets.clear();
         self.text_boxes.clear();
         self.damage = vec![Rect(0, 0, 640, 480)];
@@ -910,9 +910,10 @@ impl PreparedFrame {
                 crate::perf_trace::Count::OpacityPixels, bounds.2 as u64 * bounds.3 as u64,
             );
             let table = (!super::ink_blit::reference()).then(|| opacity_table(opacity));
+            let pixels = self.pixels.data_mut();
             for (row, y) in (bounds.1..bounds.1 + bounds.3).enumerate() {
                 let at = ((y * 640 + bounds.0) * 4) as usize;
-                for (channel, value) in self.pixels.data_mut()[at..at + bounds.2 as usize * 4]
+                for (channel, value) in pixels[at..at + bounds.2 as usize * 4]
                     .iter_mut()
                     .enumerate()
                 {
@@ -1678,7 +1679,7 @@ impl PreparedFrame {
         }
         let margin = effects::effect_padding(c);
         let tile_height = ah.saturating_add(pad.saturating_mul(2));
-        let mut tile = ink_pixmap(
+        let tile = ink_pixmap(
             c.item_extent.unwrap() + 2 * margin,
             tile_height + 2 * margin,
         )?;
@@ -1713,16 +1714,15 @@ impl PreparedFrame {
             self.draw_image(rect, &image);
         }
         self.ink_focus(c, case, focused);
-        tile = std::mem::replace(&mut self.pixels, old).into_pixmap();
+        let tile = std::mem::replace(&mut self.pixels, old);
         REPLAY_CLIP.replace(replay_clip);
         let dw = (tile.width() as f32 * scale).round() as u32;
         let dh = (tile.height() as f32 * scale).round() as u32;
+        let mut pixels = tile.0;
         if scale != 1.0 {
             check_ink_dimensions(dw, dh)?;
-            tile = fit_shelf_tile(tile, dw, dh)?;
+            fit_shelf_tile(Arc::get_mut(&mut pixels).unwrap(), dw, dh)?;
         }
-
-        let pixels = Arc::new(tile);
         if !super::ink_blit::reference() {
             SHELVES.with(|cache| {
                 let mut cache = cache.borrow_mut();
@@ -2227,6 +2227,23 @@ impl PreparedFrame {
         }
         Ok(())
     }
+    fn ink_with_scratch<T>(
+        &mut self,
+        mut local: Pixmap,
+        paint: impl FnOnce(&mut Self) -> T,
+    ) -> (Pixmap, T) {
+        if let Some(pixels) = Arc::get_mut(&mut self.pixels.0) {
+            std::mem::swap(pixels, &mut local);
+            let result = paint(self);
+            std::mem::swap(Arc::get_mut(&mut self.pixels.0).unwrap(), &mut local);
+            (local, result)
+        } else {
+            let framebuffer = std::mem::replace(&mut self.pixels, local.into());
+            let result = paint(self);
+            let local = std::mem::replace(&mut self.pixels, framebuffer).into_pixmap();
+            (local, result)
+        }
+    }
     fn ink_status(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
         if collecting_text() { return self.ink_status_contents(c, input); }
         // Fixed-width status icons may exceed a valid component's available space.
@@ -2241,13 +2258,12 @@ impl PreparedFrame {
             local.data_mut()[to..to + row_bytes]
                 .copy_from_slice(&self.pixels.data()[at..at + row_bytes]);
         }
-        let framebuffer = std::mem::replace(&mut self.pixels, local.into());
-        let result = self.ink_status_contents(c, input);
-        let local = std::mem::replace(&mut self.pixels, framebuffer);
+        let (local, result) = self.ink_with_scratch(local, |frame| frame.ink_status_contents(c, input));
+        let pixels = self.pixels.data_mut();
         for y in c.rect.1..c.rect.1 + c.rect.3 {
             let at = y as usize * stride + c.rect.0 as usize * 4;
             let from = y as usize * local_stride + c.rect.0 as usize * 4;
-            self.pixels.data_mut()[at..at + row_bytes]
+            pixels[at..at + row_bytes]
                 .copy_from_slice(&local.data()[from..from + row_bytes]);
         }
         result
@@ -2636,11 +2652,11 @@ impl PreparedFrame {
         Ok(())
     }
 }
-fn fit_shelf_tile(tile: Pixmap, dw: u32, dh: u32) -> Result<Pixmap> {
-    if tile.width() == dw && tile.height() == dh {
-        return Ok(tile);
+fn fit_shelf_tile(tile: &mut Pixmap, dw: u32, dh: u32) -> Result<()> {
+    if tile.width() != dw || tile.height() != dh {
+        *tile = crate::theme::runtime::fit_image(tile, dw, dh, crate::theme::pack::Fit::Contain)?;
     }
-    crate::theme::runtime::fit_image(&tile, dw, dh, crate::theme::pack::Fit::Contain)
+    Ok(())
 }
 
 fn primary_binding(screen: ScreenId) -> Option<Binding> {
@@ -2700,19 +2716,46 @@ thread_local! { static GUIDE_GLYPH_VISITS: std::cell::Cell<usize> = const { std:
 mod tests {
     use super::*;
     #[test]
+    fn status_scratch_preserves_unique_and_shared_frame_storage() {
+        let theme = crate::theme::render_navigation::tests::theme("orbit-hero", "square");
+        for shared in [false, true] {
+            let mut frame = PreparedFrame::unpainted(theme.clone(), ScreenId::Library);
+            frame.pixels.fill(tiny_skia::Color::from_rgba8(12, 34, 56, 255));
+            let original = frame.pixels.data().to_vec();
+            let address = Arc::as_ptr(&frame.pixels.0);
+            let presented = shared.then(|| Arc::clone(&frame.pixels.0));
+            let scratch = Pixmap::new(40, 24).unwrap();
+            let scratch_address = scratch.data().as_ptr();
+            let (scratch, result) = frame.ink_with_scratch(scratch, |frame| {
+                if !shared { assert_eq!(Arc::as_ptr(&frame.pixels.0), address); }
+                frame.pixels.fill(tiny_skia::Color::from_rgba8(90, 80, 70, 255));
+                Err::<(), _>("paint failed")
+            });
+            assert_eq!(result, Err("paint failed"));
+            assert_eq!(Arc::as_ptr(&frame.pixels.0), address);
+            assert_eq!(frame.pixels.data(), original);
+            assert_eq!(scratch.data().as_ptr(), scratch_address);
+            assert_eq!(scratch.pixel(0, 0).unwrap().red(), 90);
+            if let Some(presented) = presented {
+                assert_eq!(presented.data(), original);
+            }
+        }
+    }
+
+    #[test]
     fn identity_shelf_fit_keeps_allocation_and_pixels() {
         let mut tile = Pixmap::new(140, 140).unwrap();
         tile.fill(tiny_skia::Color::from_rgba8(12, 34, 56, 255));
         let expected = tile.clone();
         let address = tile.data().as_ptr();
-        let fitted = fit_shelf_tile(tile, 140, 140).unwrap();
-        assert_eq!(fitted.data().as_ptr(), address);
-        assert_eq!(fitted.data(), expected.data());
-        let resized = fit_shelf_tile(fitted, 70, 70).unwrap();
+        fit_shelf_tile(&mut tile, 140, 140).unwrap();
+        assert_eq!(tile.data().as_ptr(), address);
+        assert_eq!(tile.data(), expected.data());
+        fit_shelf_tile(&mut tile, 70, 70).unwrap();
         let reference =
             crate::theme::runtime::fit_image(&expected, 70, 70, crate::theme::pack::Fit::Contain)
                 .unwrap();
-        assert_eq!(resized.data(), reference.data());
+        assert_eq!(tile.data(), reference.data());
     }
 
     #[test]
@@ -2737,8 +2780,9 @@ mod tests {
             clones.push(start.elapsed().as_nanos());
             let tiles: Vec<_> = (0..1_000).map(|_| Pixmap::new(140, 140).unwrap()).collect();
             let start = std::time::Instant::now();
-            for tile in tiles {
-                std::hint::black_box(fit_shelf_tile(std::hint::black_box(tile), 140, 140).unwrap());
+            for mut tile in tiles {
+                fit_shelf_tile(std::hint::black_box(&mut tile), 140, 140).unwrap();
+                std::hint::black_box(tile);
             }
             samples.push(start.elapsed().as_nanos());
         }
@@ -3132,7 +3176,7 @@ impl PreparedFrame {
     #[doc(hidden)]
     pub fn benchmark_shadow_reset(&mut self) {
         effects::benchmark_clear_shadows();
-        self.pixels.data_mut().fill(0);
+        self.pixels.clear();
     }
     #[doc(hidden)]
     pub fn benchmark_shadow(&mut self) {

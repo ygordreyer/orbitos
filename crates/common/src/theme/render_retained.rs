@@ -392,7 +392,7 @@ impl PreparedFrame {
                 crate::display::fill_rect(&mut self.pixels.as_mut(), draw_rect(*rect), color);
             }
         } else if !(self.retained_layout && eligible(input)) {
-            self.pixels.data_mut().fill(0);
+            self.pixels.clear();
             crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, 640 * 480);
         }
         self.targets.clear();

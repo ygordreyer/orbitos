@@ -607,15 +607,17 @@ impl Display for FramebufferDisplay {
             rect.h = rect.h.min(size.h - rect.y as u32);
         }
 
+        if rect.w == 0 || rect.h == 0 {
+            return Ok(());
+        }
         // Copy saved region to current pixmap
         let width = self.width() as usize;
-        for dy in 0..rect.h {
-            for dx in 0..rect.w {
-                let x = (rect.x + dx as i32) as usize;
-                let y = (rect.y + dy as i32) as usize;
-                let idx = y * width + x;
-                self.pixmap.pixels_mut()[idx] = saved.pixels()[idx];
-            }
+        let pixels = self.pixmap.pixels_mut();
+        let saved = saved.pixels();
+        for y in rect.y as usize..rect.y as usize + rect.h as usize {
+            let start = y * width + rect.x as usize;
+            let end = start + rect.w as usize;
+            pixels[start..end].copy_from_slice(&saved[start..end]);
         }
 
         Ok(())
