@@ -36,6 +36,7 @@ use framebuffer_damage::PageHistory;
 
 pub struct FramebufferDisplay {
     page_history: Option<PageHistory>,
+    present_damage: Vec<Rect>,
     composition_revision: u64,
     pixmap: crate::display::SharedPixmap,
     iface: Framebuffer,
@@ -79,6 +80,7 @@ impl FramebufferDisplay {
         .ok();
         Ok(FramebufferDisplay {
             page_history: None,
+            present_damage: Vec::new(),
             composition_revision: 0,
             scratch: Vec::new(),
             capture_pread: std::env::var("ALLIUM_FB_CAPTURE").is_ok_and(|v| v == "pread"),
@@ -277,6 +279,8 @@ impl FramebufferDisplay {
     }
 
     fn present_rects(&mut self, areas: &[Rect], packed: Option<&PackedSpans>) -> Result<()> {
+        let layout_stage = crate::perf_trace::recording()
+            .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::PresentLayout));
         self.refresh_present_layout()?;
         let packed = packed.filter(|packed| {
             let reason = if packed.layout != self.packed_layout() { "layout_or_format" }
@@ -287,6 +291,7 @@ impl FramebufferDisplay {
             if crate::perf_trace::recording() { crate::perf_trace::packed_span_reason(reason); }
             reason == "hit"
         });
+        drop(layout_stage);
         let history_stage = crate::perf_trace::stage(crate::perf_trace::Stage::PageHistory);
         let layout_changed = self
             .page_history
@@ -308,8 +313,39 @@ impl FramebufferDisplay {
             return self.flush();
         };
         let valid = history.is_valid(page);
+        let direct = packed.is_some_and(|packed| packed.coverage_rects <= 4096)
+            && !history.needs_repair(page);
         history.add(areas);
-        let damage = history.damage(page);
+        // A clean page needs exactly the packet's clipped, aligned union. Other pages
+        // may need older damage or a full repair, including pixels outside the packet.
+        if direct {
+            drop(history_stage);
+            let packed = packed.unwrap();
+            crate::perf_trace::present_reason(if packed.bytes.len() == self.pixmap.data().len() {
+                "damage_full"
+            } else { "partial_page_history" });
+            if crate::perf_trace::recording() {
+                crate::perf_trace::damage_counts(packed.coverage_rects as u64, (packed.bytes.len() / 4) as u64);
+            }
+            let _copy_stage = crate::perf_trace::recording()
+                .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::PresentCopy));
+            let width = self.width() as usize;
+            let height = self.height() as usize;
+            let location = self.iface.var_screen_info.yoffset as usize * width * 4;
+            for row in packed.rows.iter().rev() {
+                let at = location + ((height - 1 - row.y) * width + width - row.x1) * 4;
+                let len = (row.x1 - row.x0) * 4;
+                self.iface.frame[at..at + len].copy_from_slice(&packed.bytes[row.start..row.start + len]);
+            }
+            if crate::perf_trace::recording() {
+                crate::perf_trace::count(crate::perf_trace::Count::FlushedPixels, (packed.bytes.len() / 4) as u64);
+                crate::perf_trace::count(crate::perf_trace::Count::PackedSpanHit, 1);
+            }
+            self.page_history.as_mut().unwrap().presented(page);
+            return Ok(());
+        }
+        let mut damage = std::mem::take(&mut self.present_damage);
+        history.damage_into(page, &mut damage);
         drop(history_stage);
         let full_damage = damage.len() == 1 && damage[0] == self.bounding_box();
         crate::perf_trace::present_reason(if layout_changed {
@@ -322,11 +358,16 @@ impl FramebufferDisplay {
             "partial_page_history"
         });
         crate::perf_trace::damage(&damage);
+        let _copy_stage = crate::perf_trace::recording()
+            .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::PresentCopy));
         let mut copied = false;
-        for area in damage {
+        let result = damage.iter().copied().try_for_each(|area| {
             if let Some(packed) = packed { copied |= self.write_packed_rect(area, packed)?; }
             else { self.write_rect(area)?; }
-        }
+            Ok::<_, anyhow::Error>(())
+        });
+        self.present_damage = damage;
+        result?;
         if copied && crate::perf_trace::recording() {
             crate::perf_trace::count(crate::perf_trace::Count::PackedSpanHit, 1);
         }
@@ -523,9 +564,9 @@ impl Display for FramebufferDisplay {
         for y in 0..height {
             let mut intervals: Vec<_> = areas.iter().filter(|r| r.y <= y as i32 && r.bottom() > y as i32)
                 .filter_map(|r| {
-                    let x0 = (r.x.max(0) as usize / 8 * 8).min(width);
-                    let x1 = (r.right().max(0) as usize).div_ceil(8).saturating_mul(8).min(width);
-                    (x0 < x1).then_some((x0, x1))
+                    let x0 = r.x.max(0).min(width as i32) as usize;
+                    let x1 = r.right().max(0).min(width as i32) as usize;
+                    (x0 < x1).then(|| (x0 / 8 * 8, x1.div_ceil(8).saturating_mul(8).min(width)))
                 }).collect();
             intervals.sort_unstable();
             for (x0, x1) in intervals {
@@ -535,9 +576,15 @@ impl Display for FramebufferDisplay {
             }
         }
         let length: usize = rows.iter().map(|row| (row.x1 - row.x0) * 4).sum();
+        let coverage_rects = rows.iter().filter(|row| {
+            let Some(previous_y) = row.y.checked_sub(1) else { return true; };
+            let first = rows.partition_point(|r| r.y < previous_y);
+            !rows[first..].iter().take_while(|r| r.y == previous_y)
+                .any(|r| r.x0 == row.x0 && r.x1 == row.x1)
+        }).count();
         let mut packed = PackedSpans { layout: self.packed_layout(), base: Arc::as_ptr(&self.pixmap.0) as usize,
             candidate: Arc::as_ptr(pixels) as usize, revision: self.composition_revision,
-            damage: areas.to_vec(), rows, bytes: Vec::new() };
+            damage: areas.to_vec(), rows, coverage_rects, bytes: Vec::new() };
         if length == 0 { decline!("pack_empty"); }
         let needed = packed.charge().saturating_add(length);
         if needed > available {

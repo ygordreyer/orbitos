@@ -9,12 +9,13 @@ use std::{
 };
 
 const COUNT_LEN: usize = 44;
-const STAGE_NAMES: [&str; 34] = [
+const STAGE_NAMES: [&str; 36] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
     "frame_model", "frame_normalize", "neighbor_generation", "neighbor_filter", "neighbor_search", "retained_compare", "neighbor_misses", "neighbor_clear", "frame_retire", "frame_readiness", "page_history", "drawing_style", "compose_draw", "network_overlay",
     "frame_model_key", "frame_model_lookup", "frame_model_artwork",
     "frame_art_config", "frame_art_protection",
+    "present_layout", "present_copy",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 // 64 rows cover a press burst without letting incomplete content grow the queue
@@ -1220,6 +1221,14 @@ pub fn damage(areas: &[crate::geom::Rect]) {
         }
     });
 }
+pub(crate) fn damage_counts(rects: u64, pixels: u64) {
+    TRACE.with(|t| {
+        if let Some(t) = t.borrow_mut().as_mut() {
+            t.damage_rects = rects;
+            t.damage_pixels = pixels;
+        }
+    });
+}
 #[cfg(any(test, feature = "perf-bench"))]
 pub fn start_probe(path: &str) {
     install(path).unwrap();
@@ -1296,6 +1305,8 @@ pub enum Stage {
     FrameModelArtwork,
     FrameArtConfig,
     FrameArtProtection,
+    PresentLayout,
+    PresentCopy,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -1415,6 +1426,8 @@ mod latency_stage_tests {
             Stage::FrameModelArtwork,
             Stage::FrameArtConfig,
             Stage::FrameArtProtection,
+            Stage::PresentLayout,
+            Stage::PresentCopy,
             Stage::Raster,
             Stage::Present,
             Stage::ShadowGaussian,
@@ -1448,6 +1461,8 @@ mod latency_stage_tests {
             "frame_model_artwork",
             "frame_art_config",
             "frame_art_protection",
+            "present_layout",
+            "present_copy",
             "selected_info",
             "artwork_lookup",
             "layout",
@@ -1470,11 +1485,12 @@ mod latency_stage_tests {
             assert!(start >= input && end >= start, "{name}: {row}");
         }
         let names = row["measurement"]["stage_names"].as_array().unwrap();
-        assert_eq!(names.len(), 34);
+        assert_eq!(names.len(), 36);
         for (index, name) in [(25, "page_history"), (26, "drawing_style"),
             (27, "compose_draw"), (28, "network_overlay"), (29, "frame_model_key"),
             (30, "frame_model_lookup"), (31, "frame_model_artwork"),
-            (32, "frame_art_config"), (33, "frame_art_protection")] {
+            (32, "frame_art_config"), (33, "frame_art_protection"),
+            (34, "present_layout"), (35, "present_copy")] {
             assert_eq!(names[index], name);
             assert!(row["measurement"]["frame"]["stage_begin_monotonic_us"][index].as_u64().unwrap() > 0);
         }

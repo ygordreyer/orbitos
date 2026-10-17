@@ -30,6 +30,7 @@ pub struct PackedSpans {
     pub(crate) revision: u64,
     pub(crate) damage: Vec<Rect>,
     pub(crate) rows: Vec<PackedRow>,
+    pub(crate) coverage_rects: usize,
     pub(crate) bytes: Vec<u8>,
 }
 

@@ -110,11 +110,12 @@ impl PageHistory {
             }
         }
     }
-    pub fn damage(&self, page: usize) -> Vec<Rect> {
+    pub fn damage_into(&self, page: usize, areas: &mut Vec<Rect>) {
+        areas.clear();
         if !self.pages[page].valid {
-            return vec![Rect::new(0, 0, self.width, self.height)];
+            areas.push(Rect::new(0, 0, self.width, self.height));
+            return;
         }
-        let mut areas: Vec<Rect> = vec![];
         let mut runs = self.runs.borrow_mut();
         // A run can continue only from the immediately preceding row in this call.
         runs.fill(RowRun {
@@ -155,7 +156,9 @@ impl PageHistory {
                         1,
                     ));
                     if areas.len() > 4096 {
-                        return vec![Rect::new(0, 0, self.width, self.height)];
+                        areas.clear();
+                        areas.push(Rect::new(0, 0, self.width, self.height));
+                        return;
                     }
                     areas.len() - 1
                 };
@@ -166,6 +169,11 @@ impl PageHistory {
                 };
             }
         }
+    }
+    #[cfg(test)]
+    pub fn damage(&self, page: usize) -> Vec<Rect> {
+        let mut areas = Vec::new();
+        self.damage_into(page, &mut areas);
         areas
     }
     pub fn presented(&mut self, page: usize) {
@@ -319,6 +327,34 @@ mod tests {
             previous = current;
         }
         areas
+    }
+
+    #[test]
+    fn damage_output_reuses_capacity_including_fragmentation_fallback() {
+        let mut h = history(640, 480);
+        let mut output = Vec::new();
+        h.damage_into(0, &mut output);
+        assert_eq!(output, reference(&h, 0));
+        for page in &mut h.pages {
+            page.valid = true;
+            for (y, row) in page.rows.chunks_exact_mut(h.words).enumerate() {
+                row.fill(if y % 2 == 0 { 0x5555555555555555 } else { 0xaaaaaaaaaaaaaaaa });
+            }
+        }
+        h.damage_into(0, &mut output);
+        assert_eq!(output, vec![Rect::new(0, 0, 640, 480)]);
+        let storage = (output.as_ptr(), output.capacity());
+        for areas in [vec![], vec![Rect::new(0, 70, 640, 20)],
+            vec![Rect::new(1, 2, 31, 11), Rect::new(13, 4, 64, 50)],
+            vec![Rect::new(0, 0, 640, 480)]] {
+            for page in 0..3 { h.presented(page); }
+            h.add(&areas);
+            for page in 0..3 {
+                h.damage_into(page, &mut output);
+                assert_eq!(output, reference(&h, page));
+                assert_eq!((output.as_ptr(), output.capacity()), storage);
+            }
+        }
     }
 
     #[test]

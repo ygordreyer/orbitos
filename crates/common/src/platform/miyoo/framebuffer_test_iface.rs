@@ -178,6 +178,7 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
     NEW_BACKING.with(|backing| *backing.borrow_mut() = None);
     FramebufferDisplay {
         page_history: None,
+        present_damage: Vec::new(),
         composition_revision: 0,
         pixmap: Pixmap::new(w, h).unwrap().into(),
         iface: Framebuffer {
@@ -778,6 +779,185 @@ fn frameptr_expired_art_before_first_retained_read_requires_full_render() {
         assert_eq!(display.pixmap().data(), reference.pixels().data());
         display.flush_rects(&damage).unwrap();
         assert_visible(&display, 0, "expired retained frame full render");
+    }
+}
+
+#[test]
+fn present_clean_packet_matches_legacy_repairs_and_reuses_damage_storage() {
+    use super::*;
+    let mut patterns = vec![
+        ("row_band", vec![Rect::new(0, 5, 32, 4)]),
+        ("disjoint", vec![Rect::new(1, 2, 7, 3), Rect::new(19, 13, 10, 5)]),
+        ("full", vec![Rect::new(0, 0, 32, 24)]),
+        ("overlap", vec![Rect::new(1, 2, 19, 10), Rect::new(9, 4, 18, 12)]),
+        ("clipped", vec![Rect::new(-5, -3, 11, 9), Rect::new(29, 22, 9, 9)]),
+        ("split_rows", vec![Rect::new(0, 0, 8, 20), Rect::new(24, 0, 8, 20)]),
+        ("changing_runs", vec![Rect::new(1, 0, 7, 2), Rect::new(1, 2, 15, 2), Rect::new(1, 4, 7, 2)]),
+        ("empty_with_band", vec![Rect::new(3, 3, 0, 5), Rect::new(13, 11, 7, 0), Rect::new(16, 18, 8, 2)]),
+    ];
+    let mut seed = 0x93ab12efu32;
+    for _ in 0..32 {
+        let mut areas = vec![Rect::new(0, 0, 1, 1)];
+        for _ in 0..8 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            areas.push(Rect::new((seed % 48) as i32 - 8, (seed.rotate_left(7) % 40) as i32 - 8,
+                seed.rotate_left(13) % 33, seed.rotate_left(19) % 25));
+        }
+        patterns.push(("random", areas));
+    }
+    for (name, areas) in patterns {
+        for (mode, page) in [("clean", 0), ("clean_pan", 1), ("invalid", 1), ("stale", 0)] {
+            let mut display = test_display(32, 24);
+            let mut legacy = test_display(32, 24);
+            for target in [&mut display, &mut legacy] {
+                OBSERVED.with(|s| s.borrow_mut().0.yoffset = 0);
+                target.clear(Color::new(17, 53, 91)).unwrap();
+                target.flush().unwrap();
+                if mode != "invalid" {
+                    OBSERVED.with(|s| s.borrow_mut().0.yoffset = 24);
+                    target.flush_rects(&[]).unwrap();
+                }
+                if mode == "stale" {
+                    let old = Rect::new(8, 18, 9, 2);
+                    crate::display::fill_rect(&mut target.pixmap_mut(), old, Color::new(31, 97, 241));
+                    target.flush_rects(&[old]).unwrap();
+                }
+                OBSERVED.with(|s| s.borrow_mut().0.yoffset = page * 24);
+                target.refresh_present_layout().unwrap();
+            }
+            let mut candidate = display.pixmap.as_ref().to_owned();
+            for (i, area) in areas.iter().enumerate() {
+                crate::display::fill_rect(&mut candidate.as_mut(), *area, Color::rgba(130 + i as u8, 37, 113, 211));
+            }
+            let candidate = Arc::new(candidate);
+            let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+            display.set_shared_pixmap(&candidate);
+            legacy.set_shared_pixmap(&candidate);
+            let history = legacy.page_history.as_mut().unwrap();
+            history.add(&areas);
+            let damage = history.damage(page as usize);
+            if mode.starts_with("clean") {
+                assert_eq!(packed.coverage_rects, damage.len(), "{name}");
+                assert_eq!(packed.bytes.len(), damage.iter().map(|r| r.w as usize * r.h as usize * 4).sum::<usize>());
+            }
+            for area in damage { legacy.write_packed_rect(area, &packed).unwrap(); }
+            legacy.page_history.as_mut().unwrap().presented(page as usize);
+            let storage_before = (display.present_damage.as_ptr(), display.present_damage.capacity());
+            display.flush_packed_rects(&areas, &packed).unwrap();
+            assert_eq!(display.iface.frame, legacy.iface.frame, "{name} {mode}");
+            assert_visible(&display, page as usize, name);
+            if mode.starts_with("clean") {
+                assert_eq!((display.present_damage.as_ptr(), display.present_damage.capacity()), storage_before,
+                    "direct hit changed repair output storage");
+            } else {
+                display.flush_rects(&areas).unwrap();
+                let storage = (display.present_damage.as_ptr(), display.present_damage.capacity());
+                for _ in 0..4 {
+                    display.flush_rects(&areas).unwrap();
+                    assert_eq!((display.present_damage.as_ptr(), display.present_damage.capacity()), storage,
+                        "repair output storage changed: {name} {mode}");
+                    assert_eq!(display.iface.frame, legacy.iface.frame);
+                }
+            }
+        }
+    }
+    let mut display = test_display(33, 24);
+    let candidate = Arc::new(Pixmap::new(33, 24).unwrap());
+    for areas in [vec![], vec![Rect::new(3, 3, 0, 5)], vec![Rect::new(33, 3, 4, 5)],
+        vec![Rect::new(-3, 3, 2, 5)], vec![Rect::new(3, 3, 5, 0)]] {
+        assert!(display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().is_none(),
+            "empty clipped damage must not expand into packed pixels: {areas:?}");
+    }
+}
+
+#[test]
+fn present_fragmented_packet_preserves_full_repair_fallback() {
+    use super::*;
+    let mut display = test_display(640, 128);
+    display.flush().unwrap();
+    let mut candidate = Pixmap::new(640, 128).unwrap();
+    candidate.fill(tiny_skia::Color::WHITE);
+    let candidate = Arc::new(candidate);
+    let areas: Vec<_> = (0..128).flat_map(|y| (0..40)
+        .map(move |x| Rect::new(x * 16 + y % 2 * 8, y, 8, 1))).collect();
+    let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+    assert!(packed.coverage_rects > 4096);
+    display.set_shared_pixmap(&candidate);
+    display.flush_packed_rects(&areas, &packed).unwrap();
+    assert_eq!(display.present_damage, vec![Rect::new(0, 0, 640, 128)]);
+    assert_visible(&display, 0, "fragmentation full repair");
+    assert!(display.iface.frame[640 * 128 * 4..].iter().all(|b| *b == 0xa5));
+}
+
+#[test]
+fn present_compact_plus_neighbor_geometry_and_direct_copy_match_full_frame() {
+    use super::*;
+    use crate::theme::{render::{PreparedFrame, neighbor_test_arts as arts,
+        neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let theme = theme("compact-plus", "square");
+    let arts = arts();
+    for (from, to) in [(0, 1), (1, 0)] {
+        let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, from, &arts)).unwrap();
+        let next = model(&theme, ScreenId::Recents, to, &arts);
+        let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+        let mut display = test_display(640, 480);
+        base.paint(&mut display);
+        display.flush().unwrap();
+        let packed = candidate.pack_neighbor(&mut display, 4 * 1024 * 1024, &mut Default::default()).unwrap().unwrap();
+        candidate.recycle_neighbor_base(base);
+        let damage = candidate.adopt_neighbor_damage(&mut display).unwrap();
+        let trace = std::env::temp_dir().join(format!("present-geometry-{}-{from}-{to}.jsonl", std::process::id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        display.flush_packed_rects(&damage, &packed).unwrap();
+        let counts = crate::perf_trace::probe_counts();
+        crate::perf_trace::stop_probe();
+        std::fs::remove_file(trace).unwrap();
+        assert_visible(&display, 0, "compact-plus direct");
+        assert_eq!(display.present_damage.capacity(), 0);
+        assert_eq!(counts["packed_span_hit"], 1);
+        assert_eq!(counts["converted_pixels"], 0);
+        assert_eq!(counts["flushed_pixels"], packed.bytes.len() / 4);
+        assert_eq!(counts["damage_pixels"], packed.bytes.len() / 4);
+        assert_eq!(counts["damage_rects"], packed.coverage_rects);
+        println!("PRESENT_GEOMETRY from={from} to={to} logical={damage:?} rows={} bytes={} rectangles={} full_width_rows={}",
+            packed.rows.len(), packed.bytes.len(), packed.coverage_rects,
+            packed.rows.iter().filter(|r| r.x0 == 0 && r.x1 == 640).count());
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+#[test]
+#[ignore = "cached-memory microbenchmark, not device framebuffer timing"]
+fn benchmark_present_packet_walk() {
+    use super::*;
+    use std::{hint::black_box, time::Instant};
+    let areas = [Rect::new(152, 72, 256, 52), Rect::new(152, 128, 256, 52), Rect::new(425, 16, 206, 408)];
+    let mut display = test_display(640, 480);
+    display.flush().unwrap();
+    let candidate = Arc::new(Pixmap::new(640, 480).unwrap());
+    let packed = display.pack_spans(&candidate, &areas, usize::MAX, &mut Default::default()).unwrap().unwrap();
+    display.set_shared_pixmap(&candidate);
+    assert_eq!(packed.bytes.len(), 445_952);
+    for old in [true, false, true, false] {
+        let iterations = 4000;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            if old {
+                let h = display.page_history.as_mut().unwrap();
+                h.add(black_box(&areas));
+                let damage = h.damage(0);
+                for area in damage { display.write_packed_rect(area, black_box(&packed)).unwrap(); }
+                display.page_history.as_mut().unwrap().presented(0);
+            } else {
+                display.flush_packed_rects(black_box(&areas), black_box(&packed)).unwrap();
+            }
+            black_box(&display.iface.frame);
+        }
+        println!("PRESENT_BENCH path={} bytes={} rows={} iterations={iterations} ns_per_call={:.1}",
+            if old { "legacy_scan_search" } else { "direct_packet" }, packed.bytes.len(), packed.rows.len(),
+            start.elapsed().as_nanos() as f64 / iterations as f64);
     }
 }
 
