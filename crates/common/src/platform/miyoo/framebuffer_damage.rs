@@ -94,13 +94,18 @@ impl PageHistory {
             if x0 >= x1 || y0 >= y1 {
                 continue;
             }
-            for page in &mut self.pages {
-                for y in y0..y1 {
-                    mark_groups(
-                        &mut page.rows[y * self.words..(y + 1) * self.words],
-                        (x0 / 8) as usize,
-                        x1.div_ceil(8) as usize,
-                    );
+            let start = (x0 / 8) as usize;
+            let end = x1.div_ceil(8) as usize;
+            for index in start / 64..(end - 1) / 64 + 1 {
+                let left = start.saturating_sub(index * 64);
+                let right = (end - index * 64).min(64);
+                let mask = (u64::MAX << left) & (u64::MAX >> (64 - right));
+                for page in &mut self.pages {
+                    for row in page.rows[y0 * self.words..y1 * self.words]
+                        .chunks_exact_mut(self.words)
+                    {
+                        row[index] |= mask;
+                    }
                 }
             }
         }
@@ -120,13 +125,23 @@ impl PageHistory {
         for (y, row) in self.pages[page].rows.chunks_exact(self.words).enumerate() {
             let mut x = 0;
             while x < self.groups {
-                if row[x / 64] & (1u64 << (x % 64)) == 0 {
-                    x += 1;
+                let word = row[x / 64] >> (x % 64);
+                if word == 0 {
+                    x = (x / 64 + 1) * 64;
                     continue;
                 }
+                x += word.trailing_zeros() as usize;
+                if x >= self.groups {
+                    break;
+                }
                 let first = x;
-                while x < self.groups && row[x / 64] & (1u64 << (x % 64)) != 0 {
-                    x += 1;
+                loop {
+                    let remaining = 64 - x % 64;
+                    let count = (row[x / 64] >> (x % 64)).trailing_ones() as usize;
+                    x += count.min(self.groups - x);
+                    if x == self.groups || count < remaining {
+                        break;
+                    }
                 }
                 let previous = runs[first];
                 let index = if previous.y.checked_add(1) == Some(y) && previous.end == x {
@@ -158,14 +173,6 @@ impl PageHistory {
         self.pages[page].rows.fill(0);
     }
 }
-fn mark_groups(words: &mut [u64], start: usize, end: usize) {
-    for index in start / 64..(end - 1) / 64 + 1 {
-        let left = start.saturating_sub(index * 64);
-        let right = (end - index * 64).min(64);
-        words[index] |= (u64::MAX << left) & (u64::MAX >> (64 - right));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +201,77 @@ mod tests {
                 groups
             ]),
         }
+    }
+
+    fn original_add(history: &mut PageHistory, areas: &[Rect]) {
+        for area in areas {
+            let x0 = area.x.max(0).min(history.width as i32) as u32;
+            let x1 = area.right().max(0).min(history.width as i32) as u32;
+            let y0 = area.y.max(0).min(history.height as i32) as usize;
+            let y1 = area.bottom().max(0).min(history.height as i32) as usize;
+            if x0 >= x1 || y0 >= y1 { continue; }
+            for page in &mut history.pages {
+                for y in y0..y1 {
+                    let words = &mut page.rows[y * history.words..(y + 1) * history.words];
+                    let start = (x0 / 8) as usize;
+                    let end = x1.div_ceil(8) as usize;
+                    for index in start / 64..(end - 1) / 64 + 1 {
+                        let left = start.saturating_sub(index * 64);
+                        let right = (end - index * 64).min(64);
+                        words[index] |= (u64::MAX << left) & (u64::MAX >> (64 - right));
+                    }
+                }
+            }
+        }
+    }
+
+    fn bitwise_damage(history: &PageHistory, page: usize) -> Vec<Rect> {
+        if !history.pages[page].valid {
+            return vec![Rect::new(0, 0, history.width, history.height)];
+        }
+        let mut areas: Vec<Rect> = vec![];
+        let mut runs = history.runs.borrow_mut();
+        // A run can continue only from the immediately preceding row in this call.
+        runs.fill(RowRun {
+            end: 0,
+            y: usize::MAX,
+            area: 0,
+        });
+        for (y, row) in history.pages[page].rows.chunks_exact(history.words).enumerate() {
+            let mut x = 0;
+            while x < history.groups {
+                if row[x / 64] & (1u64 << (x % 64)) == 0 {
+                    x += 1;
+                    continue;
+                }
+                let first = x;
+                while x < history.groups && row[x / 64] & (1u64 << (x % 64)) != 0 {
+                    x += 1;
+                }
+                let previous = runs[first];
+                let index = if previous.y.checked_add(1) == Some(y) && previous.end == x {
+                    areas[previous.area].h += 1;
+                    previous.area
+                } else {
+                    areas.push(Rect::new(
+                        (first * 8) as i32,
+                        y as i32,
+                        (x as u32 * 8).min(history.width) - first as u32 * 8,
+                        1,
+                    ));
+                    if areas.len() > 4096 {
+                        return vec![Rect::new(0, 0, history.width, history.height)];
+                    }
+                    areas.len() - 1
+                };
+                runs[first] = RowRun {
+                    end: x,
+                    y,
+                    area: index,
+                };
+            }
+        }
+        areas
     }
 
     fn reference(history: &PageHistory, page: usize) -> Vec<Rect> {
@@ -306,6 +384,135 @@ mod tests {
             assert_eq!(h.damage(0), reference(&h, 0));
             if width == 640 {
                 assert_eq!(h.damage(0), vec![Rect::new(0, 0, width, height)]);
+            }
+        }
+    }
+
+    #[test]
+    fn wordwise_damage_matches_bitwise_for_randomized_rects_and_words() {
+        fn next(seed: &mut u32) -> u32 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 17;
+            *seed ^= *seed << 5;
+            *seed
+        }
+        for initial_seed in 1..=96u32 {
+            for width in [1, 17, 511, 512, 513, 640, 641, 1031, 1537] {
+                let height = 19 + initial_seed % 29;
+                let mut h = history(width, height);
+                let mut original = history(width, height);
+                let mut seed = initial_seed.wrapping_mul(0x9e3779b9) ^ width;
+                for iteration in 0..18 {
+                    let rects = match iteration % 6 {
+                        0 => vec![Rect::new(0, 0, width, height)],
+                        1 => vec![Rect::new(width as i32 - 1, height as i32 - 1, 1, 1)],
+                        2 => vec![Rect::new(0, 1, width, 1), Rect::new(3, 0, 17, height)],
+                        _ => (0..12)
+                            .map(|_| Rect::new(
+                                (next(&mut seed) % (width + 32)) as i32 - 16,
+                                (next(&mut seed) % (height + 32)) as i32 - 16,
+                                next(&mut seed) % (width + 1),
+                                next(&mut seed) % (height + 1),
+                            ))
+                            .collect(),
+                    };
+                    h.add(&rects);
+                    original_add(&mut original, &rects);
+                    for page in 0..3 {
+                        assert_eq!(h.pages[page].rows, original.pages[page].rows);
+                        assert_eq!(h.needs_repair(page), original.needs_repair(page));
+                        let expected = bitwise_damage(&original, page);
+                        assert_eq!(h.damage(page), expected,
+                            "seed={initial_seed} width={width} iteration={iteration} page={page}");
+                        assert_eq!(h.damage(page), expected);
+                    }
+                    h.presented(iteration % 3);
+                    original.presented(iteration % 3);
+                }
+                // Include arbitrary sparse/dense words and dirty padding beyond groups.
+                for page in &mut h.pages {
+                    page.valid = true;
+                    for word in &mut page.rows {
+                        *word = u64::from(next(&mut seed)) << 32 | u64::from(next(&mut seed));
+                    }
+                }
+                for page in 0..3 {
+                    assert_eq!(h.damage(page), bitwise_damage(&h, page));
+                    h.presented(page);
+                    assert_eq!(h.damage(page), bitwise_damage(&h, page));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wordwise_damage_preserves_boundary_runs_clamp_and_fallback() {
+        let mut h = history(1031, 480);
+        for page in 0..3 { h.presented(page); }
+        h.add(&[Rect::new(496, 0, 535, 2), Rect::new(512, 3, 512, 2)]);
+        assert_eq!(h.damage(0), vec![
+            Rect::new(496, 0, 535, 2), Rect::new(512, 3, 512, 2),
+        ]);
+        h.presented(0);
+        let fragmented: Vec<_> = (0..480)
+            .flat_map(|y| (0..h.groups).filter_map(move |x| {
+                (x % 2 == y % 2).then_some(Rect::new((x * 8) as i32, y as i32, 1, 1))
+            }))
+            .collect();
+        h.add(&fragmented);
+        assert_eq!(h.damage(0), bitwise_damage(&h, 0));
+        assert_eq!(h.damage(0), vec![Rect::new(0, 0, 1031, 480)]);
+        // A bounded-output return must not contaminate the next query's run table.
+        h.presented(0);
+        h.add(&[Rect::new(0, 0, 8, 1)]);
+        assert_eq!(h.damage(0), vec![Rect::new(0, 0, 8, 1)]);
+        // Without the reset, the old row-zero stamp would extend an absent area.
+        h.presented(0);
+        h.add(&[Rect::new(0, 1, 8, 1)]);
+        assert_eq!(h.damage(0), vec![Rect::new(0, 1, 8, 1)]);
+        assert_eq!(h.damage(0), bitwise_damage(&h, 0));
+    }
+
+    #[cfg(feature = "perf-bench")]
+    #[test]
+    #[ignore = "microbenchmark; run with --release --features perf-bench --ignored --nocapture"]
+    fn benchmark_wordwise_damage() {
+        use std::{hint::black_box, time::Instant};
+        let mut h = history(640, 480);
+        let nav = vec![
+            Rect::new(0, 0, 640, 64),
+            Rect::new(0, 96, 376, 128),
+            Rect::new(448, 256, 112, 200),
+        ];
+        assert_eq!(nav.iter().map(|r| r.w * r.h).sum::<u32>(), 111_488);
+        for (name, areas) in [
+            ("nav", nav),
+            ("empty", vec![]),
+            ("full", vec![Rect::new(0, 0, 640, 480)]),
+        ] {
+            h.presented(0);
+            h.add(&areas);
+            assert_eq!(h.damage(0), bitwise_damage(&h, 0));
+            for (label, add) in [
+                ("old", original_add as fn(&mut PageHistory, &[Rect])),
+                ("new", PageHistory::add),
+            ] {
+                let iterations = 20_000;
+                let start = Instant::now();
+                for _ in 0..iterations { add(black_box(&mut h), black_box(&areas)); }
+                println!("HISTSCAN_ADD case={name} marking={label} iterations={iterations} ns_per_call={:.1}",
+                    start.elapsed().as_nanos() as f64 / iterations as f64);
+            }
+            for (label, plan) in [
+                ("old", bitwise_damage as fn(&PageHistory, usize) -> Vec<Rect>),
+                ("new", PageHistory::damage),
+            ] {
+                for _ in 0..128 { black_box(plan(black_box(&h), 0)); }
+                let iterations = 20_000;
+                let start = Instant::now();
+                for _ in 0..iterations { black_box(plan(black_box(&h), 0)); }
+                println!("HISTSCAN case={name} scan={label} iterations={iterations} ns_per_call={:.1}",
+                    start.elapsed().as_nanos() as f64 / iterations as f64);
             }
         }
     }

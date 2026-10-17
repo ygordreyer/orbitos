@@ -287,6 +287,7 @@ impl FramebufferDisplay {
             if crate::perf_trace::recording() { crate::perf_trace::packed_span_reason(reason); }
             reason == "hit"
         });
+        let history_stage = crate::perf_trace::stage(crate::perf_trace::Stage::PageHistory);
         let layout_changed = self
             .page_history
             .as_ref()
@@ -297,16 +298,19 @@ impl FramebufferDisplay {
         let Some(history) = &mut self.page_history else {
             if packed.is_some() && crate::perf_trace::recording() { crate::perf_trace::packed_span_reason("untracked_layout"); }
             crate::perf_trace::present_reason("untracked_layout");
+            drop(history_stage);
             return self.flush();
         };
         let Some(page) = history.page(self.iface.var_screen_info.yoffset) else {
             if packed.is_some() && crate::perf_trace::recording() { crate::perf_trace::packed_span_reason("unaligned_page"); }
             crate::perf_trace::present_reason("unaligned_page");
+            drop(history_stage);
             return self.flush();
         };
         let valid = history.is_valid(page);
         history.add(areas);
         let damage = history.damage(page);
+        drop(history_stage);
         let full_damage = damage.len() == 1 && damage[0] == self.bounding_box();
         crate::perf_trace::present_reason(if layout_changed {
             "framebuffer_layout_changed"

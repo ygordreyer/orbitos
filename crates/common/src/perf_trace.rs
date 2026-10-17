@@ -7,10 +7,10 @@ use std::{
 };
 
 const COUNT_LEN: usize = 44;
-const STAGE_NAMES: [&str; 25] = [
+const STAGE_NAMES: [&str; 26] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
-    "frame_model", "frame_normalize", "neighbor_generation", "neighbor_filter", "neighbor_search", "retained_compare", "neighbor_misses", "neighbor_clear", "frame_retire", "frame_readiness",
+    "frame_model", "frame_normalize", "neighbor_generation", "neighbor_filter", "neighbor_search", "retained_compare", "neighbor_misses", "neighbor_clear", "frame_retire", "frame_readiness", "page_history",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1078,6 +1078,7 @@ pub enum Stage {
     NeighborClear,
     FrameRetire,
     FrameReadiness,
+    PageHistory,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -1188,6 +1189,7 @@ mod latency_stage_tests {
             Stage::NeighborClear,
             Stage::FrameRetire,
             Stage::FrameReadiness,
+            Stage::PageHistory,
             Stage::Raster,
             Stage::Present,
             Stage::ShadowGaussian,
@@ -1212,6 +1214,7 @@ mod latency_stage_tests {
             "details_metadata",
             "details_database",
             "details_reflow",
+            "page_history",
             "selected_info",
             "artwork_lookup",
             "layout",
