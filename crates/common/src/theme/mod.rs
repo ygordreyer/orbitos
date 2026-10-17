@@ -5,6 +5,7 @@ pub mod pack;
 pub mod render;
 mod render_navigation;
 pub mod runtime;
+pub mod art;
 mod runtime_neon;
 pub mod selection;
 pub mod settings;

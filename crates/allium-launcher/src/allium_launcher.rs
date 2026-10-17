@@ -359,6 +359,11 @@ impl AlliumLauncher<DefaultPlatform> {
                         self.handle_command(cmd).await?;
                     }
                 }
+                _ = crate::view::orbit::art_ready() => {
+                    crate::network_runtime::trace_wake("art_completion");
+                    self.poll_media_step(&mut media_pending);
+                    last_media_step = Instant::now();
+                }
                 _ = tokio::time::sleep_until(view_deadline.into()) => {
                     crate::network_runtime::trace_wake("update_deadline");
                 }

@@ -453,7 +453,7 @@ fn exact_sample(source: &Pixmap, column: FixedSample, row: FixedSample, channel:
         + sample(column.high, row.high) * column.original;
     (top * (1.0 - row.original) + bottom * row.original).round() as u8
 }
-pub(super) fn fit_image(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Result<Pixmap> {
+pub fn fit_image(source: &Pixmap, w: u32, h: u32, fit: Fit) -> Result<Pixmap> {
     use super::runtime_neon::WEIGHT_BITS;
     #[cfg(feature = "perf-bench")]
     crate::perf::hit(crate::perf::Op::Fit);

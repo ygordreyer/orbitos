@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-const COUNT_LEN: usize = 30;
+const COUNT_LEN: usize = 32;
 const STAGE_NAMES: [&str; 14] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore",
@@ -63,6 +63,8 @@ pub enum Count {
     ArtRequestCover,
     ArtRequestNext,
     ArtRequestEntries,
+    ArtFittedHit,
+    ArtFittedMiss,
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
@@ -329,6 +331,8 @@ pub fn drawn_frame() {
             "ram_hit": trace.hits[0], "disk_cache_hit": trace.hits[1], "png_decode": trace.hits[2],
             "wall_us": trace.started.map_or(0, |start| start.elapsed().as_micros()),
         });
+        row["art_fitted_hits"] = trace.counts[30].into();
+        row["art_fitted_misses"] = trace.counts[31].into();
         row["event"] = "frame".into();
         row["pid"] = std::process::id().into();
         row["measurement"] = measurement_values(trace);
@@ -842,6 +846,7 @@ pub fn probe_counts() -> serde_json::Value {
         serde_json::json!({"measurement":measurement_values(t),"stages":stage_values(t),"compose_paint_cpu_us":t.cpu[3]/1000,"render_cpu_us":t.cpu[1..].iter().sum::<u64>()/1000,"composed_pixels":t.counts[6],"ink_bitmap_pixels":t.counts[13],"legacy_composed_pixels":t.counts[6].saturating_sub(t.counts[13]),"copied_pixels":t.counts[4],
             "converted_pixels":t.counts[7],"flushed_pixels":t.counts[5],
             "compared_pixels":t.counts[8],"scanned_pixels":t.counts[9],"changed_pixels":t.counts[10],
+            "art_fitted_hits":t.counts[30],"art_fitted_misses":t.counts[31],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
             "text_hits":t.counts[0],"text_misses":t.counts[1],"blit_map_builds":t.counts[3],
             "damage_rects":t.damage_rects,"damage_pixels":t.damage_pixels,
@@ -1027,7 +1032,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
         "final_content_us": (t.final_content_us != 0).then(|| t.final_content_us.saturating_sub(t.input_us)),
         "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries"],
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss"],
         "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })

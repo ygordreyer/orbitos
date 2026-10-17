@@ -105,7 +105,7 @@ where
     disc_picker: Option<DiscPicker>,
     details: Option<crate::view::details::Details>,
     semantic_info: Option<SelectedInfo>,
-    idle_media_key: Option<(usize, usize, usize, u64, bool, bool, super::art_queue::Demand)>,
+    idle_media_key: Option<(usize, usize, usize, u64, bool, bool, super::art_queue::Demand, common::theme::art::Targets)>,
     idle_media_work: VecDeque<super::orbit::WarmArt>,
     detail_action: usize,
     image_focus: Option<common::theme::frame::Focus>,
@@ -332,6 +332,7 @@ where
             .flat_map(|screen| &handle.pack().screens[screen].components)
             .collect();
         let demand = super::art_queue::Demand::from_components(components.iter().copied(), ink);
+        let targets = common::theme::art::Targets::from_components(handle.pack(), components.iter().copied());
         let key = (
             selected,
             first,
@@ -340,6 +341,7 @@ where
             ink,
             tall,
             demand,
+            targets,
         );
         if self.idle_media_key != Some(key) {
             let direction = self.idle_media_key.map_or(1, |old| {
@@ -359,6 +361,7 @@ where
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
         orbit.set_ink_art(ink);
         orbit.set_cover_shape(tall);
+        orbit.set_art_targets(targets);
         orbit.protect_window(
             &self.entries,
             selected,
@@ -752,6 +755,11 @@ where
                 .as_ref()
                 .is_some_and(|a| a.cover_shape == "tall"),
         );
+        let mut art_screens = vec![screen];
+        if self.details.is_some() { art_screens.push(ScreenId::GameDetail); }
+        if self.menu.is_some() { art_screens.push(ScreenId::ContextMenu); }
+        if self.disc_picker.is_some() { art_screens.push(ScreenId::DiscPicker); }
+        orbit.set_art_targets(common::theme::art::Targets::for_screens(handle.pack(), &art_screens));
         if let Some(entry) = self.entries.get(selected) {
             orbit.protect_selected(entry);
         }

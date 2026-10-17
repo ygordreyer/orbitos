@@ -228,6 +228,77 @@ pub(super) mod tests {
         traverse(false);
     }
 
+    fn fitted_input(theme: &ThemeHandle, input: &FrameInputs) -> FrameInputs {
+        let targets = crate::theme::art::Targets::for_screens(theme.pack(), &[input.screen]);
+        let fit = |source: &Arc<Pixmap>, target: Option<crate::theme::art::Target>, logo: bool| {
+            if let Some(target) = target {
+                let target = if logo { target.logo(source.width(), source.height()) } else { target };
+                let pixels = crate::theme::runtime::fit_image(source, target.width, target.height, target.fit).unwrap();
+                let identity = crate::theme::runtime::fit_image(&pixels, target.width, target.height, target.fit).unwrap();
+                assert_eq!(pixels.data(), identity.data(), "identity fit changed bytes");
+                Arc::new(pixels)
+            } else { source.clone() }
+        };
+        let mut fitted = input.clone();
+        fitted.art.selected_hero = input.art.selected_hero.as_ref().map(|source| fit(source, targets.hero, false));
+        fitted.art.selected_logo = input.art.selected_logo.as_ref().map(|source| fit(source, targets.logo, true));
+        fitted.art.selected_cover = input.art.selected_cover.as_ref().map(|source| fit(source, targets.cover, false));
+        fitted.art.next_cover = input.art.next_cover.as_ref().map(|source| fit(source, targets.cover, false));
+        for (id, source) in &input.art.entries {
+            fitted.art.entries.insert(id.clone(), fit(source, targets.cover, false));
+        }
+        fitted
+    }
+
+    #[test]
+    fn navigation_fitted_pixels_match_source_with_effects_and_replacement() {
+        for id in ["orbit-hero", "big-picture", "compact-plus"] {
+            for shape in ["square", "tall"] {
+                let theme = theme(id, shape);
+                let mut sources = arts();
+                for (index, &(w, h)) in [(101, 101), (79, 213), (137, 83)].iter().enumerate() {
+                    let mut image = Pixmap::new(w, h).unwrap();
+                    for y in 1..h - 1 {
+                        for x in 1..w - 1 {
+                            let at = ((y * w + x) * 4) as usize;
+                            let alpha = ((x * 13 + y * 7) % 256) as u8;
+                            image.data_mut()[at..at + 4].copy_from_slice(&[alpha / 3, alpha / 2, alpha, alpha]);
+                        }
+                    }
+                    sources[index] = Arc::new(image);
+                }
+                for screen in [ScreenId::Library, ScreenId::Recents] {
+                    let mut retained = None;
+                    for selected in [0, 1, 2, 0] {
+                        let original = model(&theme, screen, selected, &sources);
+                        let reference = crate::theme::render::navigation_reference(theme.clone(), &original).unwrap();
+                        let fitted = fitted_input(&theme, &original);
+                        // A cold fitted source, a reconstructed disk payload, and the
+                        // same RAM Arc all pass through the complete effects pipeline.
+                        for path in 0..3 {
+                            let mut input = fitted.clone();
+                            if path == 1 {
+                                let reload = |source: &Arc<Pixmap>| Arc::new(Pixmap::from_vec(source.data().to_vec(), tiny_skia::IntSize::from_wh(source.width(), source.height()).unwrap()).unwrap());
+                                input.art.selected_hero = input.art.selected_hero.as_ref().map(reload);
+                                input.art.selected_cover = input.art.selected_cover.as_ref().map(reload);
+                                input.art.selected_logo = input.art.selected_logo.as_ref().map(reload);
+                                input.art.next_cover = input.art.next_cover.as_ref().map(reload);
+                                for source in input.art.entries.values_mut() { *source = reload(source); }
+                            }
+                            let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, retained.take()).unwrap();
+                            assert!(frame.pixels().data() == reference.pixels().data(), "{id} {shape} {screen:?} {selected} path={path}");
+                            retained = Some(frame);
+                        }
+                        // Replacement keeps the path/row identity but changes pixels.
+                        let mut replacement = (*sources[selected]).clone();
+                        replacement.fill(tiny_skia::Color::from_rgba8(21, 39, 13, 197));
+                        sources[selected] = Arc::new(replacement);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "explicit monotonic forward traversal benchmark"]
     fn navigation_forward_benchmark() {

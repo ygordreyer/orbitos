@@ -13,9 +13,9 @@ use std::{
 use tiny_skia::Pixmap;
 
 const MAGIC: &[u8; 8] = b"ALORART\0";
-const TRANSFORM_VERSION: u32 = 3;
+const TRANSFORM_VERSION: u32 = 4;
 const HEADER_BYTES: usize = 84;
-const DISK_BYTES: u64 = 16 * 1024 * 1024;
+const DISK_BYTES: u64 = 512 * 1024 * 1024;
 // Art writes only need room to keep the card usable, not the network-library ROM reserve.
 const ART_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const WRITE_MARGIN: u64 = 1024 * 1024;
@@ -36,6 +36,17 @@ impl ArtKey {
         target: (u32, u32),
         crop: bool,
     ) -> Option<Self> {
+        Self::with_fit(path, metadata, source_bytes, source, target, crop, None)
+    }
+    pub fn with_fit(
+        path: &Path,
+        metadata: &Metadata,
+        source_bytes: &[u8],
+        source: (u32, u32),
+        target: (u32, u32),
+        crop: bool,
+        fit: Option<common::theme::pack::Fit>,
+    ) -> Option<Self> {
         let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
         let mut hash = Sha256::new();
         let path = path.as_os_str().as_encoded_bytes();
@@ -51,6 +62,7 @@ impl ArtKey {
             u64::from(target.0),
             u64::from(target.1),
             u64::from(crop),
+            match fit { None => 0, Some(common::theme::pack::Fit::Contain) => 1, Some(common::theme::pack::Fit::Cover) => 2 },
             u64::from(TRANSFORM_VERSION),
         ] {
             hash.update(value.to_le_bytes());
@@ -386,6 +398,62 @@ mod tests {
         assert!(key.load(&source).is_none());
         key.store(&source, &pixels);
     }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn fitted_round_trip_separates_geometry_fit_version_and_source() {
+        use common::theme::{pack::Fit, runtime::fit_image};
+        let fixture = Fixture::new();
+        let path = fixture.0.join("source.png");
+        let mut source = Pixmap::new(13, 21).unwrap();
+        source.fill(tiny_skia::Color::from_rgba8(30, 60, 90, 173));
+        source.save_png(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let key = |dims, fit| ArtKey::with_fit(&path, &metadata, &bytes, (0, 0), dims, false, fit).unwrap();
+        let fitted = key((9, 7), Some(Fit::Cover));
+        let version_hash = |version: u32| -> [u8; 32] {
+            let mut hash = Sha256::new();
+            let path = path.as_os_str().as_encoded_bytes();
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(Sha256::digest(&bytes));
+            let modified = metadata.modified().unwrap().duration_since(UNIX_EPOCH).unwrap();
+            for value in [metadata.len(), modified.as_secs(), u64::from(modified.subsec_nanos()),
+                0, 0, 9, 7, 0, 2, u64::from(version)] {
+                hash.update(value.to_le_bytes());
+            }
+            hash.finalize().into()
+        };
+        assert_eq!(fitted.hash, version_hash(TRANSFORM_VERSION));
+        assert_ne!(fitted.hash, version_hash(TRANSFORM_VERSION - 1));
+        let pixels = fit_image(&source, 9, 7, Fit::Cover).unwrap();
+        fitted.store(&fixture.0, &pixels);
+        let loaded = fitted.load(&fixture.0).unwrap();
+        assert_eq!((loaded.width(), loaded.height()), (9, 7));
+        assert_eq!(loaded.data(), pixels.data());
+        for other in [key((7, 9), Some(Fit::Cover)), key((9, 7), Some(Fit::Contain)), key((9, 7), None)] {
+            assert_ne!(fitted.hash, other.hash);
+            assert!(other.load(&fixture.0).is_none());
+        }
+        let mut old = fs::read(fitted.path(&fixture.0)).unwrap();
+        old[8..12].copy_from_slice(&(TRANSFORM_VERSION - 1).to_le_bytes());
+        fs::write(fitted.path(&fixture.0), old).unwrap();
+        assert!(fitted.load(&fixture.0).is_none());
+        let old_path = fixture.0.join(format!("{}.rgba", const_hex::encode(version_hash(TRANSFORM_VERSION - 1))));
+        let mut old_payload = fitted.header(pixels.data()).to_vec();
+        old_payload[8..12].copy_from_slice(&(TRANSFORM_VERSION - 1).to_le_bytes());
+        old_payload[20..52].copy_from_slice(&version_hash(TRANSFORM_VERSION - 1));
+        old_payload.extend_from_slice(pixels.data());
+        fs::write(&old_path, old_payload).unwrap();
+        assert!(fitted.load(&fixture.0).is_none());
+        assert!(old_path.exists(), "old-version filename must be ignored");
+        // Same length and mtime still cannot alias replaced source content.
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        let replaced = ArtKey::with_fit(&path, &metadata, &changed, (0, 0), (9, 7), false, Some(Fit::Cover)).unwrap();
+        assert_ne!(replaced.hash, fitted.hash);
+        assert!(replaced.load(&fixture.0).is_none());
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -582,12 +650,12 @@ mod tests {
         File::create(&young).unwrap().set_len(DISK_BYTES).unwrap();
         assert!(!prepare_write(&dir.0, 1, || Some((u64::MAX, 4096))).unwrap());
         assert!(young.exists());
-        File::options().write(true).open(&young).unwrap().set_len(15 * 1024 * 1024).unwrap();
+        File::options().write(true).open(&young).unwrap().set_len(DISK_BYTES - 1024 * 1024).unwrap();
         let valid = dir.key(b"valid").path(&dir.0);
         fs::write(&valid, vec![1; 1024 * 1024]).unwrap();
         let before: Vec<_> = fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().path()).collect();
         assert!(!prepare_write(&dir.0, 2 * 1024 * 1024, || Some((512 * 1024 * 1024, 4096))).unwrap());
-        assert_eq!(fs::metadata(&young).unwrap().len(), 15 * 1024 * 1024);
+        assert_eq!(fs::metadata(&young).unwrap().len(), DISK_BYTES - 1024 * 1024);
         assert_eq!(fs::read(&valid).unwrap(), vec![1; 1024 * 1024]);
         assert!(before.iter().all(|p| p.exists()));
     }
@@ -894,16 +962,16 @@ mod inventory_tests {
         fs::create_dir_all(&root).unwrap();
         let _writer = CacheWriter::acquire(&root).unwrap();
         for i in 0..5 {
-            File::create(root.join(format!("{i:064x}.rgba"))).unwrap().set_len(4 * 1024 * 1024).unwrap();
+            File::create(root.join(format!("{i:064x}.rgba"))).unwrap().set_len(DISK_BYTES / 4).unwrap();
         }
         fs::write(root.join("keep.txt"), b"not cache").unwrap();
         INVENTORY_PASSES.with(|n| n.set(0));
-        assert!(prepare_write(&root, 2 * 1024 * 1024, || Some((u64::MAX, 4096))).unwrap());
+        assert!(prepare_write(&root, DISK_BYTES / 8, || Some((u64::MAX, 4096))).unwrap());
         INVENTORY_PASSES.with(|n| assert_eq!(n.get(), 1));
         let remaining: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).filter(|p| cache_file(p)).collect();
         assert_eq!(remaining.len(), 3);
         assert!(root.join("keep.txt").exists());
-        assert_eq!(remaining.iter().map(|p| fs::metadata(p).unwrap().len()).sum::<u64>(), 12 * 1024 * 1024);
+        assert_eq!(remaining.iter().map(|p| fs::metadata(p).unwrap().len()).sum::<u64>(), 3 * DISK_BYTES / 4);
         drop(_writer);
         fs::remove_dir_all(root).unwrap();
     }

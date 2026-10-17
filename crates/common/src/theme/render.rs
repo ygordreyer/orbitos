@@ -787,10 +787,9 @@ impl PreparedFrame {
         let Some(source) = input.art.selected_logo.as_ref() else {
             return Ok(false);
         };
-        let scale =
-            (c.rect.2 as f32 / source.width() as f32).min(c.rect.3 as f32 / source.height() as f32);
-        let width = (source.width() as f32 * scale).round().max(1.0) as u32;
-        let height = (source.height() as f32 * scale).round().max(1.0) as u32;
+        let target = super::art::Target { width: c.rect.2, height: c.rect.3, fit: super::pack::Fit::Contain, logo_box: true }
+            .logo(source.width(), source.height());
+        let (width, height) = (target.width, target.height);
         let align = c
             .align
             .or_else(|| c.paint.as_ref().and_then(|p| p.anchor))
