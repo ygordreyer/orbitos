@@ -151,6 +151,10 @@ pub struct SearchResultsView {
 }
 
 impl SearchResultsView {
+    pub(crate) fn details_active(&self) -> bool {
+        self.list.details_active()
+    }
+
     pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {
         self.list
             .idle_media_step(handle, common::theme::pack::ScreenId::SearchResults)

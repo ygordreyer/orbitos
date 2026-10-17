@@ -219,10 +219,12 @@ impl ThemeHandle {
             }
         }
         if id == FontId::BarlowCondensed && weight >= 700 {
-            return Font::try_from_bytes(
-                include_bytes!("packs/fonts/BarlowCondensed-Bold.ttf") as &[u8]
-            )
-            .unwrap();
+            static BARLOW_BOLD: std::sync::OnceLock<Font<'static>> = std::sync::OnceLock::new();
+            return BARLOW_BOLD.get_or_init(|| {
+                Font::try_from_bytes(
+                    include_bytes!("packs/fonts/BarlowCondensed-Bold.ttf") as &[u8]
+                ).unwrap()
+            }).clone();
         }
         self.0
             .ink_fonts
@@ -309,5 +311,27 @@ impl ThemeHandle {
             ink_fonts: self.0.ink_fonts.clone(),
             generation,
         }))
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    #[test]
+    fn cached_barlow_bold_matches_parsed_face() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        let expected = Font::try_from_bytes(include_bytes!("packs/fonts/BarlowCondensed-Bold.ttf") as &[u8]).unwrap();
+        for _ in 0..3 {
+            let actual = theme.ink_font(FontId::BarlowCondensed, 700);
+            for ch in "AV To é e\u{301} 日本語ß".chars() {
+                let a = actual.glyph(ch).scaled(rusttype::Scale::uniform(28.0));
+                let b = expected.glyph(ch).scaled(rusttype::Scale::uniform(28.0));
+                assert_eq!(a.id(), b.id());
+                assert_eq!(a.h_metrics().advance_width, b.h_metrics().advance_width);
+                assert_eq!(a.exact_bounding_box(), b.exact_bounding_box());
+            }
+        }
     }
 }

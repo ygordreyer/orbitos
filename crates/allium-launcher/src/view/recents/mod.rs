@@ -75,6 +75,10 @@ impl Recents {
         }
     }
 
+    pub(crate) fn details_active(&self) -> bool {
+        matches!(self, Self::List(list) if list.details_active())
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         match self {
             Self::List(list) => list.root_tab_navigation_ready(),

@@ -48,6 +48,39 @@ fn prepare_theme_inputs(
     }
 }
 
+fn prepare_theme_frames(
+    handle: &common::theme::ThemeHandle,
+    models: &[common::theme::frame::FrameInputs],
+    previous: Vec<common::theme::render::PreparedFrame>,
+) -> Result<Vec<common::theme::render::PreparedFrame>> {
+    use common::theme::render::PreparedFrame;
+    let Some((top, lower)) = models.split_last() else {
+        return Ok(vec![]);
+    };
+    let mut previous: Vec<_> = previous.into_iter().map(Some).collect();
+    let top = PreparedFrame::prepare_reusing(
+        handle.clone(), top, previous.get_mut(lower.len()).and_then(Option::take),
+    )?;
+    // PreparedFrame proves opacity across the entire 640 by 480 framebuffer.
+    // Keep covered frames untouched; closing prepares them against current inputs.
+    let covered = top.is_opaque() && lower.iter().enumerate().all(|(i, input)| {
+        previous.get(i).and_then(Option::as_ref).is_some_and(|frame| {
+            frame.screen() == input.screen && frame.navigation_theme_matches(handle)
+        })
+    });
+    let mut frames = Vec::with_capacity(models.len());
+    for (i, input) in lower.iter().enumerate() {
+        let old = previous.get_mut(i).and_then(Option::take);
+        frames.push(if covered {
+            old.unwrap()
+        } else {
+            PreparedFrame::prepare_reusing(handle.clone(), input, old)?
+        });
+    }
+    frames.push(top);
+    Ok(frames)
+}
+
 pub(super) fn theme_content_complete(
     input: &common::theme::frame::FrameInputs,
     handle: &common::theme::ThemeHandle,
@@ -124,6 +157,9 @@ enum NavigationWarmStage {
     ),
     Rasters(VecDeque<common::theme::render::NavigationRasterWarm>),
 }
+
+#[cfg(test)]
+thread_local! { static THEME_MODEL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppState {
@@ -557,6 +593,20 @@ where
     pub(crate) fn take_present_damage(&mut self) -> Option<Vec<Rect>> {
         self.present_damage.take()
     }
+    fn details_active(&self) -> bool {
+        if self.search_view.is_active() {
+            return false;
+        }
+        if let Some(search) = &self.search_results {
+            return search.details_active();
+        }
+        match self.selected {
+            0 => self.views.0.details_active(),
+            1 => self.views.1.details_active(),
+            _ => false,
+        }
+    }
+
     fn single_game_list(&self) -> bool {
         use common::theme::pack::ScreenId;
         self.search_results.is_none()
@@ -768,7 +818,6 @@ where
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
-        use common::theme::render::PreparedFrame;
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             self.content_complete = true;
             if common::perf_trace::recording() {
@@ -803,20 +852,8 @@ where
         }
         self.theme_scene = if let Some(mut models) = models {
             self.normalize_theme_inputs(&handle, &mut models);
-            let mut previous = self
-                .theme_scene
-                .take()
-                .map(|scene| scene.frames)
-                .unwrap_or_default()
-                .into_iter();
-            let mut frames = vec![];
-            for input in models {
-                frames.push(PreparedFrame::prepare_reusing(
-                    handle.clone(),
-                    &input,
-                    previous.next(),
-                )?);
-            }
+            let previous = self.theme_scene.take().map(|scene| scene.frames).unwrap_or_default();
+            let frames = prepare_theme_frames(&handle, &models, previous)?;
             Some(crate::theme_adapter::ThemeScene { frames })
         } else {
             None
@@ -929,6 +966,8 @@ where
         &mut self,
         handle: &common::theme::ThemeHandle,
     ) -> Result<Option<Vec<common::theme::frame::FrameInputs>>> {
+        #[cfg(test)]
+        THEME_MODEL_BUILDS.with(|count| count.set(count.get() + 1));
         let models = if let Some(keyboard) = self.search_view.theme_inputs() {
             Some(vec![crate::theme_adapter::keyboard_model(keyboard)])
         } else if let Some(search) = self.search_results.as_mut() {
@@ -1312,6 +1351,7 @@ where
         } else {
             None
         };
+        let details_active = self.details_active();
         let selected = self.selected;
         let dirty = (self.dirty, self.theme_dirty);
         let handled = self.dispatch_key_event(event, commands, bubble).await?;
@@ -1320,7 +1360,10 @@ where
                 current.generation() == handle.generation() && current.digest() == handle.digest()
             });
             if retained_comparison || before.is_some() {
-                let unchanged = if !same_theme || selected != self.selected {
+                let unchanged = if !same_theme || selected != self.selected
+                    || details_active != self.details_active()
+                {
+                    // Opening/closing Details changes the scene stack unconditionally.
                     false
                 } else if retained_comparison {
                     if let Some(mut after) = self.theme_models(&handle)? {
@@ -1331,6 +1374,9 @@ where
                                     .frames
                                     .iter()
                                     .zip(&after)
+                                    .skip(if scene.frames.last().is_some_and(|top| top.is_opaque()) {
+                                        after.len().saturating_sub(1)
+                                    } else { 0 })
                                     .all(|(frame, input)| frame.input_matches(input))
                         })
                     } else {
@@ -1501,6 +1547,49 @@ mod tests {
     }
 
     #[test]
+    fn opaque_details_preserve_underlay_and_transparent_dialog_prepares_it() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, render::PreparedFrame};
+        use common::{display::Display, platform::{DefaultPlatform, Platform}};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        let mut lower = authored(ScreenId::Recents, "A", "Play");
+        lower.text.insert(Binding::SelectedTitle, "AV To é 日本語".into());
+        lower.status.clock = Some("12:34".into());
+        let mut optimized = vec![];
+        let mut reference = vec![];
+        for top_screen in [None, Some(ScreenId::GameDetail), None, Some(ScreenId::ContextMenu), None] {
+            let mut models = vec![lower.clone()];
+            if let Some(screen) = top_screen {
+                models[0].suppress_hints = true;
+                models[0].hints.clear();
+                let mut top = authored(screen, "B", "Back");
+                top.text.insert(Binding::SelectedTitle, "AV To é 日本語".into());
+                models.push(top);
+            }
+            let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
+            optimized = super::prepare_theme_frames(&theme, &models, optimized).unwrap();
+            let mut old = reference.into_iter();
+            reference = models.iter().map(|input| PreparedFrame::prepare_reusing(theme.clone(), input, old.next()).unwrap()).collect::<Vec<_>>();
+            let mut actual = <DefaultPlatform as Platform>::Display::default();
+            let mut expected = <DefaultPlatform as Platform>::Display::default();
+            for frame in &optimized { frame.paint(&mut actual); }
+            for frame in &reference { frame.paint(&mut expected); }
+            assert_eq!(actual.pixmap().data(), expected.pixmap().data(), "{top_screen:?}");
+            if top_screen == Some(ScreenId::GameDetail) {
+                assert!(optimized.last().unwrap().is_opaque());
+                assert_eq!(optimized[0].pixels().data(), before.unwrap());
+                assert!(!optimized[0].input_matches(&models[0]), "covered frame was prepared");
+                lower.status.clock = Some("12:35".into());
+                lower.status.battery = Some(41);
+            } else {
+                if top_screen == Some(ScreenId::ContextMenu) { assert!(!optimized.last().unwrap().is_opaque()); }
+                assert!(optimized[0].input_matches(&models[0]));
+            }
+        }
+    }
+
+    #[test]
     fn empty_model_stack_is_safe() {
         let mut models = vec![];
 
@@ -1653,6 +1742,38 @@ mod integration_navigation_tests {
                 assert!(warmed.0 == fresh.pixels().data(), "{id} pixels");
                 assert_eq!(warmed.1, fresh.targets, "{id} targets");
                 app.draw(&mut display, &style).unwrap();
+            }
+            if *id == "compact-plus" {
+                for cycle in 0..3 {
+                    for key in [Key::Start, Key::B] {
+                        let builds = THEME_MODEL_BUILDS.with(|n| n.get());
+                        app.handle_key_event(KeyEvent::Pressed(key), tx.clone(), &mut VecDeque::new()).await.unwrap();
+                        assert_eq!(THEME_MODEL_BUILDS.with(|n| n.get()), builds,
+                            "Details structural transition rebuilt comparison models");
+                        assert!(app.theme_dirty);
+                        // Updates arriving after input must be reflected at presentation.
+                        let mut updated = res.get::<Stylesheet>().clone();
+                        updated.status_bar.hide_status_in_launcher = cycle % 2 == 1;
+                        res.insert(updated);
+                        common::media::invalidate();
+                        app.idle_media_step();
+                        app.prepare_theme().unwrap();
+                        assert_eq!(THEME_MODEL_BUILDS.with(|n| n.get()), builds + 1);
+                        let mut models = app.theme_models(&handle).unwrap().unwrap();
+                        app.normalize_theme_inputs(&handle, &mut models);
+                        assert!(app.theme_scene.as_ref().unwrap().frames.last().unwrap().input_matches(models.last().unwrap()));
+                        app.draw(&mut display, &style).unwrap();
+                        let mut fresh = <DefaultPlatform as Platform>::Display::default();
+                        for model in models {
+                            common::theme::render::PreparedFrame::prepare(handle.clone(), &model).unwrap().paint(&mut fresh);
+                        }
+                        assert_eq!(display.pixmap().data(), fresh.pixmap().data(), "cycle {cycle}, {key:?}");
+                        for ignored in [KeyEvent::Released(key), KeyEvent::Pressed(Key::X)] {
+                            app.handle_key_event(ignored, tx.clone(), &mut VecDeque::new()).await.unwrap();
+                            assert!(!app.theme_dirty && !app.dirty, "ignored input dirtied the scene: {ignored:?}");
+                        }
+                    }
+                }
             }
         }
         std::fs::remove_dir_all(root).unwrap();

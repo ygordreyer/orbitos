@@ -279,6 +279,8 @@ struct CachedText {
     key: String,
     pixels: Arc<Pixmap>,
 }
+const TEXT_LIMIT: usize = 1024 * 1024;
+
 thread_local! {static SURFACES: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};static TEXT: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};}
 #[cfg(test)]
 thread_local! { static UNCACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -473,6 +475,8 @@ impl PreparedFrame {
             p
         } else {
             crate::perf_trace::count(crate::perf_trace::Count::TextMiss, 1);
+            let _text = crate::perf_trace::recording()
+                .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
             let lines = if guide {
                 ty.guide_lines(&value, rect.2, ty.guide_line_count(rect.3, count))
             } else {
@@ -497,19 +501,18 @@ impl PreparedFrame {
                 raster(&mut pix, ty, line, x, baseline.round(), color);
             }
             let pix = Arc::new(pix);
-            if pix.data().len() <= 512 * 1024 {
+            let bytes = pix.data().len() + key.len();
+            if bytes <= TEXT_LIMIT {
                 TEXT.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     while !cache.is_empty()
-                        && (cache.len() >= 64
-                            || cache
-                                .iter()
-                                .map(|e| e.pixels.data().len() + e.key.len())
-                                .sum::<usize>()
-                                + pix.data().len()
-                                > 512 * 1024)
+                        && cache.iter().map(|e| e.pixels.data().len() + e.key.len()).sum::<usize>()
+                            + bytes > TEXT_LIMIT
                     {
                         cache.pop_back();
+                        if crate::perf_trace::recording() {
+                            crate::perf_trace::count(crate::perf_trace::Count::TextEviction, 1);
+                        }
                     }
                     cache.push_front(CachedText {
                         theme: weak,
@@ -806,6 +809,8 @@ impl PreparedFrame {
         }
         let bounds = effects::paint_bounds(c);
         let before = if opacity < 1.0 {
+            let _capture = crate::perf_trace::recording()
+                .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::SnapshotCapture));
             crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
             crate::perf_trace::count(
                 crate::perf_trace::Count::CaptureBytes, bounds.2 as u64 * bounds.3 as u64 * 4,
@@ -3112,3 +3117,7 @@ mod counter_wiring_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "render_ink_warm_tests.rs"]
+mod warm_tests;

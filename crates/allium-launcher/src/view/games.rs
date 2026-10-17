@@ -38,6 +38,10 @@ impl Games {
             .idle_media_step(handle, common::theme::pack::ScreenId::Library)
     }
 
+    pub(crate) fn details_active(&self) -> bool {
+        self.list.details_active()
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         self.list.root_tab_navigation_ready()
     }

@@ -261,6 +261,8 @@ fn capture(pixels: &Pixmap, r: Rect) -> Vec<u8> {
     bytes
 }
 fn capture_into(pixels: &Pixmap, r: Rect, bytes: &mut Vec<u8>) {
+    let _snapshot = crate::perf_trace::recording()
+        .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::SnapshotCapture));
     crate::perf_trace::count(crate::perf_trace::Count::CaptureBytes, r.2 as u64 * r.3 as u64 * 4);
     bytes.clear();
     let stride = pixels.width() as usize * 4;
@@ -583,6 +585,8 @@ mod review_tests {
     }
 }
 fn restore(pixels: &mut Pixmap, r: Rect, data: &[u8]) {
+    let _snapshot = crate::perf_trace::recording()
+        .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::SnapshotRestore));
     crate::perf_trace::count(crate::perf_trace::Count::RestoreBytes, r.2 as u64 * r.3 as u64 * 4);
     let stride = pixels.width() as usize * 4;
     for (row, y) in (r.1..r.1 + r.3).enumerate() {
@@ -636,6 +640,8 @@ fn overlap(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 fn transfer(pixels: &mut Pixmap, r: Rect, data: &[u8], damage: &[Rect], inside: bool) {
+    let _snapshot = crate::perf_trace::recording()
+        .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::SnapshotRestore));
     let mut restored = 0;
     let stride = pixels.width() as usize * 4;
     for (row, y) in (r.1..r.1 + r.3).enumerate() {

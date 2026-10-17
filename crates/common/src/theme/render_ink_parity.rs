@@ -180,6 +180,8 @@ impl PreparedFrame {
         align: Align,
         baseline: f32,
     ) -> Result<()> {
+        let _text = crate::perf_trace::recording()
+            .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
         let value = ty
             .lines(&ty.value(text), rect.2, 1, Overflow::Ellipsis)
             .pop()

@@ -7,9 +7,9 @@ use std::{
 };
 
 const COUNT_LEN: usize = 30;
-const STAGE_NAMES: [&str; 11] = [
+const STAGE_NAMES: [&str; 14] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
-    "disk_cache", "details_metadata", "details_database", "details_reflow",
+    "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -832,6 +832,10 @@ pub fn start_probe(path: &str) {
     install(path).unwrap();
 }
 #[cfg(any(test, feature = "perf-bench"))]
+pub fn stop_probe() {
+    TRACE.with(|trace| *trace.borrow_mut() = None);
+}
+#[cfg(any(test, feature = "perf-bench"))]
 pub fn probe_counts() -> serde_json::Value {
     TRACE.with(|t| {
         let t = t.borrow(); let t = t.as_ref().unwrap();
@@ -870,6 +874,9 @@ pub enum Stage {
     DetailsMetadata,
     DetailsDatabase,
     DetailsReflow,
+    ShadowGaussian,
+    SnapshotCapture,
+    SnapshotRestore,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -967,6 +974,9 @@ mod latency_stage_tests {
             Stage::Layout,
             Stage::Raster,
             Stage::Present,
+            Stage::ShadowGaussian,
+            Stage::SnapshotCapture,
+            Stage::SnapshotRestore,
         ] {
             let _stage = stage(which);
         }
@@ -979,6 +989,9 @@ mod latency_stage_tests {
         let phases = &row["stages"]["phases"];
         assert!(input > 0);
         for name in [
+            "shadow_gaussian",
+            "snapshot_capture",
+            "snapshot_restore",
             "selection",
             "details_metadata",
             "details_database",

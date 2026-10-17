@@ -92,6 +92,8 @@ fn gaussian_alpha(alpha: &mut [f32], w: u32, h: u32, blur: u32) {
     if blur == 0 {
         return;
     }
+    let _gaussian = crate::perf_trace::recording()
+        .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::ShadowGaussian));
     let sigma = blur as f32 / 2.0;
     let reach = (sigma * 3.0).ceil() as i32;
     let mut kernel: Vec<f32> = (-reach..=reach)
