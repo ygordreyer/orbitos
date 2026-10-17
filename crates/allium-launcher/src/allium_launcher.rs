@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::Path;
 use std::process;
-use std::time::Instant;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use common::command::Command;
@@ -25,6 +27,59 @@ use crate::entry::directory::Directory;
 use crate::entry::game::Game;
 use crate::view::{App, Toast};
 
+/// One-event lookahead preserves release/action boundaries while draining repeats.
+#[derive(Default)]
+pub(crate) struct PendingInput(Option<KeyEvent>);
+
+impl PendingInput {
+    /// NAV can pass `|| pending.is_ready(platform)` into bounded idle preparation.
+    /// A ready event stays buffered for the next foreground iteration.
+    pub(crate) fn is_ready(&mut self, platform: &mut DefaultPlatform) -> bool {
+        if self.0.is_none() {
+            let mut future = std::pin::pin!(poll_platform_input(platform));
+            if let Poll::Ready(event) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                self.0 = Some(event);
+            }
+        }
+        self.0.is_some()
+    }
+
+    fn take(&mut self, platform: &mut DefaultPlatform) -> Option<KeyEvent> {
+        self.is_ready(platform);
+        self.0.take()
+    }
+}
+
+fn navigation_key(event: KeyEvent) -> Option<Key> {
+    match event {
+        KeyEvent::Pressed(key) | KeyEvent::Autorepeat(key)
+            if matches!(key, Key::Up | Key::Down | Key::Left | Key::Right) =>
+        {
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
+async fn poll_platform_input(platform: &mut DefaultPlatform) -> KeyEvent {
+    #[cfg(all(
+        test,
+        feature = "perf-bench",
+        not(any(feature = "miyoo", feature = "simulator"))
+    ))]
+    if perf_bench::has_loop_input() {
+        return perf_bench::poll_loop_input().await;
+    }
+    #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+    if navigation_warm_tests::has_input() {
+        return navigation_warm_tests::poll_input().await;
+    }
+    platform.poll().await
+}
+
 #[derive(Debug)]
 pub struct AlliumLauncher<P: Platform> {
     platform: P,
@@ -32,6 +87,8 @@ pub struct AlliumLauncher<P: Platform> {
     res: Resources,
     view: App<P::Battery>,
     toast: Option<Toast>,
+    toast_deadline: Option<Instant>,
+    first_flush: bool,
 }
 
 impl AlliumLauncher<DefaultPlatform> {
@@ -41,7 +98,7 @@ impl AlliumLauncher<DefaultPlatform> {
     }
 
     pub fn new(mut platform: DefaultPlatform) -> Result<Self> {
-        common::perf_trace::initialize();
+        common::perf_trace::lifecycle(common::perf_trace::LAUNCHER_ENTRY);
         let display = platform.display()?;
         if let Err(error) = crate::network_runtime::initialize(ALLIUM_SD_ROOT.to_path_buf()) {
             warn!(
@@ -80,6 +137,8 @@ impl AlliumLauncher<DefaultPlatform> {
             res,
             view,
             toast: None,
+            toast_deadline: None,
+            first_flush: true,
         })
     }
 
@@ -107,20 +166,50 @@ impl AlliumLauncher<DefaultPlatform> {
 
         let mut keys: EnumMap<Key, bool> = EnumMap::default();
 
-        #[cfg(not(feature = "debug-ui"))]
-        let mut frame_interval = tokio::time::interval(common::constants::UI_FRAME_INTERVAL);
-        #[cfg(feature = "debug-ui")]
-        let mut frame_interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
-
+        let mut pending_input = PendingInput::default();
+        let mut input_commands_pending = false;
+        let mut update_deadline = Instant::now();
+        let mut animation_active = false;
         let mut last_frame = Instant::now();
         let mut overlay_was_drawn = true;
         let mut warm_steps = 0;
         let mut warm_work = None;
         let mut media_pending = true;
+        let mut last_media_step = Instant::now();
         let mut name_generation = common::media::name_generation();
         let mut media_poll = Instant::now();
         loop {
             crate::network_runtime::trace_loop("loop_iteration", "before_poll");
+            #[cfg(all(
+                test,
+                feature = "perf-bench",
+                not(any(feature = "miyoo", feature = "simulator"))
+            ))]
+            perf_bench::loop_iteration();
+            // Preserve commands from the preceding input action as its boundary.
+            // Unrelated background commands must not overtake a ready input edge.
+            let event = if input_commands_pending && !rx.is_empty() {
+                None
+            } else {
+                pending_input.take(&mut self.platform)
+            };
+            let input_handled = event.is_some();
+            if let Some(event) = event {
+                self.apply_input_batch(event, &mut pending_input, &mut keys, &tx, &rx)
+                    .await?;
+                input_commands_pending = !rx.is_empty();
+                media_pending = true;
+                warm_work = None;
+                warm_steps = 0;
+            } else if let Ok(command) = rx.try_recv() {
+                media_pending = true;
+                warm_work = None;
+                warm_steps = 0;
+                self.handle_command(command).await?;
+                input_commands_pending &= !rx.is_empty();
+            }
+            #[cfg(feature = "miyoo")]
+            common::platform::cpu_tuning::expire_input_boost();
             let network_job_active = crate::network_runtime::active();
             let network_dirty = crate::network_runtime::poll();
             if network_job_active && !crate::network_runtime::active() {
@@ -130,9 +219,34 @@ impl AlliumLauncher<DefaultPlatform> {
                 self.view.set_should_draw();
                 media_pending = true;
             }
+            // Rendering can be slower than autorepeat: waiting for an input gap would
+            // starve completion adoption for the entire hold. Poll once per bounded batch.
+            if input_handled
+                && media_pending
+                && rx.is_empty()
+                && keys.values().any(|pressed| *pressed)
+                && last_media_step.elapsed() >= Duration::from_millis(10)
+            {
+                self.poll_media_step(&mut media_pending);
+                last_media_step = Instant::now();
+            }
             let dt = last_frame.elapsed();
+            let update_due = Instant::now() >= update_deadline;
+            let was_dirty = self.view.should_draw();
             self.update_view(dt, &mut name_generation, &mut media_pending);
+            if update_due && !was_dirty {
+                animation_active = self.view.should_draw();
+            }
             last_frame = Instant::now();
+            if last_frame >= update_deadline || animation_active {
+                // Re-arm from now, never catch up missed frames after a long render.
+                update_deadline = last_frame
+                    + if animation_active {
+                        common::constants::UI_FRAME_INTERVAL
+                    } else {
+                        Duration::from_secs(1)
+                    };
+            }
 
             self.present_frame(network_dirty, &mut overlay_was_drawn)
                 .await?;
@@ -186,19 +300,52 @@ impl AlliumLauncher<DefaultPlatform> {
             }
             let warm_allowed = self.navigation_warm_allowed()
                 && keys.values().all(|pressed| !pressed)
-                && rx.is_empty();
+                && rx.is_empty()
+                && !pending_input.is_ready(&mut self.platform);
             if !warm_allowed {
                 warm_work = None;
                 warm_steps = 0;
             }
 
+            #[cfg(all(
+                test,
+                feature = "perf-bench",
+                not(any(feature = "miyoo", feature = "simulator"))
+            ))]
+            if !media_pending
+                && warm_work.is_none()
+                && (!warm_allowed || warm_steps >= 2)
+                && keys.values().all(|pressed| !pressed)
+                && !crate::media_refresh::pending()
+            {
+                perf_bench::loop_idle();
+            }
             #[cfg(test)]
             crate::network_runtime::test_loop_event("wait");
+            // Lookahead can contain a boundary event. Never sleep with buffered input.
+            if pending_input.is_ready(&mut self.platform) {
+                continue;
+            }
+            let boost_deadline = {
+                #[cfg(feature = "miyoo")]
+                {
+                    common::platform::cpu_tuning::input_boost_deadline()
+                }
+                #[cfg(not(feature = "miyoo"))]
+                {
+                    None::<Instant>
+                }
+            };
+            let view_deadline = self
+                .toast_deadline
+                .map_or(update_deadline, |toast| toast.min(update_deadline));
             #[cfg(unix)]
             tokio::select! {
                 biased;
-                _ = frame_interval.tick() => { crate::network_runtime::trace_wake("frame_timer"); }
-                _ = tokio::time::sleep(if crate::network_runtime::active(){std::time::Duration::from_millis(33)}else{std::time::Duration::from_secs(86400)}) => { crate::network_runtime::trace_wake("network_timer"); }
+                event = self.poll_input() => {
+                    crate::network_runtime::trace_wake("input");
+                    pending_input.0 = Some(event);
+                }
                 _ = sigterm.recv() => {
                     crate::network_runtime::trace_wake("signal");
                     self.handle_command(Command::Exit).await?;
@@ -209,53 +356,42 @@ impl AlliumLauncher<DefaultPlatform> {
                         media_pending = true;
                         warm_work = None;
                         warm_steps = 0;
-                        let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
                         self.handle_command(cmd).await?;
                     }
                 }
-                event = self.poll_input() => {
-                    crate::network_runtime::trace_wake("input");
-                    let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
-                    warm_steps = 0;
-                    warm_work = None;
-                    media_pending = true;
-                    let mut bubble = VecDeque::new();
-                    match event {
-                        KeyEvent::Pressed(key) => {
-                            keys[key] = true;
-                        }
-                        KeyEvent::Released(key) => {
-                            keys[key] = false;
-                        }
-                        KeyEvent::Autorepeat(_) => {}
-                    }
-                    #[cfg(all(test, feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
-                    perf_bench::loop_input(&keys);
-
-                    // Ignore menu key presses
-                    if !keys[Key::Menu] && !matches!(event, KeyEvent::Released(Key::Menu)) {
-                        if !crate::network_runtime::event(event)? {self.view.handle_key_event(event, tx.clone(), &mut bubble).await?;}
-                        #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
-                        navigation_warm_tests::handled_input();
-                    }
+                _ = tokio::time::sleep_until(view_deadline.into()) => {
+                    crate::network_runtime::trace_wake("update_deadline");
                 }
+                _ = tokio::time::sleep(Duration::from_millis(33)), if crate::network_runtime::active() => {
+                    crate::network_runtime::trace_wake("network_timer");
+                }
+                _ = tokio::time::sleep_until(boost_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400)).into()), if boost_deadline.is_some() => {}
                 _ = tokio::time::sleep(if warm_work.is_some() {
                     std::time::Duration::from_millis(1)
                 } else if media_pending || (warm_allowed && warm_steps < 2) || crate::media_refresh::pending() {
                     std::time::Duration::from_millis(10)
                 } else {
-                    std::time::Duration::from_secs(1).saturating_sub(media_poll.elapsed())
-                }), if keys.values().all(|pressed| !pressed) && rx.is_empty() => {
+                    if keys.values().any(|pressed| *pressed) {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_secs(1).saturating_sub(media_poll.elapsed())
+                    }
+                }), if rx.is_empty() => {
                     if media_pending {
-                        media_pending = self.view.idle_media_step();
-                        #[cfg(all(test, feature = "perf-bench", not(any(feature = "miyoo", feature = "simulator"))))]
-                        perf_bench::loop_media_poll(media_pending);
+                        self.poll_media_step(&mut media_pending);
+                        last_media_step = Instant::now();
                         if media_pending {continue;}
                     }
+                    if pending_input.is_ready(&mut self.platform) { continue; }
                     if warm_steps<2 && warm_allowed {
-                        if self.view.prewarm_navigation_step(&mut warm_work,if warm_steps==0 {1} else {-1})? {warm_steps+=1;}
+                        if self.view.prewarm_navigation_step_with_pending(
+                            &mut warm_work,
+                            if warm_steps==0 {1} else {-1},
+                            || pending_input.is_ready(&mut self.platform),
+                        )? {warm_steps+=1;}
                     }
-                    if media_poll.elapsed()>=std::time::Duration::from_secs(1) {
+                    if pending_input.is_ready(&mut self.platform) { continue; }
+                    if keys.values().all(|pressed| !pressed) && media_poll.elapsed()>=std::time::Duration::from_secs(1) {
                         let marker = if crate::media_refresh::pending() { Ok(Some(true)) } else { crate::media_refresh::marker_ready(&ALLIUM_SD_ROOT) };
                         match marker {
                             Ok(None) => { media_poll=Instant::now(); continue; },
@@ -292,6 +428,16 @@ impl AlliumLauncher<DefaultPlatform> {
         }
     }
 
+    fn poll_media_step(&mut self, media_pending: &mut bool) {
+        *media_pending = self.view.idle_media_step();
+        #[cfg(all(
+            test,
+            feature = "perf-bench",
+            not(any(feature = "miyoo", feature = "simulator"))
+        ))]
+        perf_bench::loop_media_poll(*media_pending);
+    }
+
     fn update_view(
         &mut self,
         dt: std::time::Duration,
@@ -314,19 +460,66 @@ impl AlliumLauncher<DefaultPlatform> {
     }
 
     async fn poll_input(&mut self) -> KeyEvent {
-        #[cfg(all(
-            test,
-            feature = "perf-bench",
-            not(any(feature = "miyoo", feature = "simulator"))
-        ))]
-        if perf_bench::has_loop_input() {
-            return perf_bench::poll_loop_input().await;
+        poll_platform_input(&mut self.platform).await
+    }
+
+    async fn apply_input_batch(
+        &mut self,
+        first: KeyEvent,
+        pending: &mut PendingInput,
+        keys: &mut EnumMap<Key, bool>,
+        tx: &tokio::sync::mpsc::Sender<Command>,
+        rx: &tokio::sync::mpsc::Receiver<Command>,
+    ) -> Result<usize> {
+        let _phase = common::perf_trace::phase(common::perf_trace::Phase::Input);
+        let repeat_key = match first {
+            KeyEvent::Autorepeat(_) => navigation_key(first),
+            _ => None,
+        };
+        let mut event = first;
+        let mut count = 0;
+        let mut bubble = VecDeque::new();
+        loop {
+            match event {
+                KeyEvent::Pressed(key) => keys[key] = true,
+                KeyEvent::Released(key) => keys[key] = false,
+                KeyEvent::Autorepeat(_) => {}
+            }
+            #[cfg(feature = "miyoo")]
+            if navigation_key(event).is_some() {
+                common::platform::cpu_tuning::boost_input();
+            }
+            #[cfg(all(
+                test,
+                feature = "perf-bench",
+                not(any(feature = "miyoo", feature = "simulator"))
+            ))]
+            perf_bench::loop_input(keys);
+            if !keys[Key::Menu] && !matches!(event, KeyEvent::Released(Key::Menu)) {
+                if !crate::network_runtime::event(event)? {
+                    self.view
+                        .handle_key_event(event, tx.clone(), &mut bubble)
+                        .await?;
+                }
+                #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+                navigation_warm_tests::handled_input();
+            }
+            count += 1;
+            // Bound a continuously arriving repeat stream so completed media still gets adopted.
+            if repeat_key.is_none() || count == 64 || !rx.is_empty() {
+                break;
+            }
+            let Some(next) = pending.take(&mut self.platform) else {
+                break;
+            };
+            if matches!(next, KeyEvent::Autorepeat(key) if Some(key) == repeat_key) {
+                event = next;
+            } else {
+                pending.0 = Some(next);
+                break;
+            }
         }
-        #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
-        if navigation_warm_tests::has_input() {
-            return navigation_warm_tests::poll_input().await;
-        }
-        self.platform.poll().await
+        Ok(count)
     }
 
     async fn present_frame(
@@ -336,6 +529,7 @@ impl AlliumLauncher<DefaultPlatform> {
     ) -> Result<()> {
         if self.toast.as_ref().is_some_and(Toast::has_expired) {
             self.toast = None;
+            self.toast_deadline = None;
             self.handle_command(Command::Redraw).await?;
         }
         if self.toast.is_some() || network_dirty || *overlay_was_drawn {
@@ -411,7 +605,18 @@ impl AlliumLauncher<DefaultPlatform> {
                 }
                 crate::network_runtime::frame_presented();
             }
+            common::perf_trace::presented(common::perf_trace::generation(), self.view.content_complete());
+            if self.first_flush {
+                self.first_flush = false;
+                common::perf_trace::lifecycle(common::perf_trace::FIRST_COMPLETED_FLUSH);
+            }
             common::perf_trace::drawn_frame();
+            #[cfg(all(
+                test,
+                feature = "perf-bench",
+                not(any(feature = "miyoo", feature = "simulator"))
+            ))]
+            perf_bench::loop_present();
         }
 
         common::perf_trace::end_render();
@@ -433,24 +638,30 @@ impl AlliumLauncher<DefaultPlatform> {
         }
         match command {
             Command::Exit => {
+                #[cfg(feature = "miyoo")]
+                common::platform::cpu_tuning::restore_input_boost();
                 info!("goodbye from allium launcher");
                 self.view.save()?;
                 self.view.stop_workers();
+                common::perf_trace::lifecycle(common::perf_trace::WORKER_SHUTDOWN);
                 self.display.clear(Color::new(0, 0, 0))?;
                 self.display.flush()?;
                 process::exit(0);
             }
             #[allow(unused_mut)]
             Command::Exec(mut cmd) => {
+                common::perf_trace::lifecycle(common::perf_trace::LAUNCH_PREP);
                 info!("executing command: {:?}", cmd);
                 self.view.save()?;
                 self.view.stop_workers();
+                common::perf_trace::lifecycle(common::perf_trace::WORKER_SHUTDOWN);
                 self.display.clear(Color::new(0, 0, 0))?;
                 self.display.flush()?;
                 #[cfg(feature = "miyoo")]
                 {
                     use std::os::unix::process::CommandExt;
                     common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Game);
+                    common::perf_trace::lifecycle(common::perf_trace::IMMINENT_EXEC);
                     let _ = cmd.exec();
                     common::platform::cpu_tuning::set(
                         common::platform::cpu_tuning::Workload::Frontend,
@@ -461,6 +672,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     #[cfg(unix)]
                     {
                         use std::os::unix::process::CommandExt;
+                        common::perf_trace::lifecycle(common::perf_trace::IMMINENT_EXEC);
                         let _ = process::Command::new("/bin/sh")
                             .arg("-c")
                             .arg("make simulator bin=allium-menu")
@@ -492,6 +704,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 if needs_relayout {
                     self.view.save()?;
                     self.view.stop_workers();
+                common::perf_trace::lifecycle(common::perf_trace::WORKER_SHUTDOWN);
                     self.view = App::load_or_new(
                         self.display.bounding_box(),
                         self.res.clone(),
@@ -512,6 +725,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 self.res.insert(Locale::new(&settings.lang));
                 self.view.save()?;
                 self.view.stop_workers();
+                common::perf_trace::lifecycle(common::perf_trace::WORKER_SHUTDOWN);
                 self.view = App::load_or_new(
                     self.display.bounding_box(),
                     self.res.clone(),
@@ -533,14 +747,17 @@ impl AlliumLauncher<DefaultPlatform> {
             Command::Toast(text, duration) => {
                 debug!("showing toast: {:?}", text);
                 self.toast = Some(Toast::new(text, duration));
+                self.toast_deadline = duration.map(|duration| Instant::now() + duration);
             }
             Command::ImageToast(image, text, duration) => {
                 debug!("showing image toast: {:?}", text);
                 self.toast = Some(Toast::with_image(image, text, duration));
+                self.toast_deadline = duration.map(|duration| Instant::now() + duration);
             }
             Command::DismissToast => {
                 debug!("dismissing toast");
                 self.toast = None;
+                self.toast_deadline = None;
                 self.restore_launcher()?;
             }
             Command::PopulateDb => {
@@ -605,6 +822,7 @@ impl AlliumLauncher<DefaultPlatform> {
 
                 self.view.save()?;
                 self.view.stop_workers();
+                common::perf_trace::lifecycle(common::perf_trace::WORKER_SHUTDOWN);
                 self.view = App::load_or_new(
                     self.display.bounding_box(),
                     self.res.clone(),
@@ -1873,6 +2091,14 @@ mod orbit_proof {
         .unwrap();
         let mut app = AlliumLauncher::new(DefaultPlatform::new().unwrap()).unwrap();
         activate_orbit_fixture(&mut app);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while network::active() {
+                network::poll();
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
         let mut entries = Vec::new();
         network::merge_directory(&root.join("Roms/PS"), &mut entries);
         assert_eq!(entries.len(), 1);
@@ -2328,3 +2554,94 @@ pub(crate) mod present_dl15b_tests;
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 #[path = "navigation_warm_tests.rs"]
 pub(crate) mod navigation_warm_tests;
+
+#[cfg(all(
+    test,
+    feature = "perf-bench",
+    not(any(feature = "miyoo", feature = "simulator"))
+))]
+mod integration_measurement_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn real_input_and_completed_flush_emit_generation_and_final_totals() {
+        let mut app = AlliumLauncher::new(DefaultPlatform::new().unwrap()).unwrap();
+        crate::theme_adapter::choose(&app.res, Some("compact")).unwrap();
+        for stem in ["R4 - Ridge Racer Type 4 (USA)", "Silent Hill (USA)"] {
+            let game: common::database::NewGame =
+                Game::new(ALLIUM_GAMES_DIR.join(format!("PS/{stem}.chd"))).into();
+            app.res
+                .get::<Database>()
+                .update_games(&[game.clone()])
+                .unwrap();
+            app.res
+                .get::<Database>()
+                .increment_play_count(&game)
+                .unwrap();
+        }
+        app.view = App::load_or_new(
+            app.display.bounding_box(),
+            app.res.clone(),
+            app.platform.battery().unwrap(),
+        )
+        .unwrap();
+        app.view.proof_select_tab(0);
+        let mut overlay = false;
+        app.present_frame(false, &mut overlay).await.unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "allium-production-trace-{}.log",
+            std::process::id()
+        ));
+        common::perf_trace::start_probe(path.to_str().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        app.apply_input_batch(
+            KeyEvent::Pressed(Key::Down),
+            &mut PendingInput::default(),
+            &mut EnumMap::default(),
+            &tx,
+            &rx,
+        )
+        .await
+        .unwrap();
+        app.present_frame(false, &mut overlay).await.unwrap();
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let feedback = rows
+            .iter()
+            .find(|row| row["event"] == "first_feedback")
+            .unwrap();
+        let final_content = rows
+            .iter()
+            .find(|row| row["event"] == "final_content")
+            .unwrap();
+        assert_eq!(feedback["selection_generation"], 1);
+        assert_eq!(final_content["selection_generation"], 1);
+        assert_eq!(
+            final_content["measurement"]["first_feedback_monotonic_us"],
+            final_content["measurement"]["final_content_monotonic_us"]
+        );
+        assert!(
+            final_content["measurement"]["input"]["cpu_ns"][0]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            final_content["measurement"]["input"]["counters"][5]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let frozen = final_content["measurement"]["input"].clone();
+        app.view.idle_media_step();
+        assert_eq!(
+            common::perf_trace::probe_counts()["measurement"]["input"],
+            frozen
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+}

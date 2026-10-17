@@ -346,3 +346,55 @@ impl View for RecentsCarousel {
         self.rect.y = point.y;
     }
 }
+
+#[cfg(test)]
+mod name_refresh_tests {
+    use super::*;
+    use crate::entry::lazy_image::LazyImage;
+
+    #[test]
+    fn name_refresh_retries_cold_carousel_cover_and_updates_selected_image() {
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        let database = Database::in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!("allium-carousel-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Game.chd");
+        let cover = root.join("unrelated-cover.png");
+        let mut pixels = tiny_skia::Pixmap::new(16, 16).unwrap();
+        pixels.fill(tiny_skia::Color::from_rgba8(35, 120, 210, 255));
+        pixels.save_png(&cover).unwrap();
+        let mut row: common::database::NewGame = Game::new(path.clone()).into();
+        row.image = None;
+        database.increment_play_count(&row).unwrap();
+        map.insert(database);
+        common::media::invalidate();
+        std::fs::write(root.join("gamelist.xml"),
+            "<gameList><game><path>Game.chd</path><name>Game</name><image>unrelated-cover.png</image></game></gameList>").unwrap();
+        let mut carousel = RecentsCarousel::new(Rect::new(0, 54, 640, 376),
+            Resources::new(map), RecentsCarouselState::default()).unwrap();
+        assert_eq!(carousel.games[0].image, LazyImage::NotFound);
+        assert!(serde_json::to_value(&carousel.screenshot).unwrap()["path"].is_null());
+        let mut retained = Game::new(root.join("Other.chd"));
+        retained.image = LazyImage::Found(cover.clone());
+        carousel.games.push(retained);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while common::media::cached_name(&path).as_deref() != Some("Game") {
+            common::media::poll_name_indexes();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        carousel.update(std::time::Duration::ZERO);
+        assert_eq!(carousel.games[0].image, LazyImage::Found(cover.clone()));
+        assert_eq!(carousel.games[1].image, LazyImage::Found(cover.clone()));
+        assert_eq!(serde_json::to_value(&carousel.screenshot).unwrap()["path"], cover.to_str().unwrap());
+        assert!(carousel.screenshot.should_draw());
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+}

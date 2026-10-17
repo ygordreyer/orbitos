@@ -48,7 +48,67 @@ fn prepare_theme_inputs(
     }
 }
 
-pub(crate) enum NavigationWarm {
+pub(super) fn theme_content_complete(
+    input: &common::theme::frame::FrameInputs,
+    handle: &common::theme::ThemeHandle,
+) -> bool {
+    use common::theme::pack::{Arrangement, Binding, Kind};
+    let has_rows = input.rows.values().any(|rows| !rows.is_empty());
+    if !has_rows && input.selected.is_empty() {
+        return true;
+    }
+    handle.pack().screens[&input.screen]
+        .components
+        .iter()
+        .all(|c| {
+            if c.layout == Some(Arrangement::Hidden) {
+                return true;
+            }
+            if c.logo && input.art.selected_logo.is_none() {
+                return false;
+            }
+            if c.kind == Kind::Image {
+                match c.binding {
+                    Some(Binding::NextCover) => {
+                        return !input.art.next_cover_expected || input.art.next_cover.is_some();
+                    }
+                    Some(Binding::SelectedCover) => return input.art.selected_cover.is_some(),
+                    Some(Binding::SelectedHero) => return input.art.selected_hero.is_some(),
+                    Some(Binding::SelectedLogo) => return input.art.selected_logo.is_some(),
+                    _ => {}
+                }
+            }
+            if c.kind == Kind::Entries
+                && c.layout == Some(Arrangement::Shelf)
+                && c.paint.as_ref().is_some_and(|paint| paint.peek.is_some())
+                && input.art.next_cover_expected
+                && input.art.next_cover.is_none()
+            {
+                return false;
+            }
+            if c.kind == Kind::Entries
+                && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
+            {
+                return c
+                    .binding
+                    .and_then(|binding| input.rows.get(&binding))
+                    .is_none_or(|rows| {
+                        rows.iter()
+                            .all(|row| input.art.entries.contains_key(&row.id))
+                    });
+            }
+            true
+        })
+}
+
+pub(crate) struct NavigationWarm {
+    stamp: common::theme::render::NavigationStamp,
+    media_generation: u64,
+    name_generation: u64,
+    direction: isize,
+    stage: NavigationWarmStage,
+}
+enum NavigationWarmStage {
     Artwork(super::entry_list::NavigationWarm),
     Images(
         VecDeque<common::theme::render::NavigationImageWarm>,
@@ -82,6 +142,8 @@ where
     search_view: SearchView,
     dirty: bool,
     theme_dirty: bool,
+    navigation_direction: isize,
+    content_complete: bool,
     theme_scene: Option<crate::theme_adapter::ThemeScene>,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
@@ -195,6 +257,8 @@ where
             // title,
             dirty: true,
             theme_dirty: true,
+            navigation_direction: 1,
+            content_complete: true,
             theme_scene: None,
             present_damage: None,
             theme_was_layered: false,
@@ -466,6 +530,7 @@ where
     }
 
     pub(crate) fn theme_fallback(&mut self) -> Result<()> {
+        self.content_complete = true;
         self.theme_scene = None;
         self.theme_dirty = false;
         self.dirty = true;
@@ -497,7 +562,12 @@ where
             })
     }
 
+    pub(crate) fn content_complete(&self) -> bool {
+        self.content_complete
+    }
+
     pub(crate) fn idle_media_step(&mut self) -> bool {
+        let _task = common::perf_trace::task("media_adopt", common::perf_trace::generation());
         let completion = super::orbit::completion_generation();
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             return false;
@@ -519,9 +589,12 @@ where
     }
 
     pub(crate) fn navigation_warm_ready(&self) -> bool {
-        self.selected == 1
-            && self.single_game_list()
-            && self.views.1.navigation_warm_ready()
+        self.single_game_list()
+            && match self.selected {
+                0 => self.views.0.navigation_warm_ready(),
+                1 => self.views.1.navigation_warm_ready(),
+                _ => false,
+            }
             && !self.should_draw()
             && self.theme_scene.as_ref().is_some_and(|scene| {
                 scene.frames.len() == 1 && scene.frames[0].can_prewarm_navigation()
@@ -530,11 +603,11 @@ where
 
     #[cfg(feature = "perf-bench")]
     pub(crate) fn navigation_warm_kind(&self, work: &Option<NavigationWarm>) -> &'static str {
-        match work {
+        match work.as_ref().map(|work| &work.stage) {
             None => "plan",
-            Some(NavigationWarm::Artwork(_)) => "artwork",
-            Some(NavigationWarm::Images(_, _)) => "image_transform",
-            Some(NavigationWarm::Rasters(_)) => "raster",
+            Some(NavigationWarmStage::Artwork(_)) => "artwork",
+            Some(NavigationWarmStage::Images(_, _)) => "image_transform",
+            Some(NavigationWarmStage::Rasters(_)) => "raster",
         }
     }
 
@@ -543,53 +616,102 @@ where
         work: &mut Option<NavigationWarm>,
         direction: isize,
     ) -> Result<bool> {
+        self.prewarm_navigation_step_with_pending(work, direction, || false)
+    }
+
+    /// The launcher supplies a cheap queue check; each call runs at most one cache operation.
+    pub(crate) fn prewarm_navigation_step_with_pending(
+        &mut self,
+        work: &mut Option<NavigationWarm>,
+        direction: isize,
+        mut input_pending: impl FnMut() -> bool,
+    ) -> Result<bool> {
+        if input_pending() {
+            return Ok(false);
+        }
+        if direction != self.navigation_direction {
+            *work = None;
+            return Ok(true);
+        }
         if !self.navigation_warm_ready() {
             *work = None;
             return Ok(true);
         }
+        let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
+            *work = None;
+            return Ok(true);
+        };
         let frame = &mut self.theme_scene.as_mut().unwrap().frames[0];
-        match work.take() {
-            None => {
-                let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
-                    return Ok(true);
-                };
-                let Some(input) = frame.navigation_model() else {
-                    return Ok(true);
-                };
-                let Some(plan) = self
-                    .views
-                    .1
-                    .navigation_warm_model(&handle, direction, input)?
-                else {
-                    return Ok(true);
-                };
-                *work = Some(NavigationWarm::Artwork(plan));
+        if !frame.navigation_theme_matches(&handle) {
+            *work = None;
+            return Ok(true);
+        }
+        if work.as_ref().is_some_and(|work| {
+            !frame.navigation_is_current(&work.stamp)
+                || work.direction != direction
+                || work.media_generation != common::media::generation()
+                || work.name_generation != common::media::name_generation()
+        }) {
+            *work = None;
+            return Ok(false);
+        }
+        let _task = common::perf_trace::task("navigation_prewarm", common::perf_trace::generation());
+        let Some(mut current) = work.take() else {
+            let Some(input) = frame.navigation_model() else {
+                return Ok(true);
+            };
+            if input_pending() {
+                return Ok(false);
             }
-            Some(NavigationWarm::Artwork(mut plan)) => {
-                if self.views.1.navigation_warm_art_step(&mut plan) {
-                    let mut rasters = frame.navigation_rasters(&plan.input);
-                    if let Some(original) = frame.navigation_model() {
-                        rasters.extend(frame.navigation_rasters(&original));
-                    }
-                    *work = Some(NavigationWarm::Images(
+            let plan = match self.selected {
+                0 => self.views.0.navigation_warm_model(&handle, direction, input)?,
+                1 => self.views.1.navigation_warm_model(&handle, direction, input)?,
+                _ => None,
+            };
+            let Some(plan) = plan else {
+                return Ok(true);
+            };
+            common::perf_trace::count(common::perf_trace::Count::PlanBuilds, 1);
+            *work = Some(NavigationWarm {
+                stamp: frame.navigation_stamp(),
+                media_generation: common::media::generation(),
+                name_generation: common::media::name_generation(),
+                direction,
+                stage: NavigationWarmStage::Artwork(plan),
+            });
+            return Ok(false);
+        };
+        if input_pending() {
+            *work = Some(current);
+            return Ok(false);
+        }
+        current.stage = match current.stage {
+            NavigationWarmStage::Artwork(mut plan) => {
+                let ready = match self.selected {
+                    0 => self.views.0.navigation_warm_art_step(&mut plan),
+                    1 => self.views.1.navigation_warm_art_step(&mut plan),
+                    _ => return Ok(true),
+                };
+                if ready {
+                    NavigationWarmStage::Images(
                         frame.navigation_images(&plan.input),
-                        rasters,
-                    ));
+                        frame.navigation_rasters(&plan.input),
+                    )
                 } else {
-                    *work = Some(NavigationWarm::Artwork(plan));
+                    NavigationWarmStage::Artwork(plan)
                 }
             }
-            Some(NavigationWarm::Images(mut images, rasters)) => {
+            NavigationWarmStage::Images(mut images, rasters) => {
                 if let Some(image) = images.pop_front() {
                     frame.prewarm_navigation_image(image)?;
                 }
-                *work = Some(if images.is_empty() {
-                    NavigationWarm::Rasters(rasters)
+                if images.is_empty() {
+                    NavigationWarmStage::Rasters(rasters)
                 } else {
-                    NavigationWarm::Images(images, rasters)
-                });
+                    NavigationWarmStage::Images(images, rasters)
+                }
             }
-            Some(NavigationWarm::Rasters(mut rasters)) => {
+            NavigationWarmStage::Rasters(mut rasters) => {
                 let Some(raster) = rasters.pop_front() else {
                     return Ok(true);
                 };
@@ -597,15 +719,50 @@ where
                 if rasters.is_empty() {
                     return Ok(true);
                 }
-                *work = Some(NavigationWarm::Rasters(rasters));
+                NavigationWarmStage::Rasters(rasters)
+            }
+        };
+        *work = Some(current);
+        Ok(false)
+    }
+
+    fn normalize_theme_inputs(
+        &self,
+        handle: &common::theme::ThemeHandle,
+        models: &mut [common::theme::frame::FrameInputs],
+    ) {
+        let status = if self
+            .res
+            .get::<Stylesheet>()
+            .status_bar
+            .hide_status_in_launcher
+        {
+            common::theme::frame::Status::default()
+        } else {
+            self.status_bar.theme_inputs()
+        };
+        prepare_theme_inputs(models, &self.res, self.selected, &status);
+        if handle.pack().ink()
+            && models.len() > 1
+            && models.last().is_some_and(|m| {
+                handle.pack().screens[&m.screen]
+                    .components
+                    .iter()
+                    .any(|c| c.kind == common::theme::pack::Kind::Hints)
+            })
+        {
+            let underlay = models.len() - 1;
+            for model in &mut models[..underlay] {
+                model.hints.clear();
+                model.suppress_hints = true;
             }
         }
-        Ok(false)
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
         use common::theme::render::PreparedFrame;
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
+            self.content_complete = true;
             if self.had_theme {
                 self.views.0.clear_theme()?;
                 self.views.1.clear_theme()?;
@@ -622,33 +779,11 @@ where
         };
         self.had_theme = true;
         let models = self.theme_models(&handle)?;
+        self.content_complete = models.as_ref().is_none_or(|models| {
+            models.iter().all(|input| theme_content_complete(input, &handle))
+        });
         self.theme_scene = if let Some(mut models) = models {
-            let status = if self
-                .res
-                .get::<Stylesheet>()
-                .status_bar
-                .hide_status_in_launcher
-            {
-                common::theme::frame::Status::default()
-            } else {
-                self.status_bar.theme_inputs()
-            };
-            prepare_theme_inputs(&mut models, &self.res, self.selected, &status);
-            if handle.pack().ink()
-                && models.len() > 1
-                && models.last().is_some_and(|m| {
-                    handle.pack().screens[&m.screen]
-                        .components
-                        .iter()
-                        .any(|c| c.kind == common::theme::pack::Kind::Hints)
-                })
-            {
-                let underlay = models.len() - 1;
-                for model in &mut models[..underlay] {
-                    model.hints.clear();
-                    model.suppress_hints = true;
-                }
-            }
+            self.normalize_theme_inputs(&handle, &mut models);
             let mut previous = self
                 .theme_scene
                 .take()
@@ -1117,45 +1252,78 @@ where
         commands: Sender<Command>,
         bubble: &mut VecDeque<Command>,
     ) -> Result<bool> {
-        if self.single_game_list() {
-            let navigation = matches!(
-                event,
-                KeyEvent::Pressed(Key::L | Key::R)
-                    | KeyEvent::Pressed(Key::Left | Key::Right | Key::Up | Key::Down)
-                    | KeyEvent::Autorepeat(Key::Left | Key::Right | Key::Up | Key::Down)
-            );
-            if navigation {
-                let handled = self.dispatch_key_event(event, commands, bubble).await?;
-                self.theme_dirty |= handled;
-                return Ok(handled);
+        let navigation = matches!(
+            event,
+            KeyEvent::Pressed(Key::L | Key::R | Key::Left | Key::Right | Key::Up | Key::Down)
+                | KeyEvent::Autorepeat(Key::Left | Key::Right | Key::Up | Key::Down)
+        );
+        if self.single_game_list() && navigation {
+            let handled = self.dispatch_key_event(event, commands, bubble).await?;
+            if handled {
+                match event {
+                    KeyEvent::Pressed(Key::Left | Key::Up)
+                    | KeyEvent::Autorepeat(Key::Left | Key::Up) => self.navigation_direction = -1,
+                    KeyEvent::Pressed(Key::Right | Key::Down)
+                    | KeyEvent::Autorepeat(Key::Right | Key::Down) => self.navigation_direction = 1,
+                    _ => {}
+                }
             }
-            if matches!(
+            self.theme_dirty |= handled;
+            return Ok(handled);
+        }
+        if self.single_game_list()
+            && matches!(
                 event,
                 KeyEvent::Released(Key::L | Key::R | Key::Left | Key::Right | Key::Up | Key::Down)
-            ) {
-                return Ok(false);
-            }
+            )
+        {
+            return Ok(false);
         }
         let handle =
             crate::theme_adapter::snapshot(&self.res).filter(|_| self.theme_scene.is_some());
-        let before = if let Some(handle) = &handle {
-            self.theme_models(handle)?
+        let retained_comparison = self.theme_scene.as_ref().is_some_and(|scene| {
+            !scene.frames.is_empty() && scene.frames.iter().all(|frame| frame.has_retained_inputs())
+        });
+        let before = if !retained_comparison {
+            if let Some(handle) = &handle {
+                self.theme_models(handle)?
+            } else {
+                None
+            }
         } else {
             None
         };
         let selected = self.selected;
         let dirty = (self.dirty, self.theme_dirty);
         let handled = self.dispatch_key_event(event, commands, bubble).await?;
-        if let (Some(handle), Some(before)) = (handle, before) {
+        if let Some(handle) = handle {
             let same_theme = crate::theme_adapter::snapshot(&self.res).is_some_and(|current| {
                 current.generation() == handle.generation() && current.digest() == handle.digest()
             });
-            let unchanged = same_theme
-                && selected == self.selected
-                && self.theme_models(&handle)?.as_ref() == Some(&before);
-            self.theme_dirty = dirty.1 || !unchanged;
-            if unchanged {
-                self.dirty = dirty.0;
+            if retained_comparison || before.is_some() {
+                let unchanged = if !same_theme || selected != self.selected {
+                    false
+                } else if retained_comparison {
+                    if let Some(mut after) = self.theme_models(&handle)? {
+                        self.normalize_theme_inputs(&handle, &mut after);
+                        self.theme_scene.as_ref().is_some_and(|scene| {
+                            scene.frames.len() == after.len()
+                                && scene
+                                    .frames
+                                    .iter()
+                                    .zip(&after)
+                                    .all(|(frame, input)| frame.input_matches(input))
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    self.theme_models(&handle)?.as_ref() == before.as_ref()
+                };
+                self.theme_dirty = dirty.1 || !unchanged;
+                if unchanged {
+                    self.dirty = dirty.0;
+                }
             }
         }
         Ok(handled)
@@ -1320,5 +1488,192 @@ mod tests {
         prepare_theme_inputs(&mut models, &resources(), 1, &Status::default());
 
         assert!(models.is_empty());
+    }
+}
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod integration_navigation_tests {
+    use super::*;
+    use crate::consoles::ConsoleMapper;
+    use common::database::Database;
+    use common::theme::{ThemeHandle, fonts::FontBank, runtime::ThemeSnapshot};
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(orbit_fixture)]
+    async fn recents_warm_navigation_matches_full_compose_and_yields_to_pending_input() {
+        let root = common::constants::ALLIUM_GAMES_DIR.join("integration-recents-warm");
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let database = Database::in_memory().unwrap();
+        for index in 0..12 {
+            let path = root.join(format!("Game {index:02}.chd"));
+            std::fs::write(&path, []).unwrap();
+            for (suffix, w, h) in [("orbit", 101, 101), ("hero", 360, 210)] {
+                let mut art = tiny_skia::Pixmap::new(w, h).unwrap();
+                art.fill(tiny_skia::Color::from_rgba8(index * 17, 90, 120, 255));
+                art.save_png(root.join(format!("Imgs/Game {index:02}.{suffix}.png")))
+                    .unwrap();
+            }
+            let game: common::database::NewGame = crate::entry::game::Game::new(path).into();
+            database.update_games(&[game.clone()]).unwrap();
+            database.increment_play_count(&game).unwrap();
+        }
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        styles.recents.use_recents_carousel = false;
+        let mut map = type_map::TypeMap::new();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database);
+        let res = Resources::new(map);
+        let bank = FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        let rect = Rect::new(0, 54, 640, 376);
+        for (iteration, id) in ["compact", "orbit-hero", "big-picture", "compact-plus"]
+            .iter()
+            .enumerate()
+        {
+            let snapshot = if *id == "compact" {
+                ThemeSnapshot::builtin(id).unwrap()
+            } else {
+                ThemeSnapshot::load(
+                    &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("../../themes/{id}"))
+                        .canonicalize()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            let handle = ThemeHandle::prepare(snapshot, &bank, iteration as u64 + 800).unwrap();
+            res.insert(Some(handle.clone()));
+            let views = (
+                Recents::load_or_new(rect, res.clone(), None).unwrap(),
+                Games::load_or_new(rect, res.clone(), None).unwrap(),
+                Apps::load_or_new(rect, res.clone(), None).unwrap(),
+                Settings::new(rect, res.clone(), Default::default()).unwrap(),
+            );
+            let mut app = App::new(
+                Rect::new(0, 0, 640, 480),
+                res.clone(),
+                views,
+                0,
+                DefaultPlatform::new().unwrap().battery().unwrap(),
+            )
+            .unwrap();
+            let mut display = <DefaultPlatform as Platform>::Display::default();
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+            let style = res.get::<Stylesheet>().clone();
+            app.prepare_theme().unwrap();
+            app.draw(&mut display, &style).unwrap();
+            for _ in 0..10 {
+                assert!(app.navigation_warm_ready(), "{id}");
+                let scene = app.proof_navigation_scene();
+                let mut work = None;
+                assert!(
+                    !app.prewarm_navigation_step_with_pending(&mut work, 1, || true)
+                        .unwrap()
+                );
+                assert!(work.is_none(), "pending input must prevent planning");
+                assert!(!app.prewarm_navigation_step(&mut work, 1).unwrap());
+                assert!(
+                    work.is_some(),
+                    "Recents must produce a real navigation plan"
+                );
+                if let NavigationWarmStage::Artwork(plan) = &work.as_ref().unwrap().stage {
+                    let count = crate::theme_adapter::capacity(
+                        &handle,
+                        common::theme::pack::ScreenId::Recents,
+                        common::theme::pack::Binding::Entries,
+                    );
+                    assert_eq!(
+                        plan.input.rows[&common::theme::pack::Binding::Entries].len(),
+                        count.min(12)
+                    );
+                } else {
+                    panic!("missing artwork plan");
+                }
+                let mut checks = 0;
+                assert!(
+                    !app.prewarm_navigation_step_with_pending(&mut work, 1, || {
+                        checks += 1;
+                        checks == 2
+                    })
+                    .unwrap()
+                );
+                assert_eq!(checks, 2);
+                assert!(
+                    matches!(
+                        work.as_ref().unwrap().stage,
+                        NavigationWarmStage::Artwork(_)
+                    ),
+                    "pending input must leave queued work untouched"
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !app.prewarm_navigation_step(&mut work, 1).unwrap() {
+                    assert!(std::time::Instant::now() < deadline, "{id} warm timeout");
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    app.proof_navigation_scene() == scene,
+                    "idle warm changed the displayed frame"
+                );
+                app.handle_key_event(
+                    KeyEvent::Pressed(Key::Down),
+                    tx.clone(),
+                    &mut VecDeque::new(),
+                )
+                .await
+                .unwrap();
+                app.prepare_theme().unwrap();
+                let warmed = app.proof_navigation_scene();
+                let mut models = app.theme_models(&handle).unwrap().unwrap();
+                app.normalize_theme_inputs(&handle, &mut models);
+                let fresh =
+                    common::theme::render::PreparedFrame::prepare(handle.clone(), &models[0])
+                        .unwrap();
+                assert!(warmed.0 == fresh.pixels().data(), "{id} pixels");
+                assert_eq!(warmed.1, fresh.targets, "{id} targets");
+                app.draw(&mut display, &style).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+}
+
+#[cfg(test)]
+mod content_readiness_tests {
+    use super::*;
+    use common::theme::{fonts::FontBank, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, runtime::ThemeSnapshot, ThemeHandle};
+    #[test]
+    fn preview_pending_is_incomplete_even_when_visible_rows_are_loaded() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for name in ["orbit-hero", "orbit-row", "big-picture", "compact-plus"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(name).canonicalize().unwrap()).unwrap(), &bank, 1).unwrap();
+            let mut input = FrameInputs::new(ScreenId::Library);
+            let art = std::sync::Arc::new(tiny_skia::Pixmap::new(16, 16).unwrap());
+            input.art.selected_cover = Some(art.clone());
+            input.art.selected_hero = Some(art.clone());
+            input.art.selected_logo = Some(art.clone());
+            input.rows.insert(Binding::Entries, vec![Row {
+                id: "last".into(), label: "Last".into(), subtitle: String::new(),
+                value: String::new(), enabled: true,
+            }]);
+            input.art.entries.insert("last".into(), art.clone());
+            input.art.next_cover_expected = true;
+            // Compact Plus has no preview dependency.
+            assert_eq!(theme_content_complete(&input, &theme), name == "compact-plus", "{name} pending preview");
+            input.art.next_cover = Some(art.clone());
+            assert!(theme_content_complete(&input, &theme), "{name} loaded preview");
+            input.art.next_cover = None;
+            assert_eq!(theme_content_complete(&input, &theme), name == "compact-plus", "{name} missing preview");
+            input.art.next_cover_expected = false;
+            assert!(theme_content_complete(&input, &theme), "{name} real end fallback");
+            input.art.entries.clear();
+            if name != "compact-plus" {
+                assert!(!theme_content_complete(&input, &theme), "{name} missing fallback");
+            }
+        }
     }
 }

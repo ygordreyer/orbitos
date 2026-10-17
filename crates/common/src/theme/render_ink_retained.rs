@@ -11,6 +11,7 @@ pub(in crate::theme::render) struct Cache {
     pub(in crate::theme::render) opaque_base: bool,
     parked: VecDeque<(ScreenId, Pixmap, Vec<Entry>, bool)>,
     declined: Vec<ScreenId>,
+    plan: Option<OperationPlan>,
     #[cfg(test)]
     peak_active_bytes: usize,
     #[cfg(test)]
@@ -72,11 +73,31 @@ enum Paint {
     ShelfCard(usize),
     ShelfPeek,
 }
-struct Operation<'a> {
+struct Operation {
     component: Component,
-    input: std::borrow::Cow<'a, FrameInputs>,
+    row: Option<usize>,
     bounds: Rect,
     paint: Paint,
+}
+struct OperationPlan {
+    screen: ScreenId,
+    components: Vec<Component>,
+    rows: Vec<(Binding, Vec<Row>)>,
+    operations: Arc<Vec<Operation>>,
+}
+fn row_model(c: &Component, input: &FrameInputs, index: usize) -> FrameInputs {
+    let mut model = FrameInputs::new(input.screen);
+    let binding = c.binding.unwrap();
+    let row = &input.rows[&binding][index];
+    model.rows.insert(binding, vec![row.clone()]);
+    model.focus = input.focus.clone();
+    if let Some(selected) = input.selected.get(&binding) {
+        model.selected.insert(binding, selected.clone());
+    }
+    if let Some(art) = input.art.entries.get(&row.id) {
+        model.art.entries.insert(row.id.clone(), art.clone());
+    }
+    model
 }
 struct Hero {
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
@@ -230,11 +251,13 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
 fn capture(pixels: &Pixmap, r: Rect) -> Vec<u8> {
     #[cfg(test)]
     CAPTURED_BYTES.with(|bytes| bytes.set(bytes.get() + (r.2 * r.3 * 4) as usize));
+    crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
     let mut bytes = Vec::with_capacity((r.2 * r.3 * 4) as usize);
     capture_into(pixels, r, &mut bytes);
     bytes
 }
 fn capture_into(pixels: &Pixmap, r: Rect, bytes: &mut Vec<u8>) {
+    crate::perf_trace::count(crate::perf_trace::Count::CaptureBytes, r.2 as u64 * r.3 as u64 * 4);
     bytes.clear();
     let stride = pixels.width() as usize * 4;
     for y in r.1..r.1 + r.3 {
@@ -335,8 +358,12 @@ mod review_tests {
 
     #[test]
     fn ink_review_snapshot_budget_admits_before_capture() {
+        use crate::theme::render_navigation::tests::{arts, model};
+
         let theme = synthetic_theme(true);
-        let mut input = FrameInputs::new(ScreenId::Library);
+        let arts = arts();
+        let mut input = model(&theme, ScreenId::Library, 0, &arts);
+        let warm_input = model(&theme, ScreenId::Library, 1, &arts);
         let recents =
             PreparedFrame::prepare(theme.clone(), &FrameInputs::new(ScreenId::Recents)).unwrap();
         let mut frame = Some(
@@ -350,7 +377,7 @@ mod review_tests {
         for tick in 0..3 {
             input.status.clock = Some(format!("12:{tick:02}"));
             CAPTURED_BYTES.with(|bytes| bytes.set(0));
-            let next = PreparedFrame::prepare_reusing(theme.clone(), &input, frame).unwrap();
+            let mut next = PreparedFrame::prepare_reusing(theme.clone(), &input, frame).unwrap();
             let captured = CAPTURED_BYTES.with(|bytes| bytes.get());
             assert!(
                 captured <= 8 * 1024 * 1024,
@@ -358,9 +385,23 @@ mod review_tests {
             );
             assert_eq!(captured, 0, "oversized screens must use the uncached path");
             assert!(next.ink_cache.entries.is_empty());
+            let full = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+            assert!(next.can_prewarm_navigation());
+            let tasks = next.navigation_rasters(&warm_input);
+            assert!(tasks.iter().any(|task| matches!(
+                task.part,
+                NavigationRasterPart::InkShelfRow(_)
+            )));
+            for task in tasks {
+                next.prewarm_navigation_raster(task).unwrap();
+                assert!(next.pixels.data() == full.pixels.data());
+                assert_eq!(next.targets, full.targets);
+                assert_eq!(next.text_boxes, full.text_boxes);
+            }
             assert!(next.ink_cache.peak_active_bytes <= ACTIVE_LIMIT);
             assert!(next.ink_cache.peak_snapshot_bytes <= SNAPSHOT_LIMIT);
-            assert!(next.ink_cache.declined.contains(&ScreenId::Library));
+            assert_eq!(next.ink_cache.declined, vec![ScreenId::Library]);
+            assert!(next.ink_cache.plan.is_none());
             assert!(
                 next.ink_cache
                     .parked
@@ -480,6 +521,7 @@ mod review_tests {
     }
 }
 fn restore(pixels: &mut Pixmap, r: Rect, data: &[u8]) {
+    crate::perf_trace::count(crate::perf_trace::Count::RestoreBytes, r.2 as u64 * r.3 as u64 * 4);
     let stride = pixels.width() as usize * 4;
     for (row, y) in (r.1..r.1 + r.3).enumerate() {
         let at = y as usize * stride + r.0 as usize * 4;
@@ -532,6 +574,7 @@ fn overlap(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
 }
 fn transfer(pixels: &mut Pixmap, r: Rect, data: &[u8], damage: &[Rect], inside: bool) {
+    let mut restored = 0;
     let stride = pixels.width() as usize * 4;
     for (row, y) in (r.1..r.1 + r.3).enumerate() {
         let at = y as usize * stride + r.0 as usize * 4;
@@ -544,11 +587,114 @@ fn transfer(pixels: &mut Pixmap, r: Rect, data: &[u8], damage: &[Rect], inside: 
         {
             let (start, end) = if inside { (a, b) } else { (left, a) };
             pixels.data_mut()[at + start..at + end].copy_from_slice(&data[src + start..src + end]);
+            restored += (end - start) as u64;
             left = b;
         }
     }
+    crate::perf_trace::count(crate::perf_trace::Count::RestoreBytes, restored);
 }
 impl PreparedFrame {
+    fn reserve_navigation_bounds(&mut self, index: usize, required: Rect) {
+        if self.ink_cache.screen != Some(self.screen) {
+            return;
+        }
+        let Some(entry) = self.ink_cache.entries.get(index) else {
+            return;
+        };
+        let old = entry.bounds;
+        if inside(old, required) {
+            return;
+        }
+        let bounds = union(old, required);
+        let bytes = (bounds.2 * bounds.3 * 4) as usize;
+        if self.ink_cache.active_bytes() + bytes * 2 > ACTIVE_LIMIT {
+            return;
+        }
+        self.ink_cache.admit_active(bytes * 2);
+        let saved = capture(&self.pixels, bounds);
+        // Undo only this region in reverse paint order to recover the expanded underlay.
+        // The presentation and all other retained entries stay unchanged during idle work.
+        for entry in self.ink_cache.entries[index..].iter().rev() {
+            if !entry.before.is_empty() && overlap(entry.bounds, bounds) {
+                transfer(
+                    &mut self.pixels,
+                    entry.bounds,
+                    &entry.before,
+                    &[bounds],
+                    true,
+                );
+            }
+        }
+        let before = capture(&self.pixels, bounds);
+        restore(&mut self.pixels, bounds, &saved);
+        self.ink_cache.entries[index].bounds = bounds;
+        self.ink_cache.entries[index].before = before;
+    }
+    pub(in crate::theme::render) fn prewarm_ink_navigation(
+        &mut self,
+        c: &Component,
+        input: &FrameInputs,
+        part: &NavigationRasterPart,
+    ) -> Result<()> {
+        let mut row_component;
+        let row_input;
+        let (c, input) = if let NavigationRasterPart::InkListRow(index) = *part {
+            row_component = c.clone();
+            row_component.rect = Rect(
+                c.rect.0,
+                c.rect.1 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap()),
+                c.rect.2,
+                c.item_extent.unwrap(),
+            );
+            row_component.visible_count = Some(1);
+            row_input = row_model(c, input, index);
+            (&row_component, &row_input)
+        } else {
+            (c, input)
+        };
+        let rows = c
+            .binding
+            .and_then(|b| input.rows.get(&b))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let bounds = match *part {
+            NavigationRasterPart::InkShelfRow(index) => {
+                self.ink_shelf_bounds(c, &rows[index], index)
+            }
+            NavigationRasterPart::InkPeek if !rows.is_empty() => {
+                self.ink_shelf_bounds(c, rows.last().unwrap(), rows.len())
+            }
+            NavigationRasterPart::InkPeek => return Ok(()),
+            _ => effects::paint_bounds(c),
+        };
+        let operation = self.ink_cache.plan.as_ref().and_then(|plan| {
+            plan.operations.iter().position(|op| {
+                op.component.id == c.id
+                    && match (&op.paint, part) {
+                        (Paint::ShelfCard(a), NavigationRasterPart::InkShelfRow(b)) => a == b,
+                        (Paint::ShelfPeek, NavigationRasterPart::InkPeek) => true,
+                        _ => false,
+                    }
+            })
+        });
+        if let Some(index) = operation {
+            self.reserve_navigation_bounds(index, bounds);
+        }
+        let saved = capture(&self.pixels, bounds);
+        let targets = self.targets.len();
+        let text = self.text_boxes.len();
+        let result = match *part {
+            NavigationRasterPart::InkShelfRow(index) => {
+                self.ink_shelf(c, &rows[index], index, input, 1.0)
+            }
+            NavigationRasterPart::InkPeek => self.ink_shelf_peek(c, rows, input),
+            _ => self.ink_paint_component(c, input),
+        };
+        restore(&mut self.pixels, bounds, &saved);
+        self.targets.truncate(targets);
+        self.text_boxes.truncate(text);
+        result
+    }
     pub(in crate::theme::render) fn prewarm_ink_hero(
         &mut self,
         input: &FrameInputs,
@@ -571,7 +717,7 @@ impl PreparedFrame {
             group.push(c.clone());
         }
         if group.len() == 1 {
-            return Ok(());
+            return self.prewarm_ink_navigation(hero, input, &NavigationRasterPart::InkComponent);
         }
         let Some(entry) = self
             .ink_cache
@@ -671,97 +817,118 @@ impl PreparedFrame {
         if self.ink_cache.declined.contains(&input.screen) {
             self.ink_cache.screen = None;
             self.ink_cache.entries.clear();
+            self.ink_cache.plan = None;
             self.ink_cache.opaque_base = false;
             return self.render_ink_uncached(input, components);
         }
-        let mut operations = Vec::new();
-        let mut pending = components.iter().peekable();
-        while let Some(c) = pending.next() {
-            let rows = c.binding.and_then(|binding| input.rows.get(&binding));
-            if c.kind == Kind::Image
-                && c.binding == Some(Binding::SelectedHero)
-                && c.paint.as_ref().unwrap().action.is_none()
-            {
-                let mut group = vec![c.clone()];
-                let mut bounds = effects::paint_bounds(c);
-                while pending.peek().is_some_and(|next| {
-                    next.kind == Kind::Overlay
-                        && next.binding.is_none()
-                        && next.paint.as_ref().unwrap().gradient.is_some()
-                }) {
-                    let next = pending.next().unwrap();
-                    bounds = union(bounds, effects::paint_bounds(next));
-                    group.push(next.clone());
-                }
-                let paint = if group.len() > 1 {
-                    Paint::Hero(group)
-                } else {
-                    Paint::Component
-                };
-                operations.push(Operation {
-                    component: c.clone(),
-                    input: std::borrow::Cow::Borrowed(input),
-                    bounds,
-                    paint,
-                });
-            } else if matches!(c.kind, Kind::Entries | Kind::SettingsRows)
-                && matches!(c.layout, Some(Arrangement::List | Arrangement::Shelf))
-                && c.paint.as_ref().unwrap().opacity.unwrap_or(1.0) == 1.0
-                && rows.is_some_and(|rows| !rows.is_empty())
-            {
-                let rows = rows.unwrap();
-                for (index, row) in rows
-                    .iter()
-                    .take(c.visible_count.unwrap_or(16) as usize)
-                    .enumerate()
+        let plan_matches = self.ink_cache.plan.as_ref().is_some_and(|plan| {
+            plan.screen == input.screen
+                && plan.components == components
+                && plan.rows.iter().all(|(binding, rows)| {
+                    input.rows.get(binding).map(Vec::as_slice).unwrap_or(&[]) == rows
+                })
+        });
+        let operations = if plan_matches {
+            self.ink_cache.plan.as_ref().unwrap().operations.clone()
+        } else {
+            crate::perf_trace::count(crate::perf_trace::Count::PlanBuilds, 1);
+            let mut operations = Vec::new();
+            let mut pending = components.iter().peekable();
+            while let Some(c) = pending.next() {
+                let rows = c.binding.and_then(|binding| input.rows.get(&binding));
+                if c.kind == Kind::Image
+                    && c.binding == Some(Binding::SelectedHero)
+                    && c.paint.as_ref().unwrap().action.is_none()
                 {
-                    let mut part = c.clone();
-                    let (bounds, paint) = if c.layout == Some(Arrangement::Shelf) {
-                        (
-                            self.ink_shelf_bounds(c, row, index),
-                            Paint::ShelfCard(index),
-                        )
+                    let mut group = vec![c.clone()];
+                    let mut bounds = effects::paint_bounds(c);
+                    while pending.peek().is_some_and(|next| {
+                        next.kind == Kind::Overlay
+                            && next.binding.is_none()
+                            && next.paint.as_ref().unwrap().gradient.is_some()
+                    }) {
+                        let next = pending.next().unwrap();
+                        bounds = union(bounds, effects::paint_bounds(next));
+                        group.push(next.clone());
+                    }
+                    let paint = if group.len() > 1 {
+                        Paint::Hero(group)
                     } else {
-                        part.rect = Rect(
-                            c.rect.0,
-                            c.rect.1 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap()),
-                            c.rect.2,
-                            c.item_extent.unwrap(),
-                        );
-                        part.visible_count = Some(1);
-                        (effects::paint_bounds(&part), Paint::Component)
+                        Paint::Component
                     };
-                    let mut model = input.clone();
-                    model.rows.insert(c.binding.unwrap(), vec![row.clone()]);
-                    model.art.next_cover = None;
                     operations.push(Operation {
-                        component: part,
-                        input: std::borrow::Cow::Owned(model),
+                        component: c.clone(),
+                        row: None,
                         bounds,
                         paint,
                     });
-                }
-                if c.layout == Some(Arrangement::Shelf) && c.paint.as_ref().unwrap().peek.is_some()
+                } else if matches!(c.kind, Kind::Entries | Kind::SettingsRows)
+                    && matches!(c.layout, Some(Arrangement::List | Arrangement::Shelf))
+                    && c.paint.as_ref().unwrap().opacity.unwrap_or(1.0) == 1.0
+                    && rows.is_some_and(|rows| !rows.is_empty())
                 {
-                    let mut model = input.clone();
-                    model.focus = Default::default();
-                    model.selected.clear();
+                    let rows = rows.unwrap();
+                    for (index, row) in rows
+                        .iter()
+                        .take(c.visible_count.unwrap_or(16) as usize)
+                        .enumerate()
+                    {
+                        let mut part = c.clone();
+                        let (bounds, paint) = if c.layout == Some(Arrangement::Shelf) {
+                            (
+                                self.ink_shelf_bounds(c, row, index),
+                                Paint::ShelfCard(index),
+                            )
+                        } else {
+                            part.rect = Rect(
+                                c.rect.0,
+                                c.rect.1 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap()),
+                                c.rect.2,
+                                c.item_extent.unwrap(),
+                            );
+                            part.visible_count = Some(1);
+                            (effects::paint_bounds(&part), Paint::Component)
+                        };
+                        operations.push(Operation {
+                            component: part,
+                            row: Some(index),
+                            bounds,
+                            paint,
+                        });
+                    }
+                    if c.layout == Some(Arrangement::Shelf)
+                        && c.paint.as_ref().unwrap().peek.is_some()
+                    {
+                        operations.push(Operation {
+                            component: c.clone(),
+                            row: None,
+                            bounds: self.ink_shelf_bounds(c, rows.last().unwrap(), rows.len()),
+                            paint: Paint::ShelfPeek,
+                        });
+                    }
+                } else {
                     operations.push(Operation {
                         component: c.clone(),
-                        input: std::borrow::Cow::Owned(model),
-                        bounds: self.ink_shelf_bounds(c, rows.last().unwrap(), rows.len()),
-                        paint: Paint::ShelfPeek,
+                        row: None,
+                        bounds: effects::paint_bounds(c),
+                        paint: Paint::Component,
                     });
                 }
-            } else {
-                operations.push(Operation {
-                    component: c.clone(),
-                    input: std::borrow::Cow::Borrowed(input),
-                    bounds: effects::paint_bounds(c),
-                    paint: Paint::Component,
-                });
             }
-        }
+            let operations = Arc::new(operations);
+            self.ink_cache.plan = Some(OperationPlan {
+                screen: input.screen,
+                components: components.to_vec(),
+                rows: components
+                    .iter()
+                    .filter(|c| matches!(c.kind, Kind::Entries | Kind::SettingsRows))
+                    .filter_map(|c| c.binding)
+                    .map(|b| (b, input.rows.get(&b).cloned().unwrap_or_default()))
+                    .collect(),
+                operations: operations.clone(),
+            });
+            operations
+        };
         let underlay_bytes = operations
             .iter()
             .enumerate()
@@ -789,6 +956,7 @@ impl PreparedFrame {
             self.ink_cache.declined.push(input.screen);
             self.ink_cache.screen = None;
             self.ink_cache.entries.clear();
+            self.ink_cache.plan = None;
             self.ink_cache.opaque_base = false;
             return self.render_ink_uncached(input, components);
         }
@@ -821,8 +989,19 @@ impl PreparedFrame {
             && cache
                 .entries
                 .iter()
-                .zip(&operations)
-                .all(|(a, op)| a.component == op.component && a.bounds == op.bounds);
+                .zip(operations.iter())
+                .all(|(a, op)| a.component == op.component && inside(a.bounds, op.bounds));
+        let scratch_bytes = if incremental {
+            cache
+                .entries
+                .iter()
+                .map(|entry| (entry.bounds.2 * entry.bounds.3 * 4) as usize)
+                .max()
+                .unwrap_or(0)
+                .max(scratch_bytes)
+        } else {
+            scratch_bytes
+        };
         self.targets.clear();
         self.text_boxes.clear();
         self.damage.clear();
@@ -844,8 +1023,18 @@ impl PreparedFrame {
         });
         for (index, op) in operations.iter().enumerate() {
             let c = &op.component;
-            let input = op.input.as_ref();
-            let r = op.bounds;
+            let row_input;
+            let input = if let Some(index) = op.row {
+                row_input = row_model(c, input, index);
+                &row_input
+            } else {
+                input
+            };
+            let r = if incremental {
+                cache.entries[index].bounds
+            } else {
+                op.bounds
+            };
             let mut deps = dependencies(c, input);
             if matches!(op.paint, Paint::ShelfCard(_)) {
                 deps.art.next_cover = None;
@@ -954,5 +1143,40 @@ impl PreparedFrame {
         }
         self.ink_cache = cache;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod navigation_plan_tests {
+    use super::*;
+    use crate::theme::render_navigation::tests::{arts, model, theme};
+
+    #[test]
+    fn navigation_plan_reuses_descriptors_on_focus_and_clock_changes() {
+        let theme = theme("orbit-hero", "square");
+        let arts = arts();
+        let mut input = model(&theme, ScreenId::Library, 0, &arts);
+        let frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        let components = frame.ink_components.as_ref().unwrap().2.clone();
+        let operations = frame.ink_cache.plan.as_ref().unwrap().operations.clone();
+        input.focus.item = Some("1".into());
+        input.status.clock = Some("12:35".into());
+        let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+        assert!(Arc::ptr_eq(
+            &components,
+            &frame.ink_components.as_ref().unwrap().2
+        ));
+        assert!(Arc::ptr_eq(
+            &operations,
+            &frame.ink_cache.plan.as_ref().unwrap().operations
+        ));
+        input.rows.get_mut(&Binding::Entries).unwrap()[0].label = "Different caption width".into();
+        let frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &operations,
+            &frame.ink_cache.plan.as_ref().unwrap().operations
+        ));
+        let fresh = crate::theme::render::navigation_reference(theme, &input).unwrap();
+        assert_eq!(frame.pixels().data(), fresh.pixels().data());
     }
 }

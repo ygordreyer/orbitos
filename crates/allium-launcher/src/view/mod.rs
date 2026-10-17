@@ -1,4 +1,5 @@
 mod app;
+mod art_queue;
 mod apps;
 pub(crate) mod details;
 pub(crate) mod disc_picker;

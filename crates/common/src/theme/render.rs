@@ -20,12 +20,12 @@ use anyhow::{Result, ensure};
 use tiny_skia::Pixmap;
 use tiny_skia::{PixmapPaint, Transform};
 
+#[path = "ink_blit.rs"]
+mod ink_blit;
 #[path = "render_retained.rs"]
 mod retained;
 #[path = "render_tiles.rs"]
 mod tiles;
-#[path = "ink_blit.rs"]
-mod ink_blit;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -46,6 +46,8 @@ pub struct PreparedFrame {
     tiles: tiles::Cache,
     ink_cache: ink_renderer::retained::Cache,
     damage: Vec<Rect>,
+    navigation_epoch: std::sync::Arc<()>,
+    ink_components: Option<(ScreenId, bool, std::sync::Arc<Vec<Component>>)>,
     pub targets: Vec<Target>,
     pub text_boxes: Vec<(String, Rect)>,
 }
@@ -76,17 +78,16 @@ fn changed_runs(source: &[u8], target: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
-enum NavigationRasterPart {
-    Hero,
-    Title,
-    ShelfRow(usize),
-    Peek,
+#[cfg(test)]
+pub(super) fn navigation_reference(
+    theme: ThemeHandle,
+    input: &FrameInputs,
+) -> Result<PreparedFrame> {
+    ink_renderer::uncached(|| PreparedFrame::prepare(theme, input))
 }
-pub struct NavigationRasterWarm {
-    component: Component,
-    input: FrameInputs,
-    part: NavigationRasterPart,
-}
+
+use super::render_navigation::NavigationRasterPart;
+pub use super::render_navigation::{NavigationImageWarm, NavigationRasterWarm, NavigationStamp};
 fn shelf_tile_rect(c: &Component, x: u32) -> Rect {
     Rect(
         x.saturating_sub(4),
@@ -96,19 +97,36 @@ fn shelf_tile_rect(c: &Component, x: u32) -> Rect {
     )
 }
 
-pub struct NavigationImageWarm {
-    component: Component,
-    source: std::sync::Arc<Pixmap>,
-    rect: Rect,
-    radius: u32,
-}
-
 impl PreparedFrame {
     pub fn screen(&self) -> ScreenId {
         self.screen
     }
     pub fn can_prewarm_navigation(&self) -> bool {
-        self.retained_layout && self.screen == ScreenId::Library
+        (self.retained_layout || self.theme.pack().ink())
+            && matches!(self.screen, ScreenId::Library | ScreenId::Recents)
+            && self
+                .previous_input
+                .as_ref()
+                .is_some_and(|saved| retained::eligible(&saved.model))
+    }
+    pub fn has_retained_inputs(&self) -> bool {
+        self.previous_input.is_some()
+    }
+    pub fn input_matches(&self, input: &FrameInputs) -> bool {
+        self.previous_input
+            .as_ref()
+            .is_some_and(|saved| retained::matches(saved, input))
+    }
+    pub fn navigation_theme_matches(&self, theme: &ThemeHandle) -> bool {
+        self.theme.weak().ptr_eq(&theme.weak()) && self.theme.generation() == theme.generation()
+    }
+    pub fn navigation_stamp(&self) -> NavigationStamp {
+        NavigationStamp(std::sync::Arc::downgrade(&self.navigation_epoch))
+    }
+    pub fn navigation_is_current(&self, stamp: &NavigationStamp) -> bool {
+        stamp
+            .0
+            .ptr_eq(&std::sync::Arc::downgrade(&self.navigation_epoch))
     }
     pub fn navigation_model(&self) -> Option<FrameInputs> {
         self.can_prewarm_navigation()
@@ -120,16 +138,22 @@ impl PreparedFrame {
         input: &FrameInputs,
     ) -> std::collections::VecDeque<NavigationImageWarm> {
         let mut work = std::collections::VecDeque::new();
+        // Ink transforms depend on shape, focus scale, logo aspect ratio and preview blur.
+        // Warm them through the actual ink paint operations instead of guessing geometry.
+        if self.theme.pack().ink() {
+            return work;
+        }
         for c in &self.theme.pack().screens[&self.screen].components {
             match c.kind {
                 Kind::Image if c.binding != Some(Binding::NextCover) => {
-                    let source = if c.binding == Some(Binding::SelectedHero) {
-                        input.art.selected_hero.as_ref()
-                    } else {
-                        input.art.selected_cover.as_ref()
+                    let source = match c.binding {
+                        Some(Binding::SelectedHero) => input.art.selected_hero.as_ref(),
+                        Some(Binding::SelectedLogo) => input.art.selected_logo.as_ref(),
+                        _ => input.art.selected_cover.as_ref(),
                     };
                     if let Some(source) = source {
                         work.push_back(NavigationImageWarm {
+                            stamp: self.navigation_stamp(),
                             component: c.clone(),
                             source: source.clone(),
                             rect: c.rect,
@@ -151,6 +175,7 @@ impl PreparedFrame {
                         .chain(input.art.next_cover.iter())
                     {
                         work.push_back(NavigationImageWarm {
+                            stamp: self.navigation_stamp(),
                             component: c.clone(),
                             source: source.clone(),
                             rect: Rect(0, 0, art, art),
@@ -164,6 +189,9 @@ impl PreparedFrame {
         work
     }
     pub fn prewarm_navigation_image(&self, work: NavigationImageWarm) -> Result<()> {
+        if !self.navigation_is_current(&work.stamp) {
+            return Ok(());
+        }
         self.image_pixels_with_radius(work.rect, &work.source, &work.component, work.radius)?;
         Ok(())
     }
@@ -172,40 +200,84 @@ impl PreparedFrame {
         input: &FrameInputs,
     ) -> std::collections::VecDeque<NavigationRasterWarm> {
         let mut work = std::collections::VecDeque::new();
-        for c in &self.theme.pack().screens[&self.screen].components {
-            if self.theme.pack().ink() && c.kind == Kind::Image && c.binding == Some(Binding::SelectedHero) {
-                work.push_back(NavigationRasterWarm { component: c.clone(), input: input.clone(), part: NavigationRasterPart::Hero });
-            }
-            if c.kind == Kind::Text && c.binding == Some(Binding::SelectedTitle) {
+        let input = std::sync::Arc::new(input.clone());
+        let components = self
+            .ink_components
+            .as_ref()
+            .map(|(_, _, plan)| plan.as_slice())
+            .unwrap_or(&self.theme.pack().screens[&self.screen].components);
+        for c in components {
+            let mut add = |part| {
                 work.push_back(NavigationRasterWarm {
+                    stamp: self.navigation_stamp(),
                     component: c.clone(),
                     input: input.clone(),
-                    part: NavigationRasterPart::Title,
-                });
-            }
-            if c.kind == Kind::Entries && c.layout == Some(Arrangement::Shelf) {
-                for index in 0..input.rows.get(&c.binding.unwrap()).map_or(0, Vec::len) {
-                    work.push_back(NavigationRasterWarm {
-                        component: c.clone(),
-                        input: input.clone(),
-                        part: NavigationRasterPart::ShelfRow(index),
-                    });
+                    part,
+                })
+            };
+            if self.theme.pack().ink() {
+                match c.kind {
+                    Kind::Image if c.binding == Some(Binding::SelectedHero) => {
+                        add(NavigationRasterPart::Hero)
+                    }
+                    Kind::Text | Kind::Image => add(NavigationRasterPart::InkComponent),
+                    Kind::Entries if c.layout == Some(Arrangement::Shelf) => {
+                        for index in 0..input
+                            .rows
+                            .get(&c.binding.unwrap())
+                            .map_or(0, Vec::len)
+                            .min(c.visible_count.unwrap_or(16) as usize)
+                        {
+                            add(NavigationRasterPart::InkShelfRow(index));
+                        }
+                        add(NavigationRasterPart::InkPeek);
+                    }
+                    Kind::Entries if c.layout == Some(Arrangement::List) => {
+                        for index in 0..input
+                            .rows
+                            .get(&c.binding.unwrap())
+                            .map_or(0, Vec::len)
+                            .min(c.visible_count.unwrap_or(16) as usize)
+                        {
+                            add(NavigationRasterPart::InkListRow(index));
+                        }
+                    }
+                    _ => {}
                 }
-                work.push_back(NavigationRasterWarm {
-                    component: c.clone(),
-                    input: input.clone(),
-                    part: NavigationRasterPart::Peek,
-                });
+            } else {
+                if c.kind == Kind::Text && (c.binding == Some(Binding::SelectedTitle) || c.logo) {
+                    add(NavigationRasterPart::Title);
+                }
+                if c.kind == Kind::Entries && c.layout == Some(Arrangement::Shelf) {
+                    for index in 0..input.rows.get(&c.binding.unwrap()).map_or(0, Vec::len) {
+                        add(NavigationRasterPart::ShelfRow(index));
+                    }
+                    add(NavigationRasterPart::Peek);
+                }
             }
         }
         work
     }
+    /// Runs one cache operation on the calling (UI) thread, preserving presentation state.
     pub fn prewarm_navigation_raster(&mut self, work: NavigationRasterWarm) -> Result<()> {
+        if !self.navigation_is_current(&work.stamp) {
+            return Ok(());
+        }
         let c = &work.component;
-        if matches!(work.part, NavigationRasterPart::Hero) { return self.prewarm_ink_hero(&work.input, c); }
+        if matches!(work.part, NavigationRasterPart::Hero) {
+            return self.prewarm_ink_hero(&work.input, c);
+        }
+        if matches!(
+            work.part,
+            NavigationRasterPart::InkComponent
+                | NavigationRasterPart::InkShelfRow(_)
+                | NavigationRasterPart::InkListRow(_)
+                | NavigationRasterPart::InkPeek
+        ) {
+            return self.prewarm_ink_navigation(c, &work.input, &work.part);
+        }
         let x = |index: usize| c.rect.0 + index as u32 * (c.item_extent.unwrap() + c.gap.unwrap());
         let rect = match work.part {
-            NavigationRasterPart::Hero => unreachable!(),
             NavigationRasterPart::Title => c.rect,
             NavigationRasterPart::ShelfRow(index) => shelf_tile_rect(c, x(index)),
             NavigationRasterPart::Peek => {
@@ -217,6 +289,7 @@ impl PreparedFrame {
                     c.item_extent.unwrap(),
                 )
             }
+            _ => unreachable!(),
         };
         let stride = self.pixels.width() as usize * 4;
         let row_bytes = rect.2 as usize * 4;
@@ -228,7 +301,6 @@ impl PreparedFrame {
         let targets = self.targets.len();
         let text_boxes = self.text_boxes.len();
         let result = match work.part {
-            NavigationRasterPart::Hero => unreachable!(),
             NavigationRasterPart::Title => self.component(c, &work.input),
             NavigationRasterPart::ShelfRow(index) => self.shelf_entry(
                 c,
@@ -237,8 +309,8 @@ impl PreparedFrame {
                 &work.input,
             ),
             NavigationRasterPart::Peek => self.cover_peek(c, &work.input),
+            _ => unreachable!(),
         };
-        // Restore presentation state even when cache preparation fails.
         for (row, y) in (rect.1..rect.1 + rect.3).enumerate() {
             let at = y as usize * stride + rect.0 as usize * 4;
             self.pixels.data_mut()[at..at + row_bytes]
@@ -261,6 +333,9 @@ impl PreparedFrame {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
         #[cfg(feature = "perf-bench")]
         crate::perf::hit(crate::perf::Op::Frame);
+        if previous.is_none() {
+            crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+        }
         let mut result = previous.unwrap_or_else(|| Self {
             theme: theme.clone(),
             screen: input.screen,
@@ -273,14 +348,20 @@ impl PreparedFrame {
             tiles: Default::default(),
             ink_cache: Default::default(),
             damage: vec![],
+            navigation_epoch: std::sync::Arc::new(()),
+            ink_components: None,
             targets: vec![],
             text_boxes: vec![],
         });
+        // Reuse the token allocation when no speculative work holds a weak stamp.
+        // make_mut dissociates outstanding weak stamps before this model can be displayed.
+        std::sync::Arc::make_mut(&mut result.navigation_epoch);
         let same_theme = result.theme.weak().ptr_eq(&theme.weak())
             && result.theme.generation() == theme.generation();
         if !same_theme {
             result.tiles = Default::default();
             result.ink_cache = Default::default();
+            result.ink_components = None;
         }
         if !same_theme || result.previous_input.is_none() || result.screen != input.screen {
             result.retained_layout = retained::supported_screen(&theme, input.screen);
@@ -303,13 +384,19 @@ impl PreparedFrame {
         } else {
             "initial_or_theme_change"
         });
-        if result.theme.pack().ink() { result.render_ink(input)?; } else { result.render_components(input, incremental)?; }
+        if result.theme.pack().ink() {
+            result.render_ink(input)?;
+        } else {
+            result.render_components(input, incremental)?;
+        }
         let retained_opaque_ink = result.theme.pack().ink() && result.ink_cache.opaque_base;
         if !eligible && !retained_opaque_ink {
             crate::perf_trace::count(crate::perf_trace::Count::ScannedPixels, 640 * 480);
         }
-        result.previous_input = eligible.then(|| retained::capture(input));
-        result.opaque = retained_opaque_ink || eligible
+        result.previous_input =
+            (eligible || result.theme.pack().ink()).then(|| retained::capture(input));
+        result.opaque = retained_opaque_ink
+            || eligible
             || result
                 .pixels
                 .pixels()
@@ -502,6 +589,7 @@ impl PreparedFrame {
             "Prepared text pixel workspace exceeds budget"
         );
         super::text_cache::reserve(rect.2, rect.3, &cache_key.text_value());
+        crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
         let mut scratch =
             Pixmap::new(rect.2, rect.3).ok_or_else(|| anyhow::anyhow!("Invalid text box"))?;
         for (i, line) in wrapped.iter().enumerate() {
@@ -620,6 +708,7 @@ impl PreparedFrame {
             super::runtime::alpha_mask(&mut image, mask)?;
         }
         if let Some(background) = background {
+            crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
             let mut opaque = Pixmap::new(rect.2, rect.3).unwrap();
             opaque.fill(tiny_skia::Color::from_rgba8(
                 background[0],
@@ -674,7 +763,13 @@ impl PreparedFrame {
     fn draw_image(&mut self, rect: Rect, image: &std::sync::Arc<Pixmap>) {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Artwork);
         if self.theme.pack().ink() && !ink_blit::reference() {
-            ink_renderer::bitmap(&mut self.pixels, rect.0 as i32, rect.1 as i32, image.as_ref().as_ref(), false);
+            ink_renderer::bitmap(
+                &mut self.pixels,
+                rect.0 as i32,
+                rect.1 as i32,
+                image.as_ref().as_ref(),
+                false,
+            );
             return;
         }
         super::blit::draw_cached(
@@ -686,17 +781,28 @@ impl PreparedFrame {
         );
     }
     fn logo(&mut self, c: &Component, input: &FrameInputs) -> Result<bool> {
-        let Some(source) = input.art.selected_logo.as_ref() else { return Ok(false); };
-        let scale = (c.rect.2 as f32 / source.width() as f32).min(c.rect.3 as f32 / source.height() as f32);
+        let Some(source) = input.art.selected_logo.as_ref() else {
+            return Ok(false);
+        };
+        let scale =
+            (c.rect.2 as f32 / source.width() as f32).min(c.rect.3 as f32 / source.height() as f32);
         let width = (source.width() as f32 * scale).round().max(1.0) as u32;
         let height = (source.height() as f32 * scale).round().max(1.0) as u32;
-        let align = c.align.or_else(|| c.paint.as_ref().and_then(|p| p.anchor)).unwrap_or(Align::Left);
-        let x = c.rect.0 + match align { Align::Left => 0, Align::Center => (c.rect.2-width)/2, Align::Right => c.rect.2-width };
-        let rect = Rect(x, c.rect.1 + (c.rect.3-height)/2, width, height);
-        let mut slot=c.clone();
-        slot.fit=Some(super::pack::Fit::Contain);
-        slot.radius=Some(0);
-        let pixels=self.image_pixels(rect, source, &slot)?;
+        let align = c
+            .align
+            .or_else(|| c.paint.as_ref().and_then(|p| p.anchor))
+            .unwrap_or(Align::Left);
+        let x = c.rect.0
+            + match align {
+                Align::Left => 0,
+                Align::Center => (c.rect.2 - width) / 2,
+                Align::Right => c.rect.2 - width,
+            };
+        let rect = Rect(x, c.rect.1 + (c.rect.3 - height) / 2, width, height);
+        let mut slot = c.clone();
+        slot.fit = Some(super::pack::Fit::Contain);
+        slot.radius = Some(0);
+        let pixels = self.image_pixels(rect, source, &slot)?;
         self.draw_image(rect, &pixels);
         Ok(true)
     }
@@ -706,7 +812,9 @@ impl PreparedFrame {
                 self.panel(c.rect, c.color.unwrap(), c.radius.unwrap())
             }
             Kind::Text => {
-                if c.logo && self.logo(c, input)? { return Ok(()); }
+                if c.logo && self.logo(c, input)? {
+                    return Ok(());
+                }
                 let value = if c.binding == Some(Binding::ThemeName) {
                     self.theme.pack().name.clone()
                 } else {
@@ -1417,6 +1525,11 @@ impl PreparedFrame {
             crate::perf_trace::Count::ComposedPixels,
             rect.2 as u64 * rect.3 as u64,
         );
+        crate::perf_trace::count(
+            crate::perf_trace::Count::OpacityPixels,
+            pixels.width().min(self.pixels.width().saturating_sub(x)) as u64
+                * pixels.height().min(self.pixels.height().saturating_sub(c.rect.1)) as u64,
+        );
         self.pixels.as_mut().draw_pixmap(
             x as i32,
             c.rect.1 as i32,
@@ -1765,6 +1878,8 @@ mod tests {
             tiles: Default::default(),
             ink_cache: Default::default(),
             damage: vec![],
+            navigation_epoch: std::sync::Arc::new(()),
+            ink_components: None,
             targets: vec![],
             text_boxes: vec![],
         };
@@ -2052,8 +2167,14 @@ mod tests {
 #[path = "render_ink.rs"]
 mod ink_renderer;
 
-pub use ink_renderer::{InkTextLayout, ink_text_layout, ink_detail_pages};
+pub use ink_renderer::{InkTextLayout, ink_detail_pages, ink_text_layout};
 
 #[cfg(all(test, feature = "perf-bench"))]
 #[path = "render_selection_bench.rs"]
 mod selection_bench;
+
+#[cfg(feature = "perf-bench")]
+#[doc(hidden)]
+pub fn benchmark_blit(dest: &mut tiny_skia::PixmapMut<'_>, x: i32, y: i32, source: tiny_skia::PixmapRef<'_>) {
+    ink_blit::draw(dest, x, y, source);
+}

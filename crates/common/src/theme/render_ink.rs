@@ -216,6 +216,7 @@ struct CachedShelf {
     key: String,
     pixels: Arc<Pixmap>,
 }
+thread_local! { static PREVIEW_MASK: RefCell<Option<(tiny_skia::Mask, u32)>> = const { RefCell::new(None) }; }
 thread_local! { static SHELVES: RefCell<VecDeque<CachedShelf>> = const { RefCell::new(VecDeque::new()) }; }
 struct CachedText {
     theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
@@ -302,7 +303,9 @@ fn check_ink_dimensions(width: u32, height: u32) -> Result<()> {
 }
 fn ink_pixmap(width: u32, height: u32) -> Result<Pixmap> {
     check_ink_dimensions(width, height)?;
-    Pixmap::new(width, height).ok_or_else(|| anyhow::anyhow!("Invalid ink box"))
+    let pixels = Pixmap::new(width, height).ok_or_else(|| anyhow::anyhow!("Invalid ink box"))?;
+    crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+    Ok(pixels)
 }
 fn inside(a: Rect, b: Rect) -> bool {
     b.0 >= a.0 && b.1 >= a.1 && b.0 + b.2 <= a.0 + a.2 && b.1 + b.3 <= a.1 + a.3
@@ -686,20 +689,43 @@ impl PreparedFrame {
         }
     }
     pub(super) fn render_ink(&mut self, input: &FrameInputs) -> Result<()> {
-        let mut components = self.theme.pack().screens[&input.screen].components.clone();
         let state = primary_binding(input.screen)
             .and_then(|b| input.rows.get(&b))
             .is_some_and(|r| r.iter().any(|r| !r.label.is_empty()));
-        components.retain(|c| {
-            c.paint
-                .as_ref()
-                .unwrap()
-                .when
-                .as_deref()
-                .is_none_or(|w| (w == "populated") == state)
+        let dynamic_layout = self.theme.pack().screens[&input.screen]
+            .components
+            .iter()
+            .any(|c| {
+                c.paint
+                    .as_ref()
+                    .is_some_and(|p| p.fit_content || p.collapse_empty)
+            });
+        let cached = self
+            .ink_components
+            .as_ref()
+            .filter(|(screen, populated, _)| {
+                *screen == input.screen
+                    && *populated == state
+                    && !input.screen.is_dialog()
+                    && !dynamic_layout
+            })
+            .map(|(_, _, plan)| plan.clone());
+        let components = cached.unwrap_or_else(|| {
+            let mut components = self.theme.pack().screens[&input.screen].components.clone();
+            components.retain(|c| {
+                c.paint
+                    .as_ref()
+                    .unwrap()
+                    .when
+                    .as_deref()
+                    .is_none_or(|w| (w == "populated") == state)
+            });
+            self.ink_empty_stack(&mut components);
+            self.ink_fit_dialog(&mut components, input);
+            let components = Arc::new(components);
+            self.ink_components = Some((input.screen, state, components.clone()));
+            components
         });
-        self.ink_empty_stack(&mut components);
-        self.ink_fit_dialog(&mut components, input);
         #[cfg(test)]
         if UNCACHED.get() || std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {
             return self.render_ink_uncached(input, &components);
@@ -724,7 +750,11 @@ impl PreparedFrame {
         }
         let bounds = effects::paint_bounds(c);
         let before = if opacity < 1.0 {
-            let mut v = vec![];
+            crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+            crate::perf_trace::count(
+                crate::perf_trace::Count::CaptureBytes, bounds.2 as u64 * bounds.3 as u64 * 4,
+            );
+            let mut v = Vec::with_capacity(bounds.2 as usize * bounds.3 as usize * 4);
             for y in bounds.1..bounds.1 + bounds.3 {
                 let at = ((y * 640 + bounds.0) * 4) as usize;
                 v.extend_from_slice(&self.pixels.data()[at..at + bounds.2 as usize * 4]);
@@ -735,6 +765,9 @@ impl PreparedFrame {
         };
         self.ink_component(c, input)?;
         if let Some(before) = before {
+            crate::perf_trace::count(
+                crate::perf_trace::Count::OpacityPixels, bounds.2 as u64 * bounds.3 as u64,
+            );
             let table = (!super::ink_blit::reference()).then(|| opacity_table(opacity));
             for (row, y) in (bounds.1..bounds.1 + bounds.3).enumerate() {
                 let at = ((y * 640 + bounds.0) * 4) as usize;
@@ -1556,8 +1589,7 @@ impl PreparedFrame {
         let dh = (tile.height() as f32 * scale).round() as u32;
         if scale != 1.0 {
             check_ink_dimensions(dw, dh)?;
-            tile =
-                crate::theme::runtime::fit_image(&tile, dw, dh, crate::theme::pack::Fit::Contain)?;
+            tile = fit_shelf_tile(tile, dw, dh)?;
         }
 
         let pixels = Arc::new(tile);
@@ -1598,9 +1630,9 @@ impl PreparedFrame {
                     value: String::new(),
                     enabled: false,
                 };
-                let mut model = input.clone();
+                let mut model = FrameInputs::new(input.screen);
                 let last = rows.last().and_then(|r| input.art.entries.get(&r.id));
-            let end = last.is_some_and(|last| Arc::ptr_eq(last, source));
+                let end = last.is_some_and(|last| Arc::ptr_eq(last, source));
                 model.art.entries.insert(row.id.clone(), source.clone());
                 self.ink_shelf(
                     c,
@@ -1711,34 +1743,40 @@ impl PreparedFrame {
         if opacity == 1.0 && !super::ink_blit::reference() {
             bitmap(&mut self.pixels, atx, aty, tile.as_ref().as_ref(), true);
         } else {
-            let mut mask = tiny_skia::Mask::new(640, 480).unwrap();
-            let path = tiny_skia::PathBuilder::from_rect(
-                tiny_skia::Rect::from_xywh(0.0, 0.0, 640.0, 480.0).unwrap(),
-            );
-            mask.fill_path(
-                &path,
-                tiny_skia::FillRule::Winding,
-                false,
-                Transform::identity(),
-            );
-            if preview {
-                for y in 0..480usize {
-                    let a = y * 640 + (x + width) as usize;
-                    let b = (y + 1) * 640;
-                    mask.data_mut()[a..b].fill(0);
+            PREVIEW_MASK.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                let (mask, previous_end) = scratch.get_or_insert_with(|| {
+                    let mut mask = tiny_skia::Mask::new(640, 480).unwrap();
+                    mask.data_mut().fill(255);
+                    crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+                    crate::perf_trace::count(crate::perf_trace::Count::PreviewMaskBytes, 640 * 480);
+                    (mask, 640)
+                });
+                let end = if preview { x + width } else { 640 };
+                if end != *previous_end {
+                    let first = end.min(*previous_end) as usize;
+                    let last = end.max(*previous_end) as usize;
+                    let alpha = if end < *previous_end { 0 } else { 255 };
+                    for row in mask.data_mut().chunks_exact_mut(640) {
+                        row[first..last].fill(alpha);
+                    }
+                    crate::perf_trace::count(
+                        crate::perf_trace::Count::PreviewMaskBytes, (last - first) as u64 * 480,
+                    );
+                    *previous_end = end;
                 }
-            }
-            self.pixels.draw_pixmap(
-                atx,
-                aty,
-                tile.as_ref().as_ref(),
-                &PixmapPaint {
-                    opacity,
-                    ..Default::default()
-                },
-                Transform::identity(),
-                Some(&mask),
-            );
+                self.pixels.draw_pixmap(
+                    atx,
+                    aty,
+                    tile.as_ref().as_ref(),
+                    &PixmapPaint {
+                        opacity,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    Some(mask),
+                );
+            });
         }
         let show = !preview
             && p.caption_mode.as_deref() != Some("none")
@@ -2466,6 +2504,13 @@ impl PreparedFrame {
         Ok(())
     }
 }
+fn fit_shelf_tile(tile: Pixmap, dw: u32, dh: u32) -> Result<Pixmap> {
+    if tile.width() == dw && tile.height() == dh {
+        return Ok(tile);
+    }
+    crate::theme::runtime::fit_image(&tile, dw, dh, crate::theme::pack::Fit::Contain)
+}
+
 fn primary_binding(screen: ScreenId) -> Option<Binding> {
     Some(match screen {
         ScreenId::SettingsRoot | ScreenId::SettingsPage => Binding::SettingsRows,
@@ -2522,6 +2567,57 @@ thread_local! { static GUIDE_GLYPH_VISITS: std::cell::Cell<usize> = const { std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_shelf_fit_keeps_allocation_and_pixels() {
+        let mut tile = Pixmap::new(140, 140).unwrap();
+        tile.fill(tiny_skia::Color::from_rgba8(12, 34, 56, 255));
+        let expected = tile.clone();
+        let address = tile.data().as_ptr();
+        let fitted = fit_shelf_tile(tile, 140, 140).unwrap();
+        assert_eq!(fitted.data().as_ptr(), address);
+        assert_eq!(fitted.data(), expected.data());
+        let resized = fit_shelf_tile(fitted, 70, 70).unwrap();
+        let reference =
+            crate::theme::runtime::fit_image(&expected, 70, 70, crate::theme::pack::Fit::Contain)
+                .unwrap();
+        assert_eq!(resized.data(), reference.data());
+    }
+
+    #[test]
+    #[ignore = "host identity shelf fit benchmark"]
+    fn benchmark_identity_shelf_fit() {
+        let mut samples = Vec::new();
+        let mut clones = Vec::new();
+        for _ in 0..7 {
+            let tiles: Vec<_> = (0..1_000).map(|_| Pixmap::new(140, 140).unwrap()).collect();
+            let start = std::time::Instant::now();
+            for tile in tiles {
+                std::hint::black_box(
+                    crate::theme::runtime::fit_image(
+                        std::hint::black_box(&tile),
+                        140,
+                        140,
+                        crate::theme::pack::Fit::Contain,
+                    )
+                    .unwrap(),
+                );
+            }
+            clones.push(start.elapsed().as_nanos());
+            let tiles: Vec<_> = (0..1_000).map(|_| Pixmap::new(140, 140).unwrap()).collect();
+            let start = std::time::Instant::now();
+            for tile in tiles {
+                std::hint::black_box(fit_shelf_tile(std::hint::black_box(tile), 140, 140).unwrap());
+            }
+            samples.push(start.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        clones.sort_unstable();
+        println!(
+            "TILE_BENCH n=1000 clone_median_ns={} move_median_ns={}",
+            clones[3], samples[3]
+        );
+    }
+
     fn previous_guide_line_len(layout: &InkTextLayout, value: &str, width: u32) -> usize {
         let end = value.find('\n').unwrap_or(value.len());
         let paragraph = &value[..end];
@@ -2896,5 +2992,67 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "perf-bench")]
+impl PreparedFrame {
+    #[doc(hidden)]
+    pub fn benchmark_shadow_reset(&mut self) {
+        effects::benchmark_clear_shadows();
+        self.pixels.data_mut().fill(0);
+    }
+    #[doc(hidden)]
+    pub fn benchmark_shadow(&mut self) {
+        self.ink_shadow(Rect(100, 100, 240, 160), 12, &crate::theme::ink::Shadow {
+            x: 2, y: 4, blur: 8, color: ColorRole::Focus, alpha: 0.5,
+        });
+        std::hint::black_box(self.pixels.data());
+    }
+}
+#[cfg(test)]
+mod counter_wiring_tests {
+    use super::*;
+    #[test]
+    fn ink_operations_count_allocations_resize_opacity_and_preview_mask() {
+        use crate::perf_trace::{self, Count};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..").canonicalize().unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(), &bank, 1).unwrap();
+        let input = FrameInputs::new(ScreenId::Library);
+        let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        let path = std::env::temp_dir().join(format!("allium-ink-counters-{}", std::process::id()));
+        perf_trace::start_probe(path.to_str().unwrap());
+        let count = |kind: Count| perf_trace::probe_counts()["measurement"]["frame"]["counters"][kind as usize].as_u64().unwrap();
+        perf_trace::begin_render();
+        let source = ink_pixmap(16, 16).unwrap();
+        assert_eq!(count(Count::Allocations), 1);
+        crate::theme::runtime::fit_image(&source, 16, 16, crate::theme::pack::Fit::Cover).unwrap();
+        assert_eq!(count(Count::ResizePixels), 0, "identity fit is a copy");
+        crate::theme::runtime::fit_image(&source, 8, 8, crate::theme::pack::Fit::Cover).unwrap();
+        assert_eq!(count(Count::ResizePixels), 64);
+        let mut c = theme.pack().screens[&ScreenId::Library].components.iter()
+            .find(|c| c.kind == Kind::Panel).unwrap().clone();
+        c.paint.as_mut().unwrap().opacity = Some(0.5);
+        let bounds = effects::paint_bounds(&c);
+        perf_trace::begin_render();
+        frame.ink_paint_component(&c, &input).unwrap();
+        assert_eq!(count(Count::CaptureBytes), bounds.2 as u64 * bounds.3 as u64 * 4);
+        assert_eq!(count(Count::OpacityPixels), bounds.2 as u64 * bounds.3 as u64);
+        let c = theme.pack().screens[&ScreenId::Library].components.iter()
+            .find(|c| c.layout == Some(Arrangement::Shelf)).unwrap();
+        let row = Row { id: "preview".into(), label: String::new(), subtitle: String::new(), value: String::new(), enabled: false };
+        let mut input = input;
+        input.art.entries.insert(row.id.clone(), Arc::new(source));
+        PREVIEW_MASK.with(|mask| *mask.borrow_mut() = None);
+        perf_trace::begin_render();
+        frame.ink_shelf(c, &row, 1, &input, 0.62).unwrap();
+        assert!(count(Count::PreviewMaskBytes) >= 640 * 480);
+        assert!(count(Count::Allocations) > 0);
+        perf_trace::begin_render();
+        frame.ink_shelf(c, &row, 1, &input, 0.62).unwrap();
+        assert_eq!(count(Count::PreviewMaskBytes), 0, "unchanged reusable mask has no writes");
+        std::fs::remove_file(path).unwrap();
     }
 }

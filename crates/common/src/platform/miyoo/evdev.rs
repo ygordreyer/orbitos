@@ -58,20 +58,23 @@ impl EvdevKeys {
                 return lid_event;
             }
 
-            let timeout =
-                tokio::time::timeout(Duration::from_millis(500), self.events.next_event());
-            let Ok(result) = timeout.await else {
-                continue;
+            let result = if self.lid_switch_poller.is_some() {
+                let Ok(result) =
+                    tokio::time::timeout(Duration::from_millis(500), self.events.next_event())
+                        .await
+                else {
+                    continue;
+                };
+                result
+            } else {
+                self.events.next_event().await
             };
             let event = result.unwrap();
             if event.event_type() == EventType::KEY {
                 let key: Key = event.code().into();
                 let value = event.value();
-                // Skip stale presses after a stall, but a stale release must still
-                // pass through or the key stays latched in the caller's key state
-                if value != 0
-                    && event.timestamp().elapsed().unwrap_or_default() > MAXIMUM_FRAME_TIME
-                {
+                // Edges are lossless even after a stall. Only superseded repeats expire.
+                if stale_repeat(value, event.timestamp().elapsed().unwrap_or_default()) {
                     continue;
                 }
                 return match value {
@@ -116,4 +119,25 @@ fn read_is_lid_open() -> Result<bool> {
     let mut buffer = [0u8; 2];
     file.read_exact(&mut buffer)?;
     Ok(buffer[0] == b'1')
+}
+
+fn stale_repeat(value: i32, age: Duration) -> bool {
+    value == 2 && age > MAXIMUM_FRAME_TIME
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn queued_edges_survive_a_stall_but_old_repeats_expire() {
+        let age = Duration::from_millis(150);
+        assert!(
+            !stale_repeat(1, age),
+            "first press must reach the controller"
+        );
+        assert!(!stale_repeat(0, age), "release must clear held state");
+        assert!(stale_repeat(2, age));
+        assert!(!stale_repeat(2, MAXIMUM_FRAME_TIME));
+    }
 }

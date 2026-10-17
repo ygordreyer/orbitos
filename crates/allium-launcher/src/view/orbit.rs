@@ -51,7 +51,8 @@ fn source_account() -> std::rc::Rc<std::cell::Cell<usize>> {
     });
     account
 }
-const MAX_PNG_BYTES: u64 = 512 * 1024;
+// A 480x480 RGBA exporter PNG fits with filter/zlib overhead, within the worker memory budget.
+const MAX_PNG_BYTES: u64 = 960 * 1024;
 
 pub fn enabled() -> bool {
     Stylesheet::orbit_enabled()
@@ -60,8 +61,14 @@ pub fn enabled() -> bool {
 thread_local! {
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static METADATA_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-pub(crate) fn completion_generation() -> u64 { ART_COMPLETIONS.with(std::cell::Cell::get) }
+pub(super) fn metadata_completion_generation() -> u64 {
+    METADATA_COMPLETIONS.with(std::cell::Cell::get)
+}
+pub(crate) fn completion_generation() -> u64 {
+    ART_COMPLETIONS.with(std::cell::Cell::get)
+}
 pub(crate) fn visible_completion() {
     ART_COMPLETIONS.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
@@ -85,8 +92,25 @@ pub(crate) enum WarmArt {
     Cover(Entry),
     CoverFallback(Entry),
     Logo(Entry),
+    #[allow(dead_code)]
     OtherCover(Entry),
     Hero(Entry),
+}
+
+#[derive(Debug)]
+struct CompletedTask {
+    key: super::art_queue::AssetKey,
+    // Dedupe must not retain metadata after the common cache evicts its record.
+    metadata: Option<std::sync::Weak<common::media::Metadata>>,
+}
+impl CompletedTask {
+    fn is_resident(&self, task: &WarmArt) -> bool {
+        self.metadata.as_ref().is_none_or(|metadata| {
+            metadata.ptr_eq(&std::sync::Arc::downgrade(&common::media::cached_metadata(
+                task.entry().path(),
+            )))
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +127,11 @@ pub struct Orbit {
     worker_id: u64,
     worker_epoch: u64,
     pending_task: Option<WarmArt>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    completed_tasks: VecDeque<CompletedTask>,
+    selected_path: Option<PathBuf>,
+    protected_paths: Vec<PathBuf>,
+    visible_cover_entries: Vec<PathBuf>,
     #[cfg(feature = "perf-bench")]
     worker_samples: Vec<(common::perf::Counts, serde_json::Value)>,
 }
@@ -119,9 +148,17 @@ impl Orbit {
             tall_art: false,
             retired: Vec::new(),
             dirty: true,
-            worker_id: { static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed) },
+            worker_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             worker_epoch: 0,
             pending_task: None,
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            completed_tasks: VecDeque::new(),
+            selected_path: None,
+            protected_paths: Vec::new(),
+            visible_cover_entries: Vec::new(),
             #[cfg(feature = "perf-bench")]
             worker_samples: Vec::new(),
         }
@@ -130,6 +167,17 @@ impl Orbit {
     pub(crate) fn defer_legacy(&mut self) {
         self.legacy_ready = false;
         self.dirty = true;
+    }
+
+    pub(crate) fn refresh_names(&mut self) {
+        let media_generation = common::media::generation();
+        if self.media_generation != media_generation {
+            // Cold indexes can supply previously missing art. Successful paths remain reusable.
+            self.cache.retain(|item| item.image.is_some());
+            self.completed_tasks.clear();
+            self.media_generation = media_generation;
+        }
+        self.defer_legacy();
     }
 
     pub fn prepare(&mut self, entries: &[Entry], selected: usize) {
@@ -167,7 +215,12 @@ impl Orbit {
             return;
         };
         if !self.cache.iter().any(|item| item.path == path) {
-            let image = if self.ink_art { load_device_art(&path, 480, 200) } else { load_prepared_art(&path, (0, 0), 480, 200, false) }.map(std::sync::Arc::new);
+            let image = if self.ink_art {
+                load_device_art(&path, 480, 200)
+            } else {
+                load_prepared_art(&path, (0, 0), 480, 200, false)
+            }
+            .map(std::sync::Arc::new);
             self.insert_cached(CachedArt { path, image });
         }
     }
@@ -202,27 +255,34 @@ impl Orbit {
         }
         self.prepare_window(entries, selected, first, count);
     }
+    #[cfg(test)]
     pub(crate) fn navigation_art_work(
         entries: &[Entry],
         selected: usize,
         first: usize,
         count: usize,
     ) -> VecDeque<WarmArt> {
-        let mut work: VecDeque<_> = entries
-            .iter()
-            .skip(first)
-            .take(count.min(CACHE_ENTRIES - 1))
-            .cloned()
-            .map(WarmArt::Cover)
-            .collect();
+        let mut work = VecDeque::new();
         if let Some(entry) = entries.get(selected) {
-            work.push_back(WarmArt::Hero(entry.clone()));
-            work.push_back(WarmArt::Cover(entry.clone()));
-            work.push_back(WarmArt::Logo(entry.clone()));
+            work.extend([
+                WarmArt::Hero(entry.clone()),
+                WarmArt::Cover(entry.clone()),
+                WarmArt::Logo(entry.clone()),
+            ]);
         }
+        work.extend(
+            entries
+                .iter()
+                .skip(first)
+                .take(count.min(CACHE_ENTRIES - 1))
+                .cloned()
+                .map(WarmArt::Cover),
+        );
         if let Some(next) = peek_game(entries, first, count) {
             work.push_back(WarmArt::Cover(entries[next].clone()));
         }
+        let mut seen = std::collections::HashSet::new();
+        work.retain(|task| seen.insert(task.key()));
         work
     }
     fn warm_art_step_sync(&mut self, work: &mut VecDeque<WarmArt>) {
@@ -236,22 +296,18 @@ impl Orbit {
             }
             return;
         }
-        let entry = match &task {
-            WarmArt::Metadata(e)
-            | WarmArt::Cover(e)
-            | WarmArt::CoverFallback(e)
-            | WarmArt::Hero(e)
-            | WarmArt::Logo(e)
-            | WarmArt::OtherCover(e) => e,
-        };
-        for kind in [
-            common::media::Kind::Cover,
-            common::media::Kind::TallCover,
-            common::media::Kind::PreparedCover,
-            common::media::Kind::Background,
-            common::media::Kind::Logo,
-        ] {
-            common::media::resolve(entry.path(), kind);
+        for kind in task.media_kinds(self.tall_art) {
+            common::media::resolve(task.entry().path(), kind);
+        }
+        if matches!(task, WarmArt::Cover(_))
+            && self.tall_art
+            && common::media::cached_resolve(task.entry().path(), common::media::Kind::TallCover)
+                .is_none()
+        {
+            common::media::resolve(task.entry().path(), common::media::Kind::Cover);
+        }
+        if !art_job_current() {
+            return;
         }
         let fallback = matches!(&task, WarmArt::CoverFallback(_));
         match task {
@@ -265,7 +321,9 @@ impl Orbit {
                     common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
                 };
                 if let Some(path) = path {
-                    if path == self.cover_path(&entry) { return; }
+                    if path == self.cover_path(&entry) {
+                        return;
+                    }
                     if !self.cache.iter().any(|item| item.path == path) {
                         let image = if self.ink_art {
                             load_ink_cover(&path)
@@ -303,9 +361,15 @@ impl Orbit {
                 } else {
                     load_prepared_art(&path, (0, 0), THEME_COVER_SIZE, THEME_COVER_SIZE, false)
                 };
-                let image = if self.ink_art && self.tall_art && common::media::cached_resolve(entry.path(),common::media::Kind::TallCover).is_none() {
+                let image = if self.ink_art
+                    && self.tall_art
+                    && common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
+                        .is_none()
+                {
                     image.and_then(portrait::compose)
-                } else {image};
+                } else {
+                    image
+                };
                 if image.is_none() && !fallback {
                     work.push_front(WarmArt::CoverFallback(entry));
                 } else {
@@ -332,6 +396,7 @@ impl Orbit {
             art.selected_cover = self.theme_cover_image(entry).cloned();
         }
         if let Some(next) = peek_game(entries, first, count) {
+            art.next_cover_expected = true;
             art.next_cover = self.theme_cover_image(&entries[next]).cloned();
         }
         for entry in entries.iter().skip(first).take(count) {
@@ -365,7 +430,10 @@ impl Orbit {
             return;
         }
         if self.ink_art && dimensions == (360, 210) {
-            self.insert_cached(CachedArt { image:load_device_art(&path,640,480).map(std::sync::Arc::new), path });
+            self.insert_cached(CachedArt {
+                image: load_device_art(&path, 640, 480).map(std::sync::Arc::new),
+                path,
+            });
             return;
         }
         let (width, height, crop) = if dimensions == (101, 101) {
@@ -390,7 +458,8 @@ impl Orbit {
 
     fn source_bytes(&mut self) -> usize {
         self.retired.retain(|image| image.strong_count() != 0);
-        let bytes = self.cache
+        let bytes = self
+            .cache
             .iter()
             .filter_map(|item| item.image.as_ref())
             .map(|image| image.data().len())
@@ -401,7 +470,8 @@ impl Orbit {
                 .filter_map(std::sync::Weak::upgrade)
                 .map(|image| image.data().len())
                 .sum::<usize>();
-        self.source_account.set(bytes.saturating_sub(BASE_CACHE_BYTES));
+        self.source_account
+            .set(bytes.saturating_sub(BASE_CACHE_BYTES));
         bytes
     }
 
@@ -416,10 +486,17 @@ impl Orbit {
 
     fn insert_cached(&mut self, item: CachedArt) {
         let bytes = item.image.as_ref().map_or(0, |image| image.data().len());
-        while self.cache.len() >= CACHE_ENTRIES || self.source_bytes() + bytes > self.source_budget() {
-            let Some(old) = self.cache.pop_back() else {
+        while self.cache.len() >= CACHE_ENTRIES
+            || self.source_bytes() + bytes > self.source_budget()
+        {
+            let Some(index) = self
+                .cache
+                .iter()
+                .rposition(|item| !self.protected_paths.contains(&item.path))
+            else {
                 return;
             };
+            let old = self.cache.remove(index).unwrap();
             self.retire(old);
         }
         self.cache.push_front(item);
@@ -427,7 +504,15 @@ impl Orbit {
     }
 
     fn source_budget(&self) -> usize {
-        let other_extra = EXTRA_SOURCE_BYTES.with(|accounts| accounts.borrow().iter().filter_map(std::rc::Weak::upgrade).filter(|a| !std::rc::Rc::ptr_eq(a,&self.source_account)).map(|a|a.get()).sum::<usize>());
+        let other_extra = EXTRA_SOURCE_BYTES.with(|accounts| {
+            accounts
+                .borrow()
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .filter(|a| !std::rc::Rc::ptr_eq(a, &self.source_account))
+                .map(|a| a.get())
+                .sum::<usize>()
+        });
         BASE_CACHE_BYTES + (CACHE_PIXEL_BYTES - BASE_CACHE_BYTES).saturating_sub(other_extra)
     }
 
@@ -468,9 +553,57 @@ impl Orbit {
         }
     }
 
-    pub fn release_art(&mut self) {
+    pub(crate) fn protect_selected(&mut self, entry: &Entry) {
+        if self.selected_path.as_deref() != Some(entry.path()) {
+            self.cancel_selection();
+            self.selected_path = Some(entry.path().into());
+        }
+        self.protected_paths.clear();
+        self.protected_paths.extend([
+            self.cover_path(entry),
+            art_path(entry, "heroes"),
+            art_path(entry, "logos"),
+        ]);
+    }
+
+    pub(crate) fn protect_window(
+        &mut self,
+        entries: &[Entry],
+        selected: usize,
+        first: usize,
+        count: usize,
+        rows: bool,
+        next: bool,
+    ) {
+        if let Some(entry) = entries.get(selected) {
+            self.protect_selected(entry);
+        }
+        self.visible_cover_entries.clear();
+        if rows {
+            for entry in entries.iter().skip(first).take(count) {
+                self.protected_paths.push(self.cover_path(entry));
+                self.visible_cover_entries.push(entry.path().into());
+            }
+        }
+        if next {
+            if let Some(entry) = entries.get(first.saturating_add(count)) {
+                self.protected_paths.push(self.cover_path(entry));
+                self.visible_cover_entries.push(entry.path().into());
+            }
+        }
+    }
+
+    pub(crate) fn cancel_selection(&mut self) {
         self.worker_epoch = self.worker_epoch.wrapping_add(1);
+        self.cancellation
+            .store(self.worker_epoch, std::sync::atomic::Ordering::Release);
         self.pending_task = None;
+    }
+
+    pub fn release_art(&mut self) {
+        self.cancel_selection();
+        self.completed_tasks.clear();
+        self.protected_paths.clear();
         while let Some(item) = self.cache.pop_back() {
             self.retire(item);
         }
@@ -681,9 +814,14 @@ fn media_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format().ok()?.into_dimensions().ok()?;
-    (width > 0 && height > 0
-        && width <= MAX_MEDIA_DIMENSION && height <= MAX_MEDIA_DIMENSION
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    (width > 0
+        && height > 0
+        && width <= MAX_MEDIA_DIMENSION
+        && height <= MAX_MEDIA_DIMENSION
         && u64::from(width) * u64::from(height) <= MAX_MEDIA_PIXELS)
         .then_some((width, height))
 }
@@ -713,13 +851,38 @@ fn load_device_art(path: &Path, width: u32, height: u32) -> Option<Pixmap> {
     common::perf_trace::frontend_io_op();
     let file = File::open(path).ok()?;
     common::perf_trace::frontend_io_op();
-    if file.metadata().ok()?.len() > MAX_PNG_BYTES { return None; }
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > MAX_PNG_BYTES {
+        return None;
+    }
     common::perf_trace::frontend_io_op();
     let bytes = read_png_bytes(file)?;
-    let (w,h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
-        .with_guessed_format().ok()?.into_dimensions().ok()?;
-    if w == 0 || h == 0 || w > width || h > height { return None; }
-    decode_art_bytes(&bytes, (0,0))
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if w == 0 || h == 0 || w > width || h > height {
+        return None;
+    }
+    let key = crate::art_cache::ArtKey::new(path, &metadata, &bytes, (0, 0), (w, h), false);
+    let cache_dir = common::constants::ALLIUM_ORBIT_ART_CACHE_DIR.as_path();
+    if let Some(image) = key.as_ref().and_then(|key| key.load(cache_dir)) {
+        common::perf_trace::hit(common::perf_trace::ArtHit::Disk);
+        #[cfg(feature = "perf-bench")]
+        common::perf::hit(common::perf::Op::DiskHit);
+        return Some(image);
+    }
+    if !art_job_current() {
+        return None;
+    }
+    let image = decode_art_bytes(&bytes, (0, 0))?;
+    if art_job_current() {
+        if let Some(key) = key {
+            key.store(cache_dir, &image);
+        }
+    }
+    Some(image)
 }
 fn load_ink_cover(path: &Path) -> Option<Pixmap> {
     // MEDIA.md sources already fit the device. Geometry is fitted once by the renderer.
@@ -761,7 +924,7 @@ fn load_prepared_art(
     let key = {
         let _disk_stage = common::perf_trace::stage(common::perf_trace::Stage::DiskCache);
         metadata.as_ref().and_then(|metadata| {
-        crate::art_cache::ArtKey::new(path, metadata, &bytes, dimensions, (width, height), crop)
+            crate::art_cache::ArtKey::new(path, metadata, &bytes, dimensions, (width, height), crop)
         })
     };
     let cache_dir = common::constants::ALLIUM_ORBIT_ART_CACHE_DIR.as_path();
@@ -775,8 +938,11 @@ fn load_prepared_art(
         common::perf::hit(common::perf::Op::DiskHit);
         return Some(image);
     }
+    if !art_job_current() {
+        return None;
+    }
     let image = resize_art(decode_art_bytes(&bytes, dimensions)?, width, height, crop)?;
-    if let Some(key) = key {
+    if let Some(key) = key.filter(|_| art_job_current()) {
         let _disk_stage = common::perf_trace::stage(common::perf_trace::Stage::DiskCache);
         key.store(cache_dir, &image);
     }
@@ -803,7 +969,7 @@ fn read_png_bytes(file: File) -> Option<Vec<u8>> {
     #[cfg(feature = "perf-bench")]
     common::perf::hit(common::perf::Op::Read);
     file.take(MAX_PNG_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    (bytes.len() as u64 <= MAX_PNG_BYTES).then_some(bytes)
 }
 
 fn decode_png_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
@@ -825,8 +991,10 @@ fn decode_png_bytes(bytes: &[u8], dimensions: (u32, u32)) -> Option<Pixmap> {
     } else if (width, height) != dimensions {
         return None;
     }
-    if width > MAX_MEDIA_DIMENSION || height > MAX_MEDIA_DIMENSION
-        || u64::from(width) * u64::from(height) > MAX_MEDIA_PIXELS {
+    if width > MAX_MEDIA_DIMENSION
+        || height > MAX_MEDIA_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_MEDIA_PIXELS
+    {
         return None;
     }
     common::perf_trace::hit(common::perf_trace::ArtHit::Decode);
@@ -1241,6 +1409,7 @@ mod next_cover_tests {
         ));
     }
     #[test]
+    #[cfg(debug_assertions)]
     #[serial_test::serial(orbit_fixture)]
     fn actual_theme_art_identity_reuses_prepared_preview_and_invalidates() {
         use common::theme::{
@@ -1557,7 +1726,10 @@ mod media_contract_tests {
         let fallback = orbit.theme_art(&entries, 1, 0, 2).selected_cover.unwrap();
         assert_eq!(fallback.width() * 3, fallback.height() * 2);
         assert_eq!(fallback.width(), 64);
-        assert!(std::sync::Arc::ptr_eq(&fallback,&orbit.theme_art(&entries,1,0,2).selected_cover.unwrap()));
+        assert!(std::sync::Arc::ptr_eq(
+            &fallback,
+            &orbit.theme_art(&entries, 1, 0, 2).selected_cover.unwrap()
+        ));
     }
     #[test]
     #[serial_test::serial(orbit_fixture)]
@@ -1578,11 +1750,24 @@ mod media_contract_tests {
     }
 }
 
+thread_local! {
+    static ART_CANCELLATION: std::cell::RefCell<Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>> = const { std::cell::RefCell::new(None) };
+}
+fn art_job_current() -> bool {
+    ART_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_none_or(|(token, epoch)| token.load(std::sync::atomic::Ordering::Acquire) == *epoch)
+    })
+}
+
 #[derive(Debug)]
 struct ArtJob {
+    selection_generation: u64,
     owner: u64,
     epoch: u64,
     generation: u64,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     gate: Option<std::sync::Arc<std::sync::Barrier>>,
     ink: bool,
@@ -1596,7 +1781,11 @@ struct ArtJob {
 struct ArtResult {
     owner: u64,
     epoch: u64,
-    media: common::media::PreparedGame,
+    media: Option<common::media::PreparedGame>,
+    paths: Vec<(common::media::Kind, PathBuf)>,
+    path: PathBuf,
+    #[cfg(test)]
+    decode_attempts: usize,
     sidecars: Option<super::details::WarmCache>,
     art: VecDeque<CachedArt>,
     #[cfg(feature = "perf-bench")]
@@ -1622,12 +1811,22 @@ fn worker() -> ArtWorker {
         .spawn(move || {
             #[cfg(target_os = "linux")]
             unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                    log::warn!(
+                        "Cannot lower artwork worker priority: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
             common::perf_trace::initialize();
             common::media::set_metadata_budget(WORKER_METADATA_BYTES);
             let mut generation = None;
             while let Ok(job) = jobs.recv() {
+                #[cfg(feature = "perf-bench")]
+                if let Some(path) = &job.trace {
+                    common::perf_trace::start_probe(path);
+                }
+                let mut task = common::perf_trace::task("artwork", job.selection_generation);
                 #[cfg(test)]
                 if let Some(gate) = &job.gate {
                     gate.wait();
@@ -1638,21 +1837,26 @@ fn worker() -> ArtWorker {
                     common::media::set_metadata_budget(WORKER_METADATA_BYTES);
                     generation = Some(job.generation);
                 }
-                let entry = match &job.task {
-                    WarmArt::Metadata(e)
-                    | WarmArt::Cover(e)
-                    | WarmArt::CoverFallback(e)
-                    | WarmArt::OtherCover(e)
-                    | WarmArt::Logo(e)
-                    | WarmArt::Hero(e) => e,
-                };
-                let path = entry.path().to_owned();
+                ART_CANCELLATION
+                    .with(|slot| slot.replace(Some((job.cancellation.clone(), job.epoch))));
+                let path = job.task.entry().path().to_owned();
                 common::media::set_game_containers(
                     job.container.map(|container| (path.clone(), container)),
                 );
                 let metadata = matches!(job.task, WarmArt::Metadata(_));
-                if !job.network_paths.is_empty() {
-                    let _ = common::media::prepare_game(&path);
+                let mut kinds = job.task.media_kinds(job.tall);
+                if art_job_current() {
+                    for &kind in &kinds {
+                        common::media::resolve(&path, kind);
+                    }
+                    if matches!(job.task, WarmArt::Cover(_))
+                        && job.tall
+                        && common::media::cached_resolve(&path, common::media::Kind::TallCover)
+                            .is_none()
+                    {
+                        kinds.push(common::media::Kind::Cover);
+                        common::media::resolve(&path, common::media::Kind::Cover);
+                    }
                     common::media::adopt_fallback_paths(&path, job.network_paths);
                 }
                 let mut orbit = Orbit::new();
@@ -1660,20 +1864,32 @@ fn worker() -> ArtWorker {
                 orbit.tall_art = job.tall;
                 let mut work = VecDeque::from([job.task]);
                 #[cfg(feature = "perf-bench")]
-                if let Some(path) = &job.trace {
-                    common::perf_trace::start_probe(path);
-                }
-                #[cfg(feature = "perf-bench")]
                 common::perf::take();
                 common::perf_trace::begin_render();
-                while !work.is_empty() {
+                #[cfg(test)]
+                MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+                while !work.is_empty() && art_job_current() {
                     orbit.warm_art_step_sync(&mut work);
                 }
-                let media = common::media::prepare_game(&path);
+                let media =
+                    (metadata && art_job_current()).then(|| common::media::prepare_game_kinds(&path, &[]));
+                if kinds.contains(&common::media::Kind::Cover) {
+                    kinds.push(common::media::Kind::PreparedCover);
+                }
+                let paths = kinds
+                    .into_iter()
+                    .filter_map(|kind| {
+                        common::media::cached_resolve(&path, kind).map(|path| (kind, path))
+                    })
+                    .collect();
                 let result = ArtResult {
                     owner: job.owner,
                     epoch: job.epoch,
                     media,
+                    paths,
+                    path,
+                    #[cfg(test)]
+                    decode_attempts: MEDIA_DECODE_ATTEMPTS.with(|n| n.get()),
                     sidecars: metadata.then(super::details::warm_cache),
                     art: orbit.cache,
                     #[cfg(feature = "perf-bench")]
@@ -1681,11 +1897,12 @@ fn worker() -> ArtWorker {
                     #[cfg(feature = "perf-bench")]
                     stages: common::perf_trace::probe_counts_if_enabled(),
                 };
-                common::media::clear_prepared_paths();
-                common::perf_trace::drawn_frame();
+                ART_CANCELLATION.with(|slot| slot.replace(None));
+                task.finish();
                 if done.send(result).is_err() {
                     break;
                 }
+                common::perf_trace::drawn_frame();
             }
         })
         .expect("art worker unavailable");
@@ -1713,14 +1930,49 @@ impl Orbit {
             let worker = state.get_or_insert_with(worker);
             let mut completed = false;
             if let Ok(result) = worker.recv.try_recv() {
+                #[cfg(test)]
+                TEST_WORKER_DECODES.with(|n| n.set(result.decode_attempts));
                 worker.busy = None;
                 if result.owner == self.worker_id && result.epoch == self.worker_epoch {
                     #[cfg(all(test, feature = "perf-bench"))]
                     TEST_ART_COMPLETION.with(|slot| *slot.borrow_mut() = self.pending_task.clone());
-                    self.pending_task = None;
-                    common::media::adopt_game(result.media);
+                    let task = self.pending_task.take();
+                    let visible_cover = task.as_ref().is_some_and(|task| {
+                        matches!(task, WarmArt::Cover(_) | WarmArt::CoverFallback(_))
+                    }) && self.visible_cover_entries.contains(&result.path);
+                    let adopted_metadata = result.media.is_some() || result.sidecars.is_some();
+                    if let Some(media) = result.media {
+                        common::media::adopt_game(media);
+                    }
+                    common::media::adopt_fallback_paths(&result.path, result.paths);
                     if let Some(cache) = result.sidecars {
                         super::details::adopt_warm_cache(cache);
+                    }
+                    if adopted_metadata {
+                        METADATA_COMPLETIONS
+                            .with(|generation| generation.set(generation.get().wrapping_add(1)));
+                    }
+                    if let Some(task) = task.filter(|task| {
+                        matches!(task, WarmArt::Metadata(_))
+                            || result.art.iter().all(|art| art.image.is_none())
+                    }) {
+                        let key = task.key();
+                        let metadata = matches!(task, WarmArt::Metadata(_)).then(|| {
+                            std::sync::Arc::downgrade(&common::media::cached_metadata(
+                                task.entry().path(),
+                            ))
+                        });
+                        self.completed_tasks
+                            .retain(|completed| completed.key != key);
+                        if self.completed_tasks.len() >= 128 {
+                            self.completed_tasks.pop_back();
+                        }
+                        self.completed_tasks
+                            .push_front(CompletedTask { key, metadata });
+                    }
+                    if self.selected_path.as_ref() == Some(&result.path) || visible_cover {
+                        self.protected_paths
+                            .extend(result.art.iter().map(|item| item.path.clone()));
                     }
                     for item in result.art {
                         self.insert_cached(item);
@@ -1744,6 +1996,15 @@ impl Orbit {
                 return completed;
             }
             while let Some(task) = work.pop_front() {
+                let key = task.key();
+                if self
+                    .completed_tasks
+                    .iter()
+                    .any(|completed| completed.key == key && completed.is_resident(&task))
+                {
+                    continue;
+                }
+                work.retain(|queued| queued.key() != task.key());
                 let path = match &task {
                     WarmArt::Metadata(_) => None,
                     WarmArt::Cover(e) | WarmArt::CoverFallback(e) => Some(self.cover_path(e)),
@@ -1786,6 +2047,14 @@ impl Orbit {
                     ("logos", common::media::Kind::Logo),
                 ]
                 .into_iter()
+                .filter(|(_, kind)| {
+                    task.media_kinds(self.tall_art).contains(kind)
+                        || (matches!(task, WarmArt::Cover(_))
+                            && matches!(
+                                kind,
+                                common::media::Kind::Cover | common::media::Kind::PreparedCover
+                            ))
+                })
                 .filter_map(|(name, kind)| {
                     crate::network_runtime::art_path(entry.path(), name).map(|p| (kind, p))
                 })
@@ -1793,9 +2062,11 @@ impl Orbit {
                 let container = common::media::game_container(entry.path());
                 self.pending_task = Some(task.clone());
                 let job = ArtJob {
+                    selection_generation: common::perf_trace::generation(),
                     owner: self.worker_id,
                     epoch: self.worker_epoch,
                     generation: common::media::generation(),
+                    cancellation: self.cancellation.clone(),
                     #[cfg(test)]
                     gate: TEST_ART_GATE.with(|slot| slot.borrow().clone()),
                     ink: self.ink_art,
@@ -1823,6 +2094,8 @@ impl Orbit {
     }
 }
 
+#[cfg(test)]
+thread_local! { static TEST_WORKER_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
 thread_local! { static TEST_ART_GATE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(all(test, feature = "perf-bench"))]
@@ -1956,6 +2229,7 @@ mod network_media_tests {
             std::fs::write(system.join("gamelist.xml"), format!("<gameList><game><path>./Dir/</path><name>Gamelist directory name</name><releasedate>19981203T000000</releasedate><desc>Directory synopsis</desc><image>./art/cover.png</image><fanart>./art/hero.png</fanart>{}</game></gameList>", if marquee { "<marquee>./art/logo.png</marquee>" } else { "" })).unwrap();
             let db = Database::in_memory().unwrap();
             let raw = Game::new(root.join(&descriptor.game_path));
+            common::media::set_game_containers([(raw.path.clone(), system.join("Dir"))]);
             let row: common::database::NewGame = raw.clone().into();
             db.update_games(&[row.clone()]).unwrap();
             db.increment_play_count(&row).unwrap();
@@ -2080,7 +2354,7 @@ mod network_media_tests {
             assert_eq!(art.selected_cover.unwrap().pixel(0, 0).unwrap().red(), 255);
             assert_eq!(art.selected_hero.unwrap().pixel(0, 0).unwrap().red(), 255);
             assert_eq!(
-                common::media::cached_resolve(&raw.path, Kind::PreparedCover),
+                common::media::cached_resolve(&raw.path, Kind::Cover),
                 Some(system.join("./art/cover.png"))
             );
             assert_eq!(
@@ -2155,7 +2429,7 @@ mod latency_tests {
             + WORKER_METADATA_BYTES
             + 2 * 256 * 1024
             + 640 * 480 * 4
-            + 512 * 1024
+            + MAX_PNG_BYTES as usize
             + 64 * 1024
             + WORKER_STACK_BYTES
             + 64 * 1024;
@@ -2186,18 +2460,31 @@ mod media_dimension_review_tests {
     fn tiny_huge_jpeg_is_rejected_before_every_media_decode() {
         let mut bytes = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut bytes)
-            .encode(&[0, 0, 0], 1, 1, image::ExtendedColorType::Rgb8).unwrap();
+            .encode(&[0, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
         let sof = bytes.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
         bytes[sof + 5..sof + 7].copy_from_slice(&8192u16.to_be_bytes());
         bytes[sof + 7..sof + 9].copy_from_slice(&8192u16.to_be_bytes());
         assert!(bytes.len() < 1024);
-        assert_eq!(image::ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format().unwrap().into_dimensions().unwrap(), (8192, 8192));
-        let path = std::env::temp_dir().join(format!("allium-huge-header-{}.jpg", std::process::id()));
+        assert_eq!(
+            image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (8192, 8192)
+        );
+        let path =
+            std::env::temp_dir().join(format!("allium-huge-header-{}.jpg", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
         assert!(decode_art_bytes(&bytes, (0, 0)).is_none());
-        for (w, h, crop) in [(140, 140, false), (176, 264, false), (390, 189, true), (480, 200, false)] {
+        for (w, h, crop) in [
+            (140, 140, false),
+            (176, 264, false),
+            (390, 189, true),
+            (480, 200, false),
+        ] {
             assert!(load_prepared_art(&path, (0, 0), w, h, crop).is_none());
         }
         assert!(load_ink_cover(&path).is_none());
@@ -2223,11 +2510,411 @@ mod media_dimension_review_tests {
             }
         }
         bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
-        assert_eq!(image::ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format().unwrap().into_dimensions().unwrap(), (8192, 8192));
+        assert_eq!(
+            image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (8192, 8192)
+        );
         MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
         assert!(decode_art_bytes(&bytes, (8192, 8192)).is_none());
         assert!(decode_png_bytes(&bytes, (8192, 8192)).is_none());
         MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 0));
+    }
+}
+
+#[cfg(test)]
+mod demand_queue_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    fn drain(orbit: &mut Orbit, work: &mut VecDeque<WarmArt>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !work.is_empty() || orbit.art_pending() {
+            orbit.warm_art_step(work);
+            assert!(std::time::Instant::now() < deadline, "worker timeout");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn completed_missing_assets_and_metadata_are_not_requeued_until_invalidation() {
+        common::media::invalidate();
+        let entry = Entry::Game(crate::entry::game::Game::new(
+            "/missing-art-queue/Game.sfc".into(),
+        ));
+        let mut orbit = Orbit::new();
+        let tasks = VecDeque::from([WarmArt::Logo(entry.clone()), WarmArt::Metadata(entry)]);
+        drain(&mut orbit, &mut tasks.clone());
+        assert_eq!(orbit.completed_tasks.len(), 2);
+        orbit.cancel_selection();
+        let mut repeated = tasks.clone();
+        assert!(!orbit.warm_art_step(&mut repeated));
+        assert!(repeated.is_empty());
+        assert!(!orbit.art_pending());
+        common::media::invalidate();
+        orbit.refresh_art();
+        assert!(orbit.completed_tasks.is_empty());
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn name_refresh_retries_worker_cover_miss_after_index_adoption() {
+        common::media::invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-worker-name-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let cover = root.join("new-cover.png");
+        let pixels = Pixmap::new(32, 32).unwrap();
+        pixels.save_png(root.join("Imgs/Retained.png")).unwrap();
+        let entry = Entry::Game(crate::entry::game::Game::new(root.join("Game.sfc")));
+        let retained_entry =
+            Entry::Game(crate::entry::game::Game::new(root.join("Retained.sfc")));
+        let mut orbit = Orbit::new();
+        drain(
+            &mut orbit,
+            &mut VecDeque::from([
+                WarmArt::Cover(entry.clone()),
+                WarmArt::Metadata(entry.clone()),
+                WarmArt::Cover(retained_entry.clone()),
+            ]),
+        );
+        let failed_key = WarmArt::Cover(entry.clone()).key();
+        assert!(orbit.completed_tasks.iter().any(|task| {
+            task.key == failed_key && task.metadata.is_none()
+        }));
+        assert_eq!(orbit.completed_tasks.len(), 2);
+        let retained_path = orbit.cover_path(&retained_entry);
+        let retained = orbit.image(&retained_entry, "stock").unwrap().clone();
+        let mut repeated = VecDeque::from([WarmArt::Cover(entry.clone())]);
+        assert!(!orbit.warm_art_step(&mut repeated));
+        assert!(repeated.is_empty());
+        assert!(!orbit.art_pending());
+
+        pixels.save_png(&cover).unwrap();
+        std::fs::write(root.join("gamelist.xml"),
+            "<gameList><game><path>Game.sfc</path><name>Indexed game</name><image>new-cover.png</image></game></gameList>").unwrap();
+        common::media::defer_cold_sources();
+        common::media::check_directory(&root);
+        let generation = orbit.media_generation;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while common::media::cached_name(entry.path()).as_deref() != Some("Indexed game") {
+            common::media::poll_name_indexes();
+            assert!(std::time::Instant::now() < deadline, "name index timeout");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_ne!(generation, common::media::generation());
+        orbit.refresh_names();
+        let mut retry = VecDeque::from([WarmArt::Cover(entry.clone())]);
+        assert!(!orbit.warm_art_step(&mut retry));
+        assert!(orbit.art_pending(), "failed cover was not dispatched again");
+        drain(&mut orbit, &mut retry);
+        assert!(orbit.image(&entry, "stock").is_some());
+        assert!(orbit.completed_tasks.is_empty());
+        assert!(std::sync::Arc::ptr_eq(
+            &retained,
+            orbit.image(&retained_entry, "stock").unwrap()
+        ));
+        let mut cached = VecDeque::from([WarmArt::Cover(retained_entry)]);
+        assert!(!orbit.warm_art_step(&mut cached));
+        assert!(cached.is_empty());
+        assert!(!orbit.art_pending());
+        assert!(orbit.cache.iter().any(|item| item.path == retained_path));
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn metadata_eviction_and_revisit_reloads_completed_record() {
+        common::media::invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-metadata-revisit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let pixels = Pixmap::new(32, 32).unwrap().encode_png().unwrap();
+        let description = "D".repeat(55 * 1024);
+        let mut xml = String::from("<gameList>");
+        let entries: Vec<_> = (0..80).map(|i| {
+            xml.push_str(&format!("<game><path>./G{i}.sfc</path><desc>{description}</desc><developer>Studio {i}</developer></game>"));
+            std::fs::write(root.join(format!("Imgs/G{i}.png")), &pixels).unwrap();
+            Entry::Game(crate::entry::game::Game::new(root.join(format!("G{i}.sfc"))))
+        }).collect();
+        xml.push_str("</gameList>");
+        assert!(xml.len() > common::media::METADATA_BUDGET);
+        std::fs::write(root.join("gamelist.xml"), xml).unwrap();
+        let mut orbit = Orbit::new();
+        let mut retained = None;
+        for (index, entry) in entries.iter().enumerate() {
+            drain(
+                &mut orbit,
+                &mut VecDeque::from([
+                    WarmArt::Cover(entry.clone()),
+                    WarmArt::Metadata(entry.clone()),
+                ]),
+            );
+            assert_eq!(
+                common::media::cached_metadata(entry.path()).desc.len(),
+                description.len()
+            );
+            if index == 0 {
+                retained = Some(common::media::cached_metadata(entry.path()));
+            }
+        }
+        let first = &entries[0];
+        assert!(
+            common::media::cached_metadata(first.path()).desc.is_empty(),
+            "record was not evicted"
+        );
+        // All 80 successful metadata markers still fit in the 128-key dedupe window.
+        assert_eq!(orbit.completed_tasks.len(), 80);
+        orbit.cancel_selection();
+        drain(
+            &mut orbit,
+            &mut VecDeque::from([WarmArt::Metadata(first.clone())]),
+        );
+        let metadata = common::media::cached_metadata(first.path());
+        assert!(!std::sync::Arc::ptr_eq(
+            retained.as_ref().unwrap(),
+            &metadata
+        ));
+        let generation = metadata_completion_generation();
+        let mut repeated = VecDeque::from([WarmArt::Metadata(first.clone())]);
+        assert!(!orbit.warm_art_step(&mut repeated));
+        assert!(repeated.is_empty());
+        assert!(!orbit.art_pending());
+        assert_eq!(metadata_completion_generation(), generation);
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+        assert!(
+            metadata.desc == description,
+            "evicted synopsis did not reload"
+        );
+        assert_eq!(
+            orbit.completed_tasks.len(),
+            80,
+            "revisit duplicated a marker"
+        );
+        assert_eq!(metadata.developer, "Studio 0");
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn stale_job_is_skipped_before_decode_and_never_adopted() {
+        common::media::invalidate();
+        let fixture =
+            std::env::temp_dir().join(format!("allium-stale-queue-{}", std::process::id()));
+        std::fs::create_dir_all(fixture.join("Imgs")).unwrap();
+        Pixmap::new(360, 210)
+            .unwrap()
+            .save_png(fixture.join("Imgs/Game.hero.png"))
+            .unwrap();
+        let entry = Entry::Game(crate::entry::game::Game::new(fixture.join("Game.sfc")));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        TEST_ART_GATE.with(|slot| slot.replace(Some(gate.clone())));
+        let mut orbit = Orbit::new();
+        let mut work = VecDeque::from([WarmArt::Hero(entry)]);
+        orbit.warm_art_step(&mut work);
+        assert!(orbit.art_pending());
+        orbit.cancel_selection();
+        TEST_ART_GATE.with(|slot| slot.replace(None));
+        gate.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while orbit.art_pending() {
+            assert!(!orbit.warm_art_step(&mut work));
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(orbit.cache.is_empty());
+        assert!(orbit.completed_tasks.is_empty());
+        TEST_WORKER_DECODES.with(|n| assert_eq!(n.get(), 0));
+        std::fs::remove_dir_all(fixture).unwrap();
+        let epoch = Arc::new(AtomicU64::new(1));
+        ART_CANCELLATION.with(|slot| slot.replace(Some((epoch.clone(), 0))));
+        let bytes = Pixmap::new(2, 2).unwrap().encode_png().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("allium-stale-codec-{}.png", std::process::id()));
+        std::fs::write(&root, &bytes).unwrap();
+        MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+        assert!(load_device_art(&root, 2, 2).is_none());
+        MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 0));
+        epoch.store(0, Ordering::Release);
+        assert!(art_job_current());
+        ART_CANCELLATION.with(|slot| slot.replace(None));
+        std::fs::remove_file(root).unwrap();
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn right_press_request_and_decode_counts() {
+        use common::theme::pack::{Pack, ScreenId};
+        use std::collections::HashSet;
+        let root =
+            std::env::temp_dir().join(format!("allium-right-art-counts-{}", std::process::id()));
+        for folder in ["Imgs", "media/logos", "media/covers-tall"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let pixels = Pixmap::new(32, 32).unwrap().encode_png().unwrap();
+        let entries: Vec<_> = (0..12)
+            .map(|i| {
+                for suffix in [".png", ".hero.png", ".orbit.png"] {
+                    std::fs::write(root.join(format!("Imgs/G{i}{suffix}")), &pixels).unwrap();
+                }
+                for folder in ["logos", "covers-tall"] {
+                    std::fs::write(root.join(format!("media/{folder}/G{i}.png")), &pixels).unwrap();
+                }
+                Entry::Game(crate::entry::game::Game::new(
+                    root.join(format!("G{i}.sfc")),
+                ))
+            })
+            .collect();
+        for (id, screen, count) in [
+            ("orbit-hero", ScreenId::Recents, 3),
+            ("compact", ScreenId::Recents, 8),
+            ("compact-plus", ScreenId::Library, 9),
+        ] {
+            common::media::invalidate();
+            let pack = if id == "compact" {
+                Pack::builtin(id).unwrap()
+            } else {
+                Pack::parse(
+                    &std::fs::read(
+                        Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join(format!("../../themes/{id}/theme.json")),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            };
+            let selected = 1;
+            let first = 1;
+            // Reference trace from the pre-change idle queue and raw Ink loader.
+            let mut legacy: VecDeque<_> = entries
+                .iter()
+                .skip(first)
+                .take(count)
+                .cloned()
+                .map(WarmArt::Cover)
+                .collect();
+            legacy.extend([
+                WarmArt::Hero(entries[selected].clone()),
+                WarmArt::Cover(entries[selected].clone()),
+                WarmArt::Logo(entries[selected].clone()),
+            ]);
+            legacy.push_back(WarmArt::Cover(entries[first + count].clone()));
+            for i in [0, 2, 1] {
+                legacy.extend([
+                    WarmArt::Metadata(entries[i].clone()),
+                    WarmArt::Cover(entries[i].clone()),
+                ]);
+                if i == 1 || i == 2 {
+                    legacy.extend([
+                        WarmArt::Hero(entries[i].clone()),
+                        WarmArt::Logo(entries[i].clone()),
+                    ]);
+                }
+                if i == 1 {
+                    legacy.push_back(WarmArt::OtherCover(entries[i].clone()));
+                }
+            }
+            let before_tasks = legacy.len();
+            let mut resident = HashSet::new();
+            MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+            for task in legacy {
+                for kind in task.media_kinds(false) {
+                    common::media::resolve(task.entry().path(), kind);
+                }
+                let path = match &task {
+                    WarmArt::Metadata(_) => continue,
+                    WarmArt::Cover(e) => art_path(e, "stock"),
+                    WarmArt::Hero(e) => art_path(e, "heroes"),
+                    WarmArt::Logo(e) => {
+                        common::media::cached_resolve(e.path(), common::media::Kind::Logo).unwrap()
+                    }
+                    WarmArt::OtherCover(e) => {
+                        common::media::cached_resolve(e.path(), common::media::Kind::TallCover)
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                if resident.insert(path.clone()) {
+                    let bytes = read_png_bytes(File::open(path).unwrap()).unwrap();
+                    assert!(decode_art_bytes(&bytes, (0, 0)).is_some());
+                }
+            }
+            let before_decodes = MEDIA_DECODE_ATTEMPTS.with(|n| n.get());
+            common::media::invalidate();
+            let demand = super::super::art_queue::Demand::from_components(
+                &pack.screens[&screen].components,
+                pack.ink(),
+            );
+            let mut work =
+                super::super::art_queue::plan(&entries, selected, first, count, 1, demand);
+            let after_tasks = work.len();
+            MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+            let mut orbit = Orbit::new();
+            orbit.set_ink_art(pack.ink());
+            while !work.is_empty() {
+                orbit.warm_art_step_sync(&mut work);
+            }
+            let after_decodes = MEDIA_DECODE_ATTEMPTS.with(|n| n.get());
+            println!(
+                "Right trace {id} {screen:?}: tasks {before_tasks} -> {after_tasks}; decodes {before_decodes} -> {after_decodes}"
+            );
+            assert!(after_tasks < before_tasks);
+            assert!(after_decodes < before_decodes);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+    }
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn largest_exporter_cover_and_second_visit_use_raw_cache_without_decode() {
+        common::media::invalidate();
+        let root =
+            std::env::temp_dir().join(format!("allium-max-exporter-art-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        let cover = root.join("Imgs/Game.png");
+        let entry = Entry::Game(crate::entry::game::Game::new(root.join("Game.sfc")));
+        let mut pixels = Pixmap::new(480, 480).unwrap();
+        let mut seed = 42u32;
+        for pixel in pixels.pixels_mut() {
+            let mut channel = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            };
+            *pixel = tiny_skia::ColorU8::from_rgba(channel(), channel(), channel(), channel())
+                .premultiply();
+        }
+        let bytes = pixels.encode_png().unwrap();
+        assert!(bytes.len() > 512 * 1024 && bytes.len() as u64 <= MAX_PNG_BYTES);
+        std::fs::write(&cover, &bytes).unwrap();
+        let mut orbit = Orbit::new();
+        orbit.set_ink_art(true);
+        MEDIA_DECODE_ATTEMPTS.with(|n| n.set(0));
+        orbit.warm_art_step_sync(&mut VecDeque::from([WarmArt::Cover(entry.clone())]));
+        let first = orbit
+            .theme_art(std::slice::from_ref(&entry), 0, 0, 1)
+            .selected_cover
+            .unwrap();
+        MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 1));
+        orbit.release_art();
+        orbit.warm_art_step_sync(&mut VecDeque::from([WarmArt::Cover(entry.clone())]));
+        let second = orbit
+            .theme_art(std::slice::from_ref(&entry), 0, 0, 1)
+            .selected_cover
+            .unwrap();
+        MEDIA_DECODE_ATTEMPTS.with(|n| assert_eq!(n.get(), 1, "second visit decoded"));
+        assert_eq!(first.data(), second.data());
+        assert_eq!(first.data(), pixels.data());
+        println!(
+            "exporter_cover bytes={} first_visit_decodes=1 second_visit_decodes=0",
+            bytes.len()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
     }
 }

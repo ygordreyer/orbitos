@@ -40,6 +40,8 @@ pub struct Art {
     pub selected_logo: Option<Arc<Pixmap>>,
     pub selected_cover: Option<Arc<Pixmap>>,
     pub next_cover: Option<Arc<Pixmap>>,
+    /// The controller has a following game, even while its artwork is pending or missing.
+    pub next_cover_expected: bool,
     pub selected_hero: Option<Arc<Pixmap>>,
     pub entries: BTreeMap<String, Arc<Pixmap>>,
 }
@@ -86,6 +88,7 @@ impl PartialEq for Art {
         same(&self.selected_logo, &other.selected_logo)
             && same(&self.selected_cover, &other.selected_cover)
             && same(&self.next_cover, &other.next_cover)
+            && self.next_cover_expected == other.next_cover_expected
             && same(&self.selected_hero, &other.selected_hero)
             && self.entries.len() == other.entries.len()
             && self.entries.iter().all(|(id, pixels)| {

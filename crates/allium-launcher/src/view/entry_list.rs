@@ -35,6 +35,8 @@ pub(crate) struct NavigationWarm {
     selected: usize,
     first: usize,
     count: usize,
+    metadata: bool,
+    ink: bool,
 }
 
 #[derive(Debug)]
@@ -48,6 +50,7 @@ struct SelectedInfo {
     path: std::path::PathBuf,
     generation: u64,
     media_generation: u64,
+    adoption_generation: u64,
     metadata: String,
     metadata_runs: Vec<(String, String)>,
     blurb: String,
@@ -64,12 +67,14 @@ impl SelectedInfo {
             info.path != game.path
                 || info.generation != generation
                 || info.media_generation != common::media::generation()
+                || info.adoption_generation != super::orbit::metadata_completion_generation()
         }) {
             let details = crate::view::details::Details::cached(game, platform);
             *slot = Some(Self {
                 path: game.path.clone(),
                 generation,
                 media_generation: common::media::generation(),
+                adoption_generation: crate::view::orbit::metadata_completion_generation(),
                 metadata: details.metadata,
                 metadata_runs: details.metadata_runs,
                 blurb: details.blurb,
@@ -87,6 +92,7 @@ where
     rect: Rect,
     res: Resources,
     entries: Vec<Entry>,
+    media_generation: u64,
     sort: S,
     list: ScrollList,
     image: Image,
@@ -99,7 +105,7 @@ where
     disc_picker: Option<DiscPicker>,
     details: Option<crate::view::details::Details>,
     semantic_info: Option<SelectedInfo>,
-    idle_media_key: Option<(usize, usize, usize, u64, bool, bool)>,
+    idle_media_key: Option<(usize, usize, usize, u64, bool, bool, super::art_queue::Demand)>,
     idle_media_work: VecDeque<super::orbit::WarmArt>,
     detail_action: usize,
     image_focus: Option<common::theme::frame::Focus>,
@@ -200,6 +206,7 @@ where
             rect,
             res,
             entries: vec![],
+            media_generation: common::media::generation(),
             sort,
             list,
             image,
@@ -294,7 +301,6 @@ where
         handle: &common::theme::ThemeHandle,
         screen: common::theme::pack::ScreenId,
     ) -> bool {
-        use super::orbit::WarmArt;
         if let Some(child) = self.child.as_mut() {
             return child.idle_media_step(handle, screen);
         }
@@ -311,36 +317,6 @@ where
             .alignment
             .as_ref()
             .is_some_and(|a| a.cover_shape == "tall");
-        let key = (
-            selected,
-            first,
-            count,
-            common::media::generation(),
-            ink,
-            tall,
-        );
-        if self.idle_media_key != Some(key) {
-            self.idle_media_key = Some(key);
-            self.idle_media_work =
-                Orbit::navigation_art_work(&self.entries, selected, first, count);
-            for i in [
-                (selected + self.entries.len() - 1) % self.entries.len(),
-                (selected + 1) % self.entries.len(),
-                selected,
-            ] {
-                let e = self.entries[i].clone();
-                self.idle_media_work
-                    .extend([WarmArt::Metadata(e.clone()), WarmArt::Cover(e.clone())]);
-                // Keep full selected/next art resident; previous covers still prefetch.
-                if i == selected || i == (selected + 1) % self.entries.len() {
-                    self.idle_media_work
-                        .extend([WarmArt::Hero(e.clone()), WarmArt::Logo(e.clone())]);
-                }
-                if i == selected {
-                    self.idle_media_work.push_back(WarmArt::OtherCover(e));
-                }
-            }
-        }
         let mut composed_screens = vec![screen];
         if self.details.is_some() {
             composed_screens.push(common::theme::pack::ScreenId::GameDetail);
@@ -355,9 +331,42 @@ where
             .iter()
             .flat_map(|screen| &handle.pack().screens[screen].components)
             .collect();
+        let demand = super::art_queue::Demand::from_components(components.iter().copied(), ink);
+        let key = (
+            selected,
+            first,
+            count,
+            common::media::generation(),
+            ink,
+            tall,
+            demand,
+        );
+        if self.idle_media_key != Some(key) {
+            let direction = self.idle_media_key.map_or(1, |old| {
+                let forward = (selected + self.entries.len() - old.0.min(self.entries.len() - 1))
+                    % self.entries.len();
+                if forward > self.entries.len() / 2 {
+                    -1
+                } else {
+                    1
+                }
+            });
+            self.idle_media_key = Some(key);
+            self.idle_media_work =
+                super::art_queue::plan(&self.entries, selected, first, count, direction, demand);
+            self.orbit.get_or_insert_with(Orbit::new).cancel_selection();
+        }
         let orbit = self.orbit.get_or_insert_with(Orbit::new);
         orbit.set_ink_art(ink);
         orbit.set_cover_shape(tall);
+        orbit.protect_window(
+            &self.entries,
+            selected,
+            first,
+            count,
+            demand.rows,
+            demand.next,
+        );
         let visible_art = |mut art: common::theme::frame::Art| {
             use common::theme::pack::{Arrangement, Binding, Kind};
             let image = |binding| {
@@ -455,6 +464,27 @@ where
             return false;
         }
         work.input.art = orbit.theme_art(&self.entries, work.selected, work.first, work.count);
+        if let Some(Entry::Game(game)) = self.entries.get(work.selected)
+            && work.metadata
+        {
+            use common::theme::pack::Binding;
+            let platform = self
+                .res
+                .get::<ConsoleMapper>()
+                .get_console(&game.path)
+                .map(|console| console.name.clone())
+                .unwrap_or_default();
+            let info = SelectedInfo::get(&mut self.semantic_info, game, &platform);
+            work.input
+                .text
+                .insert(Binding::SelectedMetadata, info.metadata.clone());
+            work.input
+                .text
+                .insert(Binding::SelectedBlurb, info.blurb.clone());
+            if work.ink {
+                work.input.metadata = info.metadata_runs.clone();
+            }
+        }
         true
     }
 
@@ -464,14 +494,14 @@ where
         direction: isize,
         mut input: common::theme::frame::FrameInputs,
     ) -> Result<Option<NavigationWarm>> {
-        use common::theme::pack::{Binding, ScreenId};
+        use common::theme::pack::Binding;
         if let Some(child) = self.child.as_mut() {
             return child.navigation_warm_model(handle, direction, input);
         }
         if self.entries.len() < 2 || !self.root_tab_navigation_ready() {
             return Ok(None);
         }
-        let count = crate::theme_adapter::capacity(handle, ScreenId::Library, Binding::Entries);
+        let count = crate::theme_adapter::capacity(handle, input.screen, Binding::Entries);
         let selected = (self.list.selected() as isize + direction)
             .rem_euclid(self.entries.len() as isize) as usize;
         let first = self.list.window_start();
@@ -488,14 +518,22 @@ where
             .skip(first)
             .take(count)
             .map(|entry| common::theme::frame::Row {
-                subtitle: String::new(),
+                subtitle: self.res.get::<ConsoleMapper>().get_console(entry.path()).map(|c| c.name.clone()).unwrap_or_default(),
                 id: crate::theme_adapter::entry_id(entry.path()),
                 label: entry.name().into(),
-                value: String::new(),
+                value: if crate::network_runtime::download_id(entry.path()).is_some() {
+                    "Cloud".into()
+                } else {
+                    String::new()
+                },
                 enabled: true,
             })
             .collect();
         input.rows.insert(Binding::Entries, rows);
+        input.pagination = Some(common::theme::frame::Pagination {
+            page: selected / count.max(1) + 1,
+            total: self.entries.len().max(1).div_ceil(count.max(1)),
+        });
         let entry = &self.entries[selected];
         let id = crate::theme_adapter::entry_id(entry.path());
         input.focus.item = Some(id.clone());
@@ -503,7 +541,14 @@ where
         input
             .text
             .insert(Binding::SelectedTitle, entry.name().into());
-        if let Entry::Game(game) = entry {
+        let metadata = handle.pack().screens[&input.screen].components.iter().any(|c| {
+            matches!(c.binding, Some(Binding::SelectedMetadata | Binding::SelectedBlurb))
+        });
+        let ink = handle.pack().ink();
+        input.metadata.clear();
+        if let Entry::Game(game) = entry
+            && metadata
+        {
             let platform = self
                 .res
                 .get::<ConsoleMapper>()
@@ -517,30 +562,38 @@ where
             input
                 .text
                 .insert(Binding::SelectedBlurb, info.blurb.clone());
-            input.metadata = info.metadata_runs.clone();
+            if ink {
+                input.metadata = info.metadata_runs.clone();
+            }
+        } else {
+            let platform = self.res.get::<ConsoleMapper>().get_console(entry.path())
+                .map(|c| c.name.clone()).unwrap_or_default();
+            input.text.insert(Binding::SelectedMetadata, platform.chars().take(480).collect());
+            input.text.insert(Binding::SelectedBlurb, String::new());
         }
-        let mut artwork = Orbit::navigation_art_work(&self.entries, selected, first, count);
-        // Prime the current selection and both neighbours before the next input.
-        let current = self.list.selected();
-        for i in [
-            current,
-            (current + 1) % self.entries.len(),
-            (current + self.entries.len() - 1) % self.entries.len(),
-        ] {
-            let e = self.entries[i].clone();
-            artwork.extend([
-                super::orbit::WarmArt::Cover(e.clone()),
-                super::orbit::WarmArt::OtherCover(e.clone()),
-                super::orbit::WarmArt::Hero(e.clone()),
-                super::orbit::WarmArt::Logo(e),
-            ]);
-        }
+        let demand = super::art_queue::Demand::from_components(
+            &handle.pack().screens[&input.screen].components,
+            handle.pack().ink(),
+        );
+        let mut artwork =
+            super::art_queue::plan(&self.entries, selected, first, count, direction, demand);
+        // Warm only art used by the predicted frame; App prepares one raster neighbor.
+        artwork.retain(|task| {
+            let path = task.entry().path();
+            path == self.entries[selected].path()
+                || (demand.rows && self.entries[first..(first + count).min(self.entries.len())]
+                    .iter().any(|entry| entry.path() == path))
+                || (demand.next && self.entries.get(first + count)
+                    .is_some_and(|entry| entry.path() == path))
+        });
         Ok(Some(NavigationWarm {
             input,
             artwork,
             selected,
             first,
             count,
+            metadata,
+            ink,
         }))
     }
 
@@ -691,6 +744,9 @@ where
                 .as_ref()
                 .is_some_and(|a| a.cover_shape == "tall"),
         );
+        if let Some(entry) = self.entries.get(selected) {
+            orbit.protect_selected(entry);
+        }
         if needs_art {
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art(&self.entries, selected, first, count);
@@ -954,7 +1010,9 @@ where
 
     pub fn select(&mut self, index: usize) {
         let _stage = common::perf_trace::stage(common::perf_trace::Stage::Selection);
+        let first = self.list.window_start();
         self.list.select(index);
+        common::perf_trace::selection(common::perf_trace::generation(), first != self.list.window_start());
         if !matches!(self.entries.get(self.list.selected()), Some(Entry::Game(_))) {
             self.semantic_info = None;
         }
@@ -1040,6 +1098,7 @@ where
         self.entries = self
             .sort
             .entries(&self.res.get(), &self.res.get(), &self.res.get())?;
+        self.media_generation = common::media::generation();
         self.list.set_items(
             self.entries
                 .iter()
@@ -1657,7 +1716,9 @@ where
                 }
                 _ => {
                     let selected = self.list.selected();
+                    let first = self.list.window_start();
                     let res = self.list.handle_key_event(event, commands, bubble).await?;
+                    common::perf_trace::selection(common::perf_trace::generation(), first != self.list.window_start());
                     if self.list.selected() != selected {
                         self.prepare_orbit();
                     }
@@ -1818,6 +1879,7 @@ mod perf_fix_tests {
             path: "Game.chd".into(),
             generation: 0,
             media_generation: common::media::generation(),
+            adoption_generation: crate::view::orbit::metadata_completion_generation(),
             metadata: "metadata".into(),
             metadata_runs: vec![],
             blurb: "blurb".into(),
@@ -1849,6 +1911,91 @@ mod perf_fix_tests {
         std::fs::remove_dir_all(root).unwrap();
         common::media::invalidate();
         assert_eq!(after, "After");
+    }
+    #[tokio::test]
+    #[serial_test::serial(orbit_fixture)]
+    async fn metadata_prewarm_two_games_refreshes_warm_and_selected_text() {
+        use common::theme::{
+            ThemeHandle,
+            fonts::FontBank,
+            frame::FrameInputs,
+            pack::{Binding, ScreenId},
+            runtime::ThemeSnapshot,
+        };
+        let root =
+            std::env::temp_dir().join(format!("allium-prewarm-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Imgs")).unwrap();
+        std::fs::create_dir_all(root.join("media/logos")).unwrap();
+        let pixels = tiny_skia::Pixmap::new(32, 32)
+            .unwrap()
+            .encode_png()
+            .unwrap();
+        for name in ["First", "Second"] {
+            for suffix in [".png", ".hero.png"] {
+                std::fs::write(root.join(format!("Imgs/{name}{suffix}")), &pixels).unwrap();
+            }
+            std::fs::write(root.join(format!("media/logos/{name}.png")), &pixels).unwrap();
+        }
+        std::fs::write(root.join("gamelist.xml"), "<gameList><game><path>./First.sfc</path><desc>First synopsis</desc><developer>First studio</developer></game><game><path>./Second.sfc</path><desc>Second synopsis</desc><developer>Second studio</developer><releasedate>19990101T000000</releasedate><players>1-2</players></game></gameList>").unwrap();
+        common::media::invalidate();
+        let bank = FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        let snapshot = ThemeSnapshot::load(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../themes/compact-plus")
+                .canonicalize()
+                .unwrap(),
+        )
+        .unwrap();
+        let handle = ThemeHandle::prepare(snapshot, &bank, 992).unwrap();
+        let mut list = list();
+        list.res.insert(Some(handle.clone()));
+        list.entries = ["First", "Second"]
+            .into_iter()
+            .map(|name| Entry::Game(Game::new(root.join(format!("{name}.sfc")))))
+            .collect();
+        list.list
+            .set_items(vec!["First".into(), "Second".into()], false);
+        list.enable_orbit();
+        list.theme_models(ScreenId::Library, &handle).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while list.idle_media_step(&handle, ScreenId::Library) {
+            assert!(std::time::Instant::now() < deadline, "idle timeout");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let mut warmed = Vec::new();
+        for direction in [1, -1] {
+            let mut work = list
+                .navigation_warm_model(&handle, direction, FrameInputs::new(ScreenId::Library))
+                .unwrap()
+                .unwrap();
+            while !list.navigation_warm_art_step(&mut work) {
+                assert!(std::time::Instant::now() < deadline, "prewarm timeout");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            warmed.push(work.input);
+        }
+        let (send, _recv) = tokio::sync::mpsc::channel(4);
+        list.handle_key_event(KeyEvent::Pressed(Key::Right), send, &mut VecDeque::new())
+            .await
+            .unwrap();
+        let mut models = list.theme_models(ScreenId::Library, &handle).unwrap();
+        while list.idle_media_step(&handle, ScreenId::Library) {
+            assert!(std::time::Instant::now() < deadline, "selection timeout");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        models.extend(list.theme_models(ScreenId::Library, &handle).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+        common::media::invalidate();
+        for model in models.iter().chain(&warmed) {
+            assert_eq!(model.text[&Binding::SelectedBlurb], "Second synopsis");
+            assert!(model.text[&Binding::SelectedMetadata].contains("1999"));
+            assert!(
+                model
+                    .metadata
+                    .iter()
+                    .any(|(label, value)| label == "Released" && value == "1999")
+            );
+        }
     }
     #[tokio::test]
     #[cfg(feature = "perf-bench")]
@@ -2092,4 +2239,62 @@ pub(crate) mod ux4_tests {
         }
     }
 
+}
+
+impl<S: Sort> EntryList<S> {
+    pub fn refresh_names(&mut self) -> bool {
+        let mut changed = self
+            .child
+            .as_mut()
+            .is_some_and(|child| child.refresh_names());
+        let media_generation = common::media::generation();
+        let media_changed = self.media_generation != media_generation;
+        if media_changed {
+            for entry in &mut self.entries {
+                if let Entry::Game(game) = entry
+                    && matches!(game.image, crate::entry::lazy_image::LazyImage::NotFound)
+                {
+                    game.image = crate::entry::lazy_image::LazyImage::Unknown(game.path.clone());
+                }
+            }
+            self.media_generation = media_generation;
+        }
+        let selected_path = self
+            .entries
+            .get(self.list.selected())
+            .map(|entry| entry.path().to_path_buf());
+        let names_changed = self.sort.refresh_names(&mut self.entries);
+        if names_changed {
+            let selected = selected_path
+                .as_ref()
+                .and_then(|path| self.entries.iter().position(|entry| entry.path() == path))
+                .unwrap_or(self.list.selected());
+            self.list.set_items(
+                self.entries
+                    .iter()
+                    .map(|entry| match entry {
+                        Entry::Game(game) => {
+                            format!("{}{}", if game.favorite { "♥ " } else { "" }, entry.name())
+                        }
+                        _ => entry.name().to_string(),
+                    })
+                    .collect(),
+                false,
+            );
+            self.list.select(selected);
+        }
+        if names_changed || media_changed {
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.refresh_names();
+            }
+            self.semantic_info = None;
+            self.idle_media_key = None;
+            self.idle_media_work.clear();
+            changed = true;
+        }
+        if changed {
+            self.set_should_draw();
+        }
+        changed
+    }
 }

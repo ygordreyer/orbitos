@@ -49,6 +49,32 @@ impl Recents {
         }
     }
 
+    pub(crate) fn navigation_warm_ready(&self) -> bool {
+        matches!(self, Self::List(list) if list.navigation_warm_ready())
+    }
+
+    pub(crate) fn navigation_warm_model(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+        direction: isize,
+        input: common::theme::frame::FrameInputs,
+    ) -> Result<Option<super::entry_list::NavigationWarm>> {
+        match self {
+            Self::List(list) => list.navigation_warm_model(handle, direction, input),
+            Self::Carousel(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn navigation_warm_art_step(
+        &mut self,
+        work: &mut super::entry_list::NavigationWarm,
+    ) -> bool {
+        match self {
+            Self::List(list) => list.navigation_warm_art_step(work),
+            Self::Carousel(_) => true,
+        }
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         match self {
             Self::List(list) => list.root_tab_navigation_ready(),

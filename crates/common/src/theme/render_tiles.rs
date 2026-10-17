@@ -47,6 +47,7 @@ impl Cache {
             return false;
         };
         let tile = self.entries.remove(index).unwrap();
+        crate::perf_trace::count(crate::perf_trace::Count::RestoreBytes, rect.2 as u64 * rect.3 as u64 * 4);
         for (y, source) in tile
             .pixels
             .data()
@@ -74,6 +75,8 @@ impl Cache {
         while self.bytes + bytes > BYTE_LIMIT || self.entries.len() >= ENTRY_LIMIT {
             self.bytes -= self.entries.pop_back().unwrap().bytes();
         }
+        crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+        crate::perf_trace::count(crate::perf_trace::Count::CaptureBytes, rect.2 as u64 * rect.3 as u64 * 4);
         let mut pixels = Pixmap::new(rect.2, rect.3).unwrap();
         for (y, dest) in pixels
             .data_mut()

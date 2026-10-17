@@ -13,6 +13,27 @@ pub(super) struct Metadata {
 }
 
 pub(super) fn supported_screen(theme: &ThemeHandle, screen: ScreenId) -> bool {
+    static COMPACT: std::sync::OnceLock<BTreeMap<ScreenId, Vec<Component>>> =
+        std::sync::OnceLock::new();
+    let compact = COMPACT.get_or_init(|| {
+        let pack: super::super::pack::Pack =
+            serde_json::from_str(include_str!("packs/compact.json")).unwrap();
+        pack.screens
+            .into_iter()
+            .filter(|(screen, _)| eligible_screen(*screen))
+            .map(|(screen, layout)| (screen, layout.components))
+            .collect()
+    });
+    if compact.get(&screen).is_some_and(|original| {
+        theme
+            .pack()
+            .screens
+            .get(&screen)
+            .is_some_and(|actual| &actual.components == original)
+    }) && theme.pack().tokens.colors[&ColorRole::Background].ends_with("ff")
+    {
+        return true;
+    }
     static LAYOUTS: std::sync::OnceLock<BTreeMap<ScreenId, Vec<Component>>> =
         std::sync::OnceLock::new();
     let layouts = LAYOUTS.get_or_init(|| {
@@ -98,6 +119,7 @@ pub(super) fn restore_model(saved: &Inputs) -> FrameInputs {
 pub(super) fn capture(input: &FrameInputs) -> Inputs {
     let mut saved = input.clone();
     saved.art = Default::default();
+    saved.art.next_cover_expected = input.art.next_cover_expected;
     let mut art = ArtworkIdentity {
         logo: input.art.selected_logo.as_ref().map(Arc::downgrade),
         hero: input.art.selected_hero.as_ref().map(Arc::downgrade),
@@ -105,25 +127,26 @@ pub(super) fn capture(input: &FrameInputs) -> Inputs {
         next_cover: input.art.next_cover.as_ref().map(Arc::downgrade),
         ..Default::default()
     };
-    for row in input.rows.get(&Binding::Entries).into_iter().flatten() {
-        if let Some(pixels) = input.art.entries.get(&row.id) {
-            art.entries.insert(row.id.clone(), Arc::downgrade(pixels));
-        }
+    for (id, pixels) in &input.art.entries {
+        art.entries.insert(id.clone(), Arc::downgrade(pixels));
     }
     Inputs { model: saved, art }
 }
 pub(super) fn matches(saved: &Inputs, input: &FrameInputs) -> bool {
     let mut model = input.clone();
     model.art = Default::default();
+    model.art.next_cover_expected = input.art.next_cover_expected;
     saved.model == model
         && same_art(saved.art.logo.as_ref(), input.art.selected_logo.as_ref())
         && same_art(saved.art.hero.as_ref(), input.art.selected_hero.as_ref())
         && same_art(saved.art.cover.as_ref(), input.art.selected_cover.as_ref())
         && same_art(saved.art.next_cover.as_ref(), input.art.next_cover.as_ref())
         && saved.art.entries.len() == input.art.entries.len()
-        && input.art.entries.iter().all(|(id, image)| {
-            same_art(saved.art.entries.get(id), Some(image))
-        })
+        && input
+            .art
+            .entries
+            .iter()
+            .all(|(id, image)| same_art(saved.art.entries.get(id), Some(image)))
 }
 fn eligible_screen(screen: ScreenId) -> bool {
     matches!(

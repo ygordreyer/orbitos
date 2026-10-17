@@ -37,6 +37,26 @@ impl RecentsList {
             .idle_media_step(handle, common::theme::pack::ScreenId::Recents)
     }
 
+    pub(crate) fn navigation_warm_ready(&self) -> bool {
+        self.list.navigation_warm_ready()
+    }
+
+    pub(crate) fn navigation_warm_model(
+        &mut self,
+        handle: &common::theme::ThemeHandle,
+        direction: isize,
+        input: common::theme::frame::FrameInputs,
+    ) -> Result<Option<super::super::entry_list::NavigationWarm>> {
+        self.list.navigation_warm_model(handle, direction, input)
+    }
+
+    pub(crate) fn navigation_warm_art_step(
+        &mut self,
+        work: &mut super::super::entry_list::NavigationWarm,
+    ) -> bool {
+        self.list.navigation_warm_art_step(work)
+    }
+
     pub(crate) fn root_tab_navigation_ready(&self) -> bool {
         self.list.root_tab_navigation_ready()
     }
@@ -107,17 +127,12 @@ impl View for RecentsList {
         common::media::poll_name_indexes();
         let generation = common::media::name_generation();
         if self.name_generation != generation
+            && !self.list.interaction_active()
             && !self.list.details_active()
             && !self.list.disc_picker_active()
         {
-            let state = self.list.save();
-            match common::media::with_name_indexes(|| self.list.sort(state.sort)) {
-                Ok(()) => {
-                    self.list.select(state.selected);
-                    self.name_generation = generation;
-                }
-                Err(error) => log::error!("Refresh recent names: {error:#}"),
-            }
+            self.list.refresh_names();
+            self.name_generation = generation;
         }
         self.list.update(dt);
     }
