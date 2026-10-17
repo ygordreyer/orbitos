@@ -918,11 +918,6 @@ where
         }
         // Modal underlays still bypass both caches. Cache only raw semantics;
         // artwork and normalization (including live status) run after this call.
-        if self.menu.is_some() || self.disc_picker.is_some() {
-            return self.base_theme_model(screen, handle, selected, first, count);
-        }
-        let _semantic = common::perf_trace::recording()
-            .then(|| common::perf_trace::stage(common::perf_trace::Stage::SemanticModel));
         let revisions = RecentsRevisions {
             list_revision: self.list_revision,
             media_generation: common::media::generation(),
@@ -936,6 +931,13 @@ where
             theme_digest: handle.digest().to_owned(),
             screen,
         };
+        if self.menu.is_some() || self.disc_picker.is_some() {
+            let mut input = self.base_theme_model(screen, handle, selected, first, count);
+            input.raster_revision = Some(format!("{:?}", revisions));
+            return input;
+        }
+        let _semantic = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::SemanticModel));
         let key = RecentsSemanticKey {
             selected,
             path: self.entries.get(selected).map(|entry| entry.path().to_path_buf()),
@@ -971,7 +973,8 @@ where
                 while cache.len() > RECENTS_ROW_LIMIT { cache.pop_front(); }
                 output
             }).collect();
-        let input = self.build_theme_model(screen, handle, selected, first, count, Some(rows));
+        let mut input = self.build_theme_model(screen, handle, selected, first, count, Some(rows));
+        input.raster_revision = Some(format!("{:?}", key.revisions));
         self.recents_semantic.push_back(RecentsSemantic { key, input: input.clone() });
         while self.recents_semantic.len() > RECENTS_MODEL_LIMIT { self.recents_semantic.pop_front(); }
         input
@@ -2717,11 +2720,13 @@ pub(crate) mod ux4_tests {
         use common::theme::{frame::Art, pack::{Binding, ScreenId}};
         let mut actual = list.theme_models(ScreenId::Recents, theme).unwrap().remove(0);
         actual.art = Art::default();
+        let revision = actual.raster_revision.take();
         // Also retire the one-entry metadata cache so the oracle recomputes it.
         list.semantic_info = None;
         let expected = list.base_theme_model(ScreenId::Recents, theme, list.list.selected(),
             list.list.window_start(), crate::theme_adapter::capacity(theme, ScreenId::Recents, Binding::Entries));
         assert!(actual == expected, "cached semantics differ at selection {}", list.list.selected());
+        actual.raster_revision = revision;
         actual
     }
 
@@ -2755,6 +2760,7 @@ pub(crate) mod ux4_tests {
                 let expected = list.base_theme_model(ScreenId::Recents, &theme, selected, first, count);
                 let mut raw = actual;
                 raw.art = Default::default();
+                raw.raster_revision = None;
                 assert!(raw == expected, "{name}: selection {selected}, window {first}");
                 assert!(list.recents_semantic.len() <= RECENTS_MODEL_LIMIT);
                 assert!(list.recents_rows.as_ref().unwrap().rows.len() <= RECENTS_ROW_LIMIT);
@@ -2803,18 +2809,27 @@ pub(crate) mod ux4_tests {
         assert_ne!(common::media::name_generation(), generation);
         let renamed = semcache_assert_uncached(&mut list, &theme);
         assert_eq!(renamed.rows[&Binding::Entries][0].label, "Renamed");
+        let name_revision = renamed.raster_revision.clone();
+        assert!(name_revision.is_some());
         common::media::invalidate();
-        semcache_assert_uncached(&mut list, &theme);
+        let media = semcache_assert_uncached(&mut list, &theme);
+        assert_ne!(media.raster_revision, name_revision);
+        crate::view::details::invalidate_metadata();
+        let revision_only = semcache_assert_uncached(&mut list, &theme);
+        assert_ne!(revision_only.raster_revision, media.raster_revision);
+        assert_eq!(revision_only.text, media.text);
         let Entry::Game(game) = &mut list.entries[0] else { unreachable!() };
         game.release_date = chrono::NaiveDate::from_ymd_opt(1999, 1, 1);
         crate::view::details::invalidate_metadata();
         let metadata = semcache_assert_uncached(&mut list, &theme);
         assert!(metadata.text[&Binding::SelectedMetadata].contains("1999"));
+        assert_ne!(metadata.raster_revision, revision_only.raster_revision);
         list.entries.swap(0, 1);
         list.list_revision = list.list_revision.wrapping_add(1);
-        semcache_assert_uncached(&mut list, &theme);
+        let before_locale = semcache_assert_uncached(&mut list, &theme);
         res.insert(Locale::new("fr-FR"));
-        semcache_assert_uncached(&mut list, &theme);
+        let localized = semcache_assert_uncached(&mut list, &theme);
+        assert_ne!(localized.raster_revision, before_locale.raster_revision);
         let mut consoles = ConsoleMapper::new();
         consoles.load_config().unwrap();
         res.insert(consoles);
@@ -2938,6 +2953,7 @@ pub(crate) mod ux4_tests {
             let mut cached = list.theme_models_covered(ScreenId::Recents, theme, true).unwrap().remove(0);
             assert_eq!(builds(), before + 1, "{cause} did not settle");
             cached.art = Default::default();
+            cached.raster_revision = None;
             list.semantic_info = None;
             let fresh = list.base_theme_model(ScreenId::Recents, theme, list.list.selected(),
                 list.list.window_start(), crate::theme_adapter::capacity(theme, ScreenId::Recents, Binding::Entries));

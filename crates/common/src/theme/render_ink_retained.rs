@@ -12,6 +12,7 @@ pub(in crate::theme::render) struct Cache {
     parked: VecDeque<(ScreenId, crate::display::SharedPixmap, Vec<Entry>, bool)>,
     declined: Vec<ScreenId>,
     plan: Option<OperationPlan>,
+    panels: Panels,
     #[cfg(test)]
     peak_active_bytes: usize,
     #[cfg(test)]
@@ -70,6 +71,7 @@ struct Entry {
 enum Paint {
     Component,
     Hero(Vec<Component>),
+    Panel { group: Vec<Component>, key: String },
     ShelfCard(usize),
     ShelfPeek,
 }
@@ -84,6 +86,74 @@ struct OperationPlan {
     components: Vec<Component>,
     rows: Vec<(Binding, Vec<Row>)>,
     operations: Arc<Vec<Operation>>,
+}
+
+const PANEL_LIMIT: usize = 4 * 1024 * 1024;
+#[derive(Default)]
+struct Panels(VecDeque<Panel>);
+struct Panel {
+    key: String,
+    sources: Vec<Option<std::sync::Weak<Pixmap>>>,
+    before: Vec<u8>,
+    pixels: Vec<u8>,
+    text: Vec<(String, Rect)>,
+}
+impl Panel {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.key.capacity()
+            + self.sources.capacity() * std::mem::size_of::<Option<std::sync::Weak<Pixmap>>>()
+            + self.before.capacity() + self.pixels.capacity()
+            + self.text.capacity() * std::mem::size_of::<(String, Rect)>()
+            + self.text.iter().map(|(id, _)| id.capacity()).sum::<usize>()
+    }
+}
+impl Panels {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        // Leave room for unused deque slots as well as the live entries' allocations.
+        let limit = PANEL_LIMIT - 8 * std::mem::size_of::<Panel>();
+        if bytes > limit { return false; }
+        while self.0.len() >= 8
+            || self.0.iter().map(Panel::bytes).sum::<usize>() + bytes > limit {
+            self.0.pop_back();
+        }
+        true
+    }
+}
+fn panel_group(screen: ScreenId, components: &[Component]) -> Option<Vec<Component>> {
+    if screen != ScreenId::Recents || HERO_SCRATCH.get() { return None; }
+    let selected = |c: &Component| matches!(c.kind, Kind::Image | Kind::Text)
+        && matches!(c.binding, Some(Binding::SelectedHero | Binding::SelectedLogo
+            | Binding::SelectedCover | Binding::SelectedTitle | Binding::SelectedMetadata
+            | Binding::SelectedFacts | Binding::SelectedBlurb | Binding::SelectedEyebrow
+            | Binding::SelectedSource));
+    let first = components.iter().position(selected)?;
+    let last = components.iter().rposition(selected)?;
+    if first == last { return None; }
+    let group = &components[first..=last];
+    if group.iter().any(|c| c.paint.as_ref().unwrap().action.is_some()
+        || !(selected(c) || (c.kind == Kind::Overlay && c.binding.is_none()))) {
+        return None;
+    }
+    let bounds = group.iter().map(effects::paint_bounds).reduce(union)?;
+    // Never bake a clock (or another live component) into the underlay. In particular,
+    // a status painted before the group cannot be repaired by replaying it afterwards.
+    if components[..first].iter().chain(&components[last + 1..]).any(|c| {
+        overlap(bounds, effects::paint_bounds(c))
+            && !(matches!(c.kind, Kind::Background | Kind::Panel | Kind::Overlay | Kind::AssetImage)
+                && c.binding.is_none() && c.paint.as_ref().unwrap().action.is_none())
+    }) { return None; }
+    Some(group.to_vec())
+}
+fn panel_dependencies(input: &FrameInputs) -> FrameInputs {
+    let mut deps = input.clone();
+    // Live status is painted independently and is never part of a panel group.
+    deps.status = Default::default();
+    deps
+}
+fn panel_sources(input: &FrameInputs) -> Vec<Option<std::sync::Weak<Pixmap>>> {
+    [&input.art.selected_hero, &input.art.selected_logo, &input.art.selected_cover,
+        &input.art.next_cover].into_iter().map(|p| p.as_ref().map(Arc::downgrade))
+        .chain(input.art.entries.values().map(|p| Some(Arc::downgrade(p)))).collect()
 }
 fn row_model(c: &Component, input: &FrameInputs, index: usize) -> FrameInputs {
     let mut model = FrameInputs::new(input.screen);
@@ -911,12 +981,12 @@ impl PreparedFrame {
             .ink_cache
             .entries
             .iter()
-            .find(|entry| entry.component == *hero && entry.bounds == bounds)
+            .find(|entry| entry.component == *hero && inside(entry.bounds, bounds))
         else {
             return Ok(());
         };
         let saved = capture(&self.pixels, bounds);
-        restore(&mut self.pixels, bounds, &entry.before);
+        transfer(&mut self.pixels, entry.bounds, &entry.before, &[bounds], true);
         let result = self.ink_hero(&group, bounds, input);
         restore(&mut self.pixels, bounds, &saved);
         result
@@ -999,6 +1069,74 @@ impl PreparedFrame {
         }
         Ok(())
     }
+    fn ink_panel(&mut self, group: &[Component], descriptor: &str, r: Rect, input: &FrameInputs,
+        before: &[u8], panels: &mut Panels) -> Result<()> {
+        if HERO_SCRATCH.get() {
+            for c in group { self.ink_paint_component(c, input)?; }
+            return Ok(());
+        }
+        // Debug strings preserve exact strings, float values and descriptor fields. Artwork
+        // uses weak allocation identities so the cache cannot pin decoded media in memory.
+        let key = format!("{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            descriptor, input.raster_revision, input.text, input.rows,
+            input.selected, input.pagination, input.detail_lines, input.metadata, input.facts,
+            input.navigation, input.focus, input.hints, input.suppress_hints, input.progress,
+            input.keyboard, input.keyboard_cursor, input.art.next_cover_expected,
+            input.art.entries.keys().collect::<Vec<_>>());
+        let sources = panel_sources(input);
+        let hit = panels.0.iter().position(|entry| entry.key == key
+            && entry.sources.len() == sources.len()
+            && entry.sources.iter().zip(&sources).all(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => a.strong_count() > 0 && a.ptr_eq(b),
+                (None, None) => true,
+                _ => false,
+            }) && entry.before == before);
+        if let Some(index) = hit {
+            let entry = panels.0.remove(index).unwrap();
+            restore(&mut self.pixels, r, &entry.pixels);
+            self.text_boxes.extend(entry.text.iter().cloned());
+            panels.0.push_front(entry);
+            crate::perf_trace::count(crate::perf_trace::Count::PanelHit, 1);
+            crate::perf_trace::count(crate::perf_trace::Count::ComposedPixels, r.2 as u64 * r.3 as u64);
+            crate::perf_trace::count(crate::perf_trace::Count::InkBitmapPixels, r.2 as u64 * r.3 as u64);
+            return Ok(());
+        }
+        crate::perf_trace::count(crate::perf_trace::Count::PanelMiss, 1);
+        let text = self.text_boxes.len();
+        // Keep the original source-over order and integer rounding against the real underlay.
+        with_replay_clip(None, || -> Result<()> {
+            let mut pending = group.iter().peekable();
+            while let Some(c) = pending.next() {
+                if c.kind == Kind::Image && c.binding == Some(Binding::SelectedHero) {
+                    let mut hero = vec![c.clone()];
+                    let mut bounds = effects::paint_bounds(c);
+                    while pending.peek().is_some_and(|next| next.kind == Kind::Overlay
+                        && next.binding.is_none() && next.paint.as_ref().unwrap().gradient.is_some()) {
+                        let next = pending.next().unwrap();
+                        bounds = union(bounds, effects::paint_bounds(next));
+                        hero.push(next.clone());
+                    }
+                    if hero.len() > 1 { self.ink_hero(&hero, bounds, input)?; }
+                    else { self.ink_paint_component(c, input)?; }
+                } else { self.ink_paint_component(c, input)?; }
+            }
+            Ok(())
+        })?;
+        let mut panel = Panel { key, sources, before: Vec::new(), pixels: Vec::new(),
+            text: self.text_boxes[text..].to_vec() };
+        if panels.reserve(panel.bytes() + before.len() * 2) {
+            {
+                let _snapshot = crate::perf_trace::recording()
+                    .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::SnapshotCapture));
+                crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
+                crate::perf_trace::count(crate::perf_trace::Count::CaptureBytes, before.len() as u64);
+                panel.before = before.to_vec();
+            }
+            panel.pixels = capture(&self.pixels, r);
+            panels.0.push_front(panel);
+        }
+        Ok(())
+    }
     fn ink_operations(&mut self, input: &FrameInputs, components: &[Component]) -> Arc<Vec<Operation>> {
         let plan_matches = self.ink_cache.plan.as_ref().is_some_and(|plan| {
             plan.screen == input.screen
@@ -1012,10 +1150,19 @@ impl PreparedFrame {
         } else {
             crate::perf_trace::count(crate::perf_trace::Count::PlanBuilds, 1);
             let mut operations = Vec::new();
+            let mut panel = panel_group(input.screen, components);
             let mut pending = components.iter().peekable();
             while let Some(c) = pending.next() {
                 let rows = c.binding.and_then(|binding| input.rows.get(&binding));
-                if c.kind == Kind::Image
+                if panel.as_ref().is_some_and(|group| group[0].id == c.id) {
+                    let group = panel.take().unwrap();
+                    for _ in 1..group.len() { pending.next(); }
+                    let bounds = group.iter().map(effects::paint_bounds).reduce(union).unwrap();
+                    let key = format!("{:?}:{:?}:{}:{}", group, bounds,
+                        self.theme.generation(), self.theme.digest());
+                    operations.push(Operation { component: c.clone(), row: None,
+                        bounds, paint: Paint::Panel { group, key } });
+                } else if c.kind == Kind::Image
                     && c.binding == Some(Binding::SelectedHero)
                     && c.paint.as_ref().unwrap().action.is_none()
                 {
@@ -1113,6 +1260,9 @@ impl PreparedFrame {
         match &op.paint {
             Paint::Component => self.ink_paint_component(&op.component, input)?,
             Paint::Hero(group) => self.ink_hero(group, bounds, input)?,
+            Paint::Panel { group, .. } => {
+                for c in group { self.ink_paint_component(c, input)?; }
+            }
             Paint::ShelfCard(card) => self.ink_shelf(&op.component,
                 &input.rows[&op.component.binding.unwrap()][0], *card, input, 1.0)?,
             Paint::ShelfPeek => self.ink_shelf_peek(&op.component,
@@ -1240,6 +1390,9 @@ impl PreparedFrame {
                 op.bounds
             };
             let mut deps = dependencies(c, input);
+            if matches!(op.paint, Paint::Panel { .. }) {
+                deps = panel_dependencies(input);
+            }
             if matches!(op.paint, Paint::ShelfCard(_)) {
                 deps.art.next_cover = None;
             }
@@ -1295,7 +1448,11 @@ impl PreparedFrame {
             let text = self.text_boxes.len();
             let clip = (incremental && !changed && !covered).then(|| replay_clip(r, &self.damage));
             with_replay_clip(clip, || -> Result<()> {
-                self.ink_paint_operation(op, r, input)?;
+                if let Paint::Panel { group, key } = &op.paint {
+                    self.ink_panel(group, key, r, input, &before, &mut cache.panels)?;
+                } else {
+                    self.ink_paint_operation(op, r, input)?;
+                }
                 Ok(())
             })?;
             if !incremental && index == 0 && c.kind == Kind::Background && r == Rect(0, 0, 640, 480)
@@ -1375,6 +1532,10 @@ mod navigation_plan_tests {
         assert_eq!(frame.pixels().data(), fresh.pixels().data());
     }
 }
+
+#[cfg(test)]
+#[path = "render_ink_panel_tests.rs"]
+mod panel_tests;
 
 #[cfg(test)]
 pub(in crate::theme::render) fn clear_heroes() { HEROES.with(|heroes| heroes.borrow_mut().clear()); }

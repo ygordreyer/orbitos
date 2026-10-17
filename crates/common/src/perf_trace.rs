@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-const COUNT_LEN: usize = 35;
+const COUNT_LEN: usize = 37;
 const STAGE_NAMES: [&str; 15] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
@@ -68,6 +68,8 @@ pub enum Count {
     HeroHit,
     HeroMiss,
     HeroPrewarmPublish,
+    PanelHit,
+    PanelMiss,
 }
 #[derive(Clone, Copy)]
 struct InputTotals {
@@ -971,6 +973,7 @@ pub fn probe_counts() -> serde_json::Value {
             "compared_pixels":t.counts[8],"scanned_pixels":t.counts[9],"changed_pixels":t.counts[10],
             "art_fitted_hits":t.counts[30],"art_fitted_misses":t.counts[31],
             "hero_hits":t.counts[32],"hero_misses":t.counts[33],"hero_prewarm_publishes":t.counts[34],
+            "panel_hits":t.counts[35],"panel_misses":t.counts[36],
             "image_hits":t.counts[11],"image_misses":t.counts[12],
             "text_hits":t.counts[0],"text_misses":t.counts[1],"blit_map_builds":t.counts[3],
             "damage_rects":t.damage_rects,"damage_pixels":t.damage_pixels,
@@ -1171,7 +1174,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
             "presented_monotonic_us": t.presented_us,
             "stage_begin_monotonic_us": t.frame_stage_begin, "stage_end_monotonic_us": t.frame_stage_end},
         "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts.as_slice()},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish"],
+        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss"],
         "stage_names": STAGE_NAMES,
         "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
     })
@@ -1643,11 +1646,13 @@ mod measurement_tests {
         count(Count::HeroHit, 32);
         count(Count::HeroMiss, 33);
         count(Count::HeroPrewarmPublish, 34);
+        count(Count::PanelHit, 35);
+        count(Count::PanelMiss, 36);
         drawn_frame();
         let legacy: LegacyFrame = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(legacy.event, "frame");
-        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish"]);
-        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34]);
+        assert_eq!(&legacy.measurement.counter_names[32..], ["hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss"]);
+        assert_eq!(&legacy.measurement.frame.counters[32..], [32, 33, 34, 35, 36]);
         TRACE.with(|t| *t.borrow_mut() = None);
         std::fs::remove_file(path).unwrap();
     }

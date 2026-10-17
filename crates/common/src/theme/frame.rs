@@ -69,6 +69,8 @@ pub struct DetailLine {
 #[derive(Clone, PartialEq)]
 pub struct FrameInputs {
     pub screen: ScreenId,
+    /// Opaque controller revisions, including changes that resolve to equal visible values.
+    pub raster_revision: Option<String>,
     pub text: BTreeMap<Binding, String>,
     pub rows: BTreeMap<Binding, Vec<Row>>,
     pub selected: BTreeMap<Binding, String>,
@@ -121,6 +123,7 @@ impl FrameInputs {
     pub fn new(screen: ScreenId) -> Self {
         Self {
             screen,
+            raster_revision: None,
             text: BTreeMap::new(),
             rows: BTreeMap::new(),
             selected: BTreeMap::new(),
@@ -140,6 +143,8 @@ impl FrameInputs {
         }
     }
     pub fn validate(&self, theme: &super::fonts::ThemeHandle) -> Result<()> {
+        ensure!(self.raster_revision.as_ref().is_none_or(|r| r.len() <= 2048),
+            "Raster revision exceeds limit");
         ensure!(
             self.pagination
                 .is_none_or(|p| p.page > 0 && p.total >= p.page),
