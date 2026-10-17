@@ -282,6 +282,33 @@ mod review_tests {
     use std::path::Path;
 
     #[test]
+    fn compact_plus_covered_selection_settles_retained_operations() {
+        use crate::theme::render_navigation::tests::{arts, model, theme};
+        let theme = theme("compact-plus", "square");
+        let arts = arts();
+        for screen in [ScreenId::Library, ScreenId::Recents] {
+            let mut frame = None;
+            for selected in [0, 1, 2, 0] {
+                let mut input = model(&theme, screen, selected, &arts);
+                input.art.selected_logo = None;
+                let prepared = PreparedFrame::prepare_reusing(theme.clone(), &input, frame).unwrap();
+                assert!(prepared.input_matches(&input));
+                for entry in &prepared.ink_cache.entries {
+                    if entry.component.logo_when_no_cover {
+                        assert!(retained::matches(&entry.dependencies, &dependencies(&entry.component, &input)),
+                            "{screen:?} {} did not settle", entry.component.id);
+                    }
+                }
+                let pixels = prepared.pixels.data().to_vec();
+                let repeated = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(prepared)).unwrap();
+                assert!(repeated.damage.is_empty(), "{screen:?} unchanged input repainted: {:?}", repeated.damage);
+                assert_eq!(repeated.pixels.data(), pixels);
+                frame = Some(repeated);
+            }
+        }
+    }
+
+    #[test]
     fn logo_cover_dependencies_track_presence_without_selected_ids_or_art_maps() {
         for kind in ["text", "image"] {
             let c: Component = serde_json::from_value(serde_json::json!({

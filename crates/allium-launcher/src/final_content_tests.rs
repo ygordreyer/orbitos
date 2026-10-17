@@ -115,3 +115,70 @@ async fn pending_cover_and_logo_do_not_record_final_content() {
     assert!(!trace.contains("\"event\":\"final_content\""));
     assert!(!app.view.content_complete());
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn compact_plus_three_warm_games_present_once_per_down_press() {
+    let dir = ALLIUM_GAMES_DIR.join("compact-plus-settled-fixture");
+    assert!(!dir.exists());
+    std::fs::create_dir_all(dir.join("Imgs")).unwrap();
+    let _fixture = Fixture(dir.clone());
+    let database = Database::in_memory().unwrap();
+    for index in 0..3 {
+        let stem = format!("Game {index:02}");
+        let path = dir.join(format!("{stem}.chd"));
+        std::fs::write(&path, []).unwrap();
+        let mut cover = tiny_skia::Pixmap::new(480, 480).unwrap();
+        cover.fill(tiny_skia::Color::from_rgba8(index * 70, 90, 120, 255));
+        cover.save_png(dir.join(format!("Imgs/{stem}.png"))).unwrap();
+        let mut hero = tiny_skia::Pixmap::new(360, 210).unwrap();
+        hero.fill(tiny_skia::Color::from_rgba8(index * 70, 120, 90, 255));
+        hero.save_png(dir.join(format!("Imgs/{stem}.hero.png"))).unwrap();
+        let game: common::database::NewGame = Game::new(path).into();
+        database.update_games(&[game.clone()]).unwrap();
+        database.increment_play_count(&game).unwrap();
+    }
+    common::media::invalidate();
+    let mut app = AlliumLauncher::new(DefaultPlatform::new().unwrap()).unwrap();
+    app.res.insert(database);
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let bank = common::theme::fonts::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+    let theme = common::theme::ThemeHandle::prepare(
+        common::theme::runtime::ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(),
+        &bank, 1,
+    ).unwrap();
+    app.res.insert(Some(theme));
+    app.view = App::load_or_new(app.display.bounding_box(), app.res.clone(), app.platform.battery().unwrap()).unwrap();
+    app.view.proof_games_directory(dir.clone());
+    app.display.record_presentations();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    for tab in [0, 1] {
+        app.view.proof_select_tab(tab);
+        app.present_frame(false, &mut false).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.view.idle_media_step() {
+            app.present_frame(false, &mut false).await.unwrap();
+            assert!(Instant::now() < deadline, "tab {tab} artwork did not settle");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        app.present_frame(false, &mut false).await.unwrap();
+        assert!(app.view.content_complete());
+        app.display.take_presented_frames();
+        for press in 0..8 {
+            let mut work = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.view.prewarm_navigation_step(&mut work, 1).unwrap() {
+                assert!(Instant::now() < deadline, "tab {tab} navigation warm did not settle");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            app.view.handle_key_event(KeyEvent::Pressed(Key::Down), tx.clone(), &mut VecDeque::new()).await.unwrap();
+            app.present_frame(false, &mut false).await.unwrap();
+            assert_eq!(app.display.take_presented_frames().len(), 1, "tab {tab} press {press}");
+            assert!(!app.view.should_draw());
+            assert!(!app.view.idle_media_step(), "tab {tab} press {press} restarted art work");
+            assert!(!app.view.should_draw(), "tab {tab} press {press} requested another draw");
+            app.present_frame(false, &mut false).await.unwrap();
+            assert!(app.display.take_presented_frames().is_empty());
+        }
+    }
+}
