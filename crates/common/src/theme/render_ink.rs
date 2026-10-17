@@ -60,7 +60,7 @@ impl InkPrefixMeasure<'_> {
 #[cfg(test)]
 thread_local! { static DETAIL_GLYPH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; static REFERENCE_WIDTHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[path = "render_ink_effects.rs"]
-mod effects;
+pub(super) mod effects;
 #[path = "render_ink_parity.rs"]
 mod parity;
 pub use parity::ink_detail_pages;
@@ -505,11 +505,11 @@ impl PreparedFrame {
             if bytes <= TEXT_LIMIT {
                 TEXT.with(|cache| {
                     let mut cache = cache.borrow_mut();
-                    while !cache.is_empty()
-                        && cache.iter().map(|e| e.pixels.data().len() + e.key.len()).sum::<usize>()
-                            + bytes > TEXT_LIMIT
-                    {
-                        cache.pop_back();
+                    let mut total = cache.iter()
+                        .map(|e| e.pixels.data().len() + e.key.len()).sum::<usize>();
+                    while !cache.is_empty() && total + bytes > TEXT_LIMIT {
+                        let entry = cache.pop_back().unwrap();
+                        total -= entry.pixels.data().len() + entry.key.len();
                         if crate::perf_trace::recording() {
                             crate::perf_trace::count(crate::perf_trace::Count::TextEviction, 1);
                         }

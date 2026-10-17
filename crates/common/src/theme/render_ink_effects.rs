@@ -85,50 +85,211 @@ struct CachedShadow {
 }
 thread_local! { static SHADOWS: RefCell<VecDeque<CachedShadow>> = const { RefCell::new(VecDeque::new()) }; }
 
-// Keep the original floating-point convolution: its final rounded alpha is
-// covered by exact frame parity tests. Translation-independent tile caching
-// amortizes it without quantizing the Gaussian or changing clipped edges.
-fn gaussian_alpha(alpha: &mut [f32], w: u32, h: u32, blur: u32) {
-    if blur == 0 {
-        return;
-    }
-    let _gaussian = crate::perf_trace::recording()
-        .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::ShadowGaussian));
-    let sigma = blur as f32 / 2.0;
-    let reach = (sigma * 3.0).ceil() as i32;
-    let mut kernel: Vec<f32> = (-reach..=reach)
-        .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
-        .collect();
-    let sum: f32 = kernel.iter().sum();
-    for k in &mut kernel {
-        *k /= sum;
-    }
-    let mut scratch = vec![0.0; alpha.len()];
-    for yy in 0..h as i32 {
-        for xx in 0..w as i32 {
-            scratch[(yy * w as i32 + xx) as usize] = (-reach..=reach)
-                .filter(|d| (0..w as i32).contains(&(xx + d)))
-                .map(|d| alpha[(yy * w as i32 + xx + d) as usize] * kernel[(d + reach) as usize])
-                .sum();
+// Each reused line is compared by bits after hashing; collisions never imply equality.
+// Every computed output retains the original ascending-tap multiply/add order.
+struct GaussianAlpha {
+    alpha: Vec<f32>,
+    scratch: Vec<f32>,
+    w: usize,
+    h: usize,
+    reach: i32,
+    kernel: Vec<f32>,
+    row: usize,
+    column: usize,
+    rows: std::collections::HashMap<u32, Vec<usize>>,
+    columns: std::collections::HashMap<u32, Vec<usize>>,
+    #[cfg(test)]
+    products: usize,
+}
+fn line_hash(bits: impl Iterator<Item = u32>) -> u32 {
+    bits.fold(2166136261, |hash, bits| (hash ^ bits).wrapping_mul(16777619))
+}
+impl GaussianAlpha {
+    fn new(alpha: Vec<f32>, w: u32, h: u32, blur: u32) -> Self {
+        let sigma = blur as f32 / 2.0;
+        let reach = (sigma * 3.0).ceil() as i32;
+        let mut kernel: Vec<f32> = if blur == 0 { vec![] } else {
+            (-reach..=reach)
+                .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
+                .collect()
+        };
+        let sum: f32 = kernel.iter().sum();
+        for k in &mut kernel { *k /= sum; }
+        Self {
+            scratch: vec![0.0; alpha.len()], alpha, w: w as usize, h: h as usize,
+            reach, kernel, row: 0, column: 0,
+            rows: Default::default(), columns: Default::default(),
+            #[cfg(test)]
+            products: 0,
         }
     }
-    for yy in 0..h as i32 {
-        for xx in 0..w as i32 {
-            alpha[(yy * w as i32 + xx) as usize] = (-reach..=reach)
-                .filter(|d| (0..h as i32).contains(&(yy + d)))
-                .map(|d| {
-                    scratch[((yy + d) * w as i32 + xx) as usize] * kernel[(d + reach) as usize]
-                })
-                .sum();
+    fn step(&mut self) -> bool {
+        if self.kernel.is_empty() { return true; }
+        let _gaussian = crate::perf_trace::recording()
+            .then(|| crate::perf_trace::stage(crate::perf_trace::Stage::ShadowGaussian));
+        let Self { alpha, scratch, w, h, reach, kernel, row, column, rows, columns,
+            #[cfg(test)] products,
+        } = self;
+        if *row < *h {
+            for yy in *row..(*row + 4).min(*h) {
+                let start = yy * *w;
+                let hash = line_hash(alpha[start..start + *w].iter().map(|v| v.to_bits()));
+                let same = rows.get(&hash).and_then(|candidates| candidates.iter().copied().find(|&y| {
+                    alpha[y * *w..(y + 1) * *w].iter().zip(&alpha[start..start + *w])
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                }));
+                if let Some(y) = same {
+                    scratch.copy_within(y * *w..(y + 1) * *w, start);
+                } else {
+                    for xx in 0..*w as i32 {
+                        scratch[start + xx as usize] = (-*reach..=*reach)
+                            .filter(|d| (0..*w as i32).contains(&(xx + d)))
+                            .map(|d| {
+                                #[cfg(test)] { *products += 1; }
+                                alpha[start + (xx + d) as usize] * kernel[(d + *reach) as usize]
+                            }).sum();
+                    }
+                    rows.entry(hash).or_default().push(yy);
+                }
+            }
+            *row = (*row + 4).min(*h);
+            return false;
         }
+        for xx in *column..(*column + 4).min(*w) {
+            let hash = line_hash((0..*h).map(|y| scratch[y * *w + xx].to_bits()));
+            let same = columns.get(&hash).and_then(|candidates| candidates.iter().copied().find(|&x| {
+                (0..*h).all(|y| scratch[y * *w + x].to_bits() == scratch[y * *w + xx].to_bits())
+            }));
+            if let Some(x) = same {
+                for yy in 0..*h { alpha[yy * *w + xx] = alpha[yy * *w + x]; }
+            } else {
+                for yy in 0..*h as i32 {
+                    alpha[yy as usize * *w + xx] = (-*reach..=*reach)
+                        .filter(|d| (0..*h as i32).contains(&(yy + d)))
+                        .map(|d| {
+                            #[cfg(test)] { *products += 1; }
+                            scratch[(yy + d) as usize * *w + xx] * kernel[(d + *reach) as usize]
+                        }).sum();
+                }
+                columns.entry(hash).or_default().push(xx);
+            }
+        }
+        *column = (*column + 4).min(*w);
+        *column == *w
     }
 }
 
-impl PreparedFrame {
-    pub(super) fn ink_shadow(&mut self, rect: Rect, radius: u32, shadow: &Shadow) {
-        if shadow.alpha == 0.0 {
-            return;
+#[cfg(test)]
+fn gaussian_alpha(alpha: &mut [f32], w: u32, h: u32, blur: u32) {
+    let mut job = GaussianAlpha::new(alpha.to_vec(), w, h, blur);
+    while !job.step() {}
+    alpha.copy_from_slice(&job.alpha);
+}
+
+fn shadow_lookup(theme: &std::sync::Weak<crate::theme::fonts::PreparedTheme>, key: &ShadowKey) -> Option<Arc<Pixmap>> {
+    SHADOWS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|e| {
+            e.theme.ptr_eq(theme) && e.theme.strong_count() > 0 && e.key == *key
+        })?;
+        let entry = cache.remove(index).unwrap();
+        let pixels = entry.pixels.clone();
+        cache.push_front(entry);
+        Some(pixels)
+    })
+}
+fn shadow_admit(theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>, key: ShadowKey, pixels: Arc<Pixmap>) {
+    SHADOWS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let mut total = cache.iter().map(|e| e.pixels.data().len()).sum::<usize>();
+        while !cache.is_empty()
+            && (cache.len() >= 64 || total + pixels.data().len() > 2 * 1024 * 1024)
+        {
+            total -= cache.pop_back().unwrap().pixels.data().len();
         }
+        if pixels.data().len() <= 2 * 1024 * 1024 {
+            cache.push_front(CachedShadow { theme, key, pixels });
+        }
+    });
+}
+struct ShadowJob {
+    key: ShadowKey,
+    pixels: Pixmap,
+    path: tiny_skia::Path,
+    gaussian: GaussianAlpha,
+    blurred: bool,
+    tinted: usize,
+}
+impl ShadowJob {
+    fn new(key: ShadowKey) -> Self {
+        crate::perf_trace::count(crate::perf_trace::Count::ShadowMisses, 1);
+        let (w, h) = key.tile;
+        let mut pixels = ink_pixmap(w, h).unwrap();
+        let path = crate::display::build_rounded_rect_path(
+            draw_rect(Rect(0, 0, key.size.0, key.size.1)), key.radius,
+        ).unwrap();
+        pixels.fill_path(
+            &path,
+            &tiny_skia::Paint {
+                shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE),
+                anti_alias: true,
+                ..Default::default()
+            },
+            tiny_skia::FillRule::Winding,
+            Transform::from_translate(key.shape_origin.0 as f32, key.shape_origin.1 as f32),
+            None,
+        );
+        let alpha = pixels.pixels().iter().map(|p| p.alpha() as f32 / 255.0).collect();
+        let gaussian = GaussianAlpha::new(alpha, w, h, key.blur);
+        Self { key, pixels, path, gaussian, blurred: false, tinted: 0 }
+    }
+    fn step(&mut self) -> bool {
+        if !self.blurred {
+            self.blurred = self.gaussian.step();
+            return false;
+        }
+        let end = (self.tinted + self.key.tile.0 as usize * 4).min(self.gaussian.alpha.len());
+        let color = self.key.color;
+        for (pixel, a) in self.pixels.data_mut()[self.tinted * 4..end * 4]
+            .chunks_exact_mut(4).zip(&self.gaussian.alpha[self.tinted..end])
+        {
+            let a = (a * f32::from_bits(self.key.alpha) * color[3] as f32).round() as u32;
+            pixel.copy_from_slice(&[
+                ((color[0] as u32 * a + 127) / 255) as u8,
+                ((color[1] as u32 * a + 127) / 255) as u8,
+                ((color[2] as u32 * a + 127) / 255) as u8,
+                a as u8,
+            ]);
+        }
+        self.tinted = end;
+        if end < self.gaussian.alpha.len() { return false; }
+        // An outer box shadow never paints inside its original border box.
+        self.pixels.fill_path(
+            &self.path,
+            &tiny_skia::Paint {
+                shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE),
+                blend_mode: tiny_skia::BlendMode::DestinationOut,
+                anti_alias: true,
+                ..Default::default()
+            },
+            tiny_skia::FillRule::Winding,
+            Transform::from_translate(self.key.cutout_origin.0 as f32, self.key.cutout_origin.1 as f32),
+            None,
+        );
+        true
+    }
+}
+
+/// UI-thread cache work; owns scratch pixels and never borrows presentation state.
+pub struct DetailShadowWarm {
+    stamp: NavigationStamp,
+    theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>,
+    keys: VecDeque<ShadowKey>,
+    job: Option<ShadowJob>,
+}
+impl PreparedFrame {
+    fn shadow_key(&self, rect: Rect, radius: u32, shadow: &Shadow) -> Option<(ShadowKey, i32, i32)> {
+        if shadow.alpha == 0.0 { return None; }
         let margin = shadow.blur * 3 / 2 + 1;
         let x = rect.0 as i32 + shadow.x - margin as i32;
         let y = rect.1 as i32 + shadow.y - margin as i32;
@@ -136,105 +297,73 @@ impl PreparedFrame {
         let top = y.max(0);
         let right = (x + (rect.2 + margin * 2) as i32).min(self.pixels.width() as i32);
         let bottom = (y + (rect.3 + margin * 2) as i32).min(self.pixels.height() as i32);
-        if right <= left || bottom <= top {
-            return;
-        }
-        let w = (right - left) as u32;
-        let h = (bottom - top) as u32;
+        if right <= left || bottom <= top { return None; }
         let color = self.color(shadow.color);
-        let key = ShadowKey::new(
-            rect,
-            radius,
-            shadow,
-            left,
-            top,
-            w,
-            h,
-            [color.r(), color.g(), color.b(), color.a()],
-        );
+        Some((ShadowKey::new(rect, radius, shadow, left, top,
+            (right - left) as u32, (bottom - top) as u32,
+            [color.r(), color.g(), color.b(), color.a()]), left, top))
+    }
+    pub(super) fn ink_shadow(&mut self, rect: Rect, radius: u32, shadow: &Shadow) {
+        let Some((key, left, top)) = self.shadow_key(rect, radius, shadow) else { return; };
         let weak = self.theme.weak();
-        let found = SHADOWS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let index = cache.iter().position(|e| {
-                e.theme.ptr_eq(&weak) && e.theme.strong_count() > 0 && e.key == key
-            })?;
-            let entry = cache.remove(index).unwrap();
-            let pixels = entry.pixels.clone();
-            cache.push_front(entry);
-            Some(pixels)
-        });
-        let pixels = found.unwrap_or_else(|| {
-            crate::perf_trace::count(crate::perf_trace::Count::ShadowMisses, 1);
-            let mut pix = ink_pixmap(w, h).unwrap();
-            let path = crate::display::build_rounded_rect_path(
-                draw_rect(Rect(0, 0, rect.2, rect.3)),
-                radius.min(rect.2 / 2).min(rect.3 / 2),
-            )
-            .unwrap();
-            pix.fill_path(
-                &path,
-                &tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE),
-                    anti_alias: true,
-                    ..Default::default()
-                },
-                tiny_skia::FillRule::Winding,
-                Transform::from_translate(
-                    rect.0 as f32 + shadow.x as f32 - left as f32,
-                    rect.1 as f32 + shadow.y as f32 - top as f32,
-                ),
-                None,
-            );
-            let mut alpha: Vec<f32> = pix
-                .pixels()
-                .iter()
-                .map(|p| p.alpha() as f32 / 255.0)
-                .collect();
-            gaussian_alpha(&mut alpha, w, h, shadow.blur);
-            for (pixel, a) in pix.data_mut().chunks_exact_mut(4).zip(alpha) {
-                let a = (a * shadow.alpha * color.a() as f32).round() as u32;
-                pixel.copy_from_slice(&[
-                    ((color.r() as u32 * a + 127) / 255) as u8,
-                    ((color.g() as u32 * a + 127) / 255) as u8,
-                    ((color.b() as u32 * a + 127) / 255) as u8,
-                    a as u8,
-                ]);
-            }
-            // An outer box shadow never paints inside its original border box.
-            pix.fill_path(
-                &path,
-                &tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::WHITE),
-                    blend_mode: tiny_skia::BlendMode::DestinationOut,
-                    anti_alias: true,
-                    ..Default::default()
-                },
-                tiny_skia::FillRule::Winding,
-                Transform::from_translate(rect.0 as f32 - left as f32, rect.1 as f32 - top as f32),
-                None,
-            );
-            let pixels = Arc::new(pix);
-            SHADOWS.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                while !cache.is_empty()
-                    && (cache.len() >= 64
-                        || cache.iter().map(|e| e.pixels.data().len()).sum::<usize>()
-                            + pixels.data().len()
-                            > 2 * 1024 * 1024)
-                {
-                    cache.pop_back();
-                }
-                if pixels.data().len() <= 2 * 1024 * 1024 {
-                    cache.push_front(CachedShadow {
-                        theme: weak,
-                        key,
-                        pixels: pixels.clone(),
-                    });
-                }
-            });
+        let pixels = shadow_lookup(&weak, &key).unwrap_or_else(|| {
+            let mut job = ShadowJob::new(key.clone());
+            while !job.step() {}
+            let pixels = Arc::new(job.pixels);
+            shadow_admit(weak, key, pixels.clone());
             pixels
         });
         bitmap(&mut self.pixels, left, top, pixels.as_ref().as_ref(), true);
+    }
+    pub fn detail_shadow_warm(&self) -> DetailShadowWarm {
+        let mut keys = VecDeque::new();
+        if self.can_prewarm_navigation() && self.theme.pack().ink() {
+            // Details shadows use pack geometry, independent of metadata and pagination.
+            // Conditional/dynamic components are left to their real render-time model.
+            if let Some(screen) = self.theme.pack().screens.get(&ScreenId::GameDetail) {
+                for c in &screen.components {
+                    let Some(paint) = c.paint.as_ref() else { continue; };
+                    if paint.when.is_some() || paint.fit_content || paint.collapse_empty
+                        || c.layout == Some(Arrangement::Hidden) { continue; }
+                    let visible = match c.kind {
+                        Kind::Panel | Kind::Background | Kind::Overlay => true,
+                        Kind::Image if c.binding == Some(Binding::SelectedCover) => true,
+                        _ => false,
+                    };
+                    if visible {
+                        if let Some(shadow) = &paint.shadow {
+                            if let Some((key, _, _)) = self.shadow_key(c.rect, c.radius.unwrap_or(0), shadow) {
+                                if !keys.contains(&key) { keys.push_back(key); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        DetailShadowWarm { stamp: self.navigation_stamp(), theme: self.theme.weak(), keys, job: None }
+    }
+    /// At most four convolution scanlines or four tint rows, with no framebuffer writes.
+    pub fn prewarm_detail_shadow_step(&self, work: &mut DetailShadowWarm) -> bool {
+        if !self.navigation_is_current(&work.stamp) || !self.theme.weak().ptr_eq(&work.theme) {
+            work.keys.clear();
+            work.job = None;
+            return true;
+        }
+        if let Some(job) = &mut work.job {
+            // A real open may have populated this key since the preceding idle batch.
+            if shadow_lookup(&work.theme, &job.key).is_some() {
+                work.job = None;
+            } else if job.step() {
+                let job = work.job.take().unwrap();
+                shadow_admit(work.theme.clone(), job.key, Arc::new(job.pixels));
+            }
+            return work.job.is_none() && work.keys.is_empty();
+        }
+        let Some(key) = work.keys.pop_front() else { return true; };
+        if shadow_lookup(&work.theme, &key).is_none() {
+            work.job = Some(ShadowJob::new(key));
+        }
+        work.job.is_none() && work.keys.is_empty()
     }
 
     pub(super) fn ink_glow(&mut self, r: Rect, c: &Component) {
@@ -566,7 +695,16 @@ mod tests {
     }
 }
 
-#[cfg(feature = "perf-bench")]
+#[cfg(any(test, feature = "perf-bench"))]
 pub(super) fn benchmark_clear_shadows() {
     SHADOWS.with(|cache| cache.borrow_mut().clear());
+}
+
+#[cfg(test)]
+#[path = "render_ink_shadow_tests.rs"]
+mod shadow_tests;
+
+#[cfg(test)]
+pub(super) fn cached_shadow_count() -> usize {
+    SHADOWS.with(|cache| cache.borrow().len())
 }

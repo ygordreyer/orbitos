@@ -76,3 +76,51 @@ fn compact_plus_details_reopen_text_hits_and_bounded_pressure() {
     crate::perf_trace::stop_probe();
     std::fs::remove_file(log).unwrap();
 }
+
+#[test]
+fn details_shadow_cold_partial_full_and_cached_frames_are_identical() {
+    for shape in ["square", "tall"] {
+        let handle = theme("compact-plus", shape);
+        let arts = arts();
+        let recents = model(&handle, ScreenId::Recents, 0, &arts);
+        let mut details = FrameInputs::new(ScreenId::GameDetail);
+        details.text = recents.text.clone();
+        details.art = recents.art.clone();
+        details.status = recents.status.clone();
+        details.metadata = vec![("Developer".into(), "Namco é 日本語".into())];
+        details.detail_lines = vec![DetailLine { text: "Frozen shadow parity".into(), heading: false, gap_before: 0 }];
+        effects::benchmark_clear_shadows();
+        let cold = PreparedFrame::prepare(handle.clone(), &details).unwrap();
+        let frame = PreparedFrame::prepare(handle.clone(), &recents).unwrap();
+        let presented = (frame.pixels.data().to_vec(), frame.targets.clone(), frame.text_boxes.clone());
+        for batches in [1, 10, 100, 240, usize::MAX] {
+            effects::benchmark_clear_shadows();
+            let mut work = frame.detail_shadow_warm();
+            let mut steps = 0;
+            while steps < batches {
+                steps += 1;
+                let done = frame.prewarm_detail_shadow_step(&mut work);
+                assert_eq!(frame.pixels.data(), presented.0);
+                assert_eq!(frame.targets, presented.1);
+                assert_eq!(frame.text_boxes, presented.2);
+                if done { break; }
+                assert!(steps < 1000);
+            }
+            if batches == usize::MAX {
+                assert_eq!(effects::cached_shadow_count(), 3, "fully warmed Details keys");
+            }
+            let actual = PreparedFrame::prepare(handle.clone(), &details).unwrap();
+            assert_eq!(effects::cached_shadow_count(), 3, "real Details must use the warmed keys");
+            assert_eq!(actual.pixels.data(), cold.pixels.data(), "{shape} batches={batches}");
+            assert_eq!(actual.targets, cold.targets);
+            assert_eq!(actual.text_boxes, cold.text_boxes);
+            let cached = PreparedFrame::prepare(handle.clone(), &details).unwrap();
+            assert_eq!(cached.pixels.data(), cold.pixels.data());
+            assert_eq!(cached.targets, cold.targets);
+        }
+        let mut stale = frame.detail_shadow_warm();
+        frame.prewarm_detail_shadow_step(&mut stale);
+        let replacement = PreparedFrame::prepare(theme("compact-plus", shape), &recents).unwrap();
+        assert!(replacement.prewarm_detail_shadow_step(&mut stale), "theme replacement must discard work");
+    }
+}

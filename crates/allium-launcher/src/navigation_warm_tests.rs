@@ -195,3 +195,47 @@ async fn pending_artwork_does_not_redraw_until_worker_completion() {
     }
     assert!(app.view.should_draw(),"completed artwork must invalidate the scene");
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn details_shadow_batches_yield_to_input_without_changing_presentation_or_selection() {
+    let (_reset, mut app) = launcher_fixture();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../themes/compact-plus").canonicalize().unwrap();
+    let bank = common::theme::fonts::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+    let handle = common::theme::ThemeHandle::prepare(
+        common::theme::runtime::ThemeSnapshot::load(&root).unwrap(), &bank, 901,
+    ).unwrap();
+    app.res.insert(Some(handle));
+    let mut overlay = false;
+    app.present_frame(false, &mut overlay).await.unwrap();
+    let scene = app.view.proof_navigation_scene();
+    let selected = app.view.proof_game_theme_inputs()[0].focus.item.clone();
+    let mut work = None;
+    assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
+    assert!(app.view.proof_detail_shadow_warming(&work));
+    // The first tick creates a job, subsequent ticks advance bounded scanlines.
+    for batch in 0..12 {
+        assert!(!app.view.prewarm_navigation_step(&mut work, 1).unwrap());
+        assert!(app.view.proof_detail_shadow_warming(&work));
+        assert_eq!(app.view.proof_navigation_scene(), scene, "batch {batch}");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender.send(KeyEvent::Pressed(Key::Right)).unwrap();
+        let mut checks = 0;
+        assert!(!app.view.prewarm_navigation_step_with_pending(&mut work, 1, || {
+            checks += 1;
+            checks == 2 && !receiver.is_empty()
+        }).unwrap());
+        assert!(matches!(receiver.try_recv().unwrap(), KeyEvent::Pressed(Key::Right)));
+        assert_eq!(checks, 2);
+        assert_eq!(app.view.proof_navigation_scene(), scene);
+        assert_eq!(app.view.proof_game_theme_inputs()[0].focus.item, selected);
+        assert!(!app.view.should_draw());
+    }
+    let started = std::time::Instant::now();
+    while !app.view.prewarm_navigation_step(&mut work, 1).unwrap() {
+        assert_eq!(app.view.proof_navigation_scene(), scene);
+        assert_eq!(app.view.proof_game_theme_inputs()[0].focus.item, selected);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+}

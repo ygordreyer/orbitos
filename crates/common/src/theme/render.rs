@@ -87,6 +87,7 @@ pub(super) fn navigation_reference(
 }
 
 use super::render_navigation::NavigationRasterPart;
+pub use ink_renderer::effects::DetailShadowWarm;
 pub use super::render_navigation::{NavigationImageWarm, NavigationRasterWarm, NavigationStamp};
 fn shelf_tile_rect(c: &Component, x: u32) -> Rect {
     Rect(

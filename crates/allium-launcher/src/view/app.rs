@@ -148,6 +148,7 @@ pub(crate) struct NavigationWarm {
     name_generation: u64,
     direction: isize,
     stage: NavigationWarmStage,
+    shadows: Option<common::theme::render::DetailShadowWarm>,
 }
 enum NavigationWarmStage {
     Artwork(super::entry_list::NavigationWarm),
@@ -372,6 +373,11 @@ where
     #[cfg(test)]
     pub(crate) fn disc_picker_active(&self) -> bool {
         self.views.1.disc_picker_active()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proof_detail_shadow_warming(&self, work: &Option<NavigationWarm>) -> bool {
+        work.as_ref().is_some_and(|work| work.shadows.is_some())
     }
 
     #[cfg(test)]
@@ -661,6 +667,7 @@ where
 
     #[cfg(feature = "perf-bench")]
     pub(crate) fn navigation_warm_kind(&self, work: &Option<NavigationWarm>) -> &'static str {
+        if work.as_ref().is_some_and(|work| work.shadows.is_some()) { return "detail_shadow"; }
         match work.as_ref().map(|work| &work.stage) {
             None => "plan",
             Some(NavigationWarmStage::Artwork(_)) => "artwork",
@@ -726,20 +733,24 @@ where
                 1 => self.views.1.navigation_warm_model(&handle, direction, input)?,
                 _ => None,
             };
-            let Some(plan) = plan else {
-                return Ok(true);
-            };
             common::perf_trace::count(common::perf_trace::Count::PlanBuilds, 1);
             *work = Some(NavigationWarm {
                 stamp: frame.navigation_stamp(),
                 media_generation: common::media::generation(),
                 name_generation: common::media::name_generation(),
                 direction,
-                stage: NavigationWarmStage::Artwork(plan),
+                stage: plan.map(NavigationWarmStage::Artwork)
+                    .unwrap_or_else(|| NavigationWarmStage::Rasters(VecDeque::new())),
+                shadows: Some(frame.detail_shadow_warm()),
             });
             return Ok(false);
         };
         if input_pending() {
+            *work = Some(current);
+            return Ok(false);
+        }
+        if let Some(shadows) = &mut current.shadows {
+            if frame.prewarm_detail_shadow_step(shadows) { current.shadows = None; }
             *work = Some(current);
             return Ok(false);
         }
