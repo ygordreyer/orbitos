@@ -152,13 +152,11 @@ fn write_boost_lease(path: &Path, policy: &Path, minimum: &str) -> io::Result<()
             .create(true)
             .truncate(true)
             .open(&temporary)?;
-        serde_json::to_writer(
-            &mut file,
-            &BoostLease {
-                policy: policy.to_owned(),
-                minimum: minimum.to_owned(),
-            },
-        )?;
+        let bytes = serde_json::to_vec(&BoostLease {
+            policy: policy.to_owned(),
+            minimum: minimum.to_owned(),
+        })?;
+        file.write_all(&bytes)?;
         file.flush()?;
         fs::rename(&temporary, path)
     })();
@@ -429,6 +427,18 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn published_boost_lease_round_trips_and_removes_temporary_file() {
+        let f = Fixture::new("lease-round-trip");
+        let path = f.0.join("lease");
+        let policy = f.0.join("policy with spaces");
+        write_boost_lease(&path, &policy, "400000\n").unwrap();
+        let lease: BoostLease = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(lease.policy, policy);
+        assert_eq!(lease.minimum, "400000\n");
+        assert!(!path.with_extension(format!("{}.tmp", std::process::id())).exists());
     }
 
     #[test]

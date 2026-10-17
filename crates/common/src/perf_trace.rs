@@ -103,6 +103,7 @@ struct Trace {
     attempt: u64,
     wake_us: u64,
     input_us: u64,
+    boost_us: u64,
     damage_rects: u64,
     damage_pixels: u64,
     render_reason: &'static str,
@@ -164,6 +165,7 @@ fn install(path: &str) -> std::io::Result<()> {
             attempt: 0,
             wake_us: 0,
             input_us: 0,
+            boost_us: 0,
             damage_rects: 0,
             damage_pixels: 0,
             render_reason: "none",
@@ -216,11 +218,15 @@ pub struct PhaseGuard {
     timing: Option<Timing>,
 }
 pub fn phase(phase: Phase) -> PhaseGuard {
+    phase_at(phase, None)
+}
+fn phase_at(phase: Phase, input_start: Option<(u64, u64)>) -> PhaseGuard {
     let timing = TRACE.with(|trace| {
         let mut trace = trace.borrow_mut();
         let trace = trace.as_mut()?;
         if matches!(phase, Phase::Input) {
-            trace.input_us = monotonic_us();
+            trace.input_us = input_start.map_or_else(monotonic_us, |start| start.0);
+            trace.boost_us = 0;
             trace.generation = trace.generation.wrapping_add(1);
             trace.input_epoch = trace.input_epoch.wrapping_add(1);
             trace.input_key = None;
@@ -239,15 +245,27 @@ pub fn phase(phase: Phase) -> PhaseGuard {
             trace.stage_end = [0; STAGE_NAMES.len()];
         }
         Some(Timing {
-            start: thread_cpu_ns(),
+            start: input_start.map_or_else(thread_cpu_ns, |start| start.1),
             children: trace.cpu.iter().sum(),
         })
     });
     PhaseGuard { phase, timing }
 }
 pub fn input(event: crate::platform::KeyEvent) -> PhaseGuard {
+    input_at(event, None, 0)
+}
+pub fn input_with_boost(event: crate::platform::KeyEvent, boost: impl FnOnce()) -> PhaseGuard {
+    let start = recording().then(|| {
+        let cpu = thread_cpu_ns();
+        (monotonic_us(), cpu)
+    });
+    boost();
+    let boost_us = start.map_or(0, |start| monotonic_us().saturating_sub(start.0));
+    input_at(event, start, boost_us)
+}
+fn input_at(event: crate::platform::KeyEvent, start: Option<(u64, u64)>, boost_us: u64) -> PhaseGuard {
     use crate::platform::KeyEvent;
-    let guard = phase(Phase::Input);
+    let guard = phase_at(Phase::Input, start);
     if guard.timing.is_none() { return guard; }
     TRACE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
@@ -258,6 +276,7 @@ pub fn input(event: crate::platform::KeyEvent) -> PhaseGuard {
             };
             t.input_key = Some(key);
             t.input_edge = Some(edge);
+            t.boost_us = boost_us;
             write_event(t, "input_received", t.generation, None);
         }
     });
@@ -1077,6 +1096,7 @@ fn measurement_values(t: &Trace) -> serde_json::Value {
         "selection_generation": t.generation, "viewport_shift": t.viewport_shift,
         "input_generation": t.input_epoch, "input_key": t.input_key, "input_edge": t.input_edge,
         "input_received_monotonic_us": t.input_us,
+        "boost_us": t.boost_us,
         "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
         "content_pending_reason": t.content_pending_reason,
         "content_pending_reasons": t.content_pending_reasons.iter().map(|(reason, missing_rows)|
@@ -1346,6 +1366,54 @@ impl Drop for TaskGuard {
 mod measurement_tests {
     use super::*;
     #[test]
+    fn boost_precedes_trace_serialization_but_follows_input_receipt() {
+        use crate::platform::{Key, KeyEvent};
+        let path = std::env::temp_dir().join(format!("allium-input-boost-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        let mut boost_begin = 0;
+        let mut boost_end = 0;
+        {
+            let _input = input_with_boost(KeyEvent::Pressed(Key::B), || {
+                boost_begin = monotonic_us();
+                assert_eq!(generation(), 0);
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                boost_end = monotonic_us();
+            });
+        }
+        begin_render();
+        presented(generation(), true);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows[0]["event"], "input_received");
+        for row in &rows {
+            let measurement = &row["measurement"];
+            let receipt = measurement["input_received_monotonic_us"].as_u64().unwrap();
+            let boost_us = measurement["boost_us"].as_u64().unwrap();
+            assert!(receipt > 0 && receipt <= boost_begin);
+            assert!(boost_us >= boost_end - boost_begin);
+            assert!(receipt + boost_us <= row["monotonic_us"].as_u64().unwrap());
+            if let Some(final_us) = measurement["final_content_us"].as_u64() {
+                assert!(final_us >= boost_us);
+            }
+        }
+        { let _input = input(KeyEvent::Released(Key::B)); }
+        assert_eq!(probe_counts()["measurement"]["boost_us"], 0);
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn boost_runs_without_trace_recording() {
+        TRACE.with(|t| *t.borrow_mut() = None);
+        let mut calls = 0;
+        let guard = input_with_boost(crate::platform::KeyEvent::Pressed(crate::platform::Key::B), || calls += 1);
+        assert_eq!(calls, 1);
+        assert!(guard.timing.is_none());
+        assert!(!recording());
+    }
+
+    #[test]
     fn prewarm_flood_preserves_open_and_completed_input_rows_across_threads() {
         let path = std::env::temp_dir().join(format!("allium-prewarm-flood-{}.log", std::process::id()));
         install(path.to_str().unwrap()).unwrap();
@@ -1397,6 +1465,7 @@ mod measurement_tests {
                 assert_eq!(row["measurement"]["input_edge"], *edge);
                 assert_eq!(row["measurement"]["input_generation"], i + 1);
                 assert!(row["measurement"]["input_received_monotonic_us"].as_u64().unwrap() > 0);
+                assert_eq!(row["measurement"]["boost_us"], 0);
             }
             assert_eq!(rows[i * 2]["event"], "input_received");
             assert_eq!(rows[i * 2 + 1]["selection_generation"], 91);

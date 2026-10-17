@@ -481,9 +481,17 @@ impl AlliumLauncher<DefaultPlatform> {
         tx: &tokio::sync::mpsc::Sender<Command>,
         rx: &tokio::sync::mpsc::Receiver<Command>,
     ) -> Result<usize> {
-        let _phase = (!matches!(first,
+        let trace_input = !matches!(first,
             KeyEvent::Released(Key::L | Key::R | Key::Left | Key::Right | Key::Up | Key::Down)
-        )).then(|| common::perf_trace::input(first));
+        );
+        #[cfg(feature = "miyoo")]
+        let _phase = if boosts_cpu(first) {
+            Some(common::perf_trace::input_with_boost(first, common::platform::cpu_tuning::boost_input))
+        } else {
+            trace_input.then(|| common::perf_trace::input(first))
+        };
+        #[cfg(not(feature = "miyoo"))]
+        let _phase = trace_input.then(|| common::perf_trace::input(first));
         let repeat_key = match first {
             KeyEvent::Autorepeat(_) => navigation_key(first),
             _ => None,
@@ -498,7 +506,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 KeyEvent::Autorepeat(_) => {}
             }
             #[cfg(feature = "miyoo")]
-            if boosts_cpu(event) {
+            if count != 0 && boosts_cpu(event) {
                 common::platform::cpu_tuning::boost_input();
             }
             #[cfg(all(
