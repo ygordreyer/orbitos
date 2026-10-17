@@ -26,6 +26,9 @@ use simple_logger::SimpleLogger;
 async fn main() -> Result<()> {
     SimpleLogger::new().env().init().unwrap();
 
+    // Reverse drop order quiesces boost work before the final trace drain,
+    // including startup errors and unwinding out of the event loop.
+    let _trace_flush = common::perf_trace::FlushPendingOnDrop;
     #[cfg(feature = "miyoo")]
     let _boost_guard = common::platform::cpu_tuning::input_boost_guard();
 

@@ -1,9 +1,11 @@
 use std::{
     cell::RefCell,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::Write,
     os::unix::io::AsRawFd,
     time::Instant,
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 const COUNT_LEN: usize = 44;
@@ -14,6 +16,10 @@ const STAGE_NAMES: [&str; 32] = [
     "frame_model_key", "frame_model_lookup", "frame_model_artwork",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
+// 64 rows cover a press burst without letting incomplete content grow the queue
+// indefinitely. Drain at 16 rows after presentation, even before final content.
+const PENDING_LIMIT: usize = 64;
+const PENDING_FLUSH_THRESHOLD: usize = 16;
 static DROPPED_TRACE_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Clone, Copy)]
 pub enum Phase {
@@ -107,7 +113,7 @@ struct Trace {
     frame_stage_begin: [u64; STAGE_NAMES.len()],
     frame_stage_end: [u64; STAGE_NAMES.len()],
     presented_us: u64,
-    file: File,
+    output: Arc<TraceOutput>,
     path: String,
     cpu: [u64; 8],
     hits: [u64; 3],
@@ -154,10 +160,10 @@ pub fn initialize() {
     }
 }
 fn install(path: &str) -> std::io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let output = trace_output(path)?;
     TRACE.with(|trace| {
         *trace.borrow_mut() = Some(Trace {
-            file,
+            output,
             path: path.into(),
             counts: [0; COUNT_LEN],
             stages: [0; STAGE_NAMES.len()],
@@ -289,6 +295,7 @@ pub fn input_with_boost(event: crate::platform::KeyEvent, boost: impl FnOnce()) 
     let boost_us = start.map_or(0, |start| monotonic_us().saturating_sub(start.0));
     input_at(event, start, boost_us)
 }
+#[derive(Clone, Copy)]
 struct BoostWorkTiming {
     start: u64,
     lease: [u64; 2],
@@ -333,16 +340,7 @@ impl Drop for BoostWork {
         let Some(timing) = &self.timing else { return; };
         TRACE.with(|state| {
             if let Some(t) = state.borrow_mut().as_mut() {
-                let mut row = event_values(t, "boost_completed", 0, None);
-                row["measurement"]["boost_started_monotonic_us"] = timing.start.into();
-                row["measurement"]["boost_lease_us"] = timing.lease[1].saturating_sub(timing.lease[0]).into();
-                row["measurement"]["boost_sysfs_us"] = timing.sysfs[1].saturating_sub(timing.sysfs[0]).into();
-                row["measurement"]["boost_lease_begin_monotonic_us"] = timing.lease[0].into();
-                row["measurement"]["boost_lease_end_monotonic_us"] = timing.lease[1].into();
-                row["measurement"]["boost_sysfs_begin_monotonic_us"] = timing.sysfs[0].into();
-                row["measurement"]["boost_sysfs_end_monotonic_us"] = timing.sysfs[1].into();
-                let line = row.to_string() + "\n";
-                let _ = append_bounded(&mut t.file, line.as_bytes());
+                defer_event(t, "boost_completed", 0, Some(*timing));
             }
         });
     }
@@ -362,7 +360,7 @@ fn input_at(event: crate::platform::KeyEvent, start: Option<(u64, u64)>, boost_u
             t.input_key = Some(key);
             t.input_edge = Some(edge);
             t.boost_us = boost_us;
-            write_event(t, "input_received", t.generation, None);
+            defer_event(t, "input_received", t.generation, None);
         }
     });
     guard
@@ -487,8 +485,7 @@ pub fn drawn_frame() {
         row["event"] = "frame".into();
         row["pid"] = std::process::id().into();
         row["measurement"] = measurement_values(trace);
-        let line = row.to_string() + "\n";
-        if append_bounded(&mut trace.file, line.as_bytes()).is_err() {
+        if append_row(trace, row, true).is_err() {
             *state = None;
             return;
         }
@@ -496,6 +493,181 @@ pub fn drawn_frame() {
         trace.hits = [0; 3];
         trace.started = None;
     });
+}
+
+// Writers for one log share a FIFO, including the boost thread. A deferred
+// record prevents later rows from overtaking it until presentation or idle.
+struct TraceOutput {
+    // Never hold this lock during JSON construction, serialization or file I/O.
+    pending: Mutex<VecDeque<PendingRow>>,
+    writer: Mutex<TraceWriter>,
+}
+struct TraceWriter {
+    file: File,
+    last_write: [u64; 2],
+}
+enum PendingRow {
+    Snapshot(EventSnapshot, Vec<(&'static str, usize)>),
+    Ready(serde_json::Value, bool),
+}
+struct EventSnapshot {
+    event: &'static str,
+    monotonic_us: u64,
+    thread_cpu_ns: u64,
+    pid: u32,
+    tid: u64,
+    generation: u64,
+    measurement: MeasurementSnapshot,
+    boost: Option<BoostWorkTiming>,
+}
+impl EventSnapshot {
+    fn values(self, reasons: &[(&'static str, usize)]) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "event": self.event, "monotonic_us": self.monotonic_us,
+            "thread_cpu_ns": self.thread_cpu_ns, "pid": self.pid, "tid": self.tid,
+            "selection_generation": self.generation,
+            "viewport_shift": self.measurement.viewport_shift, "task": null,
+            "measurement": self.measurement.values(reasons),
+        });
+        if let Some(timing) = self.boost {
+            let m = &mut row["measurement"];
+            m["boost_started_monotonic_us"] = timing.start.into();
+            m["boost_lease_us"] = timing.lease[1].saturating_sub(timing.lease[0]).into();
+            m["boost_sysfs_us"] = timing.sysfs[1].saturating_sub(timing.sysfs[0]).into();
+            m["boost_lease_begin_monotonic_us"] = timing.lease[0].into();
+            m["boost_lease_end_monotonic_us"] = timing.lease[1].into();
+            m["boost_sysfs_begin_monotonic_us"] = timing.sysfs[0].into();
+            m["boost_sysfs_end_monotonic_us"] = timing.sysfs[1].into();
+        }
+        row
+    }
+}
+fn trace_output(path: &str) -> std::io::Result<Arc<TraceOutput>> {
+    static OUTPUTS: OnceLock<Mutex<HashMap<String, Weak<TraceOutput>>>> = OnceLock::new();
+    let mut outputs = OUTPUTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(output) = outputs.get(path).and_then(Weak::upgrade) {
+        return Ok(output);
+    }
+    let output = Arc::new(TraceOutput {
+        pending: Mutex::new(VecDeque::with_capacity(PENDING_LIMIT)),
+        writer: Mutex::new(TraceWriter {
+            file: OpenOptions::new().create(true).append(true).open(path)?,
+            last_write: [0; 2],
+        }),
+    });
+    outputs.retain(|_, output| output.strong_count() != 0);
+    outputs.insert(path.into(), Arc::downgrade(&output));
+    Ok(output)
+}
+fn defer_event(t: &Trace, event: &'static str, generation: u64, boost: Option<BoostWorkTiming>) {
+    #[cfg(test)]
+    SNAPSHOTS.with(|count| count.set(count.get() + 1));
+    let snapshot = EventSnapshot {
+        event, monotonic_us: monotonic_us(), thread_cpu_ns: thread_cpu_ns(),
+        pid: std::process::id(), tid: thread_id(), generation,
+        measurement: MeasurementSnapshot::capture(t), boost,
+    };
+    // Input has just cleared these reasons; boost workers also normally have none.
+    // Preserve them for callers that use boost_work on a foreground trace.
+    let reasons = t.content_pending_reasons.clone();
+    TraceOutput::enqueue(&mut t.output.pending.lock().unwrap_or_else(|e| e.into_inner()),
+        PendingRow::Snapshot(snapshot, reasons));
+}
+fn append_row(t: &Trace, row: serde_json::Value, fatal: bool) -> std::io::Result<()> {
+    // Take the writer first to preserve direct-write order, but never wait for it.
+    let mut writer = match t.output.writer.try_lock() {
+        Ok(writer) => writer,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            TraceOutput::enqueue(&mut t.output.pending.lock().unwrap_or_else(|e| e.into_inner()),
+                PendingRow::Ready(row, fatal));
+            return Ok(());
+        }
+    };
+    let mut pending = t.output.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_empty() {
+        drop(pending);
+        writer.write(row)
+    } else {
+        TraceOutput::enqueue(&mut pending, PendingRow::Ready(row, fatal));
+        Ok(())
+    }
+}
+impl TraceOutput {
+    fn enqueue(pending: &mut VecDeque<PendingRow>, row: PendingRow) {
+        if pending.len() == PENDING_LIMIT {
+            DROPPED_TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            pending.push_back(row);
+        }
+    }
+    fn flush_if_full(&self) {
+        let full = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len() >= PENDING_FLUSH_THRESHOLD;
+        if full { let _ = self.flush(); }
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound each drain even if another producer keeps adding records.
+        let count = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let mut result = Ok(());
+        for _ in 0..count {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            let Some(pending) = pending else { break; };
+            let begin = monotonic_us();
+            let (row, fatal) = match pending {
+                PendingRow::Snapshot(snapshot, reasons) => (snapshot.values(&reasons), false),
+                PendingRow::Ready(row, fatal) => (row, fatal),
+            };
+            if let Err(error) = writer.write_since(row, begin) {
+                if fatal { result = Err(error); }
+            }
+        }
+        result
+    }
+}
+impl TraceWriter {
+    fn write(&mut self, row: serde_json::Value) -> std::io::Result<()> {
+        self.write_since(row, monotonic_us())
+    }
+    fn write_since(&mut self, mut row: serde_json::Value, begin: u64) -> std::io::Result<()> {
+        // The following row exposes the preceding serialization and append cost.
+        row["trace_write_begin_us"] = self.last_write[0].into();
+        row["trace_write_end_us"] = self.last_write[1].into();
+        if let Some(m) = row.get_mut("measurement") {
+            m["dropped_trace_lines"] = DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed).into();
+        }
+        #[cfg(test)]
+        SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+        let line = row.to_string() + "\n";
+        let result = append_bounded(&mut self.file, line.as_bytes());
+        self.last_write = [begin, monotonic_us()];
+        result
+    }
+}
+
+impl Drop for TraceOutput {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static SERIALIZATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Drain at the next idle boundary, including inputs that never produced a frame.
+pub fn flush_pending() {
+    TRACE.with(|state| {
+        let mut state = state.borrow_mut();
+        let failed = state.as_ref().is_some_and(|t| {
+            t.output.flush().is_err()
+        });
+        if failed { *state = None; }
+    });
+}
+pub struct FlushPendingOnDrop;
+impl Drop for FlushPendingOnDrop {
+    fn drop(&mut self) { flush_pending(); }
 }
 
 fn append_bounded(file: &mut File, line: &[u8]) -> std::io::Result<()> {
@@ -561,6 +733,43 @@ pub fn network_event(event: &'static str, cause: &'static str, active: Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_tasks_queue_without_waiting_for_writer_and_flush_in_order() {
+        let path = std::env::temp_dir().join(format!("allium-task-writer-lock-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        drop(task("before_lock", 7));
+        let output = TRACE.with(|t| t.borrow().as_ref().unwrap().output.clone());
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _writer = output.writer.lock().unwrap();
+            locked.send(()).unwrap();
+            // Bound failure time if a regression blocks the foreground caller.
+            let _ = wait_release.recv_timeout(std::time::Duration::from_secs(2));
+        });
+        wait_locked.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        drop(task("media_adopt", 7));
+        drop(task("while_locked", 7));
+        let elapsed = start.elapsed();
+        let while_locked = std::fs::read_to_string(&path).unwrap();
+        let _ = release.send(());
+        holder.join().unwrap();
+        drop(task("after_lock", 7));
+        let before_flush = std::fs::read_to_string(&path).unwrap();
+        flush_pending();
+        let data = std::fs::read_to_string(&path).unwrap();
+        TRACE.with(|t| *t.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+        assert!(elapsed < std::time::Duration::from_millis(100), "foreground tasks waited {elapsed:?}");
+        assert_eq!(while_locked.lines().count(), 1);
+        assert_eq!(before_flush, while_locked, "later tasks must not overtake queued rows");
+        let rows: Vec<serde_json::Value> = data.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.iter().map(|row| row["task"]["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["before_lock", "media_adopt", "while_locked", "after_lock"]);
+        assert!(rows.iter().all(|row| row["event"] == "task_completed" && row["selection_generation"] == 7));
+    }
     #[test]
     fn wave2_contended_append_drops_whole_record_and_later_frame_reports_it() {
         let path = std::env::temp_dir().join(format!("allium-wave2-lock-{}.log", std::process::id()));
@@ -847,13 +1056,11 @@ impl Drop for MenuPhaseGuard {
             let Some(trace) = state.as_mut() else {
                 return;
             };
-            let line = serde_json::json!({
+            let row = serde_json::json!({
                 "menu_phase": self.name, "wall_us": started.elapsed().as_micros(),
                 "cpu_us": cpu / 1000,
-            })
-            .to_string()
-                + "\n";
-            if append_bounded(&mut trace.file, line.as_bytes()).is_err() {
+            });
+            if append_row(trace, row, true).is_err() {
                 *state = None;
             }
         });
@@ -1270,34 +1477,93 @@ mod latency_stage_tests {
 }
 
 /// Existing `stages` are inclusive input totals; frame totals reset at begin_render.
+#[derive(Clone, Copy)]
+struct MeasurementSnapshot {
+    generation: u64,
+    viewport_shift: bool,
+    input_epoch: u64,
+    input_key: Option<crate::platform::Key>,
+    input_edge: Option<&'static str>,
+    input_us: u64,
+    boost_us: u64,
+    neighbor_build: &'static str,
+    neighbor_adopt: &'static str,
+    neighbor_warm: &'static str,
+    content_pending_reason: &'static str,
+    next_cover_expected: bool,
+    missing_content_rows: usize,
+    first_feedback_us: u64,
+    final_content_us: u64,
+    frame_stages: [u64; STAGE_NAMES.len()],
+    cpu: [u64; 8],
+    counts: [u64; COUNT_LEN],
+    attempt: u64,
+    render_us: u64,
+    presented_us: u64,
+    frame_stage_begin: [u64; STAGE_NAMES.len()],
+    frame_stage_end: [u64; STAGE_NAMES.len()],
+    input: InputTotals,
+}
+impl MeasurementSnapshot {
+    fn capture(t: &Trace) -> Self {
+        Self {
+            generation: t.generation,
+            viewport_shift: t.viewport_shift,
+            input_epoch: t.input_epoch,
+            input_key: t.input_key,
+            input_edge: t.input_edge,
+            input_us: t.input_us,
+            boost_us: t.boost_us,
+            neighbor_build: t.neighbor_build,
+            neighbor_adopt: t.neighbor_adopt,
+            neighbor_warm: t.neighbor_warm,
+            content_pending_reason: t.content_pending_reason,
+            next_cover_expected: t.next_cover_expected,
+            missing_content_rows: t.missing_content_rows,
+            first_feedback_us: t.first_feedback_us,
+            final_content_us: t.final_content_us,
+            frame_stages: t.frame_stages,
+            cpu: t.cpu,
+            counts: t.counts,
+            attempt: t.attempt,
+            render_us: t.render_us,
+            presented_us: t.presented_us,
+            frame_stage_begin: t.frame_stage_begin,
+            frame_stage_end: t.frame_stage_end,
+            input: t.completed_input.unwrap_or_else(|| input_totals(t)),
+        }
+    }
+    fn values(&self, reasons: &[(&'static str, usize)]) -> serde_json::Value {
+        serde_json::json!({
+            "selection_generation": self.generation, "viewport_shift": self.viewport_shift,
+            "input_generation": self.input_epoch, "input_key": self.input_key, "input_edge": self.input_edge,
+            "input_received_monotonic_us": self.input_us,
+            "boost_us": self.boost_us,
+            "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
+            "neighbor_build": self.neighbor_build, "neighbor_adopt": self.neighbor_adopt,
+            "neighbor_warm": self.neighbor_warm,
+            "content_pending_reason": self.content_pending_reason,
+            "content_pending_reasons": reasons.iter().map(|(reason, missing_rows)|
+                serde_json::json!({"reason":reason,"missing_rows":missing_rows})).collect::<Vec<_>>(),
+            "next_cover_expected": self.next_cover_expected,
+            "missing_content_rows": self.missing_content_rows,
+            "first_feedback_monotonic_us": self.first_feedback_us,
+            "final_content_monotonic_us": self.final_content_us,
+            "first_feedback_us": (self.first_feedback_us != 0).then(|| self.first_feedback_us.saturating_sub(self.input_us)),
+            "final_content_us": (self.final_content_us != 0).then(|| self.final_content_us.saturating_sub(self.input_us)),
+            "frame": {"stage_wall_us": self.frame_stages, "cpu_ns": self.cpu, "counters": self.counts.as_slice(),
+                "render_attempt": self.attempt, "render_start_monotonic_us": self.render_us,
+                "presented_monotonic_us": self.presented_us,
+                "stage_begin_monotonic_us": self.frame_stage_begin, "stage_end_monotonic_us": self.frame_stage_end},
+            "input": {"stage_wall_us": self.input.stages, "cpu_ns": self.input.cpu, "counters": self.input.counts.as_slice()},
+            "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach", "packed_span_hit"],
+            "stage_names": STAGE_NAMES,
+            "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
+        })
+    }
+}
 fn measurement_values(t: &Trace) -> serde_json::Value {
-    let input = t.completed_input.unwrap_or_else(|| input_totals(t));
-    serde_json::json!({
-        "selection_generation": t.generation, "viewport_shift": t.viewport_shift,
-        "input_generation": t.input_epoch, "input_key": t.input_key, "input_edge": t.input_edge,
-        "input_received_monotonic_us": t.input_us,
-        "boost_us": t.boost_us,
-        "dropped_trace_lines": DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed),
-        "neighbor_build": t.neighbor_build, "neighbor_adopt": t.neighbor_adopt,
-        "neighbor_warm": t.neighbor_warm,
-        "content_pending_reason": t.content_pending_reason,
-        "content_pending_reasons": t.content_pending_reasons.iter().map(|(reason, missing_rows)|
-            serde_json::json!({"reason":reason,"missing_rows":missing_rows})).collect::<Vec<_>>(),
-        "next_cover_expected": t.next_cover_expected,
-        "missing_content_rows": t.missing_content_rows,
-        "first_feedback_monotonic_us": t.first_feedback_us,
-        "final_content_monotonic_us": t.final_content_us,
-        "first_feedback_us": (t.first_feedback_us != 0).then(|| t.first_feedback_us.saturating_sub(t.input_us)),
-        "final_content_us": (t.final_content_us != 0).then(|| t.final_content_us.saturating_sub(t.input_us)),
-        "frame": {"stage_wall_us": t.frame_stages, "cpu_ns": t.cpu, "counters": t.counts.as_slice(),
-            "render_attempt": t.attempt, "render_start_monotonic_us": t.render_us,
-            "presented_monotonic_us": t.presented_us,
-            "stage_begin_monotonic_us": t.frame_stage_begin, "stage_end_monotonic_us": t.frame_stage_end},
-        "input": {"stage_wall_us": input.stages, "cpu_ns": input.cpu, "counters": input.counts.as_slice()},
-        "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach", "packed_span_hit"],
-        "stage_names": STAGE_NAMES,
-        "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
-    })
+    MeasurementSnapshot::capture(t).values(&t.content_pending_reasons)
 }
 
 fn input_totals(t: &Trace) -> InputTotals {
@@ -1350,6 +1616,9 @@ pub fn lifecycle(event: &'static str) {
     TRACE.with(|state| {
         if let Some(t) = state.borrow_mut().as_mut() {
             write_event(t, event, t.generation, None);
+            if event != FIRST_COMPLETED_FLUSH {
+                let _ = t.output.flush();
+            }
         }
     });
 }
@@ -1360,8 +1629,7 @@ fn write_event(
     generation: u64,
     task: Option<(&'static str, u64, u64)>,
 ) {
-    let line = event_values(t, event, generation, task).to_string() + "\n";
-    let _ = append_bounded(&mut t.file, line.as_bytes());
+    let _ = append_row(t, event_values(t, event, generation, task), false);
 }
 
 fn event_values(t: &Trace, event: &'static str, generation: u64, task: Option<(&'static str, u64, u64)>) -> serde_json::Value {
@@ -1401,8 +1669,7 @@ pub fn artwork_readiness(before: &crate::theme::frame::Art, after: &crate::theme
         if !changes.is_empty() {
             let mut row = event_values(t, "artwork_readiness", t.generation, None);
             row["artwork_changes"] = changes.into();
-            let line = row.to_string() + "\n";
-            let _ = append_bounded(&mut t.file, line.as_bytes());
+            let _ = append_row(t, row, false);
         }
     });
 }
@@ -1436,6 +1703,9 @@ fn content_marker(generation: u64, final_content: bool) {
                 generation,
                 None,
             );
+            if final_content {
+                let _ = t.output.flush();
+            }
         }
     });
 }
@@ -1455,6 +1725,7 @@ pub fn presented(generation: u64, content_complete: bool) {
         let first = t.first_feedback_us == 0;
         let final_content = content_complete && t.final_content_us == 0;
         if !first && !final_content {
+            t.output.flush_if_full();
             return;
         }
         if first {
@@ -1469,6 +1740,9 @@ pub fn presented(generation: u64, content_complete: bool) {
         }
         if final_content {
             write_event(t, "final_content", generation, None);
+            let _ = t.output.flush();
+        } else {
+            t.output.flush_if_full();
         }
     });
 }
@@ -1556,6 +1830,7 @@ mod measurement_tests {
             assert_eq!(timing.lease(|| 17), 17);
             assert_eq!(timing.sysfs(|| 23), 23);
         }
+        flush_pending();
         let rows = std::fs::read_to_string(&path).unwrap();
         assert_eq!(rows.lines().count(), 1);
         let row: serde_json::Value = serde_json::from_str(rows.trim()).unwrap();
@@ -1645,6 +1920,7 @@ mod measurement_tests {
             }).join().unwrap();
             for _ in 0..1000 { let _task = task("navigation_prewarm", 1); }
         };
+        flush_pending();
         let open = std::fs::read(&path).unwrap();
         flood();
         assert_eq!(std::fs::read(&path).unwrap(), open);
@@ -1672,6 +1948,7 @@ mod measurement_tests {
             selection(91, false);
             first_feedback(91);
         }
+        flush_pending();
         let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
         for (i, (key, edge)) in [("B", "press"), ("B", "release"), ("Right", "autorepeat")].iter().enumerate() {
@@ -1996,4 +2273,332 @@ fn fpdiag_idle_build_reason_survives_into_press_final_content() {
     assert_eq!(final_row["measurement"]["neighbor_warm"], "allowed");
     stop_probe();
     std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(test)]
+mod deferred_trace_tests {
+    use super::*;
+    use crate::platform::{Key, KeyEvent};
+
+    fn path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("allium-tracedefer-{name}-{}.log", std::process::id()))
+    }
+    fn rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    #[test]
+    fn input_then_frame_keeps_event_time_fields_and_line_order() {
+        let path = path("frame");
+        install(path.to_str().unwrap()).unwrap();
+        TRACE.with(|state| {
+            let mut state = state.borrow_mut();
+            let t = state.as_mut().unwrap();
+            t.counts[0] = 17;
+            t.frame_stages[2] = 23;
+            t.frame_stage_begin[2] = 29;
+            t.frame_stage_end[2] = 31;
+            t.neighbor_build = "ready:idle";
+        });
+        let serializations = SERIALIZATIONS.with(std::cell::Cell::get);
+        let before = monotonic_us();
+        let guard = input(KeyEvent::Pressed(Key::Down));
+        let after = monotonic_us();
+        let mut expected = TRACE.with(|state| {
+            let state = state.borrow();
+            let t = state.as_ref().unwrap();
+            let pending = t.output.pending.lock().unwrap();
+            let Some(PendingRow::Snapshot(snapshot, _)) = pending.front() else { panic!("missing snapshot") };
+            assert!(before <= snapshot.monotonic_us && snapshot.monotonic_us <= after);
+            // Compare the complete pre-existing event projection at receipt,
+            // including the previous frame's counters and endpoints.
+            let mut row = event_values(t, "input_received", t.generation, None);
+            row["monotonic_us"] = snapshot.monotonic_us.into();
+            row["thread_cpu_ns"] = snapshot.thread_cpu_ns.into();
+            row
+        });
+        assert_eq!(SERIALIZATIONS.with(std::cell::Cell::get), serializations);
+        assert!(rows(&path).is_empty());
+        drop(guard);
+        selection(91, true);
+        begin_render();
+        count(Count::TextMiss, 43);
+        content_readiness("ready", false, 0);
+        presented(91, true);
+        drawn_frame();
+        let output = rows(&path);
+        assert_eq!(output.iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["input_received", "first_feedback", "final_content", "frame"]);
+        let mut actual = output[0].clone();
+        actual.as_object_mut().unwrap().remove("trace_write_begin_us");
+        actual.as_object_mut().unwrap().remove("trace_write_end_us");
+        // Other tests may drop a line on the process-wide counter concurrently.
+        expected["measurement"]["dropped_trace_lines"] = actual["measurement"]["dropped_trace_lines"].clone();
+        assert_eq!(actual, expected);
+        assert_eq!(actual["measurement"]["frame"]["counters"][0], 17);
+        assert_eq!(actual["measurement"]["input"]["cpu_ns"][0], 0);
+        assert_eq!(output[2]["measurement"]["input_key"], "Down");
+        assert_eq!(output[2]["measurement"]["selection_generation"], 91);
+        let presented = output[2]["measurement"]["final_content_monotonic_us"].as_u64().unwrap();
+        let write_begin = output[1]["trace_write_begin_us"].as_u64().unwrap();
+        let write_end = output[1]["trace_write_end_us"].as_u64().unwrap();
+        assert!(presented <= write_begin && write_begin <= write_end);
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_frame_inputs_flush_at_idle_lifecycle_and_scope_exit() {
+        let path = path("no-frame");
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = input(KeyEvent::Released(Key::B)); }
+        assert!(rows(&path).is_empty());
+        flush_pending();
+        assert_eq!(rows(&path)[0]["measurement"]["input_edge"], "release");
+        { let _input = input(KeyEvent::Pressed(Key::B)); }
+        lifecycle(LAUNCH_PREP);
+        assert_eq!(rows(&path).iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["input_received", "input_received", LAUNCH_PREP]);
+        {
+            let _flush = FlushPendingOnDrop;
+            let _input = input(KeyEvent::Autorepeat(Key::B));
+        }
+        assert_eq!(rows(&path).len(), 4);
+        { let _input = input(KeyEvent::Pressed(Key::Menu)); }
+        stop_probe();
+        assert_eq!(rows(&path).len(), 5);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn boost_worker_defers_serialization_and_keeps_shared_writer_order() {
+        let path = path("worker");
+        install(path.to_str().unwrap()).unwrap();
+        { let _input = input(KeyEvent::Pressed(Key::Down)); }
+        let worker_path = path.clone();
+        std::thread::spawn(move || {
+            install(worker_path.to_str().unwrap()).unwrap();
+            let before = SERIALIZATIONS.with(std::cell::Cell::get);
+            {
+                let mut work = boost_work();
+                work.lease(|| ());
+                work.sysfs(|| ());
+            }
+            assert_eq!(SERIALIZATIONS.with(std::cell::Cell::get), before);
+            { let _task = task("test_worker", 1); }
+            assert!(rows(&worker_path).is_empty());
+            stop_probe();
+        }).join().unwrap();
+        assert!(rows(&path).is_empty());
+        begin_render();
+        presented(generation(), true);
+        drawn_frame();
+        let output = rows(&path);
+        assert_eq!(output.iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["input_received", "boost_completed", "task_completed", "first_feedback", "final_content", "frame"]);
+        assert_ne!(output[0]["tid"], output[1]["tid"]);
+        let m = &output[1]["measurement"];
+        assert!(m["boost_started_monotonic_us"].as_u64().unwrap()
+            <= m["boost_sysfs_end_monotonic_us"].as_u64().unwrap());
+        assert!(output[1]["monotonic_us"].as_u64().unwrap()
+            <= output[3]["monotonic_us"].as_u64().unwrap());
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn disabled_input_and_boost_do_not_serialize_or_capture() {
+        stop_probe();
+        let before = SERIALIZATIONS.with(std::cell::Cell::get);
+        let snapshots = SNAPSHOTS.with(std::cell::Cell::get);
+        for event in [KeyEvent::Pressed(Key::B), KeyEvent::Released(Key::B), KeyEvent::Autorepeat(Key::Down)] {
+            let guard = input_with_boost(event, || {
+                let mut work = boost_work();
+                assert!(work.timing.is_none());
+                work.lease(|| ());
+                work.sysfs(|| ());
+            });
+            assert!(guard.timing.is_none());
+            drop(guard);
+            flush_pending();
+        }
+        assert_eq!(SERIALIZATIONS.with(std::cell::Cell::get), before);
+        assert_eq!(SNAPSHOTS.with(std::cell::Cell::get), snapshots);
+        assert!(!recording());
+    }
+
+    #[test]
+    fn queued_no_frame_inputs_are_not_overwritten_and_keep_the_log_cap() {
+        let path = path("queue");
+        install(path.to_str().unwrap()).unwrap();
+        for _ in 0..16 { let _input = input(KeyEvent::Pressed(Key::B)); }
+        assert!(rows(&path).is_empty());
+        flush_pending();
+        let output = rows(&path);
+        assert_eq!(output.len(), 16);
+        for (i, row) in output.iter().enumerate() {
+            assert_eq!(row["measurement"]["input_generation"], i + 1);
+        }
+        for _ in 0..16 {
+            for _ in 0..16 { let _input = input(KeyEvent::Pressed(Key::B)); }
+            flush_pending();
+        }
+        let output = rows(&path);
+        assert_eq!(output.last().unwrap()["measurement"]["input_generation"], 272);
+        assert!(std::fs::metadata(&path).unwrap().len() <= LOG_LIMIT);
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn deferred_contended_append_reports_dropped_lines_on_the_following_record() {
+        let path = path("drop");
+        install(path.to_str().unwrap()).unwrap();
+        let before = DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed);
+        let holder = OpenOptions::new().append(true).open(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        { let _input = input(KeyEvent::Pressed(Key::B)); }
+        flush_pending();
+        assert!(rows(&path).is_empty());
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        begin_render();
+        presented(generation(), true);
+        drawn_frame();
+        let output = rows(&path);
+        assert_eq!(output[0]["event"], "first_feedback");
+        for row in output {
+            assert!(row["measurement"]["dropped_trace_lines"].as_u64().unwrap() > before);
+        }
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn input_and_boost_snapshots_do_not_wait_for_worker_writer() {
+        let path = path("writer-lock");
+        install(path.to_str().unwrap()).unwrap();
+        let output = TRACE.with(|state| state.borrow().as_ref().unwrap().output.clone());
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut writer = output.writer.lock().unwrap();
+            locked.send(()).unwrap();
+            let released = wait_release.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            writer.write(serde_json::json!({"event":"worker_write"})).unwrap();
+            released
+        });
+        wait_locked.recv().unwrap();
+        let before = SERIALIZATIONS.with(std::cell::Cell::get);
+        let started = Instant::now();
+        { let _input = input(KeyEvent::Pressed(Key::Down)); }
+        { let _boost = boost_work(); }
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        let released = worker.join().unwrap();
+        assert_eq!(SERIALIZATIONS.with(std::cell::Cell::get), before);
+        flush_pending();
+        let events = rows(&path);
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+        assert!(released && elapsed < std::time::Duration::from_millis(100), "snapshot waited {elapsed:?}");
+        assert_eq!(events.iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["worker_write", "input_received", "boost_completed"]);
+    }
+
+    #[test]
+    fn pending_queue_bounds_both_enqueue_paths_and_reports_overflow() {
+        let path = path("overflow");
+        install(path.to_str().unwrap()).unwrap();
+        let before = DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..PENDING_LIMIT { let _input = input(KeyEvent::Pressed(Key::B)); }
+        for _ in 0..5 { let _input = input(KeyEvent::Pressed(Key::B)); }
+        for _ in 0..4 { drawn_frame(); }
+        TRACE.with(|state| {
+            assert_eq!(state.borrow().as_ref().unwrap().output.pending.lock().unwrap().len(), PENDING_LIMIT);
+        });
+        assert!(DROPPED_TRACE_LINES.load(std::sync::atomic::Ordering::Relaxed) >= before + 9);
+        assert!(rows(&path).is_empty());
+        flush_pending();
+        let output = rows(&path);
+        assert!(!output.is_empty());
+        for row in &output {
+            assert!(row["measurement"]["dropped_trace_lines"].as_u64().unwrap() >= before + 9);
+        }
+        for pair in output.windows(2) {
+            assert_eq!(pair[1]["measurement"]["input_generation"].as_u64().unwrap(),
+                pair[0]["measurement"]["input_generation"].as_u64().unwrap() + 1);
+        }
+        assert_eq!(output.last().unwrap()["measurement"]["input_generation"], PENDING_LIMIT);
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn incomplete_presentations_drain_at_threshold_without_an_input_gap() {
+        let path = path("threshold");
+        install(path.to_str().unwrap()).unwrap();
+        for _ in 0..PENDING_FLUSH_THRESHOLD { let _input = input(KeyEvent::Pressed(Key::Down)); }
+        assert!(rows(&path).is_empty());
+        presented(generation(), false);
+        assert_eq!(rows(&path).len(), PENDING_FLUSH_THRESHOLD + 1);
+        // Repeated incomplete frames must also drain after first feedback.
+        for _ in 0..PENDING_FLUSH_THRESHOLD { let _boost = boost_work(); }
+        presented(generation(), false);
+        let output = rows(&path);
+        assert_eq!(output.len(), 2 * PENDING_FLUSH_THRESHOLD + 1);
+        assert!(output.iter().all(|row| row["event"] != "final_content"));
+        stop_probe();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn final_guard_flushes_boost_completed_after_loop_exit_on_all_paths() {
+        // Model main's reverse drop order with a worker join as boost quiescence.
+        struct Quiesce(Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>);
+        impl Drop for Quiesce {
+            fn drop(&mut self) {
+                let (release, worker) = self.0.take().unwrap();
+                release.send(()).unwrap();
+                worker.join().unwrap();
+            }
+        }
+        for mode in ["normal", "error", "unwind"] {
+            let path = path(mode);
+            install(path.to_str().unwrap()).unwrap();
+            let worker_path = path.clone();
+            let (ready, wait_ready) = std::sync::mpsc::channel();
+            let (release, wait_release) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                install(worker_path.to_str().unwrap()).unwrap();
+                let work = boost_work();
+                ready.send(()).unwrap();
+                wait_release.recv().unwrap();
+                drop(work);
+                stop_probe();
+            });
+            wait_ready.recv().unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ()> {
+                let _final_flush = FlushPendingOnDrop;
+                let _boost_guard = Quiesce(Some((release, worker)));
+                {
+                    let _loop_flush = FlushPendingOnDrop;
+                    let _input = input(KeyEvent::Released(Key::B));
+                }
+                assert_eq!(rows(&path).len(), 1);
+                match mode {
+                    "normal" => Ok(()),
+                    "error" => Err(()),
+                    _ => panic!("simulate event loop unwind"),
+                }
+            }));
+            assert_eq!(result.is_err(), mode == "unwind");
+            if mode == "error" { assert_eq!(result.unwrap(), Err(())); }
+            assert_eq!(rows(&path).iter().map(|row| row["event"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["input_received", "boost_completed"]);
+            stop_probe();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
 }

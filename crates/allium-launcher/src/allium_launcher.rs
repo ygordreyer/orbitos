@@ -150,6 +150,7 @@ impl AlliumLauncher<DefaultPlatform> {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<()> {
+        let _trace_flush = common::perf_trace::FlushPendingOnDrop;
         {
             let styles = self.res.get::<Stylesheet>().display_style();
 
@@ -354,6 +355,7 @@ impl AlliumLauncher<DefaultPlatform> {
             if pending_input.is_ready(&mut self.platform) {
                 continue;
             }
+            common::perf_trace::flush_pending();
             let view_deadline = self
                 .toast_deadline
                 .map_or(update_deadline, |toast| toast.min(update_deadline));
