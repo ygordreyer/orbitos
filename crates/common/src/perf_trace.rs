@@ -94,6 +94,9 @@ pub fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::fs::metadata("/tmp/allium-perf-trace").is_ok())
 }
+pub fn recording() -> bool {
+    TRACE.with(|trace| trace.borrow().is_some())
+}
 pub fn initialize() {
     thread_local! { static INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     if enabled() {
@@ -1074,6 +1077,17 @@ pub fn presented(generation: u64, content_complete: bool) {
     });
 }
 
+/// Settle unchanged content only after this selection has actually been presented.
+pub fn settled(generation: u64) {
+    if TRACE.with(|state| {
+        state.borrow().as_ref().is_some_and(|t| {
+            t.generation == generation && t.first_feedback_us != 0 && t.final_content_us == 0
+        })
+    }) {
+        final_content(generation);
+    }
+}
+
 pub fn first_feedback(generation: u64) {
     content_marker(generation, false);
 }
@@ -1136,6 +1150,28 @@ impl Drop for TaskGuard {
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn settlement_requires_presented_current_selection_and_is_deduplicated() {
+        let path = std::env::temp_dir().join(format!("allium-settlement-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        selection(41, false);
+        settled(41);
+        assert_eq!(probe_counts()["measurement"]["final_content_monotonic_us"], 0);
+        presented(41, false);
+        settled(40);
+        assert_eq!(probe_counts()["measurement"]["final_content_monotonic_us"], 0);
+        settled(41);
+        settled(41);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.iter().filter(|row| row["event"] == "final_content").count(), 1);
+        { let _input = phase(Phase::Input); }
+        settled(generation());
+        assert_eq!(probe_counts()["measurement"]["final_content_monotonic_us"], 0);
+        TRACE.with(|state| *state.borrow_mut() = None);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn completed_input_totals_exclude_idle_work_and_reset_on_next_input() {
         let path = std::env::temp_dir().join(format!("allium-final-totals-{}.log", std::process::id()));

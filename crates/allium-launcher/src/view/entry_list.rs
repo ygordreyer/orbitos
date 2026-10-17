@@ -376,12 +376,15 @@ where
             };
             if !image(Binding::SelectedHero) {
                 art.selected_hero = None;
+                art.completed_misses.selected_hero = false;
             }
             if !image(Binding::SelectedCover) {
                 art.selected_cover = None;
+                art.completed_misses.selected_cover = false;
             }
             if !image(Binding::SelectedLogo) && !components.iter().any(|c| c.logo) {
                 art.selected_logo = None;
+                art.completed_misses.selected_logo = false;
             }
             if !image(Binding::NextCover)
                 && !components.iter().any(|c| {
@@ -390,12 +393,14 @@ where
                 })
             {
                 art.next_cover = None;
+                art.completed_misses.next_cover = false;
             }
             if !components.iter().any(|c| {
                 c.kind == Kind::Entries
                     && (c.layout == Some(Arrangement::Shelf) || c.art_size.unwrap_or(0) > 0)
             }) {
                 art.entries.clear();
+                art.completed_misses.entries.clear();
             }
             art
         };
@@ -407,6 +412,7 @@ where
         }
         let after = visible_art(orbit.theme_art(&self.entries, selected, first, count));
         let art_changed = before != after;
+        let readiness_changed = before.completed_misses != after.completed_misses;
         let mut metadata_changed = false;
         if let Some(Entry::Game(game)) = self.entries.get(selected) {
             use common::theme::pack::Binding;
@@ -436,11 +442,13 @@ where
             }
         }
         let changed = art_changed || metadata_changed;
-        if changed {
+        if changed || readiness_changed {
             super::orbit::visible_completion();
+        }
+        if changed {
             self.set_should_draw();
         }
-        pending || changed
+        pending || changed || readiness_changed
     }
 
     pub(crate) fn navigation_warm_ready(&self) -> bool {

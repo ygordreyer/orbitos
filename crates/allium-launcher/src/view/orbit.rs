@@ -405,6 +405,29 @@ impl Orbit {
                     .insert(crate::theme_adapter::entry_id(entry.path()), image.clone());
             }
         }
+        if common::perf_trace::recording() {
+            let missed = |task: WarmArt| {
+                let key = task.key();
+                self.completed_tasks.iter().any(|completed| completed.key == key)
+            };
+            if let Some(entry) = entries.get(selected) {
+                art.completed_misses.selected_cover = art.selected_cover.is_none()
+                    && missed(WarmArt::Cover(entry.clone()));
+                art.completed_misses.selected_hero = art.selected_hero.is_none()
+                    && missed(WarmArt::Hero(entry.clone()));
+                art.completed_misses.selected_logo = art.selected_logo.is_none()
+                    && missed(WarmArt::Logo(entry.clone()));
+            }
+            if let Some(next) = peek_game(entries, first, count) {
+                art.completed_misses.next_cover = art.next_cover.is_none()
+                    && missed(WarmArt::Cover(entries[next].clone()));
+            }
+            for entry in entries.iter().skip(first).take(count) {
+                if self.theme_cover_image(entry).is_none() && missed(WarmArt::Cover(entry.clone())) {
+                    art.completed_misses.entries.insert(crate::theme_adapter::entry_id(entry.path()));
+                }
+            }
+        }
         art
     }
 

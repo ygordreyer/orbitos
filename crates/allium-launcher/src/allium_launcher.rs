@@ -617,6 +617,8 @@ impl AlliumLauncher<DefaultPlatform> {
                 not(any(feature = "miyoo", feature = "simulator"))
             ))]
             perf_bench::loop_present();
+        } else if common::perf_trace::recording() && self.view.content_complete() {
+            common::perf_trace::settled(common::perf_trace::generation());
         }
 
         common::perf_trace::end_render();
@@ -2645,3 +2647,8 @@ mod integration_measurement_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+#[cfg(feature = "perf-bench")]
+#[path = "final_content_tests.rs"]
+mod final_content_tests;

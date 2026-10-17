@@ -44,6 +44,16 @@ pub struct Art {
     pub next_cover_expected: bool,
     pub selected_hero: Option<Arc<Pixmap>>,
     pub entries: BTreeMap<String, Arc<Pixmap>>,
+    /// Trace readiness only. Completed misses do not change rendered pixels or Art equality.
+    pub completed_misses: ArtMisses,
+}
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ArtMisses {
+    pub selected_logo: bool,
+    pub selected_cover: bool,
+    pub selected_hero: bool,
+    pub next_cover: bool,
+    pub entries: BTreeSet<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pagination {

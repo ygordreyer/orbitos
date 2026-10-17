@@ -64,17 +64,18 @@ pub(super) fn theme_content_complete(
             if c.layout == Some(Arrangement::Hidden) {
                 return true;
             }
-            if c.logo && input.art.selected_logo.is_none() {
+            if c.logo && input.art.selected_logo.is_none() && !input.art.completed_misses.selected_logo {
                 return false;
             }
             if c.kind == Kind::Image {
                 match c.binding {
                     Some(Binding::NextCover) => {
-                        return !input.art.next_cover_expected || input.art.next_cover.is_some();
+                        return !input.art.next_cover_expected || input.art.next_cover.is_some()
+                            || input.art.completed_misses.next_cover;
                     }
-                    Some(Binding::SelectedCover) => return input.art.selected_cover.is_some(),
-                    Some(Binding::SelectedHero) => return input.art.selected_hero.is_some(),
-                    Some(Binding::SelectedLogo) => return input.art.selected_logo.is_some(),
+                    Some(Binding::SelectedCover) => return input.art.selected_cover.is_some() || input.art.completed_misses.selected_cover,
+                    Some(Binding::SelectedHero) => return input.art.selected_hero.is_some() || input.art.completed_misses.selected_hero,
+                    Some(Binding::SelectedLogo) => return input.art.selected_logo.is_some() || input.art.completed_misses.selected_logo,
                     _ => {}
                 }
             }
@@ -83,6 +84,7 @@ pub(super) fn theme_content_complete(
                 && c.paint.as_ref().is_some_and(|paint| paint.peek.is_some())
                 && input.art.next_cover_expected
                 && input.art.next_cover.is_none()
+                && !input.art.completed_misses.next_cover
             {
                 return false;
             }
@@ -94,7 +96,8 @@ pub(super) fn theme_content_complete(
                     .and_then(|binding| input.rows.get(&binding))
                     .is_none_or(|rows| {
                         rows.iter()
-                            .all(|row| input.art.entries.contains_key(&row.id))
+                            .all(|row| input.art.entries.contains_key(&row.id)
+                                || input.art.completed_misses.entries.contains(&row.id))
                     });
             }
             true
@@ -1645,6 +1648,45 @@ mod integration_navigation_tests {
 mod content_readiness_tests {
     use super::*;
     use common::theme::{fonts::FontBank, frame::{FrameInputs, Row}, pack::{Binding, ScreenId}, runtime::ThemeSnapshot, ThemeHandle};
+    #[test]
+    fn completed_misses_settle_only_their_visible_art_bindings() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for name in ["orbit-hero", "orbit-row", "big-picture", "compact-plus"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(name)).unwrap(), &bank, 1).unwrap();
+            let demand = super::super::art_queue::Demand::from_components(
+                &theme.pack().screens[&ScreenId::Library].components, theme.pack().ink(),
+            );
+            let mut input = FrameInputs::new(ScreenId::Library);
+            input.rows.insert(Binding::Entries, vec![Row {
+                id: "missing".into(), label: "Missing".into(), subtitle: String::new(),
+                value: String::new(), enabled: true,
+            }]);
+            input.art.next_cover_expected = true;
+            let pixels = input.art.clone();
+            input.art.completed_misses = common::theme::frame::ArtMisses {
+                selected_cover: true, selected_hero: true, selected_logo: true, next_cover: true,
+                entries: std::collections::BTreeSet::from(["missing".into()]),
+            };
+            assert!(input.art == pixels, "{name} readiness must not change pixel identity");
+            assert!(theme_content_complete(&input, &theme), "{name} completed misses");
+            for (binding, required) in [(Binding::SelectedCover, demand.cover),
+                (Binding::SelectedHero, demand.hero), (Binding::SelectedLogo, demand.logo),
+                (Binding::NextCover, demand.next), (Binding::Entries, demand.rows)] {
+                let mut pending = input.clone();
+                match binding {
+                    Binding::SelectedCover => pending.art.completed_misses.selected_cover = false,
+                    Binding::SelectedHero => pending.art.completed_misses.selected_hero = false,
+                    Binding::SelectedLogo => pending.art.completed_misses.selected_logo = false,
+                    Binding::NextCover => pending.art.completed_misses.next_cover = false,
+                    Binding::Entries => pending.art.completed_misses.entries.clear(),
+                    _ => unreachable!(),
+                }
+                assert_eq!(theme_content_complete(&pending, &theme), !required, "{name} {binding:?} pending");
+            }
+        }
+    }
+
     #[test]
     fn preview_pending_is_incomplete_even_when_visible_rows_are_loaded() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
