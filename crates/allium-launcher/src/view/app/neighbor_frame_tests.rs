@@ -42,8 +42,10 @@ fn frameprep_adopts_only_the_clean_displayed_base_and_discards_sibling_damage() 
     let adopted_stamp = candidate.frame.navigation_stamp();
     let sibling = neighbor(&base, &input(&theme, 5));
     let mut slots = vec![candidate, sibling];
+    let mut adopted = false;
     let frames = prepare_theme_frames(&theme, std::slice::from_ref(&next), vec![base], &mut None,
-        &mut slots, Some(&displayed)).unwrap();
+        &mut slots, Some(&displayed), &mut adopted).unwrap();
+    assert!(adopted);
     assert!(frames[0].navigation_is_current(&adopted_stamp));
     assert!(slots.is_empty());
     identical(&frames[0], &theme, &next);
@@ -72,7 +74,9 @@ fn frameprep_wrong_base_repairs_repeat_batches_and_overlay_stacks_fall_back() {
             "status" => models[0].status.battery = Some(17),
             _ => unreachable!(),
         }
-        let frames = prepare_theme_frames(&theme, &models, vec![base], &mut None, &mut slots, displayed).unwrap();
+        let mut adopted = true;
+        let frames = prepare_theme_frames(&theme, &models, vec![base], &mut None, &mut slots, displayed, &mut adopted).unwrap();
+        assert!(!adopted, "{case} retained adoption flag");
         assert!(!frames[0].navigation_is_current(&candidate_stamp), "{case}");
         assert!(slots.is_empty(), "{case}");
         let first = if frames.last().unwrap().is_opaque() { frames.len() - 1 } else { 0 };
@@ -114,4 +118,12 @@ fn frameprep_eager_generation_checks_reject_equal_visible_value_changes() {
         }
         assert_ne!(before, NeighborGeneration::current(&res), "{change}");
     }
+}
+
+#[test]
+fn frameptr_empty_preparation_resets_presentation_flag() {
+    let mut adopted = true;
+    let frames = prepare_theme_frames(&theme(), &[], vec![], &mut None, &mut vec![], None, &mut adopted).unwrap();
+    assert!(frames.is_empty());
+    assert!(!adopted);
 }

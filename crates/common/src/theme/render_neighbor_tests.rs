@@ -166,3 +166,56 @@ fn fpdiag_wifi_status_allows_neighbors_and_rejects_changed_status() {
         assert!(!candidate.neighbor_matches(&theme, &next));
     }
 }
+
+#[test]
+fn frameptr_unsupported_display_keeps_damage_copy_fallback() {
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+    let next = model(&theme, ScreenId::Recents, 1, &arts);
+    let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+    let mut display = tests::TestDisplay(base.pixels.as_ref().to_owned());
+    candidate.recycle_neighbor_base(base);
+    let trace = std::env::temp_dir().join(format!("frameptr-fallback-{}.jsonl", std::process::id()));
+    crate::perf_trace::start_probe(trace.to_str().unwrap());
+    candidate.adopt_neighbor_damage(&mut display);
+    assert_eq!(crate::perf_trace::probe_counts()["neighbor_damage_copies"], 1);
+    assert_eq!(crate::perf_trace::probe_counts()["neighbor_pointer_adopts"], 0);
+    assert!(crate::perf_trace::probe_counts()["copied_pixels"].as_u64().unwrap() > 0);
+    crate::perf_trace::stop_probe();
+    std::fs::remove_file(trace).unwrap();
+    identical(&candidate, &theme, &next);
+    assert!(equal_words(display.0.data(), candidate.pixels().data()));
+}
+
+#[test]
+fn retained_model_requires_every_original_artwork_object() {
+    use std::sync::Arc;
+    for expired in ["logo", "hero", "cover", "next_cover", "entry"] {
+        let mut input = FrameInputs::new(ScreenId::Recents);
+        input.art.next_cover_expected = true;
+        input.art.selected_logo = Some(Arc::new(Pixmap::new(1, 1).unwrap()));
+        input.art.selected_hero = Some(Arc::new(Pixmap::new(1, 1).unwrap()));
+        input.art.selected_cover = Some(Arc::new(Pixmap::new(1, 1).unwrap()));
+        input.art.next_cover = Some(Arc::new(Pixmap::new(1, 1).unwrap()));
+        input.art.entries.insert("entry".into(), Arc::new(Pixmap::new(1, 1).unwrap()));
+        let saved = retained::capture(&input);
+        let restored = retained::restore_model(&saved).unwrap();
+        assert!(restored == input);
+        assert!(Arc::ptr_eq(restored.art.selected_logo.as_ref().unwrap(), input.art.selected_logo.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(restored.art.selected_hero.as_ref().unwrap(), input.art.selected_hero.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(restored.art.selected_cover.as_ref().unwrap(), input.art.selected_cover.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(restored.art.next_cover.as_ref().unwrap(), input.art.next_cover.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&restored.art.entries["entry"], &input.art.entries["entry"]));
+        drop(restored);
+        match expired {
+            "logo" => input.art.selected_logo = None,
+            "hero" => input.art.selected_hero = None,
+            "cover" => input.art.selected_cover = None,
+            "next_cover" => input.art.next_cover = None,
+            "entry" => { input.art.entries.clear(); },
+            _ => unreachable!(),
+        }
+        assert!(retained::restore_model(&saved).is_none(), "{expired}");
+    }
+}

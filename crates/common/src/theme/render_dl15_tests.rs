@@ -301,7 +301,7 @@ fn dl16_external_library_retains_pixels_and_metadata() {
         }
         frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
         let reference = dl15_reference(theme.clone(), &input);
-        let damage = frame.paint_damage(&mut actual);
+        let damage = frame.paint_damage(&mut actual).unwrap();
         assert!(damage.iter().map(|r| r.w as u64 * r.h as u64).sum::<u64>() < 640 * 480);
         assert!(
             frame.pixels.data() == reference.pixels.data(),
@@ -335,7 +335,7 @@ fn dl16_fragmented_copy_bounds_damage_memory_and_keeps_full_pixels() {
     }
     frame.damage = vec![Rect(0, 0, 640, 480)];
     frame.opaque = true;
-    let damage = frame.paint_damage(&mut display);
+    let damage = frame.paint_damage(&mut display).unwrap();
     assert_eq!(damage, vec![display.bounding_box()]);
     assert!(display.0.data() == frame.pixels.data());
 }
@@ -428,7 +428,7 @@ fn dl17_lists_and_tabs_match_full_render() {
             let same_screen = frame.screen == screen;
             frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
             let reference = dl15_reference(theme.clone(), &input);
-            let presented_damage = frame.paint_damage(&mut display);
+            let presented_damage = frame.paint_damage(&mut display).unwrap();
             #[cfg(feature = "perf-bench")]
             presenter
                 .present(display.0.as_ref(), &presented_damage, (step % 2) as u32)
@@ -482,7 +482,7 @@ fn dl17_library_tab_roundtrip_matches_full_render() {
         };
         frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
         let reference = dl15_reference(theme.clone(), &input);
-        let damage = frame.paint_damage(&mut display);
+        let damage = frame.paint_damage(&mut display).unwrap();
         #[cfg(feature = "perf-bench")]
         presenter
             .present(display.0.as_ref(), &damage, (step % 2) as u32)

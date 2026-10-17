@@ -41,6 +41,10 @@ pub struct PreparedFrame {
     theme: ThemeHandle,
     screen: ScreenId,
     pixels: crate::display::SharedPixmap,
+    pixels_valid: bool,
+    presented_pixels: Option<(std::sync::Weak<Pixmap>, std::cell::OnceCell<Option<Pixmap>>)>,
+    recycled_pixels: Option<crate::display::SharedPixmap>,
+    pixel_repair: Vec<Rect>,
     opaque: bool,
     blit: super::blit::BlitMap,
     previous_input: Option<retained::Inputs>,
@@ -112,7 +116,10 @@ fn changed_runs(source: &[u8], target: &[u8]) -> Vec<(usize, usize)> {
 }
 
 #[cfg(test)]
-pub(super) fn navigation_reference(
+pub(crate) use super::render_navigation::tests::{arts as neighbor_test_arts, model as neighbor_test_model, theme as neighbor_test_theme};
+
+#[cfg(test)]
+pub(crate) fn navigation_reference(
     theme: ThemeHandle,
     input: &FrameInputs,
 ) -> Result<PreparedFrame> {
@@ -172,10 +179,12 @@ impl PreparedFrame {
             if crate::perf_trace::recording() { crate::perf_trace::neighbor_build("admission_rejected"); }
             return Ok(None);
         };
+        let Some(pixels) = self.try_pixels() else { return Ok(None); };
         let _task = crate::perf_trace::task("neighbor_build", crate::perf_trace::generation());
         let fork = Self {
             theme: self.theme.clone(), screen: self.screen,
-            pixels: self.pixels.as_ref().to_owned().into(), opaque: self.opaque,
+            pixels: pixels.as_ref().to_owned().into(), opaque: self.opaque,
+            pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
             blit: Default::default(), previous_input: self.previous_input.clone(),
             component_metadata: self.component_metadata.clone(), retained_layout: self.retained_layout,
             tiles: Default::default(), ink_cache: self.ink_cache.fork_navigation(input),
@@ -242,7 +251,7 @@ impl PreparedFrame {
     }
     pub fn navigation_model(&self) -> Option<FrameInputs> {
         self.can_prewarm_navigation()
-            .then(|| self.previous_input.as_ref().map(retained::restore_model))
+            .then(|| self.previous_input.as_ref().and_then(retained::restore_model))
             .flatten()
     }
     pub fn navigation_images(
@@ -438,6 +447,7 @@ impl PreparedFrame {
             theme: theme.clone(),
             screen,
             pixels: Pixmap::new(640, 480).unwrap().into(),
+            pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
             opaque: false,
             blit: Default::default(),
             previous_input: None,
@@ -469,6 +479,8 @@ impl PreparedFrame {
             crate::perf_trace::count(crate::perf_trace::Count::Allocations, 1);
         }
         let mut result = previous.unwrap_or_else(|| Self::unpainted(theme.clone(), input.screen));
+        result.restore_pixel_storage();
+        result.recycled_pixels = None;
         // Reuse the token allocation when no speculative work holds a weak stamp.
         // make_mut dissociates outstanding weak stamps before this model can be displayed.
         std::sync::Arc::make_mut(&mut result.navigation_epoch);
@@ -525,23 +537,71 @@ impl PreparedFrame {
         } else {
             super::blit::BlitMap::new(result.pixels.as_ref())
         };
+        result.pixels_valid = true;
         Ok(result)
     }
+    /// Keep the retired base buffer, including any repairs deferred by earlier hits.
+    pub fn recycle_neighbor_base(&mut self, base: Self) {
+        self.pixel_repair = base.pixel_repair;
+        self.pixel_repair.extend_from_slice(&self.damage);
+        if self.pixel_repair.len() > 4096 { self.pixel_repair = vec![Rect(0, 0, 640, 480)]; }
+        self.recycled_pixels = Some(base.pixels);
+    }
+    /// Transfer the candidate's only strong pixel reference after the display accepts it.
+    pub fn adopt_neighbor_damage(&mut self, display: &mut impl Display) -> Option<Vec<DrawRect>> {
+        if !self.pixels_usable() { return None; }
+        if self.presented_pixels.is_none() && self.opaque && display.width() == 640 && display.height() == 480
+            && self.recycled_pixels.is_some() && display.set_shared_pixmap(&self.pixels.0)
+        {
+            self.presented_pixels = Some((std::sync::Arc::downgrade(&self.pixels.0), Default::default()));
+            self.pixels = self.recycled_pixels.take().unwrap();
+            crate::perf_trace::count(crate::perf_trace::Count::NeighborPointerAdopt, 1);
+            return Some(self.damage.iter().map(|r| DrawRect::new(r.0 as i32, r.1 as i32, r.2, r.3)).collect());
+        }
+        self.recycled_pixels = None;
+        self.pixel_repair.clear();
+        crate::perf_trace::count(crate::perf_trace::Count::NeighborDamageCopy, 1);
+        self.paint_damage(display)
+    }
+    /// Repair private storage only after presentation, during idle work or the next prepare.
+    pub fn restore_pixel_storage(&mut self) {
+        let Some((source, snapshot)) = self.presented_pixels.take() else { return; };
+        if let Some(Some(pixels)) = snapshot.into_inner() {
+            self.pixels = pixels.into();
+            if source.strong_count() == 0 { self.damage = vec![Rect(0, 0, 640, 480)]; }
+        } else if let Some(source) = source.upgrade()
+            && let Some(target) = std::sync::Arc::get_mut(&mut self.pixels.0)
+        {
+            for rect in &self.pixel_repair { copy_damage(source.data(), target.data_mut(), *rect); }
+        } else {
+            // An external mutation may retire the weak source. Rebuild from actual inputs.
+            self.pixels_valid = false;
+            self.previous_input = None;
+            self.ink_cache = Default::default();
+            self.tiles = Default::default();
+            if std::sync::Arc::strong_count(&self.pixels.0) > 1 {
+                self.pixels = Pixmap::new(640, 480).unwrap().into();
+            }
+        }
+        self.pixel_repair.clear();
+    }
     /// The destination must contain the preceding frame, without external overlays.
-    pub fn paint_damage(&self, display: &mut impl Display) -> Vec<DrawRect> {
-        if !self.opaque || display.width() != 640 || display.height() != 480 {
-            self.paint(display);
-            return vec![display.bounding_box()];
+    pub fn paint_damage(&self, display: &mut impl Display) -> Option<Vec<DrawRect>> {
+        if !self.opaque || display.width() != 640 || display.height() != 480
+            || self.presented_pixels.as_ref().is_some_and(|(source, _)| source.strong_count() == 0)
+        {
+            return self.paint(display).then(|| vec![display.bounding_box()]);
         }
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
         if self.damage.is_empty() {
-            return vec![];
+            return self.pixels_usable().then(Vec::new);
         }
+        let pixels = self.try_pixels()?;
         let mut dest = display.pixmap_mut();
         let mut damage: Vec<DrawRect> = Vec::new();
         for rect in &self.damage {
-            if dense_damage(self.pixels.data(), dest.data_mut(), *rect) {
-                copy_damage(self.pixels.data(), dest.data_mut(), *rect);
+            if dense_damage(pixels.data(), dest.data_mut(), *rect) {
+                copy_damage(pixels.data(), dest.data_mut(), *rect);
                 damage.push(DrawRect::new(rect.0 as i32, rect.1 as i32, rect.2, rect.3));
                 continue;
             }
@@ -549,7 +609,7 @@ impl PreparedFrame {
             for y in rect.1..rect.1 + rect.3 {
                 let at = (y as usize * 640 + rect.0 as usize) * 4;
                 let end = at + rect.2 as usize * 4;
-                let source = &self.pixels.data()[at..end];
+                let source = &pixels.data()[at..end];
                 let target = &mut dest.data_mut()[at..end];
                 crate::perf_trace::count(crate::perf_trace::Count::ComparedPixels, rect.2 as u64);
                 let mut current = vec![];
@@ -574,8 +634,7 @@ impl PreparedFrame {
                         ));
                         if damage.len() > 4096 {
                             drop(dest);
-                            self.paint(display);
-                            return vec![display.bounding_box()];
+                            return self.paint(display).then(|| vec![display.bounding_box()]);
                         }
                         damage.len() - 1
                     };
@@ -584,46 +643,68 @@ impl PreparedFrame {
                 previous = current;
             }
         }
-        damage
+        Some(damage)
     }
-    pub fn paint(&self, display: &mut impl Display) {
+    pub fn paint(&self, display: &mut impl Display) -> bool {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
-        if self.opaque
-            && display.width() == self.pixels.width()
-            && display.height() == self.pixels.height()
+        let Some(pixels) = self.try_pixels() else { return false; };
+        if self.presented_pixels.is_none() && self.opaque
+            && display.width() == pixels.width()
+            && display.height() == pixels.height()
             && display.set_shared_pixmap(&self.pixels.0)
         {
-            return;
+            return true;
         }
         crate::perf_trace::count(
             crate::perf_trace::Count::CopiedPixels,
-            self.pixels.width() as u64 * self.pixels.height() as u64,
+            pixels.width() as u64 * pixels.height() as u64,
         );
         let mut dest = display.pixmap_mut();
         if self.opaque
-            && dest.width() == self.pixels.width()
-            && dest.height() == self.pixels.height()
+            && dest.width() == pixels.width()
+            && dest.height() == pixels.height()
         {
-            dest.data_mut().copy_from_slice(self.pixels.data());
+            dest.data_mut().copy_from_slice(pixels.data());
         } else if self.opaque {
             dest.draw_pixmap(
                 0,
                 0,
-                self.pixels.as_ref(),
+                pixels.as_ref(),
                 &PixmapPaint::default(),
                 Transform::identity(),
                 None,
             );
         } else {
             self.blit
-                .draw(&mut dest, 0, 0, self.pixels.as_ref(), 1.0, None);
+                .draw(&mut dest, 0, 0, pixels.as_ref(), 1.0, None);
         }
+        true
     }
     pub fn is_opaque(&self) -> bool {
         self.opaque
     }
+    /// Retained pixels can expire after external display mutation and artwork eviction.
+    pub fn pixels_usable(&self) -> bool {
+        self.pixels_valid && self.presented_pixels.as_ref().is_none_or(|(source, snapshot)| {
+            snapshot.get().map_or_else(|| source.strong_count() > 0 || self.try_pixels().is_some(), Option::is_some)
+        })
+    }
+    pub fn try_pixels(&self) -> Option<&Pixmap> {
+        if !self.pixels_valid { return None; }
+        if let Some((source, snapshot)) = &self.presented_pixels {
+            snapshot.get_or_init(|| {
+                if let Some(source) = source.upgrade() {
+                    crate::perf_trace::count(crate::perf_trace::Count::CopiedPixels, 640 * 480);
+                    return Some((*source).clone());
+                }
+                // Weak upgrades preserve identity; every retained input must survive reconstruction.
+                let input = retained::restore_model(self.previous_input.as_ref()?)?;
+                Self::prepare(self.theme.clone(), &input).ok().map(|frame| frame.pixels.into_pixmap())
+            }).as_ref()
+        } else { Some(&self.pixels) }
+    }
     pub fn pixels(&self) -> &Pixmap {
-        &self.pixels
+        self.try_pixels().expect("expired retained pixels require preparation from current inputs")
     }
     pub fn snapshot(&self) -> &ThemeHandle {
         &self.theme
@@ -631,7 +712,10 @@ impl PreparedFrame {
     pub fn pixel_bytes(&self) -> usize {
         self.pixels.data().len()
     }
-    pub fn into_overlay(self) -> Result<PreparedOverlay> {
+    pub fn into_overlay(mut self) -> Result<PreparedOverlay> {
+        ensure!(self.pixels_usable(), "expired retained pixels require preparation from current inputs");
+        if self.presented_pixels.is_some() { self.try_pixels().unwrap(); }
+        self.restore_pixel_storage();
         PreparedOverlay::from_frame(self.theme, self.screen, self.pixels.into_pixmap())
     }
     fn color(&self, role: ColorRole) -> Color {
@@ -2020,6 +2104,7 @@ mod tests {
             theme,
             screen: ScreenId::Library,
             pixels: pixels.into(),
+            pixels_valid: true, presented_pixels: None, recycled_pixels: None, pixel_repair: vec![],
             opaque: true,
             blit: Default::default(),
             previous_input: None,

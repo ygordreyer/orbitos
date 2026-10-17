@@ -117,9 +117,11 @@ fn prepare_theme_frames(
     parked: &mut Option<ParkedDetails>,
     neighbors: &mut Vec<PreparedNeighbor>,
     displayed: Option<&common::theme::render::NavigationStamp>,
+    adopted: &mut bool,
 ) -> Result<Vec<common::theme::render::PreparedFrame>> {
     use common::theme::pack::ScreenId;
     use common::theme::render::PreparedFrame;
+    *adopted = false;
     let Some((top, lower)) = models.split_last() else {
         *parked = None;
         return Ok(vec![]);
@@ -172,7 +174,9 @@ fn prepare_theme_frames(
         common::perf_trace::neighbor_build("invalidated:prepare_mismatch");
     }
     neighbors.clear();
-    let top = if let Some(candidate) = candidate {
+    let top = if let Some(mut candidate) = candidate {
+        candidate.recycle_neighbor_base(old.unwrap());
+        *adopted = true;
         common::perf_trace::count(common::perf_trace::Count::NeighborHit, 1);
         candidate
     } else {
@@ -356,6 +360,7 @@ where
     parked_details: Option<ParkedDetails>,
     neighbors: Vec<PreparedNeighbor>,
     neighbor_base: Option<common::theme::render::NavigationStamp>,
+    neighbor_adopted: bool,
     present_damage: Option<Vec<Rect>>,
     theme_was_layered: bool,
     theme_presented_screen: Option<common::theme::pack::ScreenId>,
@@ -475,6 +480,7 @@ where
             parked_details: None,
             neighbors: Vec::with_capacity(2),
             neighbor_base: None,
+            neighbor_adopted: false,
             present_damage: None,
             theme_was_layered: false,
             theme_presented_screen: None,
@@ -798,6 +804,7 @@ where
         }
         self.neighbors.clear();
         self.neighbor_base = None;
+        self.neighbor_adopted = false;
     }
     pub(crate) fn take_present_damage(&mut self) -> Option<Vec<Rect>> {
         self.present_damage.take()
@@ -929,6 +936,7 @@ where
             Default::default()
         } else { self.status_bar.theme_inputs() };
         let frame = &mut self.theme_scene.as_mut().unwrap().frames[0];
+        frame.restore_pixel_storage();
         if common::perf_trace::recording() && !frame.can_prepare_neighbor() {
             common::perf_trace::neighbor_build(frame.neighbor_ineligible_reason());
         }
@@ -1006,9 +1014,11 @@ where
             NavigationWarmStage::Rasters(mut rasters) => {
                 let Some(raster) = rasters.pop_front() else {
                     current.stage = if self.selected == 0 && frame.can_prepare_neighbor() {
-                        self.views.0.navigation_warm_model(&handle, -self.navigation_direction, frame.navigation_model().unwrap())?
-                            .map(NavigationWarmStage::NeighborArtwork)
-                            .unwrap_or(NavigationWarmStage::NeighborFrame(self.navigation_direction, false))
+                        if let Some(input) = frame.navigation_model() {
+                            self.views.0.navigation_warm_model(&handle, -self.navigation_direction, input)?
+                                .map(NavigationWarmStage::NeighborArtwork)
+                                .unwrap_or(NavigationWarmStage::NeighborFrame(self.navigation_direction, false))
+                        } else { NavigationWarmStage::DetailsPlan }
                     } else { NavigationWarmStage::DetailsPlan };
                     *work = Some(current);
                     return Ok(false);
@@ -1137,6 +1147,7 @@ where
     }
 
     pub(crate) fn prepare_theme(&mut self) -> Result<()> {
+        self.neighbor_adopted = false;
         let Some(handle) = crate::theme_adapter::snapshot(&self.res) else {
             self.release_details_frame();
             self.content_complete = true;
@@ -1172,7 +1183,7 @@ where
                 || self.rect.w != 640 || self.rect.h != 480 || !self.views.0.navigation_warm_ready()
             { self.invalidate_neighbors(); }
             let frames = prepare_theme_frames(&handle, &models, previous, &mut self.parked_details,
-                &mut self.neighbors, self.neighbor_base.as_ref())?;
+                &mut self.neighbors, self.neighbor_base.as_ref(), &mut self.neighbor_adopted)?;
             let visible = visible_theme_models(&models, &frames);
             self.content_complete = visible.iter().all(|input| theme_content_complete(input, &handle));
             if common::perf_trace::recording() {
@@ -1378,16 +1389,27 @@ where
     ) -> Result<bool> {
         self.present_damage = None;
         if crate::theme_adapter::active(&self.res) {
-            if let Some(scene) = &self.theme_scene {
+            if self.theme_scene.as_ref().is_some_and(|scene|
+                scene.frames.iter().any(|frame| !frame.pixels_usable()))
+            {
+                self.theme_scene = None;
+                self.invalidate_neighbors();
+                self.dirty = true;
+                self.prepare_theme()?;
+            }
+            if let Some(scene) = &mut self.theme_scene {
                 if !self.theme_dirty && !self.dirty {
                     return Ok(false);
                 }
-                let top = scene.frames.last().unwrap();
+                let layered = scene.frames.len() != 1;
+                let top = scene.frames.last_mut().unwrap();
                 let opaque_top = top.is_opaque();
                 let same_top = self.theme_presented_screen == Some(top.screen());
-                if !self.dirty && ((scene.frames.len() == 1 && !self.theme_was_layered)
+                if !self.dirty && ((!layered && !self.theme_was_layered)
                     || (opaque_top && same_top)) {
-                    self.present_damage = Some(top.paint_damage(display));
+                    self.present_damage = Some(if std::mem::take(&mut self.neighbor_adopted) {
+                        top.adopt_neighbor_damage(display)
+                    } else { top.paint_damage(display) }.ok_or_else(|| anyhow::anyhow!("expired prepared frame"))?);
                 } else if opaque_top {
                     top.paint(display);
                 } else {
@@ -1395,6 +1417,8 @@ where
                         frame.paint(display);
                     }
                 }
+                self.neighbor_adopted = false;
+                let top = scene.frames.last().unwrap();
                 if common::perf_trace::recording() && !self.neighbors.is_empty() {
                     common::perf_trace::neighbor_build("invalidated:draw");
                 }
@@ -1921,7 +1945,7 @@ mod tests {
         models[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
         models[1].text.insert(Binding::SelectedTitle, "Selected game".into());
         prepare_theme_inputs(&mut models, &resources(), 0, &Status::default());
-        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None, &mut vec![], None).unwrap();
+        let frames = super::prepare_theme_frames(&theme, &models, vec![], &mut None, &mut vec![], None, &mut false).unwrap();
         assert!(frames.last().unwrap().is_opaque());
         let visible = super::visible_theme_models(&models, &frames);
         assert_eq!(visible.len(), 1);
@@ -1975,7 +1999,7 @@ mod tests {
                 models.push(top);
             }
             let before = optimized.first().map(|frame: &PreparedFrame| frame.pixels().data().to_vec());
-            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked, &mut vec![], None).unwrap();
+            optimized = super::prepare_theme_frames(&theme, &models, optimized, &mut parked, &mut vec![], None, &mut false).unwrap();
             if top_screen.is_some() {
                 let mut pending = models.clone();
                 pending[0].selected.insert(Binding::Entries, "missing-underlay-art".into());
@@ -2375,6 +2399,8 @@ mod integration_navigation_tests {
             for _ in 0..10 {
                 assert!(app.navigation_warm_ready(), "{id}");
                 let scene = app.proof_navigation_scene();
+                let selected = app.theme_models(&handle).unwrap().unwrap()[0]
+                    .selected.get(&common::theme::pack::Binding::Entries).cloned();
                 let mut work = None;
                 assert!(
                     !app.prewarm_navigation_step_with_pending(&mut work, 1, || true)
@@ -2431,8 +2457,7 @@ mod integration_navigation_tests {
                 let predicted = app.neighbors.iter().find(|candidate| {
                     candidate.frame.navigation_model().as_ref().is_some_and(|model|
                         model.selected.get(&common::theme::pack::Binding::Entries)
-                            != app.theme_scene.as_ref().unwrap().frames[0].navigation_model().as_ref().unwrap()
-                                .selected.get(&common::theme::pack::Binding::Entries))
+                            != selected.as_ref())
                 }).map(|candidate| candidate.frame.navigation_stamp());
                 if *id == "compact-plus" { assert_eq!(app.neighbors.len(), 2, "both directions must be resident"); }
                 app.handle_key_event(

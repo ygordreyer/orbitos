@@ -49,6 +49,9 @@ impl std::ops::Deref for SharedPixmap {
 impl std::ops::DerefMut for SharedPixmap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         if Arc::strong_count(&self.0) > 1 {
+            if self.0.width() == 640 && self.0.height() == 480 {
+                crate::perf_trace::count(crate::perf_trace::Count::FullFrameDetach, 1);
+            }
             crate::perf_trace::count(
                 crate::perf_trace::Count::CopiedPixels,
                 self.0.width() as u64 * self.0.height() as u64,

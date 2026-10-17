@@ -112,19 +112,22 @@ pub(super) struct Inputs {
     pub model: FrameInputs,
     art: ArtworkIdentity,
 }
-pub(super) fn restore_model(saved: &Inputs) -> FrameInputs {
+pub(super) fn restore_model(saved: &Inputs) -> Option<FrameInputs> {
+    let upgrade = |art: &Option<Weak<Pixmap>>| -> Option<Option<Arc<Pixmap>>> {
+        Some(match art { Some(art) => Some(art.upgrade()?), None => None })
+    };
     let mut model = saved.model.clone();
-    model.art.selected_logo = saved.art.logo.as_ref().and_then(Weak::upgrade);
-    model.art.selected_hero = saved.art.hero.as_ref().and_then(Weak::upgrade);
-    model.art.selected_cover = saved.art.cover.as_ref().and_then(Weak::upgrade);
-    model.art.next_cover = saved.art.next_cover.as_ref().and_then(Weak::upgrade);
+    model.art.selected_logo = upgrade(&saved.art.logo)?;
+    model.art.selected_hero = upgrade(&saved.art.hero)?;
+    model.art.selected_cover = upgrade(&saved.art.cover)?;
+    model.art.next_cover = upgrade(&saved.art.next_cover)?;
     model.art.entries = saved
         .art
         .entries
         .iter()
-        .filter_map(|(id, pixels)| pixels.upgrade().map(|pixels| (id.clone(), pixels)))
-        .collect();
-    model
+        .map(|(id, pixels)| pixels.upgrade().map(|pixels| (id.clone(), pixels)))
+        .collect::<Option<_>>()?;
+    Some(model)
 }
 
 pub(super) fn capture(input: &FrameInputs) -> Inputs {

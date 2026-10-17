@@ -391,7 +391,7 @@ fn panelcache_dense_damage_copies_only_the_bound_and_counts_real_work() {
             for x in r.0..r.0 + r.2 { display.0.data_mut()[((y * 640 + x) * 4) as usize] ^= 1; }
         }
         perf_trace::begin_render();
-        let damage = frame.paint_damage(&mut display);
+        let damage = frame.paint_damage(&mut display).unwrap();
         assert_eq!(display.0.data(), frame.pixels.data());
         assert_eq!(damage, vec![crate::geom::Rect::new(r.0 as i32, r.1 as i32, r.2, r.3)]);
         assert_eq!(count(Count::ComparedPixels), 32);

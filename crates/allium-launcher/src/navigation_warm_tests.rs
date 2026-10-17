@@ -343,6 +343,8 @@ async fn fpdiag_page_repair_preserves_neighbors_but_remap_rejects_them() {
         app.present_frame(false, &mut overlay).await.unwrap();
         let trace = common::perf_trace::probe_counts();
         assert_eq!(trace["neighbor_hits"], if remap { 0 } else { 1 }, "{trace}");
+        assert_eq!(trace["neighbor_pointer_adopts"], 0, "mock display cannot adopt");
+        assert_eq!(trace["neighbor_damage_copies"], if remap { 0 } else { 1 });
         assert_eq!(trace["measurement"]["neighbor_adopt"], if remap { "no_candidate" } else { "hit" });
         if remap {
             assert_eq!(trace["measurement"]["neighbor_build"], "invalidated:display_contents_or_layout");

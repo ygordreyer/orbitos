@@ -216,7 +216,7 @@ fn ink_selection_benchmark() {
                     let start = Instant::now();
                     frame =
                         PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
-                    let damage = frame.paint_damage(&mut display);
+                    let damage = frame.paint_damage(&mut display).unwrap();
                     let elapsed = start.elapsed().as_micros();
                     let mut counts = crate::perf_trace::probe_counts();
                     counts["theme"] = id.clone().into();

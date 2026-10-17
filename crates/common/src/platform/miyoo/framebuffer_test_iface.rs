@@ -270,7 +270,7 @@ fn shared_prepared_transitions_preserve_pixels_reuse_and_page_history() {
     assert_eq!(next.pixels().data(), cold.pixels().data());
     assert_ne!(next.pixels().data(), original);
     assert_eq!(display.pixmap().data(), original);
-    let damage = next.paint_damage(&mut display);
+    let damage = next.paint_damage(&mut display).unwrap();
     display.flush_rects(&damage).unwrap();
     assert_eq!(display.pixmap().data(), cold.pixels().data());
     assert_visible(&display, 0, "partial redraw after shared transition");
@@ -514,4 +514,259 @@ fn fpdiag_composition_revision_ignores_page_repair_but_tracks_external_reads_and
     assert_ne!(display.composition_revision().unwrap(), read);
     display.flush_rects(&[]).unwrap();
     assert_visible(&display, 1, "remap conservatively invalidates base");
+}
+
+#[test]
+fn frameptr_neighbor_hits_transfer_unique_pixels_and_misses_do_not_detach() {
+    use super::*;
+    use crate::theme::{render::PreparedFrame, render::{neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let arts = arts();
+    for name in ["compact", "compact-plus", "orbit-hero", "orbit-row", "big-picture"] {
+        let mut theme = theme(name, "square");
+        let mut current = model(&theme, ScreenId::Recents, 0, &arts);
+        let mut base = PreparedFrame::prepare(theme.clone(), &current).unwrap();
+        let mut display = test_display(640, 480);
+        base.paint(&mut display);
+        display.flush().unwrap();
+        let revision = display.composition_revision().unwrap();
+        // Include direction reversal, a viewport shift, and hits without intervening idle work.
+        for (step, selected) in [1, 0, 7, 8, 3, 12, 1].into_iter().enumerate() {
+            let next = model(&theme, ScreenId::Recents, selected, &arts);
+            let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+            let reference = crate::theme::render::navigation_reference(theme.clone(), &next).unwrap();
+            let prepared_pointer = candidate.pixels().data().as_ptr();
+            candidate.recycle_neighbor_base(base);
+            // Pan after preparation. Repair must still use the complete logical candidate base.
+            let page = (step % 2) as u32;
+            OBSERVED.with(|state| state.borrow_mut().0.yoffset = page * 480);
+            let trace = std::env::temp_dir().join(format!("frameptr-hit-{}-{name}-{step}.jsonl", std::process::id()));
+            crate::perf_trace::start_probe(trace.to_str().unwrap());
+            let damage = candidate.adopt_neighbor_damage(&mut display).unwrap();
+            let counts = crate::perf_trace::probe_counts();
+            crate::perf_trace::stop_probe();
+            std::fs::remove_file(trace).unwrap();
+            assert_eq!(counts["neighbor_pointer_adopts"], 1);
+            assert_eq!(counts["neighbor_damage_copies"], 0);
+            assert_eq!(counts["copied_pixels"], 0, "{name} hit {step}");
+            assert_eq!(counts["full_frame_detaches"], 0);
+            assert_eq!(Arc::strong_count(&display.pixmap.0), 1, "candidate retained displayed storage");
+            assert_eq!(display.pixmap().data().as_ptr(), prepared_pointer);
+            assert_eq!(display.pixmap().data().len(), 1_228_800);
+            assert_eq!(display.pixmap().data(), reference.pixels().data());
+            assert_eq!(candidate.targets, reference.targets);
+            assert_eq!(candidate.text_boxes, reference.text_boxes);
+            display.flush_rects(&damage).unwrap();
+            assert_visible(&display, page as usize, "adopted page");
+            OBSERVED.with(|state| state.borrow_mut().0.yoffset = (1 - page) * 480);
+            display.flush_rects(&[]).unwrap();
+            assert_visible(&display, (1 - page) as usize, "stale page after adoption");
+            assert_eq!(display.composition_revision().unwrap(), revision);
+            base = candidate;
+        }
+        for change in ["status", "artwork", "theme"] {
+            base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+            base.paint(&mut display);
+            display.flush().unwrap();
+            let next = model(&theme, ScreenId::Recents, 2, &arts);
+            let (mut hit, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap()
+                .unwrap_or_else(|| panic!("{name} {change}: {:?}, {}", base.neighbor_charge(&next), base.neighbor_ineligible_reason()));
+            hit.recycle_neighbor_base(base);
+            let damage = hit.adopt_neighbor_damage(&mut display).unwrap();
+            display.flush_rects(&damage).unwrap();
+            current = next;
+            match change {
+                "status" => current.status.clock = Some("15:21".into()),
+                "artwork" => current.art.selected_cover = Some(Arc::new((*arts[3]).clone())),
+                "theme" => theme = crate::theme::render::neighbor_test_theme(name, "square"),
+                _ => unreachable!(),
+            }
+            assert!(!hit.neighbor_matches(&theme, &current));
+            let before = display.pixmap().data().to_vec();
+            let trace = std::env::temp_dir().join(format!("frameptr-miss-{}-{name}-{change}.jsonl", std::process::id()));
+            crate::perf_trace::start_probe(trace.to_str().unwrap());
+            base = PreparedFrame::prepare_reusing(theme.clone(), &current, Some(hit)).unwrap();
+            assert_eq!(display.pixmap().data(), before, "prepare mutated the display");
+            let damage = base.paint_damage(&mut display).unwrap();
+            assert_eq!(crate::perf_trace::probe_counts()["full_frame_detaches"], 0, "{name} {change}");
+            crate::perf_trace::stop_probe();
+            std::fs::remove_file(trace).unwrap();
+            let reference = crate::theme::render::navigation_reference(theme.clone(), &current).unwrap();
+            assert_eq!(display.pixmap().data(), reference.pixels().data());
+            assert_eq!(base.targets, reference.targets);
+            assert_eq!(base.text_boxes, reference.text_boxes);
+            display.flush_rects(&damage).unwrap();
+        }
+    }
+}
+
+#[test]
+fn frameptr_idle_repair_reuses_retired_buffer_and_preserves_retained_data() {
+    use super::*;
+    use crate::theme::{render::PreparedFrame, render::{neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}, pack::ScreenId};
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    let input = model(&theme, ScreenId::Recents, 0, &arts);
+    let base = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+    let retired = base.pixels().data().as_ptr();
+    let next = model(&theme, ScreenId::Recents, 1, &arts);
+    let (mut candidate, _) = base.prepare_neighbor(&next, 4 * 1024 * 1024).unwrap().unwrap();
+    let (retained, _) = base.prepare_neighbor(&model(&theme, ScreenId::Recents, 11, &arts), 4 * 1024 * 1024).unwrap().unwrap();
+    let retained_bytes = retained.pixels().data().to_vec();
+    let expected = candidate.pixels().data().to_vec();
+    let mut display = test_display(640, 480);
+    base.paint(&mut display);
+    candidate.recycle_neighbor_base(base);
+    candidate.adopt_neighbor_damage(&mut display);
+    assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+    candidate.restore_pixel_storage();
+    assert_eq!(candidate.pixels().data().as_ptr(), retired);
+    assert_eq!(candidate.pixels().data(), expected);
+    let displayed = display.pixmap().data().to_vec();
+    let (future, _) = candidate.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().unwrap();
+    assert_ne!(future.pixels().data().as_ptr(), display.pixmap().data().as_ptr());
+    assert_eq!(display.pixmap().data(), displayed, "idle build changed displayed frame");
+    display.clear(Color::new(9, 19, 29)).unwrap();
+    assert_eq!(candidate.pixels().data(), expected);
+    assert_eq!(retained.pixels().data(), retained_bytes);
+}
+
+#[test]
+fn frameptr_menu_and_details_round_trips_after_adoption_match_reference() {
+    use super::*;
+    use crate::theme::{frame::FrameInputs, pack::ScreenId, render::{PreparedFrame,
+        neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}};
+    let arts = arts();
+    for name in ["compact", "compact-plus"] {
+        let theme = theme(name, "square");
+        let mut display = test_display(640, 480);
+        let mut reference_display = test_display(640, 480);
+        let mut base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        base.paint(&mut display);
+        for overlay_screen in [ScreenId::ContextMenu, ScreenId::GameDetail, ScreenId::ContextMenu, ScreenId::GameDetail] {
+            let input = model(&theme, ScreenId::Recents, 1, &arts);
+            let (mut candidate, _) = base.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().unwrap();
+            candidate.recycle_neighbor_base(base);
+            let damage = candidate.adopt_neighbor_damage(&mut display).unwrap();
+            display.flush_rects(&damage).unwrap();
+            assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+            let pixels = display.pixmap().data().to_vec();
+            base = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(candidate)).unwrap();
+            assert_eq!(display.pixmap().data(), pixels);
+            let overlay_input = FrameInputs::new(overlay_screen);
+            let overlay = PreparedFrame::prepare(theme.clone(), &overlay_input).unwrap();
+            let reference = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+            if !overlay.is_opaque() { base.paint(&mut display); }
+            overlay.paint(&mut display);
+            reference.paint(&mut reference_display);
+            overlay.paint(&mut reference_display);
+            assert_eq!(display.pixmap().data(), reference_display.pixmap().data(), "{name} {overlay_screen:?} open");
+            display.flush().unwrap();
+            assert_visible(&display, 0, "overlay after adoption");
+            base = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(base)).unwrap();
+            base.paint(&mut display);
+            assert_eq!(display.pixmap().data(), reference.pixels().data(), "{name} {overlay_screen:?} close");
+            display.flush().unwrap();
+            assert_visible(&display, 0, "close overlay after adoption");
+        }
+    }
+}
+
+#[test]
+fn frameptr_full_frame_detach_counter_detects_retained_strong_owner() {
+    use super::*;
+    let mut display = test_display(640, 480);
+    let retained = Arc::clone(&display.pixmap.0);
+    let before = retained.data().to_vec();
+    let trace = std::env::temp_dir().join(format!("frameptr-detach-{}.jsonl", std::process::id()));
+    crate::perf_trace::start_probe(trace.to_str().unwrap());
+    display.clear(Color::new(1, 2, 3)).unwrap();
+    assert_eq!(crate::perf_trace::probe_counts()["full_frame_detaches"], 1);
+    crate::perf_trace::stop_probe();
+    std::fs::remove_file(trace).unwrap();
+    assert_eq!(retained.data(), before);
+}
+
+#[test]
+fn frameptr_mutation_before_idle_preserves_retained_pixels_and_rebuilds_lost_source() {
+    use super::*;
+    use crate::theme::{pack::ScreenId, render::{PreparedFrame,
+        neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}};
+    let arts = arts();
+    let theme = theme("compact-plus", "square");
+    for retain_read in [false, true] {
+        let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        let mut input = model(&theme, ScreenId::Recents, 1, &arts);
+        let (mut candidate, _) = base.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().unwrap();
+        let original = candidate.pixels().data().to_vec();
+        let mut display = test_display(640, 480);
+        base.paint(&mut display);
+        candidate.recycle_neighbor_base(base);
+        candidate.adopt_neighbor_damage(&mut display);
+        assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+        if retain_read { assert_eq!(candidate.pixels().data(), original); }
+        let trace = std::env::temp_dir().join(format!("frameptr-write-{}-{retain_read}.jsonl", std::process::id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        display.clear(Color::new(9, 19, 29)).unwrap();
+        assert_eq!(candidate.try_pixels().unwrap().data(), original);
+        let damage = candidate.paint_damage(&mut display).unwrap();
+        assert_eq!(damage, vec![display.bounding_box()]);
+        assert_eq!(display.pixmap().data(), original);
+        input.status.clock = Some("15:23".into());
+        let candidate = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(candidate)).unwrap();
+        assert_eq!(crate::perf_trace::probe_counts()["full_frame_detaches"], 0);
+        crate::perf_trace::stop_probe();
+        std::fs::remove_file(trace).unwrap();
+        let reference = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+        assert_eq!(candidate.pixels().data(), reference.pixels().data());
+        assert_eq!(candidate.targets, reference.targets);
+        assert_eq!(candidate.text_boxes, reference.text_boxes);
+        // External mutation invalidates the partial base; presentation must be complete.
+        candidate.paint(&mut display);
+        assert_eq!(display.pixmap().data(), reference.pixels().data());
+    }
+}
+
+#[test]
+fn frameptr_expired_art_before_first_retained_read_requires_full_render() {
+    use super::*;
+    use crate::theme::{pack::ScreenId, render::{PreparedFrame,
+        neighbor_test_arts as arts, neighbor_test_model as model, neighbor_test_theme as theme}};
+    for name in ["compact", "compact-plus"] {
+        let arts = arts();
+        let theme = theme(name, "square");
+        let mut input = model(&theme, ScreenId::Recents, 1, &arts);
+        let base = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        let (mut candidate, _) = base.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().unwrap();
+        let original = candidate.pixels().data().to_vec();
+        let mut display = test_display(640, 480);
+        base.paint(&mut display);
+        candidate.recycle_neighbor_base(base);
+        candidate.adopt_neighbor_damage(&mut display).unwrap();
+        assert_eq!(Arc::strong_count(&display.pixmap.0), 1);
+        display.clear(Color::new(9, 19, 29)).unwrap();
+        input.art = Default::default();
+        drop(arts);
+        // This is the first pixel read after adoption, with both weak sources expired.
+        assert!(candidate.try_pixels().is_none(), "{name}");
+        assert!(!candidate.pixels_usable());
+        assert!(candidate.navigation_model().is_none());
+        assert!(candidate.prepare_neighbor(&input, 4 * 1024 * 1024).unwrap().is_none());
+        let unchanged = display.pixmap().data().to_vec();
+        assert!(!candidate.paint(&mut display));
+        assert!(candidate.paint_damage(&mut display).is_none());
+        assert!(candidate.adopt_neighbor_damage(&mut display).is_none());
+        assert_eq!(display.pixmap().data(), unchanged, "invalid frame painted");
+        candidate.restore_pixel_storage();
+        assert!(candidate.try_pixels().is_none(), "retired buffer is not valid frame storage");
+        assert!(!candidate.paint(&mut display));
+        let reference = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+        if name == "compact-plus" { assert!(reference.pixels().data() != original); }
+        let fallback = PreparedFrame::prepare_reusing(theme, &input, Some(candidate)).unwrap();
+        let damage = fallback.paint_damage(&mut display).unwrap();
+        assert_eq!(damage, vec![display.bounding_box()]);
+        assert_eq!(display.pixmap().data().len(), 1_228_800);
+        assert_eq!(display.pixmap().data(), reference.pixels().data());
+        display.flush_rects(&damage).unwrap();
+        assert_visible(&display, 0, "expired retained frame full render");
+    }
 }

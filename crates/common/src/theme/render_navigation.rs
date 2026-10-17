@@ -44,7 +44,7 @@ pub(super) mod tests {
     };
     use std::{collections::BTreeMap, path::Path, time::Instant};
 
-    pub(in crate::theme) fn theme(id: &str, shape: &str) -> ThemeHandle {
+    pub(crate) fn theme(id: &str, shape: &str) -> ThemeHandle {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -61,7 +61,7 @@ pub(super) mod tests {
         };
         ThemeHandle::prepare(snapshot, &bank, 37).unwrap()
     }
-    pub(in crate::theme) fn arts() -> Vec<Arc<Pixmap>> {
+    pub(crate) fn arts() -> Vec<Arc<Pixmap>> {
         (0..16)
             .map(|seed| {
                 let mut image = Pixmap::new(93 + seed, 71).unwrap();
@@ -77,7 +77,7 @@ pub(super) mod tests {
             })
             .collect()
     }
-    pub(in crate::theme) fn model(
+    pub(crate) fn model(
         theme: &ThemeHandle,
         screen: ScreenId,
         selected: usize,
