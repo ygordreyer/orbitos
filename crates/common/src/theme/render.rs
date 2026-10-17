@@ -28,7 +28,7 @@ mod retained;
 mod tiles;
 #[path = "render_details.rs"]
 mod details;
-pub use details::{DetailImageWarm, DetailTextWarm};
+pub use details::{DetailHeroWarm, DetailImageWarm, DetailTextWarm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -729,6 +729,9 @@ impl PreparedFrame {
             return Ok(pixels);
         }
         crate::perf_trace::count(crate::perf_trace::Count::ImageMiss, 1);
+        if ink_renderer::HERO_SCRATCH.get() {
+            return Self::transform_image(&self.theme, &key, source);
+        }
         self.theme
             .base()
             .0

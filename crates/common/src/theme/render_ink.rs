@@ -282,6 +282,19 @@ struct CachedText {
 const TEXT_LIMIT: usize = 1024 * 1024;
 
 thread_local! {static SURFACES: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};static TEXT: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};}
+thread_local! { pub(super) static HERO_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static OPACITY_TABLES: RefCell<VecDeque<(u32, Arc<[u8]>)>> = const { RefCell::new(VecDeque::new()) }; }
+#[cfg(test)]
+pub(super) fn worker_cache_residency() -> [(usize, usize); 4] {
+    let pixels = |cache: &RefCell<VecDeque<CachedText>>| {
+        let cache = cache.borrow();
+        (cache.len(), cache.iter().map(|e| e.pixels.data().len() + e.key.len()).sum())
+    };
+    [TEXT.with(pixels), effects::cached_shadow_residency(), OPACITY_TABLES.with(|tables| {
+        let tables = tables.borrow();
+        (tables.len(), tables.iter().map(|(_, table)| table.len()).sum())
+    }), SURFACES.with(pixels)]
+}
 #[cfg(test)]
 thread_local! { static UNCACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
@@ -323,8 +336,7 @@ pub(super) fn bitmap(
     }
 }
 fn opacity_table(opacity: f32) -> Arc<[u8]> {
-    thread_local! { static TABLES: RefCell<VecDeque<(u32, Arc<[u8]>)>> = const { RefCell::new(VecDeque::new()) }; }
-    TABLES.with(|tables| {
+    OPACITY_TABLES.with(|tables| {
         let mut tables = tables.borrow_mut();
         let key = opacity.to_bits();
         let index = if let Some(index) = tables.iter().position(|(bits, _)| *bits == key) {
@@ -337,6 +349,7 @@ fn opacity_table(opacity: f32) -> Arc<[u8]> {
                         (old as f32 + (value as f32 - old as f32) * opacity).round() as u8;
                 }
             }
+            if HERO_SCRATCH.get() { return table.into(); }
             if tables.len() == 8 {
                 tables.pop_back();
             }
@@ -555,7 +568,7 @@ impl PreparedFrame {
                 .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
             let pix = request().pixels()?;
             let bytes = pix.data().len() + key.len();
-            if bytes <= TEXT_LIMIT {
+            if bytes <= TEXT_LIMIT && !HERO_SCRATCH.get() {
                 TEXT.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     let mut total = cache.iter()
@@ -635,6 +648,7 @@ impl PreparedFrame {
             self.ink_surface_raw(Rect(0, 0, rect.2, rect.3), c, fill, focused, style);
             let pixels = Arc::new(std::mem::replace(&mut self.pixels, framebuffer));
             SURFACES.with(|cache| {
+                if HERO_SCRATCH.get() { return; }
                 let mut cache = cache.borrow_mut();
                 while !cache.is_empty()
                     && (cache.len() >= 64
@@ -801,7 +815,7 @@ impl PreparedFrame {
             FocusStyle::Fill => {}
         }
     }
-    pub(super) fn render_ink(&mut self, input: &FrameInputs) -> Result<()> {
+    pub(super) fn ink_resolved_components(&mut self, input: &FrameInputs) -> Arc<Vec<Component>> {
         let state = primary_binding(input.screen)
             .and_then(|b| input.rows.get(&b))
             .is_some_and(|r| r.iter().any(|r| !r.label.is_empty()));
@@ -839,6 +853,10 @@ impl PreparedFrame {
             self.ink_components = Some((input.screen, state, components.clone()));
             components
         });
+        components
+    }
+    pub(super) fn render_ink(&mut self, input: &FrameInputs) -> Result<()> {
+        let components = self.ink_resolved_components(input);
         if collecting_text() { return self.render_ink_uncached(input, &components); }
         #[cfg(test)]
         if UNCACHED.get() || std::env::var_os("ALLIUM_INK_REFERENCE").is_some() {

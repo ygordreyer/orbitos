@@ -121,11 +121,13 @@ impl PreparedFrame {
     }
 }
 
+type TextPlan = (Arc<FrameInputs>, VecDeque<ink_renderer::TextRaster>);
 type TextPixels = (String, Arc<Pixmap>);
 pub struct DetailTextWarm {
     stamp: NavigationStamp,
     plan: Option<DetailJob>,
-    planned: Option<mpsc::Receiver<Result<VecDeque<ink_renderer::TextRaster>>>>,
+    planned: Option<mpsc::Receiver<Result<TextPlan>>>,
+    input: Option<Arc<FrameInputs>>,
     texts: VecDeque<ink_renderer::TextRaster>,
     pending: Option<mpsc::Receiver<Result<TextPixels>>>,
     cancelled: Arc<AtomicBool>,
@@ -141,10 +143,13 @@ impl PreparedFrame {
         let (done, planned) = mpsc::sync_channel(1);
         let plan = Box::new(move || {
             if cancel.load(Ordering::Acquire) { return; }
-            let result = model().and_then(|input| ink_renderer::collect_detail_text(theme, &input));
+            let result = model().and_then(|input| {
+                let texts = ink_renderer::collect_detail_text(theme, &input)?;
+                Ok((Arc::new(input), texts))
+            });
             if !cancel.load(Ordering::Acquire) { let _ = done.try_send(result); }
         });
-        DetailTextWarm { stamp: self.navigation_stamp(), plan: Some(plan), planned: Some(planned), texts: VecDeque::new(), pending: None, cancelled }
+        DetailTextWarm { stamp: self.navigation_stamp(), plan: Some(plan), planned: Some(planned), input: None, texts: VecDeque::new(), pending: None, cancelled }
     }
     /// Layout and one raster at a time run on the niced image worker; admission never evicts.
     pub fn prewarm_detail_text_step(&self, work: &mut DetailTextWarm) -> Result<bool> {
@@ -154,6 +159,7 @@ impl PreparedFrame {
             work.planned = None;
             work.pending = None;
             work.texts.clear();
+            work.input = None;
             return Ok(true);
         }
         if let Some(job) = work.plan.take() {
@@ -162,7 +168,7 @@ impl PreparedFrame {
         }
         if let Some(planned) = &work.planned {
             match planned.try_recv() {
-                Ok(result) => { work.texts = result?; work.planned = None; }
+                Ok(result) => { let (input, texts) = result?; work.input = Some(input); work.texts = texts; work.planned = None; }
                 Err(mpsc::TryRecvError::Empty) => return Ok(false),
                 Err(mpsc::TryRecvError::Disconnected) => { work.planned = None; }
             }
@@ -197,6 +203,67 @@ impl PreparedFrame {
         } else {
             work.texts.push_front(Arc::try_unwrap(text).ok().unwrap());
         }
+        Ok(false)
+    }
+}
+
+/// Completed buffers cross threads; only the render thread admits them to HEROES.
+pub struct DetailHeroWarm {
+    stamp: NavigationStamp,
+    input: Option<Arc<FrameInputs>>,
+    pending: Option<mpsc::Receiver<Result<Option<ink_renderer::retained::Hero>>>>,
+    source: Option<Arc<Pixmap>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for DetailHeroWarm {
+    fn drop(&mut self) { self.cancelled.store(true, Ordering::Release); }
+}
+impl PreparedFrame {
+    pub fn detail_hero_after_text(&self, work: &mut DetailTextWarm) -> Option<DetailHeroWarm> {
+        if !self.navigation_is_current(&work.stamp) || !self.can_prewarm_navigation()
+            || !self.theme.pack().ink() { return None; }
+        let input = work.input.take()?;
+        Some(DetailHeroWarm {
+            stamp: self.navigation_stamp(), source: input.art.selected_hero.clone(),
+            input: Some(input), pending: None, cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+    pub fn prewarm_detail_hero_step(&self, work: &mut DetailHeroWarm) -> Result<bool> {
+        if !self.navigation_is_current(&work.stamp) {
+            work.cancelled.store(true, Ordering::Release);
+            work.input = None;
+            work.pending = None;
+            work.source = None;
+            return Ok(true);
+        }
+        if let Some(pending) = &work.pending {
+            match pending.try_recv() {
+                Ok(result) => {
+                    if let Some(hero) = result? {
+                        ink_renderer::retained::admit_detail_hero(hero, work.source.as_ref());
+                    }
+                    work.pending = None;
+                    work.source = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::TryRecvError::Disconnected) => { work.pending = None; work.source = None; }
+            }
+            return Ok(true);
+        }
+        let Some(input) = work.input.take() else { return Ok(true); };
+        if !ink_renderer::retained::detail_hero_fits(&self.theme) {
+            work.source = None;
+            return Ok(true);
+        }
+        let (done, pending) = mpsc::sync_channel(1);
+        let (theme, cancelled, job_input) = (self.theme.clone(), work.cancelled.clone(), input.clone());
+        if submit(Box::new(move || {
+            if cancelled.load(Ordering::Acquire) { return; }
+            let result = ink_renderer::retained::compose_detail_hero(theme, &job_input, &cancelled);
+            if !cancelled.load(Ordering::Acquire) { let _ = done.try_send(result); }
+        })).is_ok() {
+            work.pending = Some(pending);
+        } else { work.input = Some(input); }
         Ok(false)
     }
 }
@@ -252,6 +319,172 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    fn finish_hero(frame: &PreparedFrame, work: &mut DetailHeroWarm) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !frame.prewarm_detail_hero_step(work).unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn hero_plan(frame: &PreparedFrame, input: FrameInputs) -> DetailHeroWarm {
+        let mut text = frame.detail_texts(move || Ok(input));
+        finish_text(frame, &mut text);
+        frame.detail_hero_after_text(&mut text).unwrap()
+    }
+    fn on_worker(check: impl FnOnce() + Send + 'static) {
+        let (done, result) = mpsc::sync_channel(1);
+        assert!(submit(Box::new(move || {
+            let _ = done.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)));
+        })).is_ok());
+        if let Err(panic) = result.recv_timeout(Duration::from_secs(30)).unwrap() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+    #[test]
+    fn details_hero_worker_caches_unchanged_after_completion_cancellation_and_unwind() {
+        on_worker(|| {
+            let arts = arts();
+            for seeded in [false, true] {
+                let seed_theme = theme("compact-plus", "square");
+                let _seed = seeded.then(|| PreparedFrame::prepare(seed_theme.clone(),
+                    &text_model(&seed_theme, &arts, true, true)).unwrap());
+                let before = ink_renderer::worker_cache_residency();
+                assert!(before.iter().all(|&(entries, bytes)| if seeded { entries > 0 && bytes > 0 }
+                    else { entries == 0 && bytes == 0 }), "{before:?}");
+                for outcome in ["completed", "cancelled", "panic"] {
+                    // A new identity forces misses even when the worker already holds entries.
+                    let theme = theme("compact-plus", "square");
+                    let input = text_model(&theme, &arts, true, true);
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    let cancel = cancelled.clone();
+                    let reached = Arc::new(AtomicBool::new(false));
+                    let painted = reached.clone();
+                    ink_renderer::retained::HERO_AFTER_OPERATION.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move |id| {
+                            if id == "detail-reading-pane" {
+                                painted.store(true, Ordering::Release);
+                                if outcome == "cancelled" { cancel.store(true, Ordering::Release); }
+                                if outcome == "panic" { panic!("injected hero scratch unwind"); }
+                            }
+                        }));
+                    });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ink_renderer::retained::compose_detail_hero(theme, &input, &cancelled)
+                    }));
+                    ink_renderer::retained::HERO_AFTER_OPERATION.with(|hook| { hook.borrow_mut().take(); });
+                    assert!(reached.load(Ordering::Acquire));
+                    match outcome {
+                        "completed" => assert!(result.unwrap().unwrap().is_some()),
+                        "cancelled" => assert!(result.unwrap().unwrap().is_none()),
+                        _ => assert!(result.is_err()),
+                    }
+                    assert!(!ink_renderer::HERO_SCRATCH.get());
+                    assert_eq!(before, ink_renderer::worker_cache_residency(), "{outcome}, seeded={seeded}");
+                }
+            }
+        });
+    }
+    #[test]
+    fn details_text_worker_planning_and_rasters_leave_no_cache_residue() {
+        on_worker(|| {
+            let theme = theme("compact-plus", "square");
+            let arts = arts();
+            let before = ink_renderer::worker_cache_residency();
+            for (cover, logo) in [(true, true), (false, true), (false, false)] {
+                let requests = ink_renderer::collect_detail_text(theme.clone(),
+                    &text_model(&theme, &arts, cover, logo)).unwrap();
+                assert!(!requests.is_empty());
+                assert!(!ink_renderer::collecting_text());
+                assert_eq!(before, ink_renderer::worker_cache_residency());
+                for request in requests { assert!(!request.pixels().unwrap().data().is_empty()); }
+                assert_eq!(before, ink_renderer::worker_cache_residency());
+            }
+        });
+    }
+    #[test]
+    fn details_hero_warm_matches_cold_pixels_and_hits_real_group() {
+        let trace = std::env::temp_dir().join(format!("details-hero-{:?}.log", std::thread::current().id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        let arts = arts();
+        for screen in [ScreenId::Recents, ScreenId::Library] {
+        for shape in ["square", "tall"] {
+        for (cover, logo) in [(true, true), (false, true), (false, false)] {
+            let theme = theme("compact-plus", shape);
+            let frame = PreparedFrame::prepare(theme.clone(), &model(&theme, screen, 0, &arts)).unwrap();
+            let input = text_model(&theme, &arts, cover, logo);
+            ink_renderer::retained::clear_heroes();
+            crate::perf_trace::begin_render();
+            let cold = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            assert_eq!(crate::perf_trace::probe_counts()["hero_misses"], 1);
+            ink_renderer::retained::clear_heroes();
+            let displayed = frame.pixels().data().to_vec();
+            let mut work = hero_plan(&frame, input.clone());
+            crate::perf_trace::begin_render();
+            finish_hero(&frame, &mut work);
+            assert_eq!(crate::perf_trace::probe_counts()["hero_prewarm_publishes"], 1);
+            assert_eq!(frame.pixels().data(), displayed);
+            crate::perf_trace::begin_render();
+            let hot = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            assert_eq!(crate::perf_trace::probe_counts()["hero_hits"], 1);
+            assert_eq!(crate::perf_trace::probe_counts()["hero_misses"], 0);
+            assert_eq!(cold.pixels().data(), hot.pixels().data());
+            assert_eq!(cold.targets, hot.targets);
+            assert_eq!(cold.text_boxes, hot.text_boxes);
+        }
+        }
+        }
+        ink_renderer::retained::clear_heroes();
+        std::fs::remove_file(trace).unwrap();
+    }
+    #[test]
+    fn details_hero_mismatched_underlay_misses_with_correct_pixels() {
+        let trace = std::env::temp_dir().join(format!("details-hero-underlay-{:?}.log", std::thread::current().id()));
+        crate::perf_trace::start_probe(trace.to_str().unwrap());
+        let theme = theme("compact-plus", "square");
+        let arts = arts();
+        let frame = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        let input = text_model(&theme, &arts, true, true);
+        let cold = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        ink_renderer::retained::clear_heroes();
+        finish_hero(&frame, &mut hero_plan(&frame, input.clone()));
+        ink_renderer::retained::corrupt_hero_underlay();
+        crate::perf_trace::begin_render();
+        let hot = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        assert_eq!(crate::perf_trace::probe_counts()["hero_hits"], 0);
+        assert_eq!(crate::perf_trace::probe_counts()["hero_misses"], 1);
+        assert_eq!(cold.pixels().data(), hot.pixels().data());
+        ink_renderer::retained::clear_heroes();
+        std::fs::remove_file(trace).unwrap();
+    }
+    #[test]
+    fn details_hero_warm_cancels_stale_selection_theme_and_drop() {
+        let arts = arts();
+        for change_theme in [false, true] {
+        for in_flight in [false, true] {
+            let theme = theme("compact-plus", "square");
+            let mut frame = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+            ink_renderer::retained::clear_heroes();
+            let mut work = hero_plan(&frame, text_model(&theme, &arts, true, true));
+            if in_flight { assert!(!frame.prewarm_detail_hero_step(&mut work).unwrap()); }
+            let replacement = if change_theme { self::theme("compact-plus", "tall") } else { theme.clone() };
+            frame = PreparedFrame::prepare_reusing(replacement.clone(),
+                &model(&replacement, ScreenId::Recents, 1, &arts), Some(frame)).unwrap();
+            assert!(frame.prewarm_detail_hero_step(&mut work).unwrap());
+            assert!(work.cancelled.load(Ordering::Acquire));
+            assert!(work.pending.is_none() && work.input.is_none());
+            let cancel = work.cancelled.clone();
+            drop(work);
+            assert!(cancel.load(Ordering::Acquire));
+        }
+        }
+        let theme = theme("compact-plus", "square");
+        let frame = PreparedFrame::prepare(theme.clone(), &model(&theme, ScreenId::Recents, 0, &arts)).unwrap();
+        let work = hero_plan(&frame, text_model(&theme, &arts, true, true));
+        let cancel = work.cancelled.clone();
+        drop(work);
+        assert!(cancel.load(Ordering::Acquire));
+        ink_renderer::retained::clear_heroes();
     }
     #[test]
     fn details_text_warm_matches_cold_pixels_with_zero_misses() {

@@ -159,7 +159,8 @@ enum NavigationWarmStage {
     DetailsArtwork(super::entry_list::NavigationWarm),
     DetailsImages(common::theme::render::DetailImageWarm, super::entry_list::NavigationWarm),
     DetailsText(common::theme::render::DetailTextWarm),
-    DetailShadows,
+    DetailShadows(Option<common::theme::render::DetailHeroWarm>),
+    DetailsHero(common::theme::render::DetailHeroWarm),
 }
 
 #[cfg(test)]
@@ -680,7 +681,8 @@ where
             Some(NavigationWarmStage::DetailsArtwork(_)) => "details_artwork",
             Some(NavigationWarmStage::DetailsImages(..)) => "details_image_transform",
             Some(NavigationWarmStage::DetailsText(_)) => "details_text",
-            Some(NavigationWarmStage::DetailShadows) => "detail_shadow",
+            Some(NavigationWarmStage::DetailShadows(_)) => "detail_shadow",
+            Some(NavigationWarmStage::DetailsHero(_)) => "details_hero",
             Some(NavigationWarmStage::Rasters(_)) => "raster",
         }
     }
@@ -794,7 +796,7 @@ where
                         _ => None,
                     };
                     current.stage = plan.map(NavigationWarmStage::DetailsArtwork)
-                        .unwrap_or(NavigationWarmStage::DetailShadows);
+                        .unwrap_or(NavigationWarmStage::DetailShadows(None));
                     *work = Some(current);
                     return Ok(false);
                 };
@@ -818,17 +820,28 @@ where
                         } else { self.status_bar.theme_inputs() };
                         prepare_theme_inputs(std::slice::from_mut(&mut plan.input), &self.res, self.selected, &status);
                         NavigationWarmStage::DetailsText(frame.detail_texts(move || model(plan.input)))
-                    } else { NavigationWarmStage::DetailShadows }
+                    } else { NavigationWarmStage::DetailShadows(None) }
                 } else { NavigationWarmStage::DetailsImages(images, plan) }
             }
             NavigationWarmStage::DetailsText(mut text) => {
-                if frame.prewarm_detail_text_step(&mut text)? { NavigationWarmStage::DetailShadows }
+                if frame.prewarm_detail_text_step(&mut text)? {
+                    NavigationWarmStage::DetailShadows(frame.detail_hero_after_text(&mut text))
+                }
                 else { NavigationWarmStage::DetailsText(text) }
             }
-            NavigationWarmStage::DetailShadows => {
+            NavigationWarmStage::DetailShadows(hero) => {
                 let done = self.detail_shadows.as_mut()
                     .is_none_or(|shadows| frame.prewarm_detail_shadow_step(shadows));
-                current.stage = NavigationWarmStage::DetailShadows;
+                let complete = done && hero.is_none();
+                current.stage = if done { hero.map(NavigationWarmStage::DetailsHero)
+                    .unwrap_or(NavigationWarmStage::DetailShadows(None)) }
+                    else { NavigationWarmStage::DetailShadows(hero) };
+                *work = Some(current);
+                return Ok(complete);
+            }
+            NavigationWarmStage::DetailsHero(mut hero) => {
+                let done = frame.prewarm_detail_hero_step(&mut hero)?;
+                current.stage = NavigationWarmStage::DetailsHero(hero);
                 *work = Some(current);
                 return Ok(done);
             }
@@ -1750,6 +1763,7 @@ mod integration_navigation_tests {
         let mut work = None;
         let mut saw_details = false;
         let mut saw_text = false;
+        let mut saw_hero = false;
         loop {
             // Artwork notifications are consumed by the normal media poll in the real loop.
             app.idle_media_step();
@@ -1760,11 +1774,12 @@ mod integration_navigation_tests {
             let done = app.prewarm_navigation_step(&mut work, 1).unwrap();
             saw_details |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsImages(..)));
             saw_text |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsText(_)));
+            saw_hero |= matches!(work.as_ref().map(|w| &w.stage), Some(NavigationWarmStage::DetailsHero(_)));
             if done { break; }
             assert!(std::time::Instant::now() < deadline, "Details warm timeout");
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert!(saw_details && saw_text);
+        assert!(saw_details && saw_text && saw_hero);
         app.handle_key_event(KeyEvent::Pressed(Key::Start), tx.clone(), &mut VecDeque::new()).await.unwrap();
         let mut models = app.theme_models(&handle).unwrap().unwrap();
         app.normalize_theme_inputs(&handle, &mut models);
@@ -1787,6 +1802,8 @@ mod integration_navigation_tests {
         {
             assert_eq!(common::perf_trace::probe_counts()["image_misses"], 0);
             assert_eq!(common::perf_trace::probe_counts()["text_misses"], 0);
+            assert_eq!(common::perf_trace::probe_counts()["hero_hits"], 1);
+            assert_eq!(common::perf_trace::probe_counts()["hero_misses"], 0);
         }
         let cold_theme = ThemeHandle::prepare(ThemeSnapshot::load(&pack).unwrap(), &bank, 902).unwrap();
         let cold = common::theme::render::PreparedFrame::prepare(cold_theme, details).unwrap();

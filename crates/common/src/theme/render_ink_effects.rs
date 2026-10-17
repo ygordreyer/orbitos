@@ -199,6 +199,7 @@ fn shadow_lookup(theme: &std::sync::Weak<crate::theme::fonts::PreparedTheme>, ke
     })
 }
 fn shadow_admit(theme: std::sync::Weak<crate::theme::fonts::PreparedTheme>, key: ShadowKey, pixels: Arc<Pixmap>) {
+    if HERO_SCRATCH.get() { return; }
     SHADOWS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let mut total = cache.iter().map(|e| e.pixels.data().len()).sum::<usize>();
@@ -737,4 +738,11 @@ mod shadow_tests;
 #[cfg(test)]
 pub(super) fn cached_shadow_count() -> usize {
     SHADOWS.with(|cache| cache.borrow().len())
+}
+#[cfg(test)]
+pub(super) fn cached_shadow_residency() -> (usize, usize) {
+    SHADOWS.with(|cache| {
+        let cache = cache.borrow();
+        (cache.len(), cache.iter().map(|e| e.pixels.data().len()).sum())
+    })
 }
