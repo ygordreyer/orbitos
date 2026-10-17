@@ -518,10 +518,11 @@ impl PreparedFrame {
     }
     fn float_panel(&mut self, x: f32, y: f32, w: f32, h: f32, role: ColorRole) {
         if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+            let color = self.color(role);
             self.pixels.fill_rect(
                 rect,
                 &tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(self.color(role).into()),
+                    shader: tiny_skia::Shader::SolidColor(color.into()),
                     anti_alias: true,
                     ..Default::default()
                 },

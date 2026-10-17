@@ -644,9 +644,9 @@ impl PreparedFrame {
             let Ok(local) = ink_pixmap(rect.2, rect.3) else {
                 return;
             };
-            let framebuffer = std::mem::replace(&mut self.pixels, local);
+            let framebuffer = std::mem::replace(&mut self.pixels, local.into());
             self.ink_surface_raw(Rect(0, 0, rect.2, rect.3), c, fill, focused, style);
-            let pixels = Arc::new(std::mem::replace(&mut self.pixels, framebuffer));
+            let pixels = Arc::new(std::mem::replace(&mut self.pixels, framebuffer).into_pixmap());
             SURFACES.with(|cache| {
                 if HERO_SCRATCH.get() { return; }
                 let mut cache = cache.borrow_mut();
@@ -1682,7 +1682,7 @@ impl PreparedFrame {
             c.item_extent.unwrap() + 2 * margin,
             tile_height + 2 * margin,
         )?;
-        let old = std::mem::replace(&mut self.pixels, tile);
+        let old = std::mem::replace(&mut self.pixels, tile.into());
         let replay_clip = REPLAY_CLIP.take();
         let case = Rect(margin, margin, c.item_extent.unwrap(), ah + 2 * pad);
         if focused && c.focus_style == Some(FocusStyle::Glow) {
@@ -1713,7 +1713,7 @@ impl PreparedFrame {
             self.draw_image(rect, &image);
         }
         self.ink_focus(c, case, focused);
-        tile = std::mem::replace(&mut self.pixels, old);
+        tile = std::mem::replace(&mut self.pixels, old).into_pixmap();
         REPLAY_CLIP.replace(replay_clip);
         let dw = (tile.width() as f32 * scale).round() as u32;
         let dh = (tile.height() as f32 * scale).round() as u32;
@@ -2026,10 +2026,11 @@ impl PreparedFrame {
                 (r.0 as f32 + (r.2 as f32 - width) / 2.0).round() - bounds.0 * width / bounds.2,
                 (r.1 as f32 + (r.3 as f32 - height as f32) / 2.0).round() - bounds.1 * scale,
             );
+            let color = self.color(color);
             self.pixels.stroke_path(
                 &path,
                 &tiny_skia::Paint {
-                    shader: tiny_skia::Shader::SolidColor(self.color(color).into()),
+                    shader: tiny_skia::Shader::SolidColor(color.into()),
                     anti_alias: true,
                     ..Default::default()
                 },
@@ -2240,7 +2241,7 @@ impl PreparedFrame {
             local.data_mut()[to..to + row_bytes]
                 .copy_from_slice(&self.pixels.data()[at..at + row_bytes]);
         }
-        let framebuffer = std::mem::replace(&mut self.pixels, local);
+        let framebuffer = std::mem::replace(&mut self.pixels, local.into());
         let result = self.ink_status_contents(c, input);
         let local = std::mem::replace(&mut self.pixels, framebuffer);
         for y in c.rect.1..c.rect.1 + c.rect.3 {

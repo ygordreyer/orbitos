@@ -16,6 +16,40 @@ use crate::display::color::Color;
 use crate::display::overlay::{CapturedOverlay, OverlayContent, PreparedOverlay};
 use crate::geom::{Point, Rect, Size};
 
+/// Shared immutable frame storage; writes detach so cached frames stay unchanged.
+pub(crate) struct SharedPixmap(pub(crate) Arc<tiny_skia::Pixmap>);
+
+impl From<tiny_skia::Pixmap> for SharedPixmap {
+    fn from(pixels: tiny_skia::Pixmap) -> Self {
+        Self(Arc::new(pixels))
+    }
+}
+
+impl SharedPixmap {
+    pub(crate) fn into_pixmap(self) -> tiny_skia::Pixmap {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl std::ops::Deref for SharedPixmap {
+    type Target = tiny_skia::Pixmap;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SharedPixmap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if Arc::strong_count(&self.0) > 1 {
+            crate::perf_trace::count(
+                crate::perf_trace::Count::CopiedPixels,
+                self.0.width() as u64 * self.0.height() as u64,
+            );
+        }
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 /// A thread stamping a region over a repainting foreground app; it runs until this is dropped
 pub struct RectHold {
     stop: Arc<AtomicBool>,
@@ -95,6 +129,12 @@ pub trait Display: Sized {
 
     /// Get a mutable reference to the underlying pixmap
     fn pixmap_mut(&mut self) -> PixmapMut<'_>;
+
+    /// Adopt a complete frame without copying. Return false without changing the display
+    /// if unsupported. Subsequent writes must preserve other owners' pixels.
+    fn set_shared_pixmap(&mut self, _pixels: &Arc<tiny_skia::Pixmap>) -> bool {
+        false
+    }
 
     /// Apply a function to all pixels
     fn map_pixels<F>(&mut self, f: F) -> Result<()>

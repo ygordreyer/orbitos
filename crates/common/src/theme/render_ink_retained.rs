@@ -1151,7 +1151,7 @@ impl PreparedFrame {
                 .position(|(screen, _, _, _)| *screen == input.screen)
             {
                 let (_, pixels, entries, opaque_base) = cache.parked.remove(index).unwrap();
-                self.pixels = pixels;
+                self.pixels = pixels.into();
                 cache.entries = entries;
                 cache.opaque_base = opaque_base;
                 cache.screen = Some(input.screen);

@@ -40,7 +40,7 @@ pub struct Target {
 pub struct PreparedFrame {
     theme: ThemeHandle,
     screen: ScreenId,
-    pixels: Pixmap,
+    pixels: crate::display::SharedPixmap,
     opaque: bool,
     blit: super::blit::BlitMap,
     previous_input: Option<retained::Inputs>,
@@ -328,7 +328,7 @@ impl PreparedFrame {
         Self {
             theme: theme.clone(),
             screen,
-            pixels: Pixmap::new(640, 480).unwrap(),
+            pixels: Pixmap::new(640, 480).unwrap().into(),
             opaque: false,
             blit: Default::default(),
             previous_input: None,
@@ -425,6 +425,9 @@ impl PreparedFrame {
             return vec![display.bounding_box()];
         }
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
+        if self.damage.is_empty() {
+            return vec![];
+        }
         let mut dest = display.pixmap_mut();
         let mut damage: Vec<DrawRect> = Vec::new();
         for rect in &self.damage {
@@ -470,11 +473,18 @@ impl PreparedFrame {
         damage
     }
     pub fn paint(&self, display: &mut impl Display) {
+        let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
+        if self.opaque
+            && display.width() == self.pixels.width()
+            && display.height() == self.pixels.height()
+            && display.set_shared_pixmap(&self.pixels.0)
+        {
+            return;
+        }
         crate::perf_trace::count(
             crate::perf_trace::Count::CopiedPixels,
             self.pixels.width() as u64 * self.pixels.height() as u64,
         );
-        let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Compose);
         let mut dest = display.pixmap_mut();
         if self.opaque
             && dest.width() == self.pixels.width()
@@ -508,7 +518,7 @@ impl PreparedFrame {
         self.pixels.data().len()
     }
     pub fn into_overlay(self) -> Result<PreparedOverlay> {
-        PreparedOverlay::from_frame(self.theme, self.screen, self.pixels)
+        PreparedOverlay::from_frame(self.theme, self.screen, self.pixels.into_pixmap())
     }
     fn color(&self, role: ColorRole) -> Color {
         let s = &self.theme.pack().tokens.colors[&role];
@@ -1895,7 +1905,7 @@ mod tests {
         let prepared = PreparedFrame {
             theme,
             screen: ScreenId::Library,
-            pixels,
+            pixels: pixels.into(),
             opaque: true,
             blit: Default::default(),
             previous_input: None,

@@ -35,7 +35,7 @@ use framebuffer_damage::PageHistory;
 
 pub struct FramebufferDisplay {
     page_history: Option<PageHistory>,
-    pixmap: Pixmap,
+    pixmap: crate::display::SharedPixmap,
     iface: Framebuffer,
     scratch: Vec<u8>,
     capture_pread: bool,
@@ -79,7 +79,7 @@ impl FramebufferDisplay {
             page_history: None,
             scratch: Vec::new(),
             capture_pread: std::env::var("ALLIUM_FB_CAPTURE").is_ok_and(|v| v == "pread"),
-            pixmap,
+            pixmap: pixmap.into(),
             iface,
             saved: Vec::new(),
             reusable_snapshots: Vec::with_capacity(2),
@@ -374,6 +374,14 @@ impl Display for FramebufferDisplay {
 
     fn pixmap_mut(&mut self) -> PixmapMut<'_> {
         self.pixmap.as_mut()
+    }
+
+    fn set_shared_pixmap(&mut self, pixels: &Arc<Pixmap>) -> bool {
+        if pixels.width() != self.width() || pixels.height() != self.height() {
+            return false;
+        }
+        self.pixmap = crate::display::SharedPixmap(Arc::clone(pixels));
+        true
     }
 
     fn sync(&mut self) -> Result<()> {

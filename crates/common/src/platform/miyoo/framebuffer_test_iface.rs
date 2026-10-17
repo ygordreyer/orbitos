@@ -174,7 +174,7 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
     NEW_BACKING.with(|backing| *backing.borrow_mut() = None);
     FramebufferDisplay {
         page_history: None,
-        pixmap: Pixmap::new(w, h).unwrap(),
+        pixmap: Pixmap::new(w, h).unwrap().into(),
         iface: Framebuffer {
             device: File::open("/dev/null").unwrap(),
             frame: vec![0xa5; page_bytes * 2 + 64],
@@ -188,6 +188,68 @@ fn test_display(w: u32, h: u32) -> super::FramebufferDisplay {
         overlay_instance: 1,
         overlay_mapping: None,
     }
+}
+
+#[test]
+fn shared_prepared_transitions_preserve_pixels_reuse_and_page_history() {
+    use super::*;
+    use crate::theme::{
+        FontBank, ThemeHandle, frame::FrameInputs, pack::ScreenId,
+        render::PreparedFrame, runtime::ThemeSnapshot,
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..").canonicalize().unwrap();
+    let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+    let theme = ThemeHandle::prepare(
+        ThemeSnapshot::load(&root.join("themes/orbit-hero")).unwrap(), &bank, 1,
+    ).unwrap();
+    let mut input = FrameInputs::new(ScreenId::Recents);
+    input.status.clock = Some("12:34".into());
+    let recents = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+    let details = PreparedFrame::prepare(
+        theme.clone(), &FrameInputs::new(ScreenId::GameDetail),
+    ).unwrap();
+    assert!(recents.is_opaque() && details.is_opaque());
+    let original = recents.pixels().data().to_vec();
+    let targets = recents.targets.clone();
+    let mut display = test_display(640, 480);
+    for frame in [&details, &recents, &details, &recents] {
+        frame.paint(&mut display);
+        assert_eq!(display.pixmap().data().as_ptr(), frame.pixels().data().as_ptr());
+        assert_eq!(display.pixmap().data(), frame.pixels().data());
+        display.flush().unwrap();
+        assert_visible(&display, 0, "shared transition");
+        OBSERVED.with(|state| state.borrow_mut().0.yoffset = 480);
+        assert!(display.needs_present().unwrap());
+        display.flush_rects(&[]).unwrap();
+        assert_visible(&display, 1, "repair other page from shared frame");
+        OBSERVED.with(|state| state.borrow_mut().0.yoffset = 0);
+    }
+    // A partial display write must not alter the reusable prepared frame.
+    let area = Rect::new(3, 5, 7, 9);
+    crate::display::fill_rect(&mut display.pixmap_mut(), area, Color::new(9, 19, 29));
+    display.flush_rects(&[area]).unwrap();
+    assert_visible(&display, 0, "partial write detaches shared frame");
+    assert_eq!(recents.pixels().data(), original);
+    assert_eq!(recents.targets, targets);
+    recents.paint(&mut display);
+    display.flush().unwrap();
+    assert_eq!(display.pixmap().data(), original);
+
+    // Incremental preparation must leave the displayed frame intact until paint.
+    input.status.clock = Some("12:35".into());
+    let next = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(recents)).unwrap();
+    let cold = PreparedFrame::prepare(theme, &input).unwrap();
+    assert_eq!(next.pixels().data(), cold.pixels().data());
+    assert_ne!(next.pixels().data(), original);
+    assert_eq!(display.pixmap().data(), original);
+    let damage = next.paint_damage(&mut display);
+    display.flush_rects(&damage).unwrap();
+    assert_eq!(display.pixmap().data(), cold.pixels().data());
+    assert_visible(&display, 0, "partial redraw after shared transition");
+    OBSERVED.with(|state| state.borrow_mut().0.yoffset = 480);
+    display.flush_rects(&[]).unwrap();
+    assert_visible(&display, 1, "old page after partial redraw");
 }
 
 #[test]
