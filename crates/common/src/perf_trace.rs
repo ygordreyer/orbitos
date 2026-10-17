@@ -9,11 +9,12 @@ use std::{
 };
 
 const COUNT_LEN: usize = 44;
-const STAGE_NAMES: [&str; 32] = [
+const STAGE_NAMES: [&str; 34] = [
     "selection", "selected_info", "artwork_lookup", "decode", "layout", "raster", "present",
     "disk_cache", "details_metadata", "details_database", "details_reflow", "shadow_gaussian", "snapshot_capture", "snapshot_restore", "semantic_model",
     "frame_model", "frame_normalize", "neighbor_generation", "neighbor_filter", "neighbor_search", "retained_compare", "neighbor_misses", "neighbor_clear", "frame_retire", "frame_readiness", "page_history", "drawing_style", "compose_draw", "network_overlay",
     "frame_model_key", "frame_model_lookup", "frame_model_artwork",
+    "frame_art_config", "frame_art_protection",
 ];
 const LOG_LIMIT: u64 = 256 * 1024;
 // 64 rows cover a press burst without letting incomplete content grow the queue
@@ -1293,6 +1294,8 @@ pub enum Stage {
     FrameModelKey,
     FrameModelLookup,
     FrameModelArtwork,
+    FrameArtConfig,
+    FrameArtProtection,
 }
 pub struct StageGuard {
     stage: Stage,
@@ -1410,6 +1413,8 @@ mod latency_stage_tests {
             Stage::FrameModelKey,
             Stage::FrameModelLookup,
             Stage::FrameModelArtwork,
+            Stage::FrameArtConfig,
+            Stage::FrameArtProtection,
             Stage::Raster,
             Stage::Present,
             Stage::ShadowGaussian,
@@ -1441,6 +1446,8 @@ mod latency_stage_tests {
             "frame_model_key",
             "frame_model_lookup",
             "frame_model_artwork",
+            "frame_art_config",
+            "frame_art_protection",
             "selected_info",
             "artwork_lookup",
             "layout",
@@ -1463,10 +1470,11 @@ mod latency_stage_tests {
             assert!(start >= input && end >= start, "{name}: {row}");
         }
         let names = row["measurement"]["stage_names"].as_array().unwrap();
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 34);
         for (index, name) in [(25, "page_history"), (26, "drawing_style"),
             (27, "compose_draw"), (28, "network_overlay"), (29, "frame_model_key"),
-            (30, "frame_model_lookup"), (31, "frame_model_artwork")] {
+            (30, "frame_model_lookup"), (31, "frame_model_artwork"),
+            (32, "frame_art_config"), (33, "frame_art_protection")] {
             assert_eq!(names[index], name);
             assert!(row["measurement"]["frame"]["stage_begin_monotonic_us"][index].as_u64().unwrap() > 0);
         }
@@ -1551,13 +1559,13 @@ impl MeasurementSnapshot {
             "final_content_monotonic_us": self.final_content_us,
             "first_feedback_us": (self.first_feedback_us != 0).then(|| self.first_feedback_us.saturating_sub(self.input_us)),
             "final_content_us": (self.final_content_us != 0).then(|| self.final_content_us.saturating_sub(self.input_us)),
-            "frame": {"stage_wall_us": self.frame_stages, "cpu_ns": self.cpu, "counters": self.counts.as_slice(),
+            "frame": {"stage_wall_us": self.frame_stages.as_slice(), "cpu_ns": self.cpu, "counters": self.counts.as_slice(),
                 "render_attempt": self.attempt, "render_start_monotonic_us": self.render_us,
                 "presented_monotonic_us": self.presented_us,
-                "stage_begin_monotonic_us": self.frame_stage_begin, "stage_end_monotonic_us": self.frame_stage_end},
-            "input": {"stage_wall_us": self.input.stages, "cpu_ns": self.input.cpu, "counters": self.input.counts.as_slice()},
+                "stage_begin_monotonic_us": self.frame_stage_begin.as_slice(), "stage_end_monotonic_us": self.frame_stage_end.as_slice()},
+            "input": {"stage_wall_us": self.input.stages.as_slice(), "cpu_ns": self.input.cpu, "counters": self.input.counts.as_slice()},
             "counter_names": ["text_hit", "text_miss", "text_eviction", "map_build", "copied_pixels", "flushed_pixels", "composed_pixels", "converted_pixels", "compared_pixels", "scanned_pixels", "changed_pixels", "image_hit", "image_miss", "ink_bitmap_pixels", "allocations", "plan_builds", "resize_pixels", "shadow_misses", "glow_misses", "capture_bytes", "restore_bytes", "opacity_pixels", "preview_mask_bytes", "art_admission_rejected", "art_admission_rejected_bytes", "art_request_hero", "art_request_logo", "art_request_cover", "art_request_next", "art_request_entries", "art_fitted_hit", "art_fitted_miss", "hero_hit", "hero_miss", "hero_prewarm_publish", "panel_hit", "panel_miss", "neighbor_hit", "neighbor_miss", "neighbor_built", "neighbor_pointer_adopt", "neighbor_damage_copy", "full_frame_detach", "packed_span_hit"],
-            "stage_names": STAGE_NAMES,
+            "stage_names": STAGE_NAMES.as_slice(),
             "phase_names": ["input", "art_load", "component_prep", "compose", "flush", "text", "artwork", "blit"]
         })
     }

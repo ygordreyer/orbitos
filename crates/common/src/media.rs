@@ -229,6 +229,7 @@ impl Cache {
         while self.evict_record() {}
         self.local_containers.clear();
         self.paths.clear();
+        paths_changed();
         self.path_order.clear();
         self.logos.clear();
     }
@@ -238,11 +239,13 @@ impl Cache {
             if self.paths.len() >= PATH_CACHE_LIMIT {
                 if let Some(old) = self.path_order.pop_front() {
                     self.paths.remove(&old);
+                    paths_changed();
                 }
             }
             self.path_order.push_back(key.clone());
         }
         self.paths.insert(key, path);
+        paths_changed();
     }
 
     fn insert(&mut self, path: PathBuf, parent: PathBuf, data: Metadata) {
@@ -403,6 +406,14 @@ thread_local! { static GENERATION: std::cell::Cell<u64> = const { std::cell::Cel
 fn changed() {
     GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
 }
+thread_local! { static PATH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+fn paths_changed() {
+    PATH_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+}
+/// Includes hydration, FIFO eviction and clears, independently of metadata revisions.
+pub fn path_generation() -> u64 {
+    PATH_GENERATION.with(std::cell::Cell::get)
+}
 pub fn generation() -> u64 {
     GENERATION.with(std::cell::Cell::get)
 }
@@ -425,6 +436,7 @@ pub fn invalidate() {
         changed();
         return;
     }
+    paths_changed();
     CACHE.with(|c| {
         *c.borrow_mut() = Cache {
             defer_cold: UI_NAMES.with(std::cell::Cell::get),
@@ -1108,6 +1120,37 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn resolved_path_revision_tracks_insert_overwrite_eviction_and_every_clear() {
+        invalidate();
+        let mut cache = Cache::default();
+        let game = PathBuf::from("path-revision.chd");
+        let before = path_generation();
+        cache.insert_path((game.clone(), Kind::Cover), None);
+        assert_eq!(path_generation(), before.wrapping_add(1));
+        cache.insert_path((game.clone(), Kind::Cover), Some("cover.png".into()));
+        assert_eq!(path_generation(), before.wrapping_add(2));
+        for i in 1..PATH_CACHE_LIMIT {
+            cache.insert_path((PathBuf::from(format!("revision-{i}")), Kind::Cover), None);
+        }
+        let full = path_generation();
+        cache.insert_path(("evicts-first".into(), Kind::Cover), None);
+        assert_eq!(path_generation(), full.wrapping_add(2), "eviction and insert each bump");
+        assert!(!cache.paths.contains_key(&(game, Kind::Cover)));
+        let before = path_generation();
+        cache.clear_records();
+        assert_ne!(path_generation(), before);
+        let before = path_generation();
+        clear_prepared_paths();
+        assert_ne!(path_generation(), before);
+        let before = path_generation();
+        invalidate();
+        assert_ne!(path_generation(), before);
+        let before = path_generation();
+        with_name_indexes(invalidate);
+        assert_ne!(path_generation(), before);
+    }
+
     #[test]
     fn wave2_metadata_worker_lowers_priority_before_processing() {
         let before = INDEX_PRIORITY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
@@ -2504,6 +2547,7 @@ pub fn clear_prepared_paths() {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.paths.clear();
+        paths_changed();
         cache.path_order.clear();
         cache.local_containers.clear();
     });

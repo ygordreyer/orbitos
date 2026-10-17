@@ -30,6 +30,7 @@ use std::{
 };
 thread_local! {
     static COMPLETION_PENDING: Cell<bool> = const { Cell::new(false) };
+    static ART_PATH_GENERATION: Cell<u64> = const { Cell::new(0) };
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static STARTUP: RefCell<Startup> = const { RefCell::new(Startup::Legacy) };
 }
@@ -247,7 +248,12 @@ fn space_error(message: &str) -> bool {
 fn with<T>(default: T, f: impl FnOnce(&mut Runtime) -> T) -> T {
     RUNTIME.with(|cell| cell.borrow_mut().as_mut().map_or(default, f))
 }
+pub(crate) fn art_path_generation() -> u64 {
+    ART_PATH_GENERATION.with(Cell::get)
+}
 pub fn initialize(root: PathBuf) -> Result<()> {
+    // Catalog artwork depends on the immutable catalog and root installed here.
+    ART_PATH_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
     COMPLETION_PENDING.with(|pending| pending.set(false));
     RUNTIME.with(|cell| *cell.borrow_mut() = None);
     common::media::set_game_containers(std::iter::empty());

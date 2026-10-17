@@ -1067,6 +1067,8 @@ where
         input: &mut common::theme::frame::FrameInputs,
     ) -> Result<()> {
         use common::theme::pack::ScreenId;
+        let config_stage = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameArtConfig));
         let screen = input.screen;
         let config = self.media_configuration(handle, screen);
         let (count, ink, tall, targets, lower_targets) = (config.count, config.ink, config.tall,
@@ -1090,10 +1092,14 @@ where
         orbit.set_ink_art(ink);
         orbit.set_cover_shape(tall);
         orbit.set_art_targets(targets);
+        drop(config_stage);
+        let protection_stage = common::perf_trace::recording()
+            .then(|| common::perf_trace::stage(common::perf_trace::Stage::FrameArtProtection));
         orbit.protect_covered(self.entries.get(selected).filter(|_| self.details.is_some()), lower_targets);
         if let Some(entry) = self.entries.get(selected) {
             orbit.protect_selected(entry);
         }
+        drop(protection_stage);
         if needs_art {
             orbit.prepare_window(&self.entries, selected, first, count);
             input.art = orbit.theme_art_for_targets(&self.entries, selected, first, count, lower_targets);

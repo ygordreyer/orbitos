@@ -36,6 +36,7 @@ const THEME_COVER_SIZE: u32 = 140;
 const CARD_STRIDE: i32 = 176;
 const SHELF_CARDS: usize = 3;
 const CACHE_ENTRIES: usize = 16;
+const RESOLVED_PATH_LIMIT: usize = 64;
 const CACHE_PIXEL_BYTES: usize = common::theme::frame::ART_INPUT_BYTES;
 const BASE_CACHE_BYTES: usize = 3 * 1024 * 1024;
 const WORKER_METADATA_BYTES: usize = 1024 * 1024;
@@ -60,6 +61,10 @@ pub fn enabled() -> bool {
 }
 
 thread_local! {
+    #[cfg(test)]
+    static RESOLVED_PATH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static PROTECTION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ART_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_CACHE_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ART_COMPLETIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -123,6 +128,24 @@ impl CompletedTask {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathRevision {
+    media: u64,
+    paths: u64,
+    network: u64,
+}
+impl PathRevision {
+    fn current() -> Self {
+        Self { media: common::media::generation(), paths: common::media::path_generation(),
+            network: crate::network_runtime::art_path_generation() }
+    }
+}
+#[derive(Debug, Default)]
+struct ResolvedPaths {
+    revision: Option<PathRevision>,
+    entries: VecDeque<(PathBuf, bool, &'static str, PathBuf, Option<String>)>,
+}
+
 #[derive(Debug)]
 pub struct Orbit {
     cache: VecDeque<CachedArt>,
@@ -144,6 +167,8 @@ pub struct Orbit {
     completed_tasks: VecDeque<CompletedTask>,
     selected_path: Option<PathBuf>,
     protected_paths: Vec<PathBuf>,
+    selected_protection: Option<(PathRevision, bool, bool)>,
+    resolved_paths: std::cell::RefCell<ResolvedPaths>,
     visible_cover_entries: Vec<PathBuf>,
     #[cfg(feature = "perf-bench")]
     worker_samples: Vec<(common::perf::Counts, serde_json::Value)>,
@@ -174,6 +199,8 @@ impl Orbit {
             completed_tasks: VecDeque::new(),
             selected_path: None,
             protected_paths: Vec::new(),
+            selected_protection: None,
+            resolved_paths: std::cell::RefCell::new(ResolvedPaths::default()),
             visible_cover_entries: Vec::new(),
             #[cfg(feature = "perf-bench")]
             worker_samples: Vec::new(),
@@ -216,15 +243,39 @@ impl Orbit {
             self.tall_art = tall;
         }
     }
-    fn cover_path(&self, entry: &Entry) -> PathBuf {
-        if self.tall_art {
-            if let Some(path) =
-                common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
-            {
-                return path;
-            }
+    fn with_art_path<T>(&self, entry: &Entry, kind: &'static str, use_path: impl FnOnce(&Path) -> T) -> T {
+        self.with_art_identity(entry, kind, |path, _| use_path(path))
+    }
+    fn with_art_identity<T>(&self, entry: &Entry, kind: &'static str, use_path: impl FnOnce(&Path, Option<&str>) -> T) -> T {
+        let revision = PathRevision::current();
+        let directory = matches!(entry, Entry::Directory(_));
+        let mut paths = self.resolved_paths.borrow_mut();
+        if paths.revision != Some(revision) {
+            paths.entries.clear();
+            paths.revision = Some(revision);
         }
-        art_path(entry, "stock")
+        if let Some((_, _, _, path, id)) = paths.entries.iter().find(|(game, dir, k, _, _)| {
+            game == entry.path() && *dir == directory && *k == kind
+        }) {
+            return use_path(path, id.as_deref());
+        }
+        #[cfg(test)]
+        RESOLVED_PATH_BUILDS.with(|n| n.set(n.get() + 1));
+        let path = if kind == "tall" {
+            common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
+                .unwrap_or_else(|| art_path(entry, "stock"))
+        } else { art_path(entry, kind) };
+        if paths.entries.len() >= RESOLVED_PATH_LIMIT { paths.entries.pop_front(); }
+        let id = matches!(kind, "tall" | "stock").then(|| crate::theme_adapter::entry_id(entry.path()));
+        paths.entries.push_back((entry.path().into(), directory, kind, path, id));
+        let item = paths.entries.back().unwrap();
+        use_path(&item.3, item.4.as_deref())
+    }
+    fn with_cover_path<T>(&self, entry: &Entry, use_path: impl FnOnce(&Path) -> T) -> T {
+        self.with_art_path(entry, if self.tall_art { "tall" } else { "stock" }, use_path)
+    }
+    fn cover_path(&self, entry: &Entry) -> PathBuf {
+        self.with_cover_path(entry, Path::to_path_buf)
     }
     fn cache_logo(&mut self, entry: &Entry) {
         let Some(path) = common::media::cached_resolve(entry.path(), common::media::Kind::Logo)
@@ -453,19 +504,20 @@ impl Orbit {
         let _stage = common::perf_trace::stage(common::perf_trace::Stage::ArtworkLookup);
         let mut art = common::theme::frame::Art::default();
         if let Some(entry) = entries.get(selected) {
-            art.selected_logo = self.cached_variant(&art_path(entry, "logos"), targets.logo).cloned();
-            art.selected_hero = self.cached_variant(&art_path(entry, "heroes"), if self.ink_art { targets.hero } else { None }).cloned();
-            art.selected_cover = self.cached_variant(&self.cover_path(entry), targets.cover).cloned();
+            art.selected_logo = self.with_art_path(entry, "logos", |path| self.cached_variant(path, targets.logo).cloned());
+            art.selected_hero = self.with_art_path(entry, "heroes", |path| self.cached_variant(path, if self.ink_art { targets.hero } else { None }).cloned());
+            art.selected_cover = self.with_cover_path(entry, |path| self.cached_variant(path, targets.cover).cloned());
         }
         if let Some(next) = peek_game(entries, first, count) {
             art.next_cover_expected = true;
-            art.next_cover = self.cached_variant(&self.cover_path(&entries[next]), targets.cover).cloned();
+            art.next_cover = self.with_cover_path(&entries[next], |path| self.cached_variant(path, targets.cover).cloned());
         }
         for entry in entries.iter().skip(first).take(count) {
-            if let Some(image) = self.cached_variant(&self.cover_path(entry), targets.cover) {
-                art.entries
-                    .insert(crate::theme_adapter::entry_id(entry.path()), image.clone());
-            }
+            self.with_art_identity(entry, if self.tall_art { "tall" } else { "stock" }, |path, id| {
+                if let Some(image) = self.cached_variant(path, targets.cover) {
+                    art.entries.insert(id.unwrap().to_owned(), image.clone());
+                }
+            });
         }
         if common::perf_trace::recording() {
             let missed = |task: WarmArt| {
@@ -485,9 +537,11 @@ impl Orbit {
                     && missed(WarmArt::Cover(entries[next].clone()));
             }
             for entry in entries.iter().skip(first).take(count) {
-                if self.cached_variant(&self.cover_path(entry), targets.cover).is_none() && missed(WarmArt::Cover(entry.clone())) {
-                    art.completed_misses.entries.insert(crate::theme_adapter::entry_id(entry.path()));
-                }
+                self.with_art_identity(entry, if self.tall_art { "tall" } else { "stock" }, |path, id| {
+                    if self.cached_variant(path, targets.cover).is_none() && missed(WarmArt::Cover(entry.clone())) {
+                        art.completed_misses.entries.insert(id.unwrap().to_owned());
+                    }
+                });
             }
         }
         art
@@ -660,6 +714,10 @@ impl Orbit {
     }
 
     pub(crate) fn protect_selected(&mut self, entry: &Entry) {
+        let proof = (PathRevision::current(), self.tall_art, matches!(entry, Entry::Directory(_)));
+        if self.selected_path.as_deref() == Some(entry.path()) && self.selected_protection == Some(proof) { return; }
+        #[cfg(test)]
+        PROTECTION_BUILDS.with(|n| n.set(n.get() + 1));
         if self.selected_path.as_deref() != Some(entry.path()) {
             self.cancel_selection();
             self.selected_path = Some(entry.path().into());
@@ -667,9 +725,10 @@ impl Orbit {
         self.protected_paths.clear();
         self.protected_paths.extend([
             self.cover_path(entry),
-            art_path(entry, "heroes"),
-            art_path(entry, "logos"),
+            self.with_art_path(entry, "heroes", Path::to_path_buf),
+            self.with_art_path(entry, "logos", Path::to_path_buf),
         ]);
+        self.selected_protection = Some(proof);
     }
 
     pub(crate) fn protect_window(
@@ -684,6 +743,7 @@ impl Orbit {
         if let Some(entry) = entries.get(selected) {
             self.protect_selected(entry);
         }
+        self.selected_protection = None;
         self.visible_cover_entries.clear();
         if rows {
             for entry in entries.iter().skip(first).take(count) {
@@ -713,6 +773,8 @@ impl Orbit {
         self.cancel_selection();
         self.completed_tasks.clear();
         self.protected_paths.clear();
+        self.selected_protection = None;
+        self.resolved_paths.get_mut().entries.clear();
         self.covered_art.clear();
         while let Some(item) = self.cache.pop_back() {
             self.retire(item);
@@ -1654,6 +1716,173 @@ mod refresh_tests {
         pixels.fill(tiny_skia::Color::from_rgba8(red, 0, 0, 255));
         pixels.save_png(path).unwrap();
     }
+    fn uncached_art(orbit: &Orbit, entries: &[Entry], selected: usize, first: usize, count: usize) -> common::theme::frame::Art {
+        let cover = |entry: &Entry| {
+            if orbit.tall_art {
+                if let Some(path) = common::media::cached_resolve(entry.path(), common::media::Kind::TallCover) { return path; }
+            }
+            art_path(entry, "stock")
+        };
+        let mut art = common::theme::frame::Art::default();
+        if let Some(entry) = entries.get(selected) {
+            art.selected_logo = orbit.cached_variant(&art_path(entry, "logos"), orbit.targets.logo).cloned();
+            art.selected_hero = orbit.cached_variant(&art_path(entry, "heroes"), if orbit.ink_art { orbit.targets.hero } else { None }).cloned();
+            art.selected_cover = orbit.cached_variant(&cover(entry), orbit.targets.cover).cloned();
+        }
+        if let Some(next) = peek_game(entries, first, count) {
+            art.next_cover_expected = true;
+            art.next_cover = orbit.cached_variant(&cover(&entries[next]), orbit.targets.cover).cloned();
+        }
+        for entry in entries.iter().skip(first).take(count) {
+            if let Some(image) = orbit.cached_variant(&cover(entry), orbit.targets.cover) {
+                art.entries.insert(crate::theme_adapter::entry_id(entry.path()), image.clone());
+            }
+        }
+        art
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn warmed_artwork_matches_original_sources_and_ids() {
+        common::media::invalidate();
+        let entries: Vec<_> = (0..4).map(|i| Entry::Game(Game::new(format!("/artrefresh/Compare{i}.chd").into()))).collect();
+        let mut orbit = Orbit::new();
+        for entry in &entries {
+            for kind in ["stock", "logos", "heroes"] {
+                assert!(orbit.insert_cached(CachedArt { target: None, path: art_path(entry, kind),
+                    image: Some(std::sync::Arc::new(Pixmap::new(1, 1).unwrap())) }));
+            }
+        }
+        for selected in [0, 1, 2, 3, 0] {
+            for first in 0..4 {
+                let expected = uncached_art(&orbit, &entries, selected, first, 2);
+                let actual = orbit.theme_art(&entries, selected, first, 2);
+                assert!(actual == expected, "selection {selected}, first {first}");
+                assert_eq!(actual.entries.len(), (4 - first).min(2));
+                for (id, pixels) in &actual.entries {
+                    assert_eq!(pixels.data(), expected.entries[id].data());
+                }
+            }
+        }
+        let game = Entry::Game(Game::new("/artrefresh/Container.ext".into()));
+        let directory = Entry::Directory(crate::entry::directory::Directory {
+            path: game.path().into(), ..Default::default()
+        });
+        orbit.protect_selected(&game);
+        orbit.protect_selected(&directory);
+        assert_eq!(orbit.protected_paths[0], art_path(&directory, "stock"));
+        assert_ne!(art_path(&game, "stock"), orbit.protected_paths[0]);
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[ignore = "explicit artwork refresh host microbenchmark"]
+    #[serial_test::serial(orbit_fixture)]
+    fn artrefresh_warmed_artwork_bench() {
+        common::media::invalidate();
+        let entries: Vec<_> = (0..12).map(|i| Entry::Game(Game::new(format!("/artrefresh/Bench{i}.chd").into()))).collect();
+        let mut orbit = Orbit::new();
+        for entry in &entries {
+            assert!(orbit.insert_cached(CachedArt { target: None, path: art_path(entry, "stock"),
+                image: Some(std::sync::Arc::new(Pixmap::new(1, 1).unwrap())) }));
+        }
+        orbit.theme_art(&entries, 0, 0, 6);
+        orbit.theme_art(&entries, 1, 0, 6);
+        let mut times = [Vec::new(), Vec::new()];
+        for i in 0..1001 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(uncached_art(&orbit, &entries, i % 2, 0, 6));
+            times[0].push(start.elapsed().as_nanos());
+            let start = std::time::Instant::now();
+            std::hint::black_box(orbit.theme_art(&entries, i % 2, 0, 6));
+            times[1].push(start.elapsed().as_nanos());
+        }
+        for values in &mut times { values.sort_unstable(); }
+        println!("ARTREFRESH host_debug_samples=1001 uncached_median_ns={} cached_median_ns={}", times[0][500], times[1][500]);
+        common::media::invalidate();
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn warmed_paths_and_protection_skip_builds_and_follow_all_revisions() {
+        let entry = Entry::Game(Game::new("/artrefresh/Game.chd".into()));
+        let entries = [entry.clone()];
+        common::media::invalidate();
+        let mut orbit = Orbit::new();
+        orbit.set_cover_shape(true);
+        common::media::adopt_fallback_paths(entry.path(), [(common::media::Kind::TallCover, "tall.png".into())]);
+        orbit.protect_selected(&entry);
+        orbit.theme_art(&entries, 0, 0, 1);
+        let counts = || (RESOLVED_PATH_BUILDS.with(std::cell::Cell::get), PROTECTION_BUILDS.with(std::cell::Cell::get));
+        let warmed = counts();
+        for _ in 0..10 {
+            orbit.protect_selected(&entry);
+            orbit.theme_art(&entries, 0, 0, 1);
+        }
+        assert_eq!(counts(), warmed, "hit path must build neither paths nor protection");
+        assert_eq!(orbit.cover_path(&entry), Path::new("tall.png"));
+        // No metadata/model generation changes during FIFO eviction.
+        let media = common::media::generation();
+        for i in 0..512 {
+            common::media::adopt_fallback_paths(Path::new(&format!("/artrefresh/Other{i}.chd")),
+                [(common::media::Kind::Cover, "other.png".into())]);
+        }
+        assert_eq!(common::media::generation(), media);
+        let fallback = art_path(&entry, "stock");
+        assert_eq!(orbit.cover_path(&entry), fallback);
+        orbit.protect_selected(&entry);
+        assert_eq!(orbit.protected_paths[0], fallback);
+        common::media::adopt_fallback_paths(entry.path(), [(common::media::Kind::TallCover, "new-tall.png".into())]);
+        assert_eq!(orbit.cover_path(&entry), Path::new("new-tall.png"));
+        common::media::clear_prepared_paths();
+        assert_eq!(orbit.cover_path(&entry), fallback);
+        let before = counts();
+        common::media::invalidate();
+        orbit.protect_selected(&entry);
+        assert!(counts().0 > before.0 && counts().1 > before.1);
+        orbit.protect_window(&entries, 0, 0, 1, true, false);
+        assert_eq!(orbit.protected_paths.len(), 4);
+        let before = counts().1;
+        orbit.protect_selected(&entry);
+        assert_eq!(counts().1, before + 1, "window protection must be replaced");
+        assert_eq!(orbit.protected_paths.len(), 3);
+        orbit.set_cover_shape(false);
+        orbit.protect_selected(&entry);
+        assert_eq!(orbit.selected_protection.unwrap().1, false);
+        let before = counts();
+        orbit.release_art();
+        orbit.protect_selected(&entry);
+        assert!(counts().0 > before.0 && counts().1 > before.1);
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let first = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 901).unwrap();
+        let changed = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 901).unwrap();
+        assert!(orbit.set_art_theme(&first));
+        orbit.protect_selected(&entry);
+        let before = counts();
+        assert!(!orbit.set_art_theme(&first));
+        orbit.protect_selected(&entry);
+        assert_eq!(counts(), before);
+        assert!(orbit.set_art_theme(&changed), "digest change at same generation must refresh");
+        orbit.protect_selected(&entry);
+        assert!(counts().0 > before.0 && counts().1 > before.1);
+        let new_generation = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 902).unwrap();
+        let before = counts();
+        assert!(orbit.set_art_theme(&new_generation));
+        orbit.protect_selected(&entry);
+        assert!(counts().0 > before.0 && counts().1 > before.1);
+        let before = counts();
+        crate::network_runtime::initialize(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        orbit.protect_selected(&entry);
+        assert!(counts().0 > before.0 && counts().1 > before.1, "runtime replacement must invalidate fallbacks");
+        for i in 0..RESOLVED_PATH_LIMIT * 2 {
+            orbit.cover_path(&Entry::Game(Game::new(format!("/artrefresh/Bound{i}.chd").into())));
+        }
+        assert_eq!(orbit.resolved_paths.borrow().entries.len(), RESOLVED_PATH_LIMIT);
+        common::media::invalidate();
+    }
+
     #[test]
     #[serial_test::serial(orbit_fixture)]
     fn resolved_art_path_can_change_without_model_key_revisions() {
@@ -2223,6 +2452,7 @@ impl Orbit {
                     let missed = result.art.iter().all(|art| art.image.is_none());
                     let visible = self.selected_path.as_ref() == Some(&result.path) || visible_cover;
                     if visible {
+                        self.selected_protection = None;
                         self.protected_paths
                             .extend(result.art.iter().map(|item| item.path.clone()));
                     }
