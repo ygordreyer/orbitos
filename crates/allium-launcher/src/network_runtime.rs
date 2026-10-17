@@ -1341,6 +1341,12 @@ pub(crate) mod tests {
         let game = Game::new(fixture.root.join(&fixture.game.game_path));
         (fixture, game)
     }
+    pub(crate) fn set_semcache_cached(path: &Path, cached: bool) {
+        with((), |runtime| {
+            let id = runtime.descriptor(path).unwrap().id;
+            runtime.status.insert(id, if cached { "Cached" } else { "Missing" }.into());
+        });
+    }
     fn settle() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while active() {
