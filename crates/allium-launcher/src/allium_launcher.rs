@@ -213,8 +213,6 @@ impl AlliumLauncher<DefaultPlatform> {
                 self.handle_command(command).await?;
                 input_commands_pending &= !rx.is_empty();
             }
-            #[cfg(feature = "miyoo")]
-            common::platform::cpu_tuning::expire_input_boost();
             let network_job_active = crate::network_runtime::active();
             let network_dirty = crate::network_runtime::poll();
             if network_job_active && !crate::network_runtime::active() {
@@ -331,16 +329,6 @@ impl AlliumLauncher<DefaultPlatform> {
             if pending_input.is_ready(&mut self.platform) {
                 continue;
             }
-            let boost_deadline = {
-                #[cfg(feature = "miyoo")]
-                {
-                    common::platform::cpu_tuning::input_boost_deadline()
-                }
-                #[cfg(not(feature = "miyoo"))]
-                {
-                    None::<Instant>
-                }
-            };
             let view_deadline = self
                 .toast_deadline
                 .map_or(update_deadline, |toast| toast.min(update_deadline));
@@ -375,7 +363,6 @@ impl AlliumLauncher<DefaultPlatform> {
                 _ = tokio::time::sleep(Duration::from_millis(33)), if crate::network_runtime::active() => {
                     crate::network_runtime::trace_wake("network_timer");
                 }
-                _ = tokio::time::sleep_until(boost_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400)).into()), if boost_deadline.is_some() => {}
                 _ = tokio::time::sleep(if warm_work.is_some() {
                     std::time::Duration::from_millis(1)
                 } else if media_pending || (warm_allowed && warm_steps < 2) || crate::media_refresh::pending() {

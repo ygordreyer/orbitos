@@ -263,6 +263,65 @@ pub fn input_with_boost(event: crate::platform::KeyEvent, boost: impl FnOnce()) 
     let boost_us = start.map_or(0, |start| monotonic_us().saturating_sub(start.0));
     input_at(event, start, boost_us)
 }
+struct BoostWorkTiming {
+    start: u64,
+    lease: [u64; 2],
+    sysfs: [u64; 2],
+}
+
+pub struct BoostWork {
+    timing: Option<BoostWorkTiming>,
+}
+
+/// Worker-local timings never mutate the input thread's trace or extend boost_us.
+pub fn boost_work() -> BoostWork {
+    BoostWork {
+        timing: recording().then(|| BoostWorkTiming {
+            start: monotonic_us(),
+            lease: [0; 2],
+            sysfs: [0; 2],
+        }),
+    }
+}
+
+impl BoostWork {
+    pub fn lease<T>(&mut self, work: impl FnOnce() -> T) -> T {
+        let Some(timing) = self.timing.as_mut() else { return work(); };
+        timing.lease[0] = monotonic_us();
+        let result = work();
+        timing.lease[1] = monotonic_us();
+        result
+    }
+
+    pub fn sysfs<T>(&mut self, work: impl FnOnce() -> T) -> T {
+        let Some(timing) = self.timing.as_mut() else { return work(); };
+        timing.sysfs[0] = monotonic_us();
+        let result = work();
+        timing.sysfs[1] = monotonic_us();
+        result
+    }
+}
+
+impl Drop for BoostWork {
+    fn drop(&mut self) {
+        let Some(timing) = &self.timing else { return; };
+        TRACE.with(|state| {
+            if let Some(t) = state.borrow_mut().as_mut() {
+                let mut row = event_values(t, "boost_completed", 0, None);
+                row["measurement"]["boost_started_monotonic_us"] = timing.start.into();
+                row["measurement"]["boost_lease_us"] = timing.lease[1].saturating_sub(timing.lease[0]).into();
+                row["measurement"]["boost_sysfs_us"] = timing.sysfs[1].saturating_sub(timing.sysfs[0]).into();
+                row["measurement"]["boost_lease_begin_monotonic_us"] = timing.lease[0].into();
+                row["measurement"]["boost_lease_end_monotonic_us"] = timing.lease[1].into();
+                row["measurement"]["boost_sysfs_begin_monotonic_us"] = timing.sysfs[0].into();
+                row["measurement"]["boost_sysfs_end_monotonic_us"] = timing.sysfs[1].into();
+                let line = row.to_string() + "\n";
+                let _ = append_bounded(&mut t.file, line.as_bytes());
+            }
+        });
+    }
+}
+
 fn input_at(event: crate::platform::KeyEvent, start: Option<(u64, u64)>, boost_us: u64) -> PhaseGuard {
     use crate::platform::KeyEvent;
     let guard = phase_at(Phase::Input, start);
@@ -1365,6 +1424,39 @@ impl Drop for TaskGuard {
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn boost_worker_timings_are_one_row_and_disabled_work_still_runs() {
+        let path = std::env::temp_dir().join(format!("allium-boost-work-{}.log", std::process::id()));
+        install(path.to_str().unwrap()).unwrap();
+        {
+            let mut timing = boost_work();
+            assert_eq!(timing.lease(|| 17), 17);
+            assert_eq!(timing.sysfs(|| 23), 23);
+        }
+        let rows = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        let row: serde_json::Value = serde_json::from_str(rows.trim()).unwrap();
+        assert_eq!(row["event"], "boost_completed");
+        let m = &row["measurement"];
+        let start = m["boost_started_monotonic_us"].as_u64().unwrap();
+        let lease_begin = m["boost_lease_begin_monotonic_us"].as_u64().unwrap();
+        let lease_end = m["boost_lease_end_monotonic_us"].as_u64().unwrap();
+        let sysfs_begin = m["boost_sysfs_begin_monotonic_us"].as_u64().unwrap();
+        let sysfs_end = m["boost_sysfs_end_monotonic_us"].as_u64().unwrap();
+        assert!(start > 0 && start <= lease_begin && lease_begin <= lease_end);
+        assert!(lease_end <= sysfs_begin && sysfs_begin <= sysfs_end);
+        assert_eq!(m["boost_lease_us"], lease_end - lease_begin);
+        assert_eq!(m["boost_sysfs_us"], sysfs_end - sysfs_begin);
+        TRACE.with(|trace| *trace.borrow_mut() = None);
+        let mut timing = boost_work();
+        assert!(timing.timing.is_none());
+        assert_eq!(timing.lease(|| 31), 31);
+        assert_eq!(timing.sysfs(|| 47), 47);
+        drop(timing);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rows);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn boost_precedes_trace_serialization_but_follows_input_receipt() {
         use crate::platform::{Key, KeyEvent};

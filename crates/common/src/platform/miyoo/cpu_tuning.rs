@@ -3,9 +3,10 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -30,7 +31,7 @@ struct OndemandTuning {
     root: PathBuf,
     warned: [AtomicBool; 3],
     ownership_epoch: Mutex<u64>,
-    input_boost: Mutex<InputBoost>,
+    input_boost: InputBoostWorker,
 }
 
 impl OndemandTuning {
@@ -39,7 +40,7 @@ impl OndemandTuning {
             root: sysfs_root.join("devices/system/cpu/cpufreq/ondemand"),
             warned: std::array::from_fn(|_| AtomicBool::new(false)),
             ownership_epoch: Mutex::new(0),
-            input_boost: Mutex::new(InputBoost::new(sysfs_root, lease_path)),
+            input_boost: InputBoostWorker::new(InputBoost::new(sysfs_root, lease_path)),
         }
     }
 
@@ -50,10 +51,9 @@ impl OndemandTuning {
             .unwrap_or_else(|e| e.into_inner());
         *epoch = epoch.checked_add(1).expect("CPU tuning epoch exhausted");
         if matches!(workload, Workload::Game) {
-            self.input_boost
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .restore();
+            self.input_boost.restore();
+        } else {
+            self.input_boost.enable();
         }
         self.write_values(workload);
         *epoch
@@ -96,6 +96,7 @@ impl Drop for ForegroundTuning<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if *epoch == self.epoch {
+            self.tuning.input_boost.restore();
             self.tuning.write_values(Workload::Game);
         }
     }
@@ -118,10 +119,20 @@ fn open_lease_lock(path: &Path) -> io::Result<fs::File> {
         .open(path.with_extension("lock"))
 }
 
-fn try_lease_lock(path: &Path) -> io::Result<Option<fs::File>> {
+struct LeaseLock(fs::File);
+
+impl Drop for LeaseLock {
+    fn drop(&mut self) {
+        // A concurrent spawn can inherit the open description until exec. Closing
+        // only this descriptor would leave its flock held in that child meanwhile.
+        let _ = self.0.unlock();
+    }
+}
+
+fn try_lease_lock(path: &Path) -> io::Result<Option<LeaseLock>> {
     let file = open_lease_lock(path)?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(LeaseLock(file))),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(error)) => Err(error),
     }
@@ -130,12 +141,13 @@ fn try_lease_lock(path: &Path) -> io::Result<Option<fs::File>> {
 /// Inhibit new input boosts until the daemon resumes the launcher.
 /// The OS releases the lock even if the daemon exits unexpectedly.
 pub struct InputBoostPause {
-    _lock: fs::File,
+    _lock: LeaseLock,
 }
 
 fn pause_input_boost_at(path: &Path) -> io::Result<InputBoostPause> {
     let lock = open_lease_lock(path)?;
     lock.lock()?;
+    let lock = LeaseLock(lock);
     restore_locked_boost_lease_at(path)?;
     Ok(InputBoostPause { _lock: lock })
 }
@@ -209,11 +221,7 @@ pub struct InputBoostGuard<'a> {
 
 impl Drop for InputBoostGuard<'_> {
     fn drop(&mut self) {
-        self.tuning
-            .input_boost
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .restore();
+        self.tuning.input_boost.restore();
     }
 }
 
@@ -223,6 +231,126 @@ pub fn input_boost_guard() -> InputBoostGuard<'static> {
 }
 
 const INPUT_BOOST_WINDOW: Duration = Duration::from_millis(1500);
+
+struct BoostRequests {
+    enabled: bool,
+    pending: bool,
+    running: bool,
+    shutdown: bool,
+}
+
+struct BoostWorkerShared {
+    requests: Mutex<BoostRequests>,
+    wake: Condvar,
+    boost: Mutex<InputBoost>,
+}
+
+struct InputBoostWorker {
+    shared: Arc<BoostWorkerShared>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InputBoostWorker {
+    fn new(boost: InputBoost) -> Self {
+        let shared = Arc::new(BoostWorkerShared {
+            requests: Mutex::new(BoostRequests {
+                enabled: true,
+                pending: false,
+                running: false,
+                shutdown: false,
+            }),
+            wake: Condvar::new(),
+            boost: Mutex::new(boost),
+        });
+        let worker = Arc::clone(&shared);
+        let thread = thread::Builder::new().name("input-boost".into()).spawn(move || {
+            crate::perf_trace::initialize();
+            let mut deadline = None;
+            let mut requests = worker.requests.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                while !requests.shutdown && !requests.pending {
+                    if let Some(end) = deadline {
+                        let now = Instant::now();
+                        if now >= end { break; }
+                        requests = worker.wake.wait_timeout(requests, end - now)
+                            .unwrap_or_else(|e| e.into_inner()).0;
+                    } else {
+                        requests = worker.wake.wait(requests).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                if requests.shutdown { break; }
+                let input = requests.pending;
+                requests.pending = false;
+                requests.running = true;
+                #[cfg(test)]
+                worker.wake.notify_all();
+                drop(requests);
+                {
+                    let mut boost = worker.boost.lock().unwrap_or_else(|e| e.into_inner());
+                    if input {
+                        boost.input(Instant::now());
+                    } else {
+                        boost.expire(Instant::now());
+                    }
+                    deadline = boost.deadline;
+                }
+                requests = worker.requests.lock().unwrap_or_else(|e| e.into_inner());
+                requests.running = false;
+                worker.wake.notify_all();
+                // A synchronous restore owns expiry while requests are disabled.
+                if !requests.enabled { deadline = None; }
+            }
+        });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                log::warn!("Cannot start input boost worker: {error}");
+                shared.requests.lock().unwrap_or_else(|e| e.into_inner()).enabled = false;
+                None
+            }
+        };
+        Self { shared, thread }
+    }
+
+    fn input(&self) {
+        // The worker never holds this lock across lease, sysfs, or trace I/O.
+        let mut requests = self.shared.requests.lock().unwrap_or_else(|e| e.into_inner());
+        if requests.enabled {
+            requests.pending = true;
+            self.shared.wake.notify_one();
+        }
+    }
+
+    fn enable(&self) {
+        if self.thread.is_some() {
+            self.shared.requests.lock().unwrap_or_else(|e| e.into_inner()).enabled = true;
+        }
+    }
+
+    fn restore(&self) {
+        let mut requests = self.shared.requests.lock().unwrap_or_else(|e| e.into_inner());
+        requests.enabled = false;
+        requests.pending = false;
+        #[cfg(test)]
+        self.shared.wake.notify_all();
+        while requests.running {
+            requests = self.shared.wake.wait(requests).unwrap_or_else(|e| e.into_inner());
+        }
+        // Hold the request gate until restoration finishes, including after a poisoned lock.
+        self.shared.boost.lock().unwrap_or_else(|e| e.into_inner()).restore();
+    }
+}
+
+impl Drop for InputBoostWorker {
+    fn drop(&mut self) {
+        self.restore();
+        self.shared.requests.lock().unwrap_or_else(|e| e.into_inner()).shutdown = true;
+        self.shared.wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 struct InputBoost {
     lease_path: PathBuf,
@@ -292,15 +420,16 @@ impl InputBoost {
                 self.unavailable = true;
                 return;
             };
-            if let Err(error) = write_boost_lease(
+            let mut timing = crate::perf_trace::boost_work();
+            if let Err(error) = timing.lease(|| write_boost_lease(
                 &self.lease_path,
                 self.min_path.parent().expect("CPU policy directory"),
                 &min,
-            ) {
+            )) {
                 log::warn!("Cannot save CPU boost lease: {error}");
                 return;
             }
-            if let Err(error) = self.write_min(max.trim()) {
+            if let Err(error) = timing.sysfs(|| self.write_min(max.trim())) {
                 log::warn!("Cannot boost {}: {error}", self.min_path.display());
                 self.unavailable = true;
                 return;
@@ -331,37 +460,14 @@ impl InputBoost {
     }
 }
 
-/// Extend the input boost without repeating sysfs writes within its window.
+/// Coalesce input requests without waiting for the lease or frequency switch.
 pub fn boost_input() {
-    system()
-        .input_boost
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .input(Instant::now());
+    system().input_boost.input();
 }
 
+/// Disable and drain requests before restoring for exit or game handoff.
 pub fn restore_input_boost() {
-    system()
-        .input_boost
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .restore();
-}
-
-pub fn expire_input_boost() {
-    system()
-        .input_boost
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .expire(Instant::now());
-}
-
-pub fn input_boost_deadline() -> Option<Instant> {
-    system()
-        .input_boost
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .deadline
+    system().input_boost.restore();
 }
 
 fn system() -> &'static OndemandTuning {
@@ -427,6 +533,21 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn lease_unlock_is_not_delayed_by_an_inherited_open_description() {
+        let f = Fixture::new("lease-unlock");
+        let path = f.0.join("lease");
+        let lock = try_lease_lock(&path).unwrap().unwrap();
+        // A cloned descriptor has the same flock lifetime as one inherited at fork.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(try_lease_lock(&path).unwrap().is_none());
+        drop(lock);
+        let next = try_lease_lock(&path).unwrap();
+        assert!(next.is_some(), "a completed transaction must release its lock before exec");
+        drop(next);
+        drop(inherited);
     }
 
     #[test]
@@ -541,12 +662,12 @@ mod tests {
             f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
         fs::write(&minimum, "400000").unwrap();
         let tuning = OndemandTuning::new(&f.0, &f.0.join("lease"));
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = InputBoostGuard { tuning: &tuning };
-            let mut boost = tuning.input_boost.lock().unwrap();
+            let mut boost = tuning.input_boost.shared.boost.lock().unwrap();
             boost.input(Instant::now());
             panic!("launcher panic during boost");
-        });
+        }));
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&minimum).unwrap(), "400000");
         assert!(!f.0.join("lease").exists());
@@ -624,10 +745,125 @@ mod tests {
             f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
         fs::write(&min, "400000").unwrap();
         let tuning = OndemandTuning::new(&f.0, &f.0.join("lease"));
-        tuning.input_boost.lock().unwrap().input(Instant::now());
+        tuning.input_boost.shared.boost.lock().unwrap().input(Instant::now());
         tuning.set(Workload::Game);
         assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
-        assert!(tuning.input_boost.lock().unwrap().deadline.is_none());
+        assert!(tuning.input_boost.shared.boost.lock().unwrap().deadline.is_none());
+    }
+
+    fn wait_requests(worker: &InputBoostWorker, ready: impl Fn(&BoostRequests) -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut requests = worker.shared.requests.lock().unwrap();
+        while !ready(&requests) {
+            let left = end.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "boost worker did not reach expected state");
+            requests = worker.shared.wake.wait_timeout(requests, left).unwrap().0;
+        }
+    }
+
+    #[test]
+    fn boost_worker_coalesces_bursts_without_waiting_for_sysfs() {
+        let f = Fixture::new("worker-coalesce");
+        f.seed(["20000", "60", "1"]);
+        let min = f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
+        fs::write(&min, "400000").unwrap();
+        let worker = InputBoostWorker::new(InputBoost::new(&f.0, &f.0.join("lease")));
+        let boost = worker.shared.boost.lock().unwrap();
+        worker.input();
+        wait_requests(&worker, |r| r.running);
+        // The worker is blocked at the transaction lock, but signaling still completes.
+        for _ in 0..1000 { worker.input(); }
+        {
+            let requests = worker.shared.requests.lock().unwrap();
+            assert!(requests.running && requests.pending);
+        }
+        drop(boost);
+        wait_requests(&worker, |r| !r.running && !r.pending);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "1200000");
+        // A coalesced extension must retain the original lease baseline.
+        worker.restore();
+        assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
+    }
+
+    #[test]
+    fn game_handoff_drains_inflight_and_discards_pending_worker_requests() {
+        let f = Fixture::new("worker-handoff");
+        f.seed(["20000", "60", "1"]);
+        let min = f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
+        fs::write(&min, "400000").unwrap();
+        let tuning = OndemandTuning::new(&f.0, &f.0.join("lease"));
+        let worker = &tuning.input_boost;
+        thread::scope(|scope| {
+            let boost = worker.shared.boost.lock().unwrap();
+            worker.input();
+            wait_requests(worker, |r| r.running);
+            worker.input();
+            assert!(worker.shared.requests.lock().unwrap().pending);
+            let handoff = scope.spawn(|| tuning.set(Workload::Game));
+            wait_requests(worker, |r| !r.enabled && !r.pending);
+            assert!(!handoff.is_finished(), "handoff must wait for in-flight boost");
+            worker.input();
+            assert!(!worker.shared.requests.lock().unwrap().pending);
+            drop(boost);
+            handoff.join().unwrap();
+        });
+        assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
+        assert!(!f.0.join("lease").exists());
+        worker.input();
+        let requests = worker.shared.requests.lock().unwrap();
+        assert!(!requests.enabled && !requests.pending && !requests.running);
+        drop(requests);
+        // Failed exec returns to the frontend and explicitly permits fresh requests.
+        tuning.set(Workload::Frontend);
+        worker.input();
+        wait_requests(worker, |r| !r.running && !r.pending);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "1200000");
+        worker.restore();
+        assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
+    }
+
+    #[test]
+    fn boost_worker_expires_without_an_input_thread_wakeup() {
+        let f = Fixture::new("worker-expiry");
+        f.seed(["20000", "60", "1"]);
+        let min = f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
+        fs::write(&min, "400000").unwrap();
+        let worker = InputBoostWorker::new(InputBoost::new(&f.0, &f.0.join("lease")));
+        worker.input();
+        wait_requests(&worker, |r| !r.running && !r.pending);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "1200000");
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut requests = worker.shared.requests.lock().unwrap();
+        while worker.shared.boost.lock().unwrap().deadline.is_some() {
+            let left = end.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "worker did not expire boost");
+            requests = worker.shared.wake.wait_timeout(requests, left).unwrap().0;
+        }
+        drop(requests);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
+        assert!(!f.0.join("lease").exists());
+    }
+
+    #[test]
+    fn daemon_pause_blocks_pending_worker_and_resumed_boost_reads_new_minimum() {
+        let f = Fixture::new("worker-pause");
+        f.seed(["20000", "60", "1"]);
+        let min = f.0.join("devices/system/cpu/cpufreq/policy0/scaling_min_freq");
+        let lease = f.0.join("lease");
+        fs::write(&min, "400000").unwrap();
+        let worker = InputBoostWorker::new(InputBoost::new(&f.0, &lease));
+        let pause = pause_input_boost_at(&lease).unwrap();
+        worker.input();
+        wait_requests(&worker, |r| !r.running && !r.pending);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "400000");
+        assert!(!lease.exists());
+        fs::write(&min, "600000").unwrap();
+        drop(pause);
+        worker.input();
+        wait_requests(&worker, |r| !r.running && !r.pending);
+        assert_eq!(fs::read_to_string(&min).unwrap(), "1200000");
+        worker.restore();
+        assert_eq!(fs::read_to_string(&min).unwrap(), "600000");
     }
 
     #[test]
