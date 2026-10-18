@@ -288,6 +288,7 @@ impl Sort for RecentsSort {
 
         Ok(games
             .into_iter()
+            .filter(|game| crate::entry::listed_path(&game.path))
             .map(|game| {
                 let extension = game
                     .path

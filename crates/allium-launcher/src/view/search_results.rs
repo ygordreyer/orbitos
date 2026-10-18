@@ -94,6 +94,7 @@ impl Sort for SearchResultsSort {
 
         let mut entries = games
             .into_iter()
+            .filter(|game| crate::entry::listed_path(&game.path))
             .map(|game| {
                 let extension = game
                     .path
@@ -725,5 +726,22 @@ mod metadata_tests {
         assert_eq!(state.selected_path.as_ref(), Some(&paths[0]));
         std::fs::remove_dir_all(root).unwrap();
         common::media::invalidate();
+    }
+}
+
+#[cfg(test)]
+mod rom_filter_tests {
+    use super::*;
+    #[test]
+    fn search_does_not_revive_indexed_commands_or_metadata_sidecars() {
+        let database = Database::in_memory().unwrap();
+        for name in ["~Filter.miyoocmd", "Refresh.MIYOOCMD", "metadata.xml", "systeminfo.txt"] {
+            database.update_games(&[Game::new(std::path::PathBuf::from(name)).into()]).unwrap();
+        }
+        for name in ["Filter", "Refresh", "metadata", "systeminfo"] {
+            let entries = SearchResultsSort::Relevance(name.into()).entries(
+                &database, &ConsoleMapper::new(), &Locale::new("en-US")).unwrap();
+            assert!(entries.is_empty(), "sidecar appeared in search: {name}");
+        }
     }
 }

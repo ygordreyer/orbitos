@@ -58,7 +58,7 @@ impl Entry {
             Some(file_name) => file_name,
             None => return Ok(None),
         };
-        if file_name.starts_with('.') || file_name.starts_with('_') {
+        if !listed_path(&path) {
             return Ok(None);
         }
 
@@ -137,6 +137,16 @@ impl Entry {
             Entry::App(app) => app.image.as_deref(),
         }
     }
+}
+
+pub(crate) fn listed_path(path: &Path) -> bool {
+    !path.file_name().and_then(OsStr::to_str).is_some_and(|name| name.starts_with(['.', '_']) || (name.starts_with('~') && path.is_dir()) || name.eq_ignore_ascii_case("~Import.sh")) && !path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+        ["miyoocmd", "xml", "json", "txt", "db", "nfo", "sbi", "msu", "pcm"].iter().any(|excluded| ext.eq_ignore_ascii_case(excluded))
+    }) && !path.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+        ["metadata", "systeminfo", "cover.png", "icon.png", "logo.png", "background.png", "system.png"].iter().any(|excluded| name.eq_ignore_ascii_case(excluded))
+    }) && !path.components().any(|part| {
+        ["media", "Imgs", "Guides"].iter().any(|name| part.as_os_str().eq_ignore_ascii_case(name))
+    })
 }
 
 fn short_name(mut name: &str) -> String {

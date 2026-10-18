@@ -166,9 +166,13 @@ impl SettingsList {
         self.labels.iter().zip(&self.right).enumerate()
             .skip(self.top).take(self.visible_count()).map(|(index, (label, value))| {
                 crate::theme::frame::Row { id: format!("setting-{index}"),
-                    label: label.clone(), subtitle: String::new(), value: value.theme_value(), enabled: true }
+                    label: label.clone(), subtitle: String::new(), value: if self.focused && index == self.selected {
+                        format!("‹ {} ›", value.theme_value())
+                    } else { value.theme_value() }, enabled: true }
             }).collect()
     }
+
+    pub fn editing(&self) -> bool { self.focused }
 
     pub fn resources(&self) -> &Resources { &self.res }
 

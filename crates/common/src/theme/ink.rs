@@ -204,6 +204,7 @@ pub struct Paint {
     pub action_focus_style: Option<Surface>,
     pub fit_content: bool,
     pub icon_ink_height: Option<u32>,
+    pub breadcrumb_icon: bool,
     pub anchor: Option<Align>,
     pub suffix: Option<String>,
     pub empty: Option<Empty>,
@@ -211,10 +212,12 @@ pub struct Paint {
     pub label: Option<Run>,
     pub value: Option<Run>,
     pub value_gap: Option<u32>,
+    pub value_width_percent: Option<u32>,
     pub section_style: Option<Run>,
 }
 impl Paint {
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.value_width_percent.is_none_or(|value| (20..=90).contains(&value)), "Invalid value column width");
         ensure!(
             self.icons.len() <= 4
                 && self

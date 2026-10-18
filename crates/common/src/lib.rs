@@ -20,6 +20,7 @@ pub mod stylesheet;
 pub mod theme;
 pub mod view;
 pub mod wifi;
+pub mod timezone;
 
 #[cfg(feature = "perf-bench")]
 pub mod perf;

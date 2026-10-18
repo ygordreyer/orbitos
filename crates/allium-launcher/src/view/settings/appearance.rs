@@ -151,7 +151,9 @@ impl Appearance {
         self.list.set_visible_count_override(Some(count))?;
         let mut input = FrameInputs::new(screen);
         input.pagination = Some(common::theme::frame::Pagination {page:self.list.selected()/count.max(1)+1,total:rows(&self.choices,Some(handle)).len().max(1).div_ceil(count.max(1))});
-        input.text.insert(Binding::Title, "Theme".into());
+        let locale = self.res.get::<common::locale::Locale>();
+        input.text.insert(Binding::Title, locale.t("settings-theme"));
+        super::page_context(&mut input, &locale, "settings-theme");
         input.rows.insert(
             Binding::SettingsRows,
             rows(&self.choices, Some(handle))
@@ -308,6 +310,7 @@ mod tests {
         let active = runtime.choose("compact-plus").unwrap();
         let mut map = type_map::TypeMap::new();
         map.insert(Stylesheet::new());
+        map.insert(common::locale::Locale::new("en-US"));
         map.insert(active.snapshot.clone());
         map.insert(Rc::new(RefCell::new(ThemeService {
             runtime: Some(runtime),

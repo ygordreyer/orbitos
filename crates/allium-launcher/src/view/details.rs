@@ -152,8 +152,11 @@ impl Details {
                 "Released {} ({})",
                 entry.year, entry.release_region
             ));
-        } else {
-            fields.push("Year unavailable".into());
+        }
+        let summary_count = fields.len();
+        let mut metadata_runs = vec![("Platform".into(), platform.into())];
+        if let Some(released) = fields.get(1) {
+            metadata_runs.push(("Released".into(), released.trim_start_matches("Released ").into()));
         }
         if let Some(value) = game
             .developer
@@ -201,7 +204,6 @@ impl Details {
             .unwrap_or_else(|| "Synopsis unavailable.".into());
         let blurb = synopsis.chars().take(480).collect();
         let synopsis_section = synopsis.clone();
-        let summary_count = 2;
         let metadata: String = fields[..summary_count]
             .join(" · ")
             .chars()
@@ -213,9 +215,7 @@ impl Details {
         } else {
             format!("{facts}\n\n{synopsis}")
         };
-        if !shared.scraper.is_empty() {
-            full_text.push_str(&format!("\n\nMetadata source: {}", shared.scraper));
-        } else if let Some(entry) = fallback {
+        if let Some(entry) = fallback {
             full_text.push_str(&format!(
                 "\n\nFirst release: {}\nMetadata source: {}\n{}",
                 entry.first_release_year,
@@ -229,8 +229,6 @@ impl Details {
                     display_url(&entry.source.license.url)
                 ));
             }
-        } else {
-            full_text.push_str("\n\nMetadata source: unavailable\nLicense: unavailable");
         }
         let mut fact_runs = vec![];
         if let Some(value) = game
@@ -258,9 +256,7 @@ impl Details {
         if !shared.players.is_empty() {
             fact_runs.push(("Players".into(), shared.players.clone()));
         }
-        let source = if !shared.scraper.is_empty() {
-            format!("Source: {}", shared.scraper)
-        } else {
+        let source = {
             fallback
                 .map(|e| format!("Source: {}", e.source.title))
                 .unwrap_or_default()
@@ -280,20 +276,12 @@ impl Details {
             let mut provenance = format!("First release: {}\nSource: {}", entry.first_release_year, source_name);
             if !has_local_synopsis { provenance.push_str(&format!("\n{}", entry.source.license.name)); }
             sections.push((Some("PROVENANCE".into()), provenance));
-        } else if !shared.scraper.is_empty() {
-            sections.push((Some("PROVENANCE".into()), format!("Source: {}", shared.scraper)));
         }
         Self {
             section_pages: Vec::new(),
             sections,
             metadata,
-            metadata_runs: vec![
-                ("Platform".into(), platform.into()),
-                (
-                    "Released".into(),
-                    fields[1].trim_start_matches("Released ").into(),
-                ),
-            ],
+            metadata_runs,
             facts: fact_runs,
             source,
             ink_body,
@@ -1340,7 +1328,6 @@ mod media_contract_tests {
             "Racing, Arcade",
             "Players: 1-2",
             "Metadata rating: 8/10",
-            "Metadata source: Fixture scraper",
         ] {
             assert!(
                 details.full_text.contains(value),
@@ -1349,9 +1336,12 @@ mod media_contract_tests {
             );
         }
         assert!(!details.full_text.contains("unavailable"));
-        assert_eq!(details.source, "Source: Fixture scraper");
+        assert!(details.source.is_empty());
+        assert!(!details.full_text.contains("Fixture scraper"));
+        assert!(!details.sections.iter().any(|(_, text)| text.contains("Fixture scraper")));
         let missing = Details::new(&Game::new(root.join("Missing.sfc")), "Fixture console");
-        assert!(missing.metadata.contains("Year unavailable"));
+        assert!(!missing.metadata.contains("Year unavailable"));
+        assert!(!missing.metadata_runs.iter().any(|(label, _)| label == "Released"));
         assert!(missing.full_text.contains("Synopsis unavailable"));
     }
 }

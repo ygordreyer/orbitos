@@ -94,7 +94,9 @@ impl Game {
     pub fn from_db(game: DbGame) -> Option<Game> {
         #[cfg(test)]
         super::load_work::record(|work| work.metadata += 1);
-        if !game.path.exists() && !crate::network_runtime::registered(&game.path) {
+        if !super::listed_path(&game.path)
+            || (!game.path.exists() && !crate::network_runtime::registered(&game.path))
+        {
             return None;
         }
         Some(Self::from_db_present(game))

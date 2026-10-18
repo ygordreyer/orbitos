@@ -788,6 +788,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     self.platform.battery()?,
                 )?;
             }
+            Command::ClockChanged => self.view.set_should_draw(),
             Command::Redraw => {
                 trace!("redrawing");
                 self.restore_launcher()?;

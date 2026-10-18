@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Local;
 
 use tokio::sync::mpsc::Sender;
 
@@ -70,6 +69,8 @@ impl View for Clock {
     }
 
     fn set_should_draw(&mut self) {
+        self.label.set_text(text());
+        self.last_updated = Instant::now();
         self.label.set_should_draw();
     }
 
@@ -104,5 +105,20 @@ fn text() -> String {
     if let Ok(clock) = std::env::var("ALLIUM_PERF_CLOCK") {
         return clock;
     }
-    format!("{}", Local::now().format("%H:%M"))
+    format!("{}", crate::timezone::local_now().format("%H:%M"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn change_event_refreshes_clock_before_the_timer_expires() {
+        let mut clock = Clock {
+            label: Label::new(Point::zero(), "stale clock".to_owned(), Alignment::Right, None),
+            last_updated: Instant::now(),
+        };
+        clock.set_should_draw();
+        assert_eq!(clock.theme_status().unwrap().clock.unwrap(), text());
+        assert!(clock.last_updated.elapsed() < CLOCK_UPDATE_INTERVAL);
+    }
 }

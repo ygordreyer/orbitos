@@ -1105,6 +1105,12 @@ impl PreparedFrame {
                 self.ink_surface(c.rect, c, c.color, false, None)
             }
             Kind::Text => {
+                if c.binding == Some(Binding::Breadcrumb) && p.breadcrumb_icon {
+                    if let Some(icon) = input.text.get(&Binding::Breadcrumb) {
+                        self.ink_nav_icon(c.rect, icon, p.icon_ink_height.unwrap_or(40), c.color.unwrap_or(ColorRole::Accent));
+                    }
+                    return Ok(());
+                }
                 if c.binding == Some(Binding::KeyboardValue) {
                     return self.ink_query(c, input);
                 }
@@ -1630,13 +1636,15 @@ impl PreparedFrame {
         let mut vt = self.ink_type(&action_component, false);
         vt.color = ty.color;
         vt.size *= 0.82;
+        if let Some(run) = &p.value { vt = self.ink_subtype(c, run); }
+        if focused { vt.color = ty.color; }
         let value_geometry = row_text_geometry(&self.theme, &vt, &row.value, rect, focused);
         let value_width = if row.value.is_empty() {
             0.0
         } else {
             value_geometry.metrics.0
                 .ceil()
-                .min(r.2 as f32 * 0.38)
+                .min(p.value_width_percent.map_or(r.2 as f32 * 0.38, |percent| rect.2 as f32 * percent as f32 / 100.0))
         };
         let copy_width = (rect.2 as f32
             - if value_width > 0.0 {
@@ -2060,6 +2068,25 @@ impl PreparedFrame {
                 b.line_to(12.0, 12.0);
                 b.line_to(16.0, 14.0);
                 (3.0, 3.0, 18.0, 18.0)
+            }
+            "display" => {
+                b.push_rect(tiny_skia::Rect::from_xywh(2.0, 3.0, 20.0, 14.0).unwrap());
+                b.move_to(12.0, 17.0); b.line_to(12.0, 21.0);
+                b.move_to(7.0, 21.0); b.line_to(17.0, 21.0);
+                (1.0, 2.0, 22.0, 20.0)
+            }
+            "power" => {
+                b.move_to(7.0, 5.0); b.cubic_to(0.0, 9.0, 3.0, 21.0, 12.0, 21.0);
+                b.cubic_to(21.0, 21.0, 24.0, 9.0, 17.0, 5.0);
+                b.move_to(12.0, 2.0); b.line_to(12.0, 12.0);
+                (1.0, 1.0, 22.0, 22.0)
+            }
+            "wifi" => {
+                for (x, y, width) in [(2.0, 8.0, 20.0), (5.0, 12.0, 14.0), (9.0, 16.0, 6.0)] {
+                    b.move_to(x, y); b.quad_to(12.0, y - width / 3.0, x + width, y);
+                }
+                b.push_circle(12.0, 20.0, 1.0);
+                (1.0, 1.0, 22.0, 21.0)
             }
             "settings" => {
                 b.move_to(12.0, 3.0);
@@ -3379,5 +3406,53 @@ mod row_geometry_tests {
             assert!(c.front().unwrap().key.text.starts_with("0999"));
             assert!(!c.iter().any(|e| e.key.text == "AV Atari café"));
         });
+    }
+}
+
+#[cfg(test)]
+mod settings_fit_tests {
+    use super::*;
+    #[test]
+    fn settings_breadcrumb_icon_is_descriptor_opt_in() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for name in ["orbit-row", "orbit-hero", "compact-plus"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(name)).unwrap(), &bank, 1).unwrap();
+            let c = theme.pack().screens[&ScreenId::SettingsPage].components.iter()
+                .find(|c| c.binding == Some(Binding::Breadcrumb)).unwrap().clone();
+            let icon = name == "compact-plus";
+            assert_eq!(c.paint.as_ref().unwrap().breadcrumb_icon, icon);
+            let mut input = FrameInputs::new(ScreenId::SettingsPage);
+            let mut actual = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            let mut text = PreparedFrame::prepare(theme, &input).unwrap();
+            input.text.insert(Binding::Breadcrumb, "display".into());
+            input.text.insert(Binding::Subtitle, "display".into());
+            actual.ink_component(&c, &input).unwrap();
+            let mut text_component = c;
+            text_component.binding = Some(Binding::Subtitle);
+            text.ink_component(&text_component, &input).unwrap();
+            assert_eq!(actual.pixels().data() == text.pixels().data(), !icon,
+                "{name}: existing breadcrumbs must retain their text geometry");
+        }
+    }
+
+    #[test]
+    fn compact_settings_values_and_headers_fit_without_ellipsis() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        let frame = PreparedFrame::prepare(theme.clone(), &FrameInputs::new(ScreenId::SettingsPage)).unwrap();
+        let rows = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.kind == Kind::SettingsRows).unwrap();
+        let p = rows.paint.as_ref().unwrap();
+        let ty = frame.ink_subtype(rows, p.value.as_ref().unwrap());
+        let width = ((rows.rect.2 - 2 * theme.pack().alignment.as_ref().unwrap().row_inset) * p.value_width_percent.unwrap() / 100) as u32;
+        for value in ["2026-10-18 11:30:00", "English (United States)", "Check for Updates", "‹ UTC-3:30 ›"] {
+            assert_eq!(ty.lines(value, width, 1, Overflow::Ellipsis), [value], "value must fit: {value}");
+        }
+        let title = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.binding == Some(Binding::Title)).unwrap();
+        let ty = frame.ink_type(title, false);
+        let lines = ty.lines("SYSTEM UPDATE", title.rect.2, title.max_lines.unwrap(), title.overflow.unwrap());
+        assert!(!lines.iter().any(|line| line.contains('…')));
+        assert_eq!(lines.join(" "), "SYSTEM UPDATE");
     }
 }

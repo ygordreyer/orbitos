@@ -1,9 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Result, anyhow};
@@ -21,6 +23,14 @@ use crate::{
     entry::{Entry, game::Game, gamelist::GameList, lazy_image::LazyImage, short_name},
 };
 
+thread_local! {
+    static SYSTEM_COUNTS: RefCell<HashMap<PathBuf, (SystemTime, usize)>> = RefCell::new(HashMap::new());
+}
+
+pub(crate) fn invalidate_system_counts() {
+    SYSTEM_COUNTS.with(|counts| counts.borrow_mut().clear());
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Directory {
     pub name: String,
@@ -29,6 +39,8 @@ pub struct Directory {
     /// image is loaded lazily.
     /// None means image hasn't been looked for, Some(None) means no image was found, Some(Some(path)) means an image was found.
     pub image: LazyImage,
+    #[serde(skip)]
+    pub game_count: Option<usize>,
 }
 
 impl Ord for Directory {
@@ -50,6 +62,7 @@ impl Default for Directory {
             full_name: "Games".into(),
             path: ALLIUM_GAMES_DIR.to_owned(),
             image: LazyImage::Unknown(ALLIUM_GAMES_DIR.to_owned()),
+            game_count: None,
         }
     }
 }
@@ -68,6 +81,7 @@ impl Directory {
             full_name,
             path,
             image,
+            game_count: None,
         }
     }
 
@@ -83,7 +97,74 @@ impl Directory {
             full_name,
             path,
             image,
+            game_count: None,
         }
+    }
+
+    fn retain_populated_systems(entries: &mut Vec<Entry>, console_mapper: &ConsoleMapper) {
+        entries.retain_mut(|entry| {
+            if let Entry::Directory(directory) = entry {
+                let virtual_system = crate::network_runtime::virtual_directory(&directory.path);
+                if virtual_system {
+                    directory.game_count = None;
+                    return true;
+                }
+                let count = directory.cached_game_count(console_mapper);
+                directory.game_count = Some(count);
+                count > 0
+            } else { true }
+        });
+    }
+
+    fn cached_game_count(&self, console_mapper: &ConsoleMapper) -> usize {
+        let modified = fs::metadata(&self.path).and_then(|metadata| metadata.modified()).ok();
+        SYSTEM_COUNTS.with(|counts| {
+            if let Some((stamp, count)) = counts.borrow().get(&self.path) {
+                if modified == Some(*stamp) { return *count; }
+            }
+            // Stop the emptiness probe at the first playable entry. Only count a
+            // populated system once, until its mtime or an explicit rescan changes.
+            let count = if self.walk_games(console_mapper, &mut HashSet::new(), 1) == 0 {
+                0
+            } else {
+                self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX)
+            };
+            if let Some(modified) = modified {
+                counts.borrow_mut().insert(self.path.clone(), (modified, count));
+            }
+            count
+        })
+    }
+
+    fn walk_games(&self, console_mapper: &ConsoleMapper, ancestors: &mut HashSet<PathBuf>, limit: usize) -> usize {
+        let Ok(canonical) = self.path.canonicalize() else { return 0; };
+        if !ancestors.insert(canonical.clone()) { return 0; }
+        #[cfg(test)]
+        super::load_work::record(|work| work.directory_reads += 1);
+        let count = fs::read_dir(&self.path).map_or(0, |entries| {
+            let mut count = 0;
+            for entry in entries.filter_map(Result::ok) {
+                #[cfg(test)]
+                super::load_work::record(|work| work.file_types += 1);
+                let path = entry.path();
+                let is_dir = match entry.file_type() {
+                    Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                    _ => match path.metadata() {
+                        Ok(metadata) => metadata.is_dir(),
+                        Err(_) => continue,
+                    },
+                };
+                count += match Entry::from_scanned_path(path, is_dir, console_mapper).ok().flatten() {
+                    Some(Entry::Directory(directory)) => directory.walk_games(console_mapper, ancestors, limit - count),
+                    Some(Entry::Game(_) | Entry::App(_)) => 1,
+                    None => 0,
+                };
+                if count >= limit { break; }
+            }
+            count
+        });
+        ancestors.remove(&canonical);
+        count
     }
 
     pub fn image(&mut self) -> Option<&Path> {
@@ -107,6 +188,10 @@ impl Directory {
 
         let games = gamelist.games.into_iter().filter_map(|game| {
             let path = self.path.join(&game.path).canonicalize().ok()?;
+            if !super::listed_path(&path) { return None; }
+            if path.is_dir() && !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u")) {
+                return Some(Entry::Directory(Directory::with_name(path, game.name)));
+            }
             let extension = game
                 .path
                 .extension()
@@ -147,7 +232,7 @@ impl Directory {
 
         let folders = gamelist.folders.into_iter().filter_map(|folder| {
             let path = self.path.join(&folder.path);
-            if !path.exists() {
+            if !path.is_dir() || !super::listed_path(&path) {
                 return None;
             }
 
@@ -297,8 +382,12 @@ impl Directory {
             // with literal parent comparisons without loading the entire database.
             rows.retain(|row| row.path.parent() == Some(query_path.as_path()));
         }
+        let directories: HashSet<_> = scanned.iter().filter(|(_, is_dir, _)| *is_dir)
+            .map(|(path, _, _)| path.as_path()).collect();
         let mut games = HashMap::with_capacity(rows.len());
         for row in rows {
+            if !super::listed_path(&row.path) || directories.contains(row.path.as_path())
+                && !row.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u")) { continue; }
             games.insert(row.path.clone(), GameMetadata::from(&row));
             let exists = inventory_contains_or_exists(&inventory, &row.path);
             if exists || crate::network_runtime::registered(&row.path) {
@@ -306,6 +395,7 @@ impl Directory {
             }
         }
         drop(inventory);
+        drop(directories);
         entries.extend(
             scanned
                 .into_iter()
@@ -320,7 +410,10 @@ impl Directory {
 
         crate::network_runtime::merge_directory(&self.path, &mut entries);
         let mut uniques = HashSet::with_capacity(entries.len());
-        entries.retain(|entry| uniques.insert(entry.path().to_path_buf()));
+        entries.retain(|entry| super::listed_path(entry.path()) && uniques.insert(entry.path().to_path_buf()));
+        if self.path == *ALLIUM_GAMES_DIR {
+            Self::retain_populated_systems(&mut entries, console_mapper);
+        }
 
         // Imports and physical entries can be absent from the bulk result, including
         // immediate children. Recover their metadata with exact path lookups.
@@ -369,6 +462,7 @@ impl Directory {
         console_mapper: &ConsoleMapper,
         locale: &Locale,
     ) -> Result<()> {
+        invalidate_system_counts();
         let entries = self.entries(database, console_mapper, locale)?;
 
         for entry in &entries {
@@ -495,6 +589,132 @@ pub(crate) mod list_tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0.path).unwrap();
         }
+    }
+
+    #[test]
+    fn library_hides_command_only_systems_and_retains_nested_game_counts() {
+        let fixture = Fixture::new();
+        for system in ["GG", "SFC"] {
+            let directory = fixture.0.path.join(system);
+            fs::create_dir_all(directory.join("Shortcuts")).unwrap();
+            for name in ["~Filter.miyoocmd", "~Refresh roms.miyoocmd", "Shortcuts/~Import games.miyoocmd"] {
+                fs::write(directory.join(name), b"command").unwrap();
+            }
+        }
+        let sfc = fixture.0.path.join("SFC");
+        fs::create_dir(sfc.join("ROMHACKS")).unwrap();
+        fs::create_dir(sfc.join("media")).unwrap();
+        fs::write(sfc.join("media/Art.png"), b"art").unwrap();
+        fs::write(sfc.join("ROMHACKS/Real.sfc"), b"rom").unwrap();
+        let database = Database::in_memory().unwrap();
+        let mapper = ConsoleMapper::new();
+        let mut entries = fixture.0.entries(&database, &mapper, &Locale::new("en-US")).unwrap();
+        Directory::retain_populated_systems(&mut entries, &mapper);
+        assert_eq!(entries.len(), 1);
+        let Entry::Directory(system) = &entries[0] else { panic!("expected system"); };
+        assert_eq!(system.path, sfc);
+        assert_eq!(system.game_count, Some(1));
+    }
+
+    #[test]
+    fn sidecars_and_onion_commands_are_filtered_from_scan_xml_and_database() {
+        let fixture = Fixture::new();
+        let database = Database::in_memory().unwrap();
+        let mapper = ConsoleMapper::new();
+        let names = ["~Filter.miyoocmd", "Refresh.MIYOOCMD", "~Import.sh", "metadata.xml", "systeminfo.txt", "metadata", "systeminfo", "icon.png", "Real.sfc", "~Hack.sfc"];
+        let mut xml = "<gameList>".to_owned();
+        for name in names {
+            let path = fixture.0.path.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            database.update_games(&[Game::new(path.clone()).into()]).unwrap();
+            xml.push_str(&format!("<game><path>./{name}</path><name>{name}</name></game>"));
+            assert_eq!(Game::from_db(database.select_game(&path).unwrap().unwrap()).is_some(), matches!(name, "Real.sfc" | "~Hack.sfc"));
+        }
+        use crate::entry::Sort;
+        let recent = crate::view::recents::RecentsSort::Random.entries(&database, &mapper, &Locale::new("en-US")).unwrap();
+        assert_eq!(recent.len(), 2);
+        xml.push_str("</gameList>");
+        fs::write(fixture.0.path.join("gamelist.xml"), xml).unwrap();
+        let parsed = fixture.0.parse_game_list(&fixture.0.path.join("gamelist.xml")).unwrap();
+        assert_eq!(parsed.len(), 2);
+        let hidden = fixture.0.path.join("~Shortcuts");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("Hidden.sfc"), b"rom").unwrap();
+        assert!(Entry::new(hidden, &mapper).unwrap().is_none());
+        for _ in 0..2 {
+            let entries = fixture.0.entries(&database, &mapper, &Locale::new("en-US")).unwrap();
+            assert_eq!(entries.len(), 2);
+            for name in ["Real.sfc", "~Hack.sfc"] {
+                assert!(entries.iter().any(|entry| entry.path() == fixture.0.path.join(name)));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_counts_linked_games_and_directories_without_cycles() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let targets = Fixture::new();
+        let system = fixture.0.path.join("SFC");
+        fs::create_dir(&system).unwrap();
+        fs::create_dir(targets.0.path.join("Nested")).unwrap();
+        fs::write(targets.0.path.join("Game.sfc"), b"rom").unwrap();
+        fs::write(targets.0.path.join("Nested/Other.sfc"), b"rom").unwrap();
+        symlink(targets.0.path.join("Game.sfc"), system.join("Linked.sfc")).unwrap();
+        symlink(targets.0.path.join("Nested"), system.join("Folder")).unwrap();
+        symlink(&system, targets.0.path.join("Nested/Back")).unwrap();
+        symlink(targets.0.path.join("Missing.sfc"), system.join("Broken.sfc")).unwrap();
+        let database = Database::in_memory().unwrap();
+        let mapper = ConsoleMapper::new();
+        let locale = Locale::new("en-US");
+        let scanned = Directory::new(system.clone()).entries(&database, &mapper, &locale).unwrap();
+        assert!(scanned.iter().any(|entry| matches!(entry, Entry::Game(game) if game.path == system.join("Linked.sfc"))));
+        let mut root = fixture.0.entries(&database, &mapper, &locale).unwrap();
+        Directory::retain_populated_systems(&mut root, &mapper);
+        assert_eq!(root.len(), 1);
+        let Entry::Directory(system) = &root[0] else { panic!("expected system"); };
+        assert_eq!(system.game_count, Some(2));
+    }
+
+    #[test]
+    fn library_counts_are_cached_across_root_loads_and_invalidated_by_mtime_and_rescan() {
+        let fixture = Fixture::new();
+        let system = Directory::new(fixture.0.path.join("SFC"));
+        fs::create_dir(&system.path).unwrap();
+        for i in 0..1700 {
+            fs::write(system.path.join(format!("Game{i}.sfc")), b"rom").unwrap();
+        }
+        let database = Database::in_memory().unwrap();
+        let mapper = ConsoleMapper::new();
+        let locale = Locale::new("en-US");
+        load_work::take();
+        assert_eq!(system.walk_games(&mapper, &mut HashSet::new(), 1), 1);
+        let probe = load_work::take();
+        assert_eq!(probe.directory_reads, 1);
+        assert_eq!(probe.file_types, 1, "emptiness must stop at the first playable entry");
+        for load in 0..2 {
+            load_work::take();
+            let mut root = fixture.0.entries(&database, &mapper, &locale).unwrap();
+            Directory::retain_populated_systems(&mut root, &mapper);
+            let work = load_work::take();
+            let Entry::Directory(directory) = &root[0] else { panic!("expected system"); };
+            assert_eq!(directory.game_count, Some(1700));
+            if load == 1 {
+                assert_eq!(work.directory_reads, 1, "warm root load only reads the root directory");
+                println!("SECOND_ROOT_LOAD read_dir={}", work.directory_reads);
+            }
+        }
+        let stamp = fs::metadata(&system.path).unwrap().modified().unwrap();
+        fs::create_dir(system.path.join("Nested")).unwrap();
+        fs::write(system.path.join("Nested/Extra.sfc"), b"rom").unwrap();
+        let changed = stamp + std::time::Duration::from_secs(2);
+        File::open(&system.path).unwrap().set_times(fs::FileTimes::new().set_modified(changed)).unwrap();
+        assert_eq!(system.cached_game_count(&mapper), 1701, "system mtime invalidates the cached count");
+        fs::write(system.path.join("Nested/Another.sfc"), b"rom").unwrap();
+        assert_eq!(system.cached_game_count(&mapper), 1701, "nested changes wait for an explicit refresh");
+        system.populate_db(&mut VecDeque::new(), &database, &mapper, &locale).unwrap();
+        assert_eq!(system.cached_game_count(&mapper), 1702, "existing database rescan invalidates counts");
     }
 
     // Reference for the original warm load, with no gamelist import or network catalog.

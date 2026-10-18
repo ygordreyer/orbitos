@@ -164,6 +164,7 @@ pub(crate) fn consume(
             }
             Ok(Update::Finished) | Err(TryRecvError::Disconnected) => {
                 *slot = None;
+                crate::entry::directory::invalidate_system_counts();
                 crate::view::orbit::invalidate_art();
                 crate::view::details::invalidate_metadata();
                 return Ok(true);

@@ -3,7 +3,6 @@ use std::env;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Local;
 use common::command::Command;
 use common::constants::ALLIUM_TIMEZONE;
 
@@ -28,99 +27,15 @@ pub struct Clock {
     button_hints: ButtonHints<String>,
 }
 
-// POSIX TZ offset are opposite of UTC naming convention:
-// https://unix.stackexchange.com/questions/104088/why-does-tz-utc-8-produce-dates-that-are-utc8
-const TIMEZONE_VALUES: [&str; 39] = [
-    "UTC-0",
-    "UTC-1",
-    "UTC-2",
-    "UTC-3",
-    "UTC-3:30",
-    "UTC-4",
-    "UTC-4:30",
-    "UTC-5",
-    "UTC-5:30",
-    "UTC-5:45",
-    "UTC-6",
-    "UTC-6:30",
-    "UTC-7",
-    "UTC-8",
-    "UTC-8:45",
-    "UTC-9",
-    "UTC-9:30",
-    "UTC-10",
-    "UTC-10:30",
-    "UTC-11",
-    "UTC-12",
-    "UTC-12:45",
-    "UTC-13",
-    "UTC-13:45",
-    "UTC-14",
-    "UTC+12",
-    "UTC+11",
-    "UTC+10",
-    "UTC+9:30",
-    "UTC+9",
-    "UTC+8",
-    "UTC+7",
-    "UTC+6",
-    "UTC+5",
-    "UTC+4",
-    "UTC+3",
-    "UTC+3:30",
-    "UTC+2",
-    "UTC+1",
-];
-
-const TIMEZONE_NAMES: [&str; 39] = [
-    "UTC+0",
-    "UTC+1",
-    "UTC+2",
-    "UTC+3",
-    "UTC+3:30",
-    "UTC+4",
-    "UTC+4:30",
-    "UTC+5",
-    "UTC+5:30",
-    "UTC+5:45",
-    "UTC+6",
-    "UTC+6:30",
-    "UTC+7",
-    "UTC+8",
-    "UTC+8:45",
-    "UTC+9",
-    "UTC+9:30",
-    "UTC+10",
-    "UTC+10:30",
-    "UTC+11",
-    "UTC+12",
-    "UTC+12:45",
-    "UTC+13",
-    "UTC+13:45",
-    "UTC+14",
-    "UTC-12",
-    "UTC-11",
-    "UTC-10",
-    "UTC-9:30",
-    "UTC-9",
-    "UTC-8",
-    "UTC-7",
-    "UTC-6",
-    "UTC-5",
-    "UTC-4",
-    "UTC-3",
-    "UTC-3:30",
-    "UTC-2",
-    "UTC-1",
-];
+use common::timezone::{TIMEZONE_VALUES, TIMEZONE_NAMES};
 
 impl Clock {
     pub fn new(rect: Rect, res: Resources, state: Option<ChildState>) -> Self {
         let Rect { x, y, w, .. } = rect;
 
-        let timezone = env::var("TZ")
-            .map(|tz| TIMEZONE_VALUES.iter().position(|&s| s == tz).unwrap_or(0))
-            .unwrap_or(0);
+        let timezone = env::var("TZ").ok()
+            .and_then(|tz| TIMEZONE_VALUES.iter().position(|&value| value == tz))
+            .unwrap_or_else(|| TIMEZONE_VALUES.iter().position(|&value| value == "UTC-0").unwrap());
         let locale = res.get::<Locale>();
         let styles = res.get::<Stylesheet>();
 
@@ -163,7 +78,7 @@ impl Clock {
             vec![
                 Box::new(DateTime::new(
                     Point::zero(),
-                    Local::now().naive_local(),
+                    common::timezone::local_now().naive_local(),
                     Alignment::Right,
                 )),
                 Box::new(Select::new(
@@ -257,13 +172,15 @@ impl View for Clock {
                                 0,
                                 Box::new(DateTime::new(
                                     Point::zero(),
-                                    Local::now().naive_local(),
+                                    common::timezone::local_now().naive_local(),
                                     Alignment::Right,
                                 )),
                             );
                         }
                         _ => unreachable!("Invalid index"),
                     }
+                    bubble.push_back(Command::ClockChanged);
+                    break;
                 }
             }
             return Ok(true);

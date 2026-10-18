@@ -893,10 +893,15 @@ where
                     .text
                     .insert(Binding::SelectedBlurb, info.blurb.clone());
             } else {
-                input.text.insert(
-                    Binding::SelectedMetadata,
-                    platform.chars().take(480).collect(),
-                );
+                let metadata = if let Entry::Directory(directory) = entry {
+                    directory.game_count.map(|count| {
+                        let mut args = std::collections::HashMap::new();
+                        args.insert("count".into(), common::locale::LocaleFluentValue::from(count.to_string()));
+                        self.res.get::<Locale>().ta("library-game-count", &args)
+                    }).unwrap_or_default()
+                } else { String::new() };
+                if !metadata.is_empty() { input.metadata = vec![(String::new(), metadata.clone())]; }
+                input.text.insert(Binding::SelectedMetadata, metadata);
                 input.text.insert(Binding::SelectedBlurb, String::new());
             }
         }
@@ -1508,7 +1513,8 @@ where
 
                 entries
             }
-            Entry::App(_) | Entry::Directory(_) => {
+            Entry::Directory(_) => vec![MenuEntry::Launch(None), MenuEntry::RepopulateDatabase],
+            Entry::App(_) => {
                 vec![
                     MenuEntry::Launch(None),
                     MenuEntry::Reset,
@@ -2180,7 +2186,7 @@ mod perf_fix_tests {
         let first = SelectedInfo::get(&mut slot, &game, "PlayStation");
         let generation = first.generation;
         assert_eq!(first.blurb, "First");
-        assert!(first.metadata.contains("Year unavailable"));
+        assert!(!first.metadata.contains("Year unavailable"));
         std::fs::write(
             &xml,
             "<gameList><game><path>./Game.chd</path><desc>Replacement</desc></game></gameList>",
@@ -2231,6 +2237,31 @@ mod perf_fix_tests {
         map.insert(Database::in_memory().unwrap());
         EntryList::new(Rect::new(0, 54, 640, 376), Resources::new(map), EmptySort).unwrap()
     }
+    #[test]
+    fn system_preview_uses_cached_count_without_repeating_platform() {
+        use common::theme::{fonts::FontBank, pack::{Binding, ScreenId}, runtime::ThemeSnapshot, ThemeHandle};
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
+        let mut list = list();
+        select_directory(&mut list);
+        if let Entry::Directory(directory) = &mut list.entries[0] { directory.game_count = Some(47); }
+        let models = list.theme_models(ScreenId::Library, &theme).unwrap();
+        assert_eq!(models[0].text[&Binding::SelectedMetadata], "47 games");
+        assert_eq!(models[0].metadata, [(String::new(), "47 games".into())]);
+        assert_eq!(theme.pack().screens[&ScreenId::Library].components.iter().filter(|c| c.binding == Some(Binding::SelectedTitle)).count(), 1);
+    }
+
+    #[test]
+    fn folders_only_offer_navigation_and_database_refresh() {
+        let mut list = list();
+        select_directory(&mut list);
+        list.open_menu().unwrap();
+        let entries = &list.menu_entries;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| matches!(entry, MenuEntry::Launch(_) | MenuEntry::RepopulateDatabase)));
+    }
+
     fn select_directory(list: &mut EntryList<EmptySort>) {
         list.entries = vec![Entry::Directory(Directory::new(PathBuf::from("Child")))];
         list.list.set_items(vec!["Child".into()], false);

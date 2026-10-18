@@ -214,3 +214,35 @@ settings-about-license = Upstream license
 settings-about-authors = Upstream authors
 settings-about-source = Upstream source
 settings-about-warranty = Upstream license note
+
+button-save = Save
+button-cancel = Cancel
+button-change = Change
+button-select-field = Select field
+library-game-count = { $count } games
+settings-update-manual = Manual updates
+settings-update-managed = Updates are managed manually for this build.
+settings-context-clock-heading = YOUR TIME
+settings-context-clock-description = Set the date and time.
+    Choose your local time zone.
+settings-context-update-heading = YOUR BUILD
+settings-context-update-description = Check your installed version.
+    Update this build manually.
+settings-context-wifi-heading = YOUR NETWORK
+settings-context-wifi-description = Connect to a Wi-Fi network.
+    Manage wireless access.
+settings-context-power-heading = YOUR POWER
+settings-context-power-description = Choose sleep and power options.
+    Keep your battery lasting longer.
+settings-context-display-heading = YOUR DISPLAY
+settings-context-display-description = Adjust brightness and colors.
+    Set a comfortable view.
+settings-context-theme-heading = YOUR STYLE
+settings-context-theme-description = Choose your launcher theme.
+    Adjust its colors and artwork.
+settings-context-language-heading = YOUR LANGUAGE
+settings-context-language-description = Choose your menu language.
+    Make the launcher feel familiar.
+settings-context-about-heading = YOUR DEVICE
+settings-context-about-description = View your installed build.
+    See device information.

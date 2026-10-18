@@ -1604,6 +1604,11 @@ where
             .handle_key_event(event, commands, bubble)
             .await?
         {
+            if bubble.iter().any(|command| matches!(command, Command::ClockChanged)) {
+                self.status_bar.set_should_draw();
+                self.theme_dirty = true;
+                bubble.retain(|command| !matches!(command, Command::ClockChanged));
+            }
             return Ok(true);
         }
         if (crate::theme_adapter::active(&self.res)

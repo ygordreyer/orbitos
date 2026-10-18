@@ -376,6 +376,23 @@ impl View for Settings {
     }
 }
 
+fn page_context(input: &mut common::theme::frame::FrameInputs, locale: &Locale, title_key: &str) {
+    use common::theme::pack::Binding;
+    let (page, icon) = match title_key {
+        "settings-clock" => ("clock", "recents"),
+        "settings-system-update-menu" => ("update", "apps"),
+        "settings-wifi" => ("wifi", "wifi"),
+        "settings-power" => ("power", "power"),
+        "settings-theme" => ("theme", "settings"),
+        "settings-language" => ("language", "library"),
+        "settings-about" => ("about", "apps"),
+        _ => ("display", "display"),
+    };
+    input.text.insert(Binding::Subtitle, locale.t(&format!("settings-context-{page}-heading")));
+    input.text.insert(Binding::Message, locale.t(&format!("settings-context-{page}-description")));
+    input.text.insert(Binding::Breadcrumb, icon.into());
+}
+
 fn page_models(
     list: &mut common::view::SettingsList,
     handle: &common::theme::ThemeHandle,
@@ -396,24 +413,34 @@ fn page_models(
         locale.t(title_key)
     };
     input.text.insert(Binding::Title, title.clone());
+    page_context(&mut input, &locale, title_key);
     input.rows.insert(Binding::SettingsRows, list.theme_rows());
     input.focus = Focus {
         component: crate::theme_adapter::component_id(handle, screen, Binding::SettingsRows),
         item: Some(format!("setting-{}", list.selected())),
     };
-    let editable = title_key != "settings-about"
+    let editable = title_key != "settings-about" && title_key != "settings-system-update-menu"
         && !(title_key == "settings-display" && list.selected() == 0)
         && !(title_key == "settings-wifi" && list.selected() == 1);
-    if editable {
-        input.hints.push(Hint {
-            button: "A".into(),
-            label: locale.t("button-edit"),
-        });
+    if list.editing() {
+        if title_key == "settings-clock" && list.selected() == 0 {
+            input.hints.extend([
+                Hint { button: "Up/Down".into(), label: locale.t("button-change") },
+                Hint { button: "Left/Right".into(), label: locale.t("button-select-field") },
+            ]);
+        } else {
+            input.hints.push(Hint { button: "Left/Right".into(), label: locale.t("button-change") });
+        }
+        input.hints.extend([
+            Hint { button: "A".into(), label: locale.t("button-save") },
+            Hint { button: "B".into(), label: locale.t("button-cancel") },
+        ]);
+    } else {
+        if editable {
+            input.hints.push(Hint { button: "A".into(), label: locale.t("button-edit") });
+        }
+        input.hints.push(Hint { button: "B".into(), label: locale.t("button-back") });
     }
-    input.hints.push(Hint {
-        button: "B".into(),
-        label: locale.t("button-back"),
-    });
     let mut models = vec![input];
     if let Some(capture) = list.theme_keyboard() {
         let mut keyboard = FrameInputs::new(ScreenId::Keyboard);

@@ -24,6 +24,7 @@ use simple_logger::SimpleLogger;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    common::timezone::load_saved_timezone();
     SimpleLogger::new().env().init().unwrap();
 
     // Reverse drop order quiesces boost work before the final trace drain,

@@ -982,6 +982,15 @@ pub fn resolve(path: &Path, kind: Kind) -> Option<PathBuf> {
             .filter(|tag| !tag.is_empty() && Path::new(tag).is_relative())
             .map(|tag| parent.join(tag))
             .find(|candidate| is_file(candidate.as_path()));
+        if found.is_none() && path.is_dir() {
+            let names: &[&str] = match kind {
+                Kind::Logo => &["logo.png", "icon.png", "media/logo.png"],
+                Kind::Cover | Kind::TallCover | Kind::PreparedCover => &["cover.png", "icon.png", "media/cover.png", "media/system.png", "logo.png"],
+                Kind::Background => &["background.png", "media/background.png"],
+                _ => &[],
+            };
+            found = names.iter().map(|name| path.join(name)).find(|candidate| is_file(candidate));
+        }
         let stem = path.file_stem().unwrap_or_default();
         let inherited_stem = identity.file_stem().unwrap_or_default();
         let kinds: &[&str] = match kind {
@@ -1120,6 +1129,20 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn system_directory_art_uses_the_cached_media_resolver() {
+        let root = std::env::temp_dir().join(format!("orbit-system-art-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("icon.png"), b"fixture").unwrap();
+        invalidate();
+        for kind in [Kind::Cover, Kind::TallCover, Kind::Logo] {
+            assert_eq!(resolve(&root, kind), Some(root.join("icon.png")));
+            assert_eq!(cached_resolve(&root, kind), Some(root.join("icon.png")));
+        }
+        fs::remove_dir_all(root).unwrap();
+        invalidate();
+    }
+
     #[test]
     fn resolved_path_revision_tracks_insert_overwrite_eviction_and_every_clear() {
         invalidate();

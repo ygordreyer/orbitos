@@ -19,6 +19,7 @@ pub enum Command {
     TrapFocus,
     Unfocus,
     Redraw,
+    ClockChanged,
     StartSearch,
     Search(String),
     Toast(String, Option<Duration>),

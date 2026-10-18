@@ -338,6 +338,7 @@ async fn sleep_until_wake(deadline: Option<tokio::time::Instant>) {
 }
 
 async fn spawn_main() -> Result<Child> {
+    common::timezone::load_saved_timezone();
     #[cfg(feature = "miyoo")]
     return Ok(match GameInfo::load()? {
         Some(mut game_info) => {

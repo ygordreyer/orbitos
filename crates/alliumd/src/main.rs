@@ -11,6 +11,7 @@ use crate::alliumd::AlliumD;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    common::timezone::load_saved_timezone();
     let _trace_drain = allium_menu::open_trace::ShutdownDrain;
     SimpleLogger::new().env().init().unwrap();
 
