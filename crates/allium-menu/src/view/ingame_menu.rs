@@ -1266,12 +1266,12 @@ mod theme_adapter_tests {
     async fn ux4_menu_shows_all_actions_without_scroll_and_reuses_frame() {
         let (builtin, root) = orbit_handle();
         let bank = common::theme::FontBank::bind(&ALLIUM_FONTS_DIR).unwrap();
-        let snapshot = common::theme::runtime::ThemeSnapshot::load(std::path::Path::new(
-            &std::env::var("ALLIUM_UX4_PACK").unwrap(),
-        ))
-        .unwrap();
-        let external = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
-        for theme in [builtin, external] {
+        let packs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../themes").canonicalize().unwrap();
+        let mut themes = vec![builtin, ThemeHandle::prepare(ThemeSnapshot::builtin("compact").unwrap(), &bank, 1).unwrap()];
+        for name in ["compact-plus", "big-picture", "orbit-hero", "orbit-row"] {
+            themes.push(ThemeHandle::prepare(ThemeSnapshot::load(&packs.join(name)).unwrap(), &bank, 1).unwrap());
+        }
+        for theme in themes {
             for guide in [false, true] {
                 let mut map = TypeMap::new();
                 map.insert(Stylesheet::load().unwrap());

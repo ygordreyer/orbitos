@@ -3456,3 +3456,7 @@ mod settings_fit_tests {
         assert_eq!(lines.join(" "), "SYSTEM UPDATE");
     }
 }
+
+#[cfg(test)]
+#[path = "ingame_menu_tests.rs"]
+mod ingame_menu_tests;

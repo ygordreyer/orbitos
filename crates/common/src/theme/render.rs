@@ -1637,11 +1637,6 @@ impl PreparedFrame {
             rect.2 > 2 * pad && rect.3 >= font,
             "Row text does not fit actual model"
         );
-        let value = if row.value.is_empty() {
-            row.label.clone()
-        } else {
-            format!("{}  {}", row.label, row.value)
-        };
         let art_size = c.art_size.unwrap_or(0);
         let art_offset = if art_size > 0 {
             if let Some(image) = input.art.entries.get(&row.id) {
@@ -1660,25 +1655,42 @@ impl PreparedFrame {
         } else {
             0
         };
+        let text_rect = Rect(
+            rect.0 + pad + art_offset,
+            rect.1 + (rect.3 - font) / 2,
+            rect.2 - 2 * pad - art_offset,
+            font,
+        );
+        let color = if !row.enabled {
+            ColorRole::Muted
+        } else if focused || selected {
+            ColorRole::FocusText
+        } else {
+            ColorRole::Text
+        };
+        let value_width = if row.value.is_empty() { 0 } else {
+            self.theme.text_style(c.role.unwrap(), self.color(color)).measure(&row.value).w
+                .min(text_rect.2 * 2 / 5)
+        };
         self.text(
             &c.id,
             Rect(
-                rect.0 + pad + art_offset,
-                rect.1 + (rect.3 - font) / 2,
-                rect.2 - 2 * pad - art_offset,
-                font,
+                text_rect.0, text_rect.1,
+                text_rect.2.saturating_sub(value_width + if value_width > 0 { 8 } else { 0 }),
+                text_rect.3,
             ),
             c.role.unwrap(),
-            if !row.enabled {
-                ColorRole::Muted
-            } else if focused || selected {
-                ColorRole::FocusText
-            } else {
-                ColorRole::Text
-            },
-            &value,
+            color,
+            &row.label,
             1,
         )?;
+        if value_width > 0 {
+            self.text_options(
+                &c.id,
+                Rect(text_rect.0 + text_rect.2 - value_width, text_rect.1, value_width, font),
+                c.role.unwrap(), color, &row.value, 1, Align::Right, Overflow::Ellipsis,
+            )?;
+        }
         self.targets.push(Target {
             component: c.id.clone(),
             item: row.id.clone(),

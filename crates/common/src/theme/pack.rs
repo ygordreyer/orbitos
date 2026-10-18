@@ -628,7 +628,7 @@ impl Pack {
                 ensure!(has(Kind::Hints), "Missing back/action hints");
             }
             if screen.is_dialog() {
-                ensure!(has(Kind::DialogActions), "Missing dialog actions");
+                ensure!(screen == ScreenId::IngameMenu || has(Kind::DialogActions), "Missing dialog actions");
             }
             if screen.is_osd() {
                 ensure!(
@@ -1495,7 +1495,8 @@ pub fn required_bindings(screen: ScreenId) -> &'static [Binding] {
             &[Title, KeyboardValue, Keyboard, Navigation, Status, Hints]
         }
         ScreenId::DiscPicker => &[Title, Subtitle, Discs, Actions, Hints],
-        ScreenId::ContextMenu | ScreenId::IngameMenu => &[Title, Subtitle, Entries, Actions, Hints],
+        ScreenId::ContextMenu => &[Title, Subtitle, Entries, Actions, Hints],
+        ScreenId::IngameMenu => &[Title, Entries, Hints],
         ScreenId::Toast => &[Title, Message, Actions, Hints],
         ScreenId::NetworkDialog => &[
             Title,

@@ -1523,7 +1523,9 @@ fn ux4_seven_menu_rows_fit_builtin_and_external_pack() {
             assert!(
                 targets
                     .iter()
-                    .all(|t| t.rect.1 >= 130 && t.rect.1 + t.rect.3 <= 396)
+                    .all(|t| if screen == ScreenId::IngameMenu {
+                        t.rect.1 >= 16 && t.rect.1 + t.rect.3 <= 424
+                    } else { t.rect.1 >= 130 && t.rect.1 + t.rect.3 <= 396 })
             );
             let rows = theme.pack().screens[&screen]
                 .components
@@ -1608,6 +1610,13 @@ fn theme_port_all_variants_all_screens_real_raster() {
             input.art = Default::default();
             let title=match screen{ScreenId::Apps=>"Apps",ScreenId::Recents=>"Recents",ScreenId::SettingsRoot=>"Settings",ScreenId::SettingsPage=>"Display",ScreenId::Search|ScreenId::Keyboard=>"Search",ScreenId::SearchResults=>"Search results",ScreenId::DiscPicker=>"Choose a disc",ScreenId::ContextMenu=>"Game actions",ScreenId::IngameMenu=>"In-game menu",ScreenId::NetworkDialog=>"Manage storage",ScreenId::Toast=>"Ready",ScreenId::OsdVolume=>"Volume",ScreenId::OsdBrightness=>"Brightness",ScreenId::GuideSelector=>"Guide Watch",ScreenId::TextReader=>"Real Racing Roots",_=>"Library"};
             input.text.insert(Binding::Title,title.into());
+            if screen == ScreenId::IngameMenu {
+                input.text.insert(Binding::Title, "Gleylancer".into());
+                input.rows.insert(Binding::Actions, vec![]);
+                input.rows.insert(Binding::Entries, ["Continue", "Save", "Load", "Guide", "Settings", "Reset", "Quit"]
+                    .map(|label| Row { id: label.to_lowercase(), label: label.into(), subtitle: String::new(),
+                        value: if matches!(label, "Save" | "Load") { "Slot 0".into() } else { String::new() }, enabled: true }).into());
+            }
             input.selected.insert(Binding::Navigation,match screen{ScreenId::Apps|ScreenId::GuideSelector|ScreenId::TextReader=>"apps",ScreenId::SettingsRoot|ScreenId::SettingsPage=>"settings",ScreenId::Recents=>"recents",_=>"library"}.into());
             input.text.insert(Binding::SelectedMetadata,"PlayStation · Released 1998 (USA)".into());
             input.facts=vec![("Developer".into(),"Namco".into()),("Publisher".into(),"Namco".into()),("Genres".into(),"Racing".into()),("First release".into(),"1998".into())];

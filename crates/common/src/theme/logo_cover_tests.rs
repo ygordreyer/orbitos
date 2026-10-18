@@ -158,7 +158,7 @@ fn media_logo_cover_exclusion_all_packs_variants_and_views() {
             );
         }
     }
-    assert_eq!((covered_views - hero_views, hero_views, logo_views), (63, 7, 98));
+    assert_eq!((covered_views - hero_views, hero_views, logo_views), (61, 7, 98));
     println!(
         "LOGO_COVER_AUDIT {} single-cover views, {hero_views} hero banner views, {logo_views} logo views, {} violations",
         covered_views - hero_views,

@@ -1777,9 +1777,9 @@
           "kind": "panel",
           "rect": [
             90,
-            64,
+            16,
             460,
-            352
+            408
           ],
           "color": "surface",
           "radius": 16
@@ -1789,9 +1789,9 @@
           "kind": "text",
           "rect": [
             106,
-            78,
+            32,
             428,
-            38
+            64
           ],
           "binding": "title",
           "role": "title",
@@ -1806,16 +1806,16 @@
           "kind": "entries",
           "rect": [
             106,
-            130,
+            112,
             428,
-            266
+            302
           ],
           "binding": "entries",
           "layout": "list",
           "role": "row",
-          "visible_count": 7,
-          "item_extent": 38,
-          "gap": 0,
+          "visible_count": 8,
+          "item_extent": 36,
+          "gap": 2,
           "padding": 6,
           "art_size": 0,
           "caption_height": 0,
@@ -1826,36 +1826,6 @@
           "focus_style": "outline",
           "focus_width": 2,
           "glow_radius": 0
-        },
-        {
-          "id": "subtitle",
-          "kind": "text",
-          "rect": [
-            106,
-            314,
-            428,
-            44
-          ],
-          "binding": "subtitle",
-          "role": "label",
-          "color": "text",
-          "max_lines": 2,
-          "overflow": "wrap",
-          "align": "left"
-        },
-        {
-          "id": "actions",
-          "kind": "dialog_actions",
-          "rect": [
-            106,
-            366,
-            428,
-            36
-          ],
-          "binding": "actions",
-          "role": "row",
-          "layout": "horizontal",
-          "radius": 6
         },
         {
           "id": "hints",
