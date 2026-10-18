@@ -1,6 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
+    os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -119,7 +120,7 @@ fn open_lease_lock(path: &Path) -> io::Result<fs::File> {
         .open(path.with_extension("lock"))
 }
 
-struct LeaseLock(fs::File);
+struct LeaseLock(Arc<fs::File>);
 
 impl Drop for LeaseLock {
     fn drop(&mut self) {
@@ -130,7 +131,10 @@ impl Drop for LeaseLock {
 }
 
 fn try_lease_lock(path: &Path) -> io::Result<Option<LeaseLock>> {
-    let file = open_lease_lock(path)?;
+    try_lease_lock_file(Arc::new(open_lease_lock(path)?))
+}
+
+fn try_lease_lock_file(file: Arc<fs::File>) -> io::Result<Option<LeaseLock>> {
     match file.try_lock() {
         Ok(()) => Ok(Some(LeaseLock(file))),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -147,7 +151,7 @@ pub struct InputBoostPause {
 fn pause_input_boost_at(path: &Path) -> io::Result<InputBoostPause> {
     let lock = open_lease_lock(path)?;
     lock.lock()?;
-    let lock = LeaseLock(lock);
+    let lock = LeaseLock(Arc::new(lock));
     restore_locked_boost_lease_at(path)?;
     Ok(InputBoostPause { _lock: lock })
 }
@@ -156,24 +160,28 @@ pub fn pause_input_boost() -> io::Result<InputBoostPause> {
     pause_input_boost_at(Path::new(BOOST_LEASE_PATH))
 }
 
-fn write_boost_lease(path: &Path, policy: &Path, minimum: &str) -> io::Result<()> {
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+fn write_boost_lease(
+    path: &Path, temporary: &Path, policy: &Path, minimum: &str, bytes: &mut Vec<u8>,
+) -> io::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Lease<'a> {
+        policy: &'a Path,
+        minimum: &'a str,
+    }
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&temporary)?;
-        let bytes = serde_json::to_vec(&BoostLease {
-            policy: policy.to_owned(),
-            minimum: minimum.to_owned(),
-        })?;
-        file.write_all(&bytes)?;
+            .open(temporary)?;
+        bytes.clear();
+        serde_json::to_writer(&mut *bytes, &Lease { policy, minimum })?;
+        file.write_all(bytes)?;
         file.flush()?;
-        fs::rename(&temporary, path)
+        fs::rename(temporary, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary);
     }
     result
 }
@@ -317,6 +325,7 @@ impl InputBoostWorker {
         let mut requests = self.shared.requests.lock().unwrap_or_else(|e| e.into_inner());
         if requests.enabled {
             requests.pending = true;
+            drop(requests);
             self.shared.wake.notify_one();
         }
     }
@@ -352,10 +361,74 @@ impl Drop for InputBoostWorker {
     }
 }
 
+struct PolicyFiles {
+    minimum: fs::File,
+    maximum: fs::File,
+    identities: [(u64, u64); 2],
+}
+
+impl PolicyFiles {
+    fn open(minimum: &Path, maximum: &Path) -> io::Result<Self> {
+        let minimum = OpenOptions::new().read(true).write(true).open(minimum)?;
+        let maximum = fs::File::open(maximum)?;
+        let identities = [minimum.metadata()?, maximum.metadata()?]
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        Ok(Self { minimum, maximum, identities })
+    }
+
+    fn read(&self, paths: [&Path; 2], values: [&mut String; 2]) -> io::Result<()> {
+        for (((file, identity), path), value) in [&self.minimum, &self.maximum]
+            .into_iter().zip(self.identities).zip(paths).zip(values)
+        {
+            let metadata = fs::metadata(path)?;
+            if (metadata.dev(), metadata.ino()) != identity {
+                return Err(io::Error::other("CPU policy changed"));
+            }
+            let mut bytes = [0; 64];
+            let len = file.read_at(&mut bytes, 0)?;
+            if len == 0 || len == bytes.len() {
+                return Err(io::Error::other("Invalid CPU frequency length"));
+            }
+            let text = std::str::from_utf8(&bytes[..len])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            value.clear();
+            value.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn write_min(&mut self, path: &Path, value: &str) -> io::Result<()> {
+        let write = |file: &fs::File| -> io::Result<()> {
+            if file.write_at(value.as_bytes(), 0)? != value.len() {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            Ok(())
+        };
+        if write(&self.minimum).is_err() {
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            let metadata = file.metadata()?;
+            // The published lease belongs to the policy read before this write.
+            if (metadata.dev(), metadata.ino()) != self.identities[0] {
+                return Err(io::Error::other("CPU policy changed after lease publication"));
+            }
+            self.minimum = file;
+            write(&self.minimum)?;
+        }
+        Ok(())
+    }
+}
+
 struct InputBoost {
+    sysfs: PathBuf,
     lease_path: PathBuf,
+    lease_temporary: PathBuf,
+    lease_lock: Option<Arc<fs::File>>,
+    lease_bytes: Vec<u8>,
     min_path: PathBuf,
     max_path: PathBuf,
+    files: Option<PolicyFiles>,
+    minimum: String,
+    maximum: String,
     previous: Option<String>,
     deadline: Option<Instant>,
     unavailable: bool,
@@ -367,43 +440,83 @@ impl InputBoost {
         if let Err(error) = &recovery {
             log::warn!("Cannot recover CPU boost lease: {error}");
         }
-        let policy = [
-            "devices/system/cpu/cpufreq/policy0",
-            "devices/system/cpu/cpu0/cpufreq",
-        ]
-        .into_iter()
-        .map(|path| sysfs.join(path))
-        .find(|path| path.join("scaling_min_freq").is_file())
-        .unwrap_or_else(|| sysfs.join("devices/system/cpu/cpufreq/policy0"));
+        let policy = Self::policy(sysfs);
         Self {
+            sysfs: sysfs.to_owned(),
             lease_path: lease_path.to_owned(),
+            lease_temporary: lease_path.with_extension(format!("{}.tmp", std::process::id())),
+            lease_lock: None,
+            lease_bytes: Vec::new(),
             min_path: policy.join("scaling_min_freq"),
             max_path: policy.join("scaling_max_freq"),
+            files: None,
+            minimum: String::new(),
+            maximum: String::new(),
             previous: None,
             deadline: None,
             unavailable: recovery.is_err(),
         }
     }
 
-    fn write_min(&self, value: &str) -> std::io::Result<()> {
-        OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.min_path)?
-            .write_all(value.as_bytes())
+    fn policy(sysfs: &Path) -> PathBuf {
+        [
+            "devices/system/cpu/cpufreq/policy0",
+            "devices/system/cpu/cpu0/cpufreq",
+        ]
+        .into_iter()
+        .map(|path| sysfs.join(path))
+        .find(|path| path.join("scaling_min_freq").is_file())
+        .unwrap_or_else(|| sysfs.join("devices/system/cpu/cpufreq/policy0"))
+    }
+
+    fn try_lock(&mut self) -> io::Result<Option<LeaseLock>> {
+        for attempt in 0..2 {
+            if self.lease_lock.is_none() {
+                self.lease_lock = Some(Arc::new(open_lease_lock(&self.lease_path)?));
+            }
+            let result = try_lease_lock_file(Arc::clone(self.lease_lock.as_ref().unwrap()));
+            if result.is_ok() || attempt == 1 {
+                return result;
+            }
+            self.lease_lock = None;
+        }
+        unreachable!()
+    }
+
+    fn read_values(&mut self) -> io::Result<()> {
+        for attempt in 0..2 {
+            if attempt == 1 {
+                self.files = None;
+                let policy = Self::policy(&self.sysfs);
+                self.min_path = policy.join("scaling_min_freq");
+                self.max_path = policy.join("scaling_max_freq");
+            }
+            let result = (|| {
+                if self.files.is_none() {
+                    self.files = Some(PolicyFiles::open(&self.min_path, &self.max_path)?);
+                }
+                self.files.as_ref().unwrap().read(
+                    [&self.min_path, &self.max_path], [&mut self.minimum, &mut self.maximum],
+                )
+            })();
+            if result.is_ok() || attempt == 1 {
+                return result;
+            }
+        }
+        unreachable!()
     }
 
     fn input(&mut self, now: Instant) {
         if self.unavailable {
             return;
         }
-        let _lock = match try_lease_lock(&self.lease_path) {
+        let _lock = match self.try_lock() {
             Ok(Some(lock)) => lock,
             _ => return,
         };
         // The daemon may have restored the lease while this process was stopped.
         if self.previous.is_some() && !self.lease_path.exists() {
-            self.previous = None;
+            self.minimum = self.previous.take().unwrap();
             self.deadline = None;
         }
         if self.previous.is_none() {
@@ -414,27 +527,29 @@ impl InputBoost {
                     _ => return,
                 }
             }
-            let values = fs::read_to_string(&self.min_path)
-                .and_then(|min| fs::read_to_string(&self.max_path).map(|max| (min, max)));
-            let Ok((min, max)) = values else {
+            if self.read_values().is_err() {
                 self.unavailable = true;
                 return;
-            };
+            }
             let mut timing = crate::perf_trace::boost_work();
             if let Err(error) = timing.lease(|| write_boost_lease(
                 &self.lease_path,
+                &self.lease_temporary,
                 self.min_path.parent().expect("CPU policy directory"),
-                &min,
+                &self.minimum,
+                &mut self.lease_bytes,
             )) {
                 log::warn!("Cannot save CPU boost lease: {error}");
                 return;
             }
-            if let Err(error) = timing.sysfs(|| self.write_min(max.trim())) {
+            if let Err(error) = timing.sysfs(|| self.files.as_mut().unwrap()
+                .write_min(&self.min_path, self.maximum.trim()))
+            {
                 log::warn!("Cannot boost {}: {error}", self.min_path.display());
                 self.unavailable = true;
                 return;
             }
-            self.previous = Some(min);
+            self.previous = Some(std::mem::take(&mut self.minimum));
         }
         self.deadline = Some(now + INPUT_BOOST_WINDOW);
     }
@@ -448,7 +563,9 @@ impl InputBoost {
     fn restore(&mut self) {
         match restore_boost_lease_at(&self.lease_path) {
             Ok(_) => {
-                self.previous = None;
+                if let Some(previous) = self.previous.take() {
+                    self.minimum = previous;
+                }
                 self.deadline = None;
             }
             Err(error) => {
@@ -555,7 +672,8 @@ mod tests {
         let f = Fixture::new("lease-round-trip");
         let path = f.0.join("lease");
         let policy = f.0.join("policy with spaces");
-        write_boost_lease(&path, &policy, "400000\n").unwrap();
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        write_boost_lease(&path, &temporary, &policy, "400000\n", &mut Vec::new()).unwrap();
         let lease: BoostLease = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(lease.policy, policy);
         assert_eq!(lease.minimum, "400000\n");
@@ -735,6 +853,94 @@ mod tests {
         assert!(boost.previous.is_none());
         assert!(boost.deadline.is_none());
         assert!(!boost.min_path.exists());
+    }
+
+    #[test]
+    fn cold_boost_reuses_descriptors_but_reads_fresh_minimum_and_maximum() {
+        use std::os::fd::AsRawFd;
+
+        let f = Fixture::new("reuse-boost");
+        f.seed(["20000", "60", "1"]);
+        let lease = f.0.join("lease");
+        let mut boost = InputBoost::new(&f.0, &lease);
+        let min = boost.min_path.clone();
+        fs::write(&min, "400000\n").unwrap();
+        let now = Instant::now();
+        boost.input(now);
+        let lock = Arc::clone(boost.lease_lock.as_ref().unwrap());
+        let files = boost.files.as_ref().unwrap();
+        let descriptors = (files.minimum.as_raw_fd(), files.maximum.as_raw_fd());
+        let bytes_capacity = boost.lease_bytes.capacity();
+        boost.expire(now + INPUT_BOOST_WINDOW);
+        fs::write(&min, "600000\n").unwrap();
+        fs::write(&boost.max_path, "1100000\n").unwrap();
+        boost.input(now + Duration::from_secs(2));
+        let saved: BoostLease = serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+        assert_eq!(saved.minimum, "600000\n");
+        assert_eq!(saved.policy, min.parent().unwrap());
+        assert_eq!(fs::read_to_string(&min).unwrap(), "1100000");
+        assert!(Arc::ptr_eq(&lock, boost.lease_lock.as_ref().unwrap()));
+        let files = boost.files.as_ref().unwrap();
+        assert_eq!(descriptors, (files.minimum.as_raw_fd(), files.maximum.as_raw_fd()));
+        assert_eq!(bytes_capacity, boost.lease_bytes.capacity());
+        assert!(try_lease_lock(&lease).unwrap().is_some());
+        boost.restore();
+        assert_eq!(fs::read_to_string(&min).unwrap(), "600000");
+    }
+
+    #[test]
+    fn cold_boost_reopens_failed_read_and_write_descriptors() {
+        let f = Fixture::new("reopen-boost");
+        f.seed(["20000", "60", "1"]);
+        let lease = f.0.join("lease");
+        let mut boost = InputBoost::new(&f.0, &lease);
+        fs::write(&boost.min_path, "400000").unwrap();
+        boost.input(Instant::now());
+        boost.restore();
+        // Reading a write-only descriptor fails with EBADF without invalid ownership.
+        boost.files.as_mut().unwrap().minimum = OpenOptions::new()
+            .write(true).open(&boost.min_path).unwrap();
+        fs::write(&boost.min_path, "600000").unwrap();
+        boost.input(Instant::now());
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "1200000");
+        boost.restore();
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "600000");
+        boost.files.as_mut().unwrap().minimum = fs::File::open(&boost.min_path).unwrap();
+        boost.input(Instant::now());
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "1200000");
+        boost.restore();
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "600000");
+        assert!(!boost.unavailable);
+    }
+
+    #[test]
+    fn cold_boost_reopens_replaced_policy_and_falls_back_to_cpu0() {
+        let f = Fixture::new("replace-policy-boost");
+        f.seed(["20000", "60", "1"]);
+        let lease = f.0.join("lease");
+        let mut boost = InputBoost::new(&f.0, &lease);
+        fs::write(&boost.min_path, "400000").unwrap();
+        boost.input(Instant::now());
+        boost.restore();
+        let replacement = f.0.join("replacement");
+        fs::write(&replacement, "600000").unwrap();
+        fs::rename(&replacement, &boost.min_path).unwrap();
+        boost.input(Instant::now());
+        boost.restore();
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "600000");
+        let policy = boost.min_path.parent().unwrap().to_owned();
+        let fallback = f.0.join("devices/system/cpu/cpu0/cpufreq");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        fs::rename(&policy, &fallback).unwrap();
+        fs::write(fallback.join("scaling_min_freq"), "500000").unwrap();
+        boost.input(Instant::now());
+        let saved: BoostLease = serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+        assert_eq!(saved.policy, fallback);
+        assert_eq!(saved.minimum, "500000");
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "1200000");
+        boost.restore();
+        assert_eq!(fs::read_to_string(&boost.min_path).unwrap(), "500000");
+        assert!(!boost.unavailable);
     }
 
     #[test]
