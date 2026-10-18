@@ -44,10 +44,12 @@ pub struct EvdevKeys {
 impl EvdevKeys {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            events: Device::open("/dev/input/event0")
-                .unwrap()
-                .into_event_stream()?,
-            lid_switch_poller: DefaultPlatform::has_lid().then(LidSwitchPoller::new),
+            events: Device::open("/dev/input/event0")?.into_event_stream()?,
+            lid_switch_poller: if DefaultPlatform::has_lid() {
+                Some(LidSwitchPoller::new()?)
+            } else {
+                None
+            },
         })
     }
 
@@ -93,9 +95,9 @@ struct LidSwitchPoller {
 }
 
 impl LidSwitchPoller {
-    fn new() -> Self {
-        let is_lid_open = read_is_lid_open().expect("Failed to read lid switch state");
-        Self { is_lid_open }
+    fn new() -> Result<Self> {
+        let is_lid_open = read_is_lid_open()?;
+        Ok(Self { is_lid_open })
     }
 
     fn poll(&mut self) -> Option<KeyEvent> {
@@ -114,8 +116,7 @@ impl LidSwitchPoller {
 }
 
 fn read_is_lid_open() -> Result<bool> {
-    let mut file = File::open("/sys/devices/soc0/soc/soc:hall-mh248/hallvalue")
-        .expect("Failed to open /sys/devices/soc0/soc/soc:hall-mh248/hallvalue");
+    let mut file = File::open("/sys/devices/soc0/soc/soc:hall-mh248/hallvalue")?;
     let mut buffer = [0u8; 2];
     file.read_exact(&mut buffer)?;
     Ok(buffer[0] == b'1')

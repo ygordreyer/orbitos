@@ -66,6 +66,10 @@ impl Platform for MiyooPlatform {
         })
     }
 
+    fn reset_input(&mut self) -> Result<()> {
+        super::reset_input_reader(&mut self.keys, EvdevKeys::new)
+    }
+
     async fn poll(&mut self) -> KeyEvent {
         self.keys.poll().await
     }

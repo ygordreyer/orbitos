@@ -93,6 +93,9 @@ impl AlliumMenu<DefaultPlatform> {
         theme: Option<ThemeHandle>,
         game_info: GameInfo,
     ) -> Result<()> {
+        if let Err(error) = self.platform.reset_input() {
+            warn!("failed to reset menu input, keeping previous reader: {error:#}");
+        }
         self.refresh_locale();
         self.res.insert(game_info);
         self.res.insert(theme);

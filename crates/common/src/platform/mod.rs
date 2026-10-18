@@ -58,6 +58,11 @@ pub trait Platform {
 
     fn battery(&self) -> Result<Self::Battery>;
 
+    /// Discard events queued before a new input session, when supported.
+    fn reset_input(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     async fn poll(&mut self) -> KeyEvent;
 
     fn shutdown(&self) -> Result<()>;
@@ -83,6 +88,13 @@ pub trait Platform {
     fn has_lid() -> bool;
 
     fn daemon(&self) {}
+}
+
+#[cfg(any(test, feature = "miyoo"))]
+fn reset_input_reader<T>(reader: &mut T, open: impl FnOnce() -> Result<T>) -> Result<()> {
+    // Open first so a failed reset preserves the current reader and its queue.
+    *reader = open()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +126,61 @@ pub enum Key {
     VolUp,
     LidClose,
     Unknown,
+}
+
+#[cfg(test)]
+mod input_session_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::os::fd::AsRawFd;
+
+    struct Reader {
+        queued: VecDeque<KeyEvent>,
+        _fd: std::io::PipeWriter,
+    }
+
+    fn reader() -> (Reader, std::io::PipeReader) {
+        let (read, write) = std::io::pipe().unwrap();
+        (
+            Reader {
+                queued: VecDeque::new(),
+                _fd: write,
+            },
+            read,
+        )
+    }
+
+    fn writer_closed(read: &std::io::PipeReader) -> bool {
+        let mut fd = libc::pollfd {
+            fd: read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut fd, 1, 0) } >= 0);
+        fd.revents & libc::POLLHUP != 0
+    }
+
+    #[test]
+    fn reset_discards_old_menu_press_keeps_new_edges_and_closes_old_fd() {
+        let (mut input, old_fd) = reader();
+        input.queued.push_back(KeyEvent::Pressed(Key::Menu));
+        let (next, new_fd) = reader();
+        reset_input_reader(&mut input, || Ok(next)).unwrap();
+        assert!(writer_closed(&old_fd), "old reader leaked its file descriptor");
+        assert!(!writer_closed(&new_fd));
+        input.queued.push_back(KeyEvent::Pressed(Key::A));
+        assert_eq!(input.queued.pop_front(), Some(KeyEvent::Pressed(Key::A)));
+        assert_eq!(input.queued.pop_front(), None);
+    }
+
+    #[test]
+    fn failed_reset_preserves_reader_and_queued_events() {
+        let (mut input, old_fd) = reader();
+        input.queued.push_back(KeyEvent::Pressed(Key::Menu));
+        assert!(reset_input_reader(&mut input, || anyhow::bail!("open failed")).is_err());
+        assert!(!writer_closed(&old_fd));
+        assert_eq!(input.queued.pop_front(), Some(KeyEvent::Pressed(Key::Menu)));
+    }
 }
 
 #[cfg(all(feature = "perf-bench", not(feature = "miyoo")))]

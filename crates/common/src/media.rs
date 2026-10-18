@@ -1403,6 +1403,26 @@ mod tests {
 
     #[test]
     fn oversized_source_keeps_a_bounded_resident_prefix_without_scratch_files() {
+        const ISOLATED: &str = "ALLIUM_TEST_ISOLATED_SCRATCH_FDS";
+        // The fd assertion covers the whole process, so run it without other tests.
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "media::tests::oversized_source_keeps_a_bounded_resident_prefix_without_scratch_files",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated scratch fd check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
         let root =
             std::env::temp_dir().join(format!("allium-index-bounded-{}", std::process::id()));
