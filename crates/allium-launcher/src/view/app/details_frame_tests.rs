@@ -31,6 +31,22 @@ fn details(theme: &ThemeHandle) -> FrameInputs {
     input
 }
 
+#[test]
+fn details_highlights_the_originating_tab() {
+    let theme = theme(1);
+    let mut map = type_map::TypeMap::new();
+    map.insert(common::locale::Locale::new("en-US"));
+    map.insert(Some(theme.clone()));
+    let res = common::resources::Resources::new(map);
+    for (screen, selected) in [(ScreenId::Recents, 0), (ScreenId::Library, 1)] {
+        let mut models = vec![FrameInputs::new(screen), details(&theme)];
+        super::normalize_theme_models(&theme, &mut models, &res, selected, &Default::default());
+        for model in &models {
+            assert_eq!(model.selected[&Binding::Navigation], format!("tab-{selected}"));
+        }
+    }
+}
+
 fn assert_cold(frame: &PreparedFrame, input: &FrameInputs) {
     let cold = PreparedFrame::prepare(theme(999), input).unwrap();
     assert_eq!(frame.pixels().data(), cold.pixels().data());

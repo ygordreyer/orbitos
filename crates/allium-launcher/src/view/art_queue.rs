@@ -110,7 +110,7 @@ pub(super) fn plan(
                     WarmArt::Logo(_) => Some(Count::ArtRequestLogo),
                     WarmArt::Cover(entry) => Some(if entries.get(selected).is_some_and(|e| e.path() == entry.path()) {
                         Count::ArtRequestCover
-                    } else if entries.get(first.saturating_add(count)).is_some_and(|e| e.path() == entry.path()) {
+                    } else if super::orbit::peek_game(entries, first, count).is_some_and(|i| entries[i].path() == entry.path()) {
                         Count::ArtRequestNext
                     } else if entries.iter().skip(first).take(count).any(|e| e.path() == entry.path()) {
                         Count::ArtRequestEntries
@@ -154,8 +154,8 @@ pub(super) fn plan(
         }
     }
     if demand.next {
-        if let Some(entry) = entries.get(first.saturating_add(count)) {
-            push(WarmArt::Cover(entry.clone()));
+        if let Some(index) = super::orbit::peek_game(entries, first, count) {
+            push(WarmArt::Cover(entries[index].clone()));
         }
     }
     if neighbours && entries.len() > 1 {

@@ -152,7 +152,7 @@ pub fn shell(input: &mut FrameInputs, res: &Resources, selected: usize) {
         );
         input
             .selected
-            .insert(Binding::Navigation, format!("tab-{}", if input.screen == ScreenId::GameDetail { 1 } else { selected }));
+            .insert(Binding::Navigation, format!("tab-{selected}"));
     }
     input.navigation.insert(NavGroup::LibraryActions, vec![]);
     if input.hints.is_empty() {

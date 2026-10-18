@@ -2461,8 +2461,9 @@ impl PreparedFrame {
                     .as_ref()
                     .filter(|s| !s.is_empty())
                     .map_or(0, |s| {
-                        let (_, left, right) = ty.metrics(&ty.value(s));
-                        (right - left).ceil().max(0.0) as u32 + 1
+                        // Ellipsis checks advance width, which can exceed the visible ink.
+                        let (advance, left, right) = ty.metrics(&ty.value(s));
+                        advance.max(right - left).ceil().max(0.0) as u32 + 1
                     })
                     .min(c.rect.2);
                 if let Some(text) = text {

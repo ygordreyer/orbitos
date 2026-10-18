@@ -834,9 +834,9 @@ impl Orbit {
             }
         }
         if next {
-            if let Some(entry) = entries.get(first.saturating_add(count)) {
-                self.protected_paths.push(self.cover_path(entry));
-                self.visible_cover_entries.push(entry.path().into());
+            if let Some(index) = peek_game(entries, first, count) {
+                self.protected_paths.push(self.cover_path(&entries[index]));
+                self.visible_cover_entries.push(entries[index].path().into());
             }
         }
     }
@@ -1533,8 +1533,12 @@ mod tests {
     }
 }
 
-fn peek_game(entries: &[Entry], first: usize, count: usize) -> Option<usize> {
+pub(super) fn peek_game(entries: &[Entry], first: usize, count: usize) -> Option<usize> {
+    if first >= entries.len() || count == 0 {
+        return None;
+    }
     let next = first.checked_add(count)?;
+    let next = if next >= entries.len() { 0 } else { next };
     matches!(entries.get(next), Some(Entry::Game(_))).then_some(next)
 }
 
@@ -1763,7 +1767,11 @@ mod next_cover_tests {
         PreparedFrame::prepare(handle.clone(), &input).unwrap();
         assert_ne!(handle.debug_prepared_preview_identity(), Some(cached));
         input.art = orbit.theme_art(&entries, 2, 2, 1);
-        assert!(input.art.next_cover.is_none());
+        assert!(input.art.next_cover.is_some());
+        PreparedFrame::prepare(handle.clone(), &input).unwrap();
+        assert!(handle.debug_prepared_preview_identity().is_some());
+        input.art.next_cover = None;
+        input.art.next_cover_expected = false;
         PreparedFrame::prepare(handle.clone(), &input).unwrap();
         assert!(handle.debug_prepared_preview_identity().is_none());
         orbit.release_art();
@@ -1776,17 +1784,36 @@ mod next_cover_tests {
         std::fs::remove_file(extra).unwrap();
     }
     #[test]
-    fn next_cover_follows_visible_window_without_wrap() {
+    fn next_cover_wraps_and_is_requested_and_protected_at_the_last_window() {
         let entries = vec![
             Entry::Game(crate::entry::game::Game::new("First.chd".into())),
             Entry::Game(crate::entry::game::Game::new("Second.chd".into())),
         ];
         assert_eq!(peek_game(&entries, 0, 1), Some(1));
-        assert_eq!(peek_game(&entries, 0, 2), None);
+        assert_eq!(peek_game(&entries, 0, 2), Some(0));
         assert_eq!(peek_game(&entries, usize::MAX, 1), None);
-        assert_eq!(peek_game(&entries, 1, 1), None);
-        assert_eq!(peek_game(&entries[..1], 0, 1), None);
+        assert_eq!(peek_game(&entries, 1, 1), Some(0));
+        assert_eq!(peek_game(&entries, 1, 8), Some(0));
+        assert_eq!(peek_game(&entries, 0, 0), None);
+        assert_eq!(peek_game(&entries, 1, usize::MAX), None);
+        assert_eq!(peek_game(&entries[..1], 0, 1), Some(0));
         assert_eq!(peek_game(&[], 0, 1), None);
+        let work = super::super::art_queue::plan(&entries, 1, 1, 1, 1,
+            super::super::art_queue::Demand { next: true, ..Default::default() }, false);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].entry().path(), entries[0].path());
+        let mut orbit = Orbit::new();
+        let path = orbit.cover_path(&entries[0]);
+        let image = std::sync::Arc::new(Pixmap::new(10, 10).unwrap());
+        orbit.insert_cached(CachedArt { path: path.clone(), target: None, image: Some(image.clone()) });
+        let art = orbit.theme_art(&entries, 1, 1, 1);
+        assert!(art.next_cover_expected);
+        assert!(std::sync::Arc::ptr_eq(art.next_cover.as_ref().unwrap(), &image));
+        orbit.protect_window(&entries, 1, 1, 1, false, true);
+        assert!(orbit.protected_paths.contains(&path));
+        assert!(orbit.visible_cover_entries.contains(&entries[0].path().to_owned()));
+        let mixed = [Entry::Directory(crate::entry::directory::Directory::new("Folder".into())), entries[1].clone()];
+        assert_eq!(peek_game(&mixed, 1, 1), None);
     }
 }
 

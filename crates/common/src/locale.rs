@@ -88,6 +88,27 @@ struct CachedLoader {
 
 static THEME: OnceLock<Mutex<Option<CachedLoader>>> = OnceLock::new();
 
+fn bundled_english(key: &str, args: Option<&HashMap<Cow<'static, str>, FluentValue<'_>>>) -> Option<String> {
+    use fluent_templates::{FluentBundle, fluent_bundle::{FluentArgs, FluentResource}};
+    static ENGLISH: OnceLock<FluentBundle<FluentResource>> = OnceLock::new();
+    let bundle = ENGLISH.get_or_init(|| {
+        let mut bundle = FluentBundle::new_concurrent(vec![langid!("en-US")]);
+        bundle.set_use_isolating(false);
+        for source in [
+            include_str!("../../../static/.allium/locales/en-US/main.ftl"),
+            include_str!("../../../static/.allium/locales/en-US/langs.ftl"),
+            include_str!("../../../static/.allium/locales/en-US/activity-tracker.ftl"),
+            include_str!("../../../static/.allium/locales/en-US/screenshots-viewer.ftl"),
+        ] {
+            bundle.add_resource(FluentResource::try_new(source.into()).unwrap()).unwrap();
+        }
+        bundle
+    });
+    let message = bundle.get_message(key)?;
+    let args = args.map(|args| args.iter().map(|(key, value)| (key.as_ref(), value.clone())).collect::<FluentArgs>());
+    Some(bundle.format_pattern(message.value()?, args.as_ref(), &mut Vec::new()).into_owned())
+}
+
 // Explicit settings reloads and theme changes must see edits even within
 // FAT32's timestamp resolution, where length and mtime can remain unchanged.
 pub(crate) fn invalidate_theme_loader() {
@@ -190,14 +211,18 @@ impl Locale {
                     None as Option<&HashMap<&str, _>>,
                 )
             })
-            .unwrap_or_else(|| self.default_loader.lookup(&self.lang, key))
+            .or_else(|| self.default_loader.try_lookup(&self.lang, key))
+            .or_else(|| bundled_english(key, None))
+            .unwrap_or_else(|| key.into())
     }
 
     pub fn ta(&self, key: &str, args: &HashMap<Cow<'static, str>, FluentValue<'_>>) -> String {
         self.theme_loader
             .as_ref()
             .and_then(|loader| loader.lookup_no_default_fallback(&self.lang, key, Some(args)))
-            .unwrap_or_else(|| self.default_loader.lookup_with_args(&self.lang, key, args))
+            .or_else(|| self.default_loader.try_lookup_with_args(&self.lang, key, args))
+            .or_else(|| bundled_english(key, Some(args)))
+            .unwrap_or_else(|| key.into())
     }
 
     pub fn language(&self) -> String {
@@ -224,6 +249,29 @@ impl fmt::Debug for Locale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_installed_locale_falls_back_to_bundled_english_with_arguments() {
+        let fixture = ThemeFixture::new("stale-default");
+        let mut locale = Locale {
+            default_loader: build_loader(&fixture.0),
+            theme_loader: None,
+            lang: langid!("en-US"),
+        };
+        for lang in ["en-US", "fr-FR", "zz-ZZ"] {
+            locale.lang = lang.parse().unwrap();
+            assert_eq!(locale.t("tab-settings"), "First override");
+            assert_eq!(locale.t("settings-about-version"), "Version");
+            assert_eq!(locale.ta("settings-about-version", &HashMap::new()), "Version");
+            let args = HashMap::from([(Cow::Borrowed("core"), FluentValue::from("Test core"))]);
+            assert_eq!(locale.ta("menu-launch-with-core", &args), "Launch with Test core");
+            assert_eq!(locale.t("unknown-key"), "unknown-key");
+        }
+        locale.lang = langid!("en-US");
+        locale.theme_loader = Some(build_loader(&fixture.0));
+        assert_eq!(locale.t("tab-settings"), "First override");
+        assert_eq!(locale.t("settings-about-version"), "Version");
+    }
 
     #[test]
     fn repeated_construction_shares_parsed_bundles_and_switches_language() {

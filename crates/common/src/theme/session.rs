@@ -206,18 +206,7 @@ impl ThemeRuntime {
                 if !unchanged || !matches!(requested.id.as_str(), "orbit" | "compact") {
                     let (id, settings) =
                         super::settings::migrate(&requested.id, &requested.settings);
-                    let result = self
-                        .prepare_options(&id, requested.generation, &settings)
-                        .and_then(|h| {
-                            ensure!(
-                                h.digest() == requested.digest
-                                    || h.pack().revision != requested.revision
-                                    || id != requested.id
-                                    || h.settings() != &requested.settings,
-                                "Requested theme bytes differ"
-                            );
-                            Ok(h)
-                        });
+                    let result = self.prepare_options(&id, requested.generation, &settings);
                     match result {
                         Ok(h) => {
                             // Fully validated updates and canonical defaults publish a new identity
@@ -526,6 +515,48 @@ mod review_fix_tests {
             assert_eq!(restored.settings(), &wanted);
         }
     }
+    #[test]
+    fn theme_json_update_preserves_selected_pack_color_and_shape_without_revision_bump() {
+        let root = Fixture::new("same-revision-update");
+        let pack = root.0.join("compact-plus");
+        std::fs::create_dir_all(pack.join("assets")).unwrap();
+        let source = themes().join("compact-plus");
+        let mut raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(source.join("theme.json")).unwrap()).unwrap();
+        for asset in std::fs::read_dir(source.join("assets")).unwrap() {
+            let asset = asset.unwrap();
+            std::fs::copy(asset.path(), pack.join("assets").join(asset.file_name())).unwrap();
+        }
+        let write = |raw: &serde_json::Value| {
+            std::fs::write(pack.join("theme.json"), serde_json::to_vec(raw).unwrap()).unwrap();
+        };
+        write(&raw);
+        let wanted = Values::from([
+            ("cover_shape".into(), "tall".into()),
+            ("color_scheme".into(), "black".into()),
+        ]);
+        let mut runtime = root.runtime(&root.0);
+        runtime.choose_with_settings("compact-plus", &wanted).unwrap();
+        let previous = runtime.store.read().unwrap().unwrap();
+        raw["tokens"]["typography"]["status"]["size"] = json!(19);
+        write(&raw);
+        for mut runtime in [root.runtime(&root.0), runtime] {
+            let active = runtime.activate(Boundary::Launcher);
+            assert!(active.status.diagnostic.is_none(), "{:?}", active.status);
+            let handle = active.snapshot.unwrap();
+            assert_eq!(handle.pack().id, "compact-plus");
+            assert_eq!(handle.pack().tokens.typography[&super::super::pack::Role::Status].size, 19);
+            assert_eq!(handle.pack().revision, previous.revision);
+            assert_eq!(handle.settings(), &wanted);
+            let saved = runtime.store.read().unwrap().unwrap();
+            assert_eq!(saved.id, "compact-plus");
+            assert_ne!(saved.digest, previous.digest);
+            assert_eq!(saved.settings, wanted);
+            assert_eq!(saved.theme_settings["compact-plus"], wanted);
+            assert_eq!(saved.generation, previous.generation + 1);
+        }
+    }
+
     #[test]
     fn review_validated_pack_updates_migrate_identity_and_defaults() {
         for change in 0..4 {

@@ -509,8 +509,8 @@ where
                     path == self.entries[selected].path()
                         || (lower.rows && self.entries.iter().skip(first).take(count)
                             .any(|entry| entry.path() == path))
-                        || (lower.next && self.entries.get(first.saturating_add(count))
-                            .is_some_and(|entry| entry.path() == path))
+                        || (lower.next && super::orbit::peek_game(&self.entries, first, count)
+                            .is_some_and(|i| self.entries[i].path() == path))
                 });
             }
             self.orbit.get_or_insert_with(Orbit::new).cancel_selection();
@@ -734,8 +734,8 @@ where
             path == self.entries[selected].path()
                 || (demand.rows && self.entries[first..(first + count).min(self.entries.len())]
                     .iter().any(|entry| entry.path() == path))
-                || (demand.next && self.entries.get(first + count)
-                    .is_some_and(|entry| entry.path() == path))
+                || (demand.next && super::orbit::peek_game(&self.entries, first, count)
+                    .is_some_and(|i| self.entries[i].path() == path))
         });
         Ok(Some(NavigationWarm {
             input,

@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn compact_plus_stacked_clock_fits_every_minute_without_ellipsis() {
+    let theme = crate::theme::render_navigation::tests::theme("compact-plus", "square");
+    for screen in [ScreenId::Recents, ScreenId::GameDetail] {
+        let status = theme.pack().screens[&screen].components.iter()
+            .find(|c| c.kind == Kind::Status).unwrap();
+        let mut frame = PreparedFrame::unpainted(theme.clone(), screen);
+        let mut input = FrameInputs::new(screen);
+        input.status.battery = Some(100);
+        input.status.charging = true;
+        input.status.network = Some("online".into());
+        for minute in 0..24 * 60 {
+            let clock = format!("{:02}:{:02}", minute / 60, minute % 60);
+            input.status.clock = Some(clock.clone());
+            TEXT_PLAN.with(|plan| *plan.borrow_mut() = Some(Vec::new()));
+            let result = frame.ink_status_contents(status, &input);
+            let texts = TEXT_PLAN.with(|plan| plan.borrow_mut().take().unwrap());
+            result.unwrap();
+            let text = texts.iter().find(|text| text.value == clock).unwrap();
+            assert_eq!(text.ty.lines(&text.value, text.rect.2, text.count, text.overflow),
+                vec![clock.clone()], "{screen:?} {clock}");
+            assert!(text.rect.0 >= status.rect.0 && text.rect.0 + text.rect.2 <= status.rect.0 + status.rect.2);
+        }
+    }
+}
+
 pub(super) fn reference_lines(layout: &InkTextLayout, text: &str, width: u32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
