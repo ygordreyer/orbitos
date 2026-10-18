@@ -31,4 +31,5 @@ path = "../common"
 path = "../allium-menu"
 
 [dev-dependencies]
+async-trait.workspace = true
 tiny-skia.workspace = true

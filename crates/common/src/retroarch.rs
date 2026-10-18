@@ -33,6 +33,7 @@ pub enum RetroArchCommand {
     SlowMotion,
     VolumeUp,
     VolumeDown,
+    ShowMsg(String),
     OverlayNext,
     DiskEjectToggle,
     DiskNext,
@@ -120,6 +121,7 @@ impl RetroArchCommand {
             RetroArchCommand::SlowMotion => Cow::Borrowed("SLOWMOTION"),
             RetroArchCommand::VolumeUp => Cow::Borrowed("VOLUME_UP"),
             RetroArchCommand::VolumeDown => Cow::Borrowed("VOLUME_DOWN"),
+            RetroArchCommand::ShowMsg(message) => Cow::Owned(format!("SHOW_MSG {message}")),
             RetroArchCommand::OverlayNext => Cow::Borrowed("OVERLAY_NEXT"),
             RetroArchCommand::DiskEjectToggle => Cow::Borrowed("DISK_EJECT_TOGGLE"),
             RetroArchCommand::DiskNext => Cow::Borrowed("DISK_NEXT"),
@@ -136,6 +138,21 @@ impl RetroArchCommand {
             RetroArchCommand::SetStateSlot(slot) => Cow::Owned(format!("SET_STATE_SLOT {slot}")),
             RetroArchCommand::SaveStateSlot(slot) => Cow::Owned(format!("SAVE_STATE_SLOT {slot}")),
             RetroArchCommand::LoadStateSlot(slot) => Cow::Owned(format!("LOAD_STATE_SLOT {slot}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetroArchCommand;
+
+    #[test]
+    fn show_msg_serializes_as_one_network_command() {
+        for message in ["Volume 40%", "Brightness 55%"] {
+            assert_eq!(
+                RetroArchCommand::ShowMsg(message.into()).as_str(),
+                format!("SHOW_MSG {message}")
+            );
         }
     }
 }

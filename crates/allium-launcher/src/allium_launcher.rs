@@ -95,6 +95,7 @@ pub struct AlliumLauncher<P: Platform> {
     toast_deadline: Option<Instant>,
     first_flush: bool,
     display_revision: u64,
+    osd: crate::osd::LauncherOsd,
 }
 
 impl AlliumLauncher<DefaultPlatform> {
@@ -146,11 +147,15 @@ impl AlliumLauncher<DefaultPlatform> {
             toast_deadline: None,
             first_flush: true,
             display_revision: 0,
+            osd: crate::osd::LauncherOsd::default(),
         })
     }
 
     pub async fn run_event_loop(&mut self) -> Result<()> {
         let _trace_flush = common::perf_trace::FlushPendingOnDrop;
+        #[cfg(unix)]
+        let mut osd_socket = crate::osd::bind().map_err(|error|
+            warn!("Launcher OSD socket unavailable: {error}")).ok();
         {
             let styles = self.res.get::<Stylesheet>().display_style();
 
@@ -359,9 +364,13 @@ impl AlliumLauncher<DefaultPlatform> {
             let view_deadline = self
                 .toast_deadline
                 .map_or(update_deadline, |toast| toast.min(update_deadline));
+            let osd_deadline = self.osd.deadline();
             #[cfg(unix)]
             tokio::select! {
                 biased;
+                wake = crate::osd::wait(&mut osd_socket, osd_deadline) => {
+                    self.handle_osd_wake(wake);
+                }
                 event = self.poll_input() => {
                     crate::network_runtime::trace_wake("input");
                     pending_input.0 = Some(event);
@@ -480,6 +489,7 @@ impl AlliumLauncher<DefaultPlatform> {
 
     fn navigation_warm_allowed(&self) -> bool {
         self.toast.is_none()
+            && !self.osd.is_active()
             && !crate::network_runtime::blocks_navigation_warm()
             && self.view.navigation_warm_ready()
     }
@@ -557,17 +567,38 @@ impl AlliumLauncher<DefaultPlatform> {
         Ok(count)
     }
 
+    #[cfg(unix)]
+    fn handle_osd_wake(&mut self, wake: crate::osd::Wake) {
+        match wake {
+            crate::osd::Wake::Event(event) => self.receive_osd(event),
+            crate::osd::Wake::Expired => self.osd.expire(Instant::now()),
+        }
+    }
+
+    fn receive_osd(&mut self, event: common::osd::OsdEvent) {
+        let title = self.res.get::<Locale>().t(event.kind.title_key(event.direction));
+        let styles = self.res.get::<Stylesheet>().display_style();
+        if let Err(error) = self.osd.receive(event, Instant::now(),
+            crate::theme_adapter::snapshot(&self.res), &title, &styles, &self.display) {
+            warn!("Launcher OSD preparation failed: {error:#}");
+        }
+    }
+
     async fn present_frame(
         &mut self,
         network_dirty: bool,
         overlay_was_drawn: &mut bool,
     ) -> Result<()> {
+        self.osd.expire(Instant::now());
+        let osd_dirty = self.osd.take_dirty();
+        let osd_active = self.osd.is_active();
         if self.toast.as_ref().is_some_and(Toast::has_expired) {
             self.toast = None;
             self.toast_deadline = None;
             self.handle_command(Command::Redraw).await?;
         }
-        if self.toast.is_some() || network_dirty || *overlay_was_drawn {
+        if self.toast.is_some() || network_dirty || *overlay_was_drawn
+            || osd_dirty || (osd_active && self.view.should_draw()) {
             self.view.force_full_present();
         }
         let revision = self.display.composition_revision()?;
@@ -641,7 +672,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 let _stage = common::perf_trace::stage(common::perf_trace::Stage::Present);
                 let _phase = common::perf_trace::phase(common::perf_trace::Phase::Flush);
                 if let Some(damage) =
-                    present_damage.filter(|_| !*overlay_was_drawn && !network_dirty)
+                    present_damage.filter(|_| !*overlay_was_drawn && !network_dirty && !osd_active && !osd_dirty)
                 {
                     common::perf_trace::present_reason("partial");
                     self.view.flush_prepared_damage(&mut self.display, &damage)?;
@@ -654,7 +685,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     } else {
                         "view_full"
                     });
-                    self.display.flush()?;
+                    self.osd.present(&mut self.display)?;
                 }
                 crate::network_runtime::frame_presented();
             }
@@ -2628,6 +2659,119 @@ mod perf_bench;
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 #[path = "present_dl15b_tests.rs"]
 pub(crate) mod present_dl15b_tests;
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod launcher_osd_tests {
+    use super::*;
+    use common::{osd::{OSD_DURATION, OsdEvent, OsdKind}, theme::{frame::{FrameInputs, Hint},
+        pack::Binding, render::PreparedFrame}};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(orbit_fixture)]
+    async fn socket_and_expiry_wakes_present_plate_then_restore_once_without_view_dirtying() {
+        let (mut app, baseline, mut overlay) = super::present_dl15b_tests::launcher().await;
+        assert!(!app.view.should_draw());
+        let path = std::env::temp_dir().join(format!("allium-osd-loop-{}.sock", std::process::id()));
+        let mut socket = Some(crate::osd::bind_at(&path).unwrap());
+        // Unlink even if an assertion unwinds.
+        struct SocketPath(std::path::PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _path = SocketPath(path.clone());
+        for kind in [OsdKind::Volume, OsdKind::Brightness] {
+            let event = OsdEvent::new(kind, 0.6, -1, 42);
+            event.send_to(&path).unwrap();
+            let wake = tokio::time::timeout(Duration::from_millis(250),
+                crate::osd::wait(&mut socket, app.osd.deadline())).await.unwrap();
+            assert!(matches!(wake, crate::osd::Wake::Event(received) if received == event));
+            app.handle_osd_wake(wake);
+            assert!(!app.view.should_draw(), "socket wake must dirty only the OSD");
+            assert!(app.osd.is_active());
+            let mut expected = DefaultPlatform::new().unwrap().display().unwrap();
+            expected.pixmap_mut().data_mut().copy_from_slice(baseline.data());
+            expected.record_presentations();
+            app.osd.present(&mut expected).unwrap();
+            let expected = expected.take_presented_frames().pop().unwrap();
+            assert_ne!(expected.data(), baseline.data());
+            app.present_frame(false, &mut overlay).await.unwrap();
+            let frames = app.display.take_presented_frames();
+            assert_eq!(frames.len(), 1, "the socket wake must cause a present");
+            super::present_dl15b_tests::assert_frames(&frames, &expected, "OSD present");
+            app.present_frame(false, &mut overlay).await.unwrap();
+            assert!(app.display.take_presented_frames().is_empty());
+
+            let wake = tokio::time::timeout(OSD_DURATION + Duration::from_millis(250),
+                crate::osd::wait(&mut socket, app.osd.deadline())).await.unwrap();
+            assert!(matches!(wake, crate::osd::Wake::Expired));
+            app.handle_osd_wake(wake);
+            assert!(!app.osd.is_active(), "the timer arm must expire the plate");
+            app.present_frame(false, &mut overlay).await.unwrap();
+            let frames = app.display.take_presented_frames();
+            assert_eq!(frames.len(), 1, "expiry must present the clean frame exactly once");
+            super::present_dl15b_tests::assert_frames(&frames, &baseline, "OSD expiry");
+            assert!(tokio::time::timeout(Duration::from_millis(30),
+                crate::osd::wait(&mut socket, app.osd.deadline())).await.is_err(),
+                "idle OSD must have no timer wake");
+            for _ in 0..3 {
+                app.present_frame(false, &mut overlay).await.unwrap();
+                assert!(app.display.take_presented_frames().is_empty(), "idle must not present");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(orbit_fixture)]
+    async fn themed_osd_is_last_in_each_present_survives_repaint_and_expires_once() {
+        let (mut app, _, mut overlay) = super::present_dl15b_tests::launcher().await;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themes/compact-plus").canonicalize().unwrap();
+        let bank = common::theme::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        let theme = common::theme::ThemeHandle::prepare(
+            common::theme::runtime::ThemeSnapshot::load(&root).unwrap(), &bank, 100).unwrap();
+        app.res.insert(Some(theme));
+        app.view.set_should_draw();
+        app.present_frame(false, &mut overlay).await.unwrap();
+        let baseline = app.display.take_presented_frames().pop().unwrap();
+        for kind in [OsdKind::Volume, OsdKind::Brightness] {
+            let event = OsdEvent::new(kind, 0.6, -1, 42);
+            app.receive_osd(event);
+            assert!(!app.navigation_warm_allowed());
+            let mut input = FrameInputs::new(kind.screen());
+            input.text.insert(Binding::Title, app.res.get::<Locale>().t(kind.title_key(-1)));
+            input.progress = Some(0.6);
+            input.hints.push(Hint { button: "B".into(), label: "Back".into() });
+            let theme = crate::theme_adapter::snapshot(&app.res).unwrap();
+            let prepared = PreparedFrame::prepare_osd_overlay(theme, &input, false).unwrap();
+            assert_eq!(prepared.bounds(), common::theme::pack::Rect(0, 0, 640, 480));
+            let mut expected = baseline.clone();
+            prepared.compose(&mut expected.as_mut());
+            assert_ne!(expected.data(), baseline.data());
+            for _ in 0..2 {
+                app.view.set_should_draw();
+                app.present_frame(false, &mut overlay).await.unwrap();
+                let frames = app.display.take_presented_frames();
+                assert_eq!(frames.len(), 1);
+                super::present_dl15b_tests::assert_frames(&frames, &expected, "OSD present");
+                assert!(app.display.pixmap().data() == baseline.data(), "logical frame must remain clean");
+            }
+            app.present_frame(false, &mut overlay).await.unwrap();
+            assert!(app.display.take_presented_frames().is_empty(), "active OSD must not repaint on idle wakes");
+            let wake = tokio::time::timeout(OSD_DURATION + Duration::from_millis(250),
+                crate::osd::wait(&mut None, app.osd.deadline())).await.unwrap();
+            assert!(matches!(wake, crate::osd::Wake::Expired));
+            app.handle_osd_wake(wake);
+            assert!(!app.osd.is_active(), "the timer arm must expire the plate");
+            app.present_frame(false, &mut overlay).await.unwrap();
+            let frames = app.display.take_presented_frames();
+            assert_eq!(frames.len(), 1);
+            super::present_dl15b_tests::assert_frames(&frames, &baseline, "OSD expiry");
+            app.present_frame(false, &mut overlay).await.unwrap();
+            assert!(app.display.take_presented_frames().is_empty(), "expiry must repaint only once");
+        }
+    }
+}
 
 #[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
 #[path = "navigation_warm_tests.rs"]

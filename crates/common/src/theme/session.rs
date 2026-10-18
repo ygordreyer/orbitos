@@ -57,6 +57,7 @@ pub struct ThemeRuntime {
     last_diagnostic: Option<String>,
     option_cache: std::collections::VecDeque<ThemeHandle>,
     pending_settings: Option<super::selection::Selection>,
+    osd_token: Option<Option<super::selection::SelectionToken>>,
     menu_cache: Option<(Option<super::selection::SelectionToken>, String)>,
 }
 impl ThemeRuntime {
@@ -85,6 +86,7 @@ impl ThemeRuntime {
             status: ThemeStatus::default(),
             last_diagnostic: None,
             menu_cache: None,
+            osd_token: None,
             option_cache: Default::default(),
             pending_settings: None,
         })
@@ -101,6 +103,7 @@ impl ThemeRuntime {
         }
     }
     pub fn choose_legacy(&mut self) -> Result<Activation> {
+        self.osd_token = None;
         self.flush_settings()?;
         self.option_cache.clear();
         self.menu_cache = None;
@@ -171,7 +174,36 @@ impl ThemeRuntime {
         activation
     }
 
+    /// Volume keys reuse validated assets until an explicit selection/settings change.
+    /// General activation boundaries still revalidate external packs and invalidate this cache.
+    pub fn activate_osd(&mut self) -> Activation {
+        let token = self.store.cache_token().ok();
+        let root_valid = self.themes.as_ref().is_none_or(|(binding, held)| binding.verify_held(held).is_ok());
+        if self.pending_settings.is_none() && root_valid && token.is_some() {
+            let current = self.osd_token == token || (self.status.diagnostic.is_none()
+                && self.store.read().ok().is_some_and(|selection| match (&self.active, selection) {
+                    (None, None) => true,
+                    (Some(active), Some(selected)) => active.pack().id == selected.id
+                        && active.pack().revision == selected.revision && active.digest() == selected.digest
+                        && active.generation() == selected.generation && active.settings() == &selected.settings,
+                    _ => false,
+                }) && self.store.cache_token().ok() == token);
+            if current {
+                self.osd_token = token;
+                return Activation { snapshot: self.active.clone(), status: self.status.clone(), changed: false, diagnostic_once: None };
+            }
+        }
+        let start = std::time::Instant::now();
+        let activation = self.activate(Boundary::OsdOpening);
+        if activation.status.diagnostic.is_none() && self.store.cache_token().ok() == token {
+            self.osd_token = token;
+        }
+        log::info!(target: "alliumd::osd", "osd theme activation changed={} elapsed_ms={}", activation.changed, start.elapsed().as_millis());
+        activation
+    }
+
     pub fn activate(&mut self, _boundary: Boundary) -> Activation {
+        self.osd_token = None;
         if let Err(error) = self.flush_settings() {
             self.status.diagnostic = Some(format!("Theme settings could not be saved: {error}"));
             return Activation {
@@ -486,6 +518,29 @@ mod review_fix_tests {
             .canonicalize()
             .unwrap()
     }
+    #[test]
+    fn osd_activation_reuses_external_snapshot_and_invalidates_on_selection_change() {
+        let root = Fixture::new("osd-cache");
+        let mut runtime = root.runtime(&themes());
+        runtime.choose("compact-plus").unwrap();
+        let first = runtime.activate_osd().snapshot.unwrap();
+        REVIEW_COUNTS.with(|c| c.set([0; 4]));
+        let next = runtime.activate_osd().snapshot.unwrap();
+        assert!(first.downgrade().matches(&next));
+        assert_eq!(REVIEW_COUNTS.with(|c| c.get()), [0; 4], "hot volume keys do no parsing/decoding/font preparation");
+        let menu = runtime.activate(Boundary::MenuOpening).snapshot.unwrap();
+        REVIEW_COUNTS.with(|c| c.set([0; 4]));
+        let after_menu = runtime.activate_osd().snapshot.unwrap();
+        assert!(menu.downgrade().matches(&after_menu), "menu activation already validated this snapshot");
+        assert_eq!(REVIEW_COUNTS.with(|c| c.get()), [0; 4]);
+        runtime.choose("big-picture").unwrap();
+        let changed = runtime.activate_osd().snapshot.unwrap();
+        assert_eq!(changed.pack().id, "big-picture");
+        assert!(!first.downgrade().matches(&changed));
+        runtime.choose_legacy().unwrap();
+        assert!(runtime.activate_osd().snapshot.is_none());
+    }
+
     #[test]
     fn review_per_theme_options_survive_switching_and_legacy_records() {
         for legacy in [false, true] {

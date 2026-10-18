@@ -15,25 +15,13 @@ use common::theme::{
     pack::{Binding, ScreenId},
     render::PreparedFrame,
 };
-use log::warn;
+use log::{info, warn};
 use tokio::time::Instant;
 
-const HIDE_TIMEOUT: Duration = Duration::from_millis(1000);
+const HIDE_TIMEOUT: Duration = common::osd::OSD_DURATION;
 const UI_REDRAW_PERIOD: Duration = Duration::from_micros(UI_FRAME_INTERVAL.as_micros() as u64 / 2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OsdKind {
-    Volume,
-    Brightness,
-}
-impl OsdKind {
-    fn screen(self) -> ScreenId {
-        match self {
-            Self::Volume => ScreenId::OsdVolume,
-            Self::Brightness => ScreenId::OsdBrightness,
-        }
-    }
-}
+pub use common::osd::OsdKind;
 
 #[derive(Clone, Copy)]
 struct Plate {
@@ -172,11 +160,16 @@ impl<D: Display> Legacy<D> {
             self.display.pixmap().to_owned(),
             common::theme::pack::Rect(rect.x as u32, rect.y as u32, rect.w, rect.h),
         );
-        if let Ok(candidate) = candidate
-            && self.display.check_overlay(&candidate).is_ok()
-        {
-            return OverlaySurface::replace(&mut self.display, &mut self.surface, Some(&candidate))
-                .inspect_err(|_| self.faulted = true);
+        match candidate {
+            Ok(candidate) => {
+                let candidate = candidate.with_repainting(repainting);
+                match self.display.check_overlay(&candidate) {
+                    Ok(()) => return OverlaySurface::replace(&mut self.display, &mut self.surface, Some(&candidate))
+                        .inspect_err(|_| self.faulted = true),
+                    Err(error) => info!("osd legacy masked backend unavailable error={error:#}"),
+                }
+            }
+            Err(error) => info!("osd legacy prepare error={error:#}"),
         }
         self.display.load(rect)?;
         if let Err(error) = self.draw(styles, kind, fraction)
@@ -235,11 +228,20 @@ impl<D: Display> Themed<D> {
         let result = OverlaySurface::replace(&mut display, &mut surface, Some(candidate));
         match result {
             Ok(()) => Ok(Self { display, surface }),
-            Err(_) if surface.is_some() => Ok(Self { display, surface }),
+            Err(error) if surface.is_some() => {
+                info!("osd install cleanup fault error={error:#}");
+                Ok(Self { display, surface })
+            },
             Err(error) => Err(error),
         }
     }
     fn replace(&mut self, candidate: &PreparedOverlay) -> Result<()> {
+        if let Some(surface) = self.surface.as_mut()
+            && surface.update(&mut self.display, candidate)? {
+                info!("osd branch=themed_update_in_place");
+                return Ok(());
+            }
+        info!("osd branch=themed_replace");
         OverlaySurface::replace(&mut self.display, &mut self.surface, Some(candidate))
     }
     fn hide(&mut self) -> Result<()> {
@@ -288,9 +290,7 @@ impl<P: Platform> Osd<P> {
     }
     pub fn next_wake(&self) -> Option<Instant> {
         self.shown.as_ref().and_then(|shown| {
-            if shown.presentation.faulted() {
-                return None;
-            }
+            if shown.presentation.faulted() { return None; }
             Some(match &shown.presentation {
                 Presentation::Legacy(Legacy {
                     refresh: Some(LegacyRefresh::Periodic { next }),
@@ -309,6 +309,22 @@ impl<P: Platform> Osd<P> {
         repainting: bool,
         opening_theme: Option<ThemeHandle>,
     ) -> Result<()> {
+        info!("osd show kind={kind:?} repainting={repainting} theme={} visible_before={}", opening_theme.is_some(), self.is_visible());
+        let start = std::time::Instant::now();
+        let result = self.show_inner(platform, kind, title, fraction, repainting, opening_theme);
+        if result.is_err() && self.shown.as_ref().is_some_and(|shown| shown.presentation.faulted()) {
+            let _ = self.hide();
+        }
+        match &result {
+            Ok(()) => info!("osd show installed_ms={}", start.elapsed().as_millis()),
+            Err(error) => info!("osd show error={error:#} elapsed_ms={}", start.elapsed().as_millis()),
+        }
+        result
+    }
+    fn show_inner(
+        &mut self, platform: &mut P, kind: OsdKind, title: &str, fraction: f32,
+        repainting: bool, opening_theme: Option<ThemeHandle>,
+    ) -> Result<()> {
         let fraction = fraction.clamp(0.0, 1.0);
         if let Some(shown) = self.shown.as_mut() {
             ensure!(
@@ -317,13 +333,14 @@ impl<P: Platform> Osd<P> {
             );
             match &mut shown.presentation {
                 Presentation::Legacy(legacy) => {
+                    info!("osd branch=legacy");
                     legacy.update(&self.styles, kind, fraction, repainting)?
                 }
                 Presentation::Themed(themed) => {
                     let theme = themed
                         .theme()
                         .ok_or_else(|| anyhow::anyhow!("Visible themed OSD lost its snapshot"))?;
-                    let candidate = prepare_overlay(theme, kind, title, fraction)?;
+                    let candidate = prepare_overlay(theme, kind, title, fraction, repainting)?;
                     themed.replace(&candidate)?;
                 }
             }
@@ -331,7 +348,7 @@ impl<P: Platform> Osd<P> {
             return Ok(());
         }
         if let Some(theme) = opening_theme {
-            match prepare_overlay(theme, kind, title, fraction) {
+            match prepare_overlay(theme, kind, title, fraction, repainting) {
                 Ok(candidate) => {
                     let mut display = platform.display_partial()?;
                     if let Err(error) = display.check_overlay(&candidate) {
@@ -339,6 +356,7 @@ impl<P: Platform> Osd<P> {
                             "themed OSD unavailable before presentation, using Legacy: {error:#}"
                         );
                     } else {
+                        info!("osd branch=themed_replace");
                         match Themed::install(display, &candidate) {
                             Ok(themed) if !themed.faulted() => {
                                 self.shown = Some(Shown {
@@ -361,6 +379,7 @@ impl<P: Platform> Osd<P> {
                 Err(error) => warn!("failed to prepare themed OSD, using Legacy: {error:#}"),
             }
         }
+        info!("osd branch=legacy");
         let mut legacy = Legacy::new(platform.display_partial()?, &self.styles)?;
         legacy.update(&self.styles, kind, fraction, repainting)?;
         self.shown = Some(Shown {
@@ -373,12 +392,9 @@ impl<P: Platform> Osd<P> {
         let Some(shown) = self.shown.as_mut() else {
             return Ok(());
         };
-        ensure!(
-            !shown.presentation.faulted(),
-            "OSD faulted; explicit recovery required"
-        );
         let now = Instant::now();
-        if now >= shown.hide_at {
+        if now >= shown.hide_at || shown.presentation.faulted() {
+            info!("osd hide reason={}", if shown.presentation.faulted() { "fault" } else { "timeout" });
             return self.hide();
         }
         if let Presentation::Legacy(Legacy {
@@ -394,6 +410,7 @@ impl<P: Platform> Osd<P> {
         Ok(())
     }
     pub fn hide(&mut self) -> Result<()> {
+        info!("osd hide visible_before={}", self.is_visible());
         let Some(shown) = self.shown.as_mut() else {
             return Ok(());
         };
@@ -404,10 +421,22 @@ impl<P: Platform> Osd<P> {
         if result.is_ok() {
             self.shown.take();
         }
-        result
+        result.inspect_err(|error| info!("osd hide error={error:#}"))
+    }
+
+    pub fn warm_theme(theme: ThemeHandle) -> Result<()> {
+        let start = std::time::Instant::now();
+        for kind in [OsdKind::Volume, OsdKind::Brightness] {
+            for repainting in [false, true] {
+                prepare_overlay(theme.clone(), kind, "Level", 0.5, repainting)?;
+            }
+        }
+        info!("osd warm theme={} elapsed_ms={}", theme.pack().id, start.elapsed().as_millis());
+        Ok(())
     }
 }
 
+#[cfg(test)]
 fn prepare_frame(
     theme: ThemeHandle,
     kind: OsdKind,
@@ -427,8 +456,19 @@ fn prepare_overlay(
     kind: OsdKind,
     title: &str,
     fraction: f32,
+    repainting: bool,
 ) -> Result<PreparedOverlay> {
-    prepare_frame(theme, kind, title, fraction)?.into_overlay()
+    let mut input = FrameInputs::new(kind.screen());
+    input.text.insert(Binding::Title, title.chars().take(512).collect());
+    input.progress = Some(fraction.clamp(0.0, 1.0));
+    input.hints.push(common::theme::frame::Hint { button: "B".into(), label: "Back".into() });
+    let start = std::time::Instant::now();
+    let result = PreparedFrame::prepare_osd_overlay(theme, &input, repainting);
+    match &result {
+        Ok(overlay) => info!("osd prepare kind={kind:?} repainting={repainting} elapsed_ms={} non_transparent_pixels={}", start.elapsed().as_millis(), overlay.covered_bytes() / 4),
+        Err(error) => info!("osd prepare error={error:#} elapsed_ms={}", start.elapsed().as_millis()),
+    }
+    result
 }
 
 #[cfg(test)]
@@ -436,6 +476,22 @@ mod theme_overlay_tests {
     use super::*;
     use common::constants::ALLIUM_FONTS_DIR;
     use common::theme::{FontBank, runtime::ThemeSnapshot};
+
+    #[test]
+    fn repainting_flag_selects_plate_and_launcher_keeps_full_screen() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        for pack in ["compact-plus", "big-picture"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes").join(pack)).unwrap(), &bank, 42).unwrap();
+            for kind in [OsdKind::Volume, OsdKind::Brightness] {
+                let game = prepare_overlay(theme.clone(), kind, "Level", 0.6, true).unwrap();
+                assert_eq!(game.bounds(), theme.pack().component(kind.screen(), "plate").unwrap().rect);
+                let launcher = prepare_overlay(theme.clone(), kind, "Level", 0.6, false).unwrap();
+                assert_eq!(launcher.bounds(), common::theme::pack::Rect(0, 0, 640, 480));
+                assert_eq!(launcher.covered_bytes(), prepare_frame(theme.clone(), kind, "Level", 0.6).unwrap().into_overlay().unwrap().covered_bytes());
+            }
+        }
+    }
 
     fn custom_handle(root: &std::path::Path) -> ThemeHandle {
         std::fs::create_dir_all(root.join("assets")).unwrap();
@@ -501,6 +557,9 @@ mod theme_overlay_tests {
         );
         assert!(overlay.covered_bytes() < 384 * 88 * 4);
         assert!(overlay.accounted_bytes() < 16 * 1024 * 1024);
+        let fallback = prepare_overlay(theme.clone(), OsdKind::Volume, "Volume +", 0.65, true).unwrap();
+        assert_eq!(fallback.bounds(), overlay.bounds(), "missing plate preserves the descriptor path");
+        assert_eq!(fallback.covered_bytes(), overlay.covered_bytes());
         if let Ok(proof) = std::env::var("ALLIUM_ORBIT_PROOF_DIR") {
             std::fs::create_dir_all(&proof).unwrap();
             prepare_frame(theme.clone(), OsdKind::Volume, "Volume +", 0.65)

@@ -11,7 +11,7 @@ use framebuffer::{FixScreeninfo, Framebuffer, VarScreeninfo};
 #[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
 #[path = "framebuffer_test_iface.rs"]
 mod test_iface;
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 #[cfg(all(any(test, feature = "perf-bench"), not(feature = "miyoo")))]
 use test_iface::{FixScreeninfo, Framebuffer, VarScreeninfo};
 use tiny_skia::{Pixmap, PixmapMut, PixmapRef};
@@ -800,6 +800,7 @@ impl Display for FramebufferDisplay {
             .overlay_mapping
             .ok_or_else(|| anyhow!("Overlay framebuffer open binding unavailable"))?;
         let layout = overlay_layout(&self.iface, open)?;
+        info!(target: "common::display::overlay", "overlay present open_pan={},{} page={}", self.iface.var_screen_info.xoffset, self.iface.var_screen_info.yoffset, self.iface.var_screen_info.yoffset / self.iface.var_screen_info.yres);
         overlay.present(&layout, &mut self.iface.frame, content)
     }
 
@@ -818,11 +819,15 @@ impl Display for FramebufferDisplay {
         let layout = overlay_layout(&iface, open)?;
         overlay.check_layout(&layout)?;
         let hold = RectHold::try_spawn(move |stop| {
-            run_overlay_hold(stop, || {
+            info!(target: "common::display::overlay", "overlay hold start pan={},{} page={}", open.xoffset, open.yoffset, open.yoffset / open.height);
+            let result = run_overlay_hold(stop, || {
                 let current = overlay_layout(&iface, open)?;
                 overlay.poll(&current, &mut iface.frame)?;
                 Ok(())
-            })
+            });
+            if let Err(error) = &result { info!(target: "common::display::overlay", "overlay hold error={error:#}"); }
+            overlay.log_hold_summary(if result.is_err() { "fault" } else if overlay.hold_expired() { "timeout" } else { "hide" });
+            result
         })?;
         Ok(Some(hold))
     }

@@ -16,6 +16,7 @@ use common::constants::{
 };
 use common::display::settings::DisplaySettings;
 use common::locale::{Locale, LocaleSettings};
+use common::osd::OsdEvent;
 use common::power::{PowerButtonAction, PowerSettings, VolumeOnStartup};
 use common::retroarch::RetroArchCommand;
 use common::stylesheet::Stylesheet;
@@ -434,13 +435,23 @@ impl AlliumD<DefaultPlatform> {
         // One load per process: font data is Arc'd, so clones share it
         let styles = Stylesheet::load()?;
 
-        let theme_runtime = ThemeRuntime::bind(
+        let mut theme_runtime = ThemeRuntime::bind(
             &ALLIUM_BASE_DIR.join("state"),
             &ALLIUM_THEMES_DIR,
             &ALLIUM_FONTS_DIR,
         )
         .map_err(|error| warn!("Theme runtime unavailable, using Legacy menu/OSD: {error:#}"))
         .ok();
+
+        if let Some(runtime) = theme_runtime.as_mut() {
+            let activation = runtime.activate_osd();
+            if let Some(message) = activation.diagnostic_once { warn!("{message}"); }
+            if let Some(theme) = activation.snapshot {
+                if let Err(error) = Osd::<DefaultPlatform>::warm_theme(theme) {
+                    warn!("OSD warmup failed: {error:#}");
+                }
+            }
+        }
 
         // Spawn the persistent menu thread at startup
         let menu = MenuHandle::new(styles.clone());
@@ -525,12 +536,14 @@ impl AlliumD<DefaultPlatform> {
                         match completion {
                             Some(()) => {
                                 info!("menu finished, resuming game");
+                                self.hide_osd();
                                 self.menu_open = false;
                                 RetroArchCommand::Unpause.send().await?;
                             }
                             None => {
                                 error!("menu thread unavailable; disabling menu completion channel");
                                 if disable_menu(&mut self.menu_available, &mut self.menu_open) {
+                                    self.hide_osd();
                                     RetroArchCommand::Unpause.send().await?;
                                 }
                             }
@@ -654,17 +667,17 @@ impl AlliumD<DefaultPlatform> {
             match key_event {
                 KeyEvent::Pressed(Key::Up | Key::VolUp)
                 | KeyEvent::Autorepeat(Key::Up | Key::VolUp) => {
-                    self.add_brightness(5)?;
+                    self.add_brightness(5).await?;
                 }
                 KeyEvent::Pressed(Key::Down | Key::VolDown)
                 | KeyEvent::Autorepeat(Key::Down | Key::VolDown) => {
-                    self.add_brightness(-5)?;
+                    self.add_brightness(-5).await?;
                 }
                 KeyEvent::Pressed(Key::Left) | KeyEvent::Autorepeat(Key::Left) => {
-                    self.add_volume(-1)?;
+                    self.add_volume(-1).await?;
                 }
                 KeyEvent::Pressed(Key::Right) | KeyEvent::Autorepeat(Key::Right) => {
-                    self.add_volume(1)?;
+                    self.add_volume(1).await?;
                 }
                 KeyEvent::Released(Key::Power) => {
                     let game_info = GameInfo::load()?;
@@ -689,10 +702,10 @@ impl AlliumD<DefaultPlatform> {
         } else {
             match key_event {
                 KeyEvent::Pressed(Key::VolDown) | KeyEvent::Autorepeat(Key::VolDown) => {
-                    self.add_volume(-1)?
+                    self.add_volume(-1).await?
                 }
                 KeyEvent::Pressed(Key::VolUp) | KeyEvent::Autorepeat(Key::VolUp) => {
-                    self.add_volume(1)?
+                    self.add_volume(1).await?
                 }
                 KeyEvent::Autorepeat(Key::Power) if !self.keys[Key::Menu] => {
                     #[cfg(unix)]
@@ -954,21 +967,7 @@ impl AlliumD<DefaultPlatform> {
         Path::new(&*ALLIUM_GAME_INFO).exists()
     }
 
-    /// Whether the foreground repaints the frame itself; apps exec over the launcher
-    /// without writing game info, so `is_ingame` alone misses them
-    fn foreground_repaints(&self) -> bool {
-        let exe = self
-            .main
-            .id()
-            .and_then(|pid| fs::canonicalize(format!("/proc/{pid}/exe")).ok());
-        let launcher = fs::canonicalize(ALLIUM_LAUNCHER.as_path()).ok();
-        match (exe, launcher) {
-            (Some(exe), Some(launcher)) => exe != launcher,
-            _ => self.is_ingame(),
-        }
-    }
-
-    fn add_volume(&mut self, add: i32) -> Result<()> {
+    async fn add_volume(&mut self, add: i32) -> Result<()> {
         info!("adding volume: {}", add);
         self.state.volume = (self.state.volume + add).clamp(0, MAX_VOLUME);
         // Draw first: set_volume spawns myctl, which costs tens of ms on this SoC
@@ -976,12 +975,13 @@ impl AlliumD<DefaultPlatform> {
             OsdKind::Volume,
             self.state.volume as f32 / MAX_VOLUME as f32,
             add.signum(),
-        );
+        )
+        .await;
         self.platform.set_volume(self.state.volume)?;
         Ok(())
     }
 
-    fn add_brightness(&mut self, add: i8) -> Result<()> {
+    async fn add_brightness(&mut self, add: i8) -> Result<()> {
         info!("adding brightness: {}", add);
         self.state.brightness =
             (self.state.brightness as i8 + add).clamp(0, MAX_BRIGHTNESS as i8) as u8;
@@ -990,13 +990,37 @@ impl AlliumD<DefaultPlatform> {
             OsdKind::Brightness,
             self.state.brightness as f32 / MAX_BRIGHTNESS as f32,
             i32::from(add.signum()),
-        );
+        )
+        .await;
         self.platform.set_brightness(self.state.brightness)?;
         Ok(())
     }
 
-    fn show_osd(&mut self, kind: OsdKind, fraction: f32, direction: i32) {
-        let repainting = self.foreground_repaints() && !self.menu_open;
+    async fn show_osd(&mut self, kind: OsdKind, fraction: f32, direction: i32) {
+        let game_info = fs::read(ALLIUM_GAME_INFO.as_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<GameInfo>(&bytes).ok());
+        let launcher = self.main.id().and_then(|pid| fs::canonicalize(format!("/proc/{pid}/exe")).ok())
+            .zip(fs::canonicalize(ALLIUM_LAUNCHER.as_path()).ok())
+            .is_some_and(|(exe, launcher)| exe == launcher);
+        let target = OsdTarget::for_foreground(self.menu_open, game_info.as_ref(), launcher);
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let event = OsdEvent::new(kind, fraction, direction, seq);
+        present_foreground_osd(
+            target, event, fraction, send_launcher_osd,
+            |command| async move { command.send().await },
+            |action| match action {
+                FramebufferOsdAction::Retire => self.hide_osd(),
+                FramebufferOsdAction::Show => self.show_framebuffer_osd(
+                    kind, fraction, direction, target.repaints(),
+                ),
+            },
+        ).await;
+    }
+
+    fn show_framebuffer_osd(&mut self, kind: OsdKind, fraction: f32, direction: i32, repainting: bool) {
+        let opening_start = std::time::Instant::now();
         let title = self.locale.t(match (kind, direction.is_negative()) {
             (OsdKind::Volume, false) => "hotkeys-volume-up",
             (OsdKind::Volume, true) => "hotkeys-volume-down",
@@ -1007,13 +1031,14 @@ impl AlliumD<DefaultPlatform> {
             None
         } else {
             self.theme_runtime.as_mut().and_then(|runtime| {
-                let activation = runtime.activate(Boundary::OsdOpening);
+                let activation = runtime.activate_osd();
                 if let Some(message) = activation.diagnostic_once {
                     warn!("{message}");
                 }
                 activation.snapshot
             })
         };
+        info!(target: "alliumd::osd", "osd opening theme_ms={} repainting={repainting}", opening_start.elapsed().as_millis());
         // Cosmetic only: a failed overlay must not take down the daemon
         if let Err(e) = self.osd.show(
             &mut self.platform,
@@ -1032,6 +1057,268 @@ impl AlliumD<DefaultPlatform> {
         if let Err(e) = self.osd.hide() {
             error!("failed to hide OSD: {}", e);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OsdTarget {
+    Launcher,
+    RetroArch,
+    Framebuffer,
+}
+
+impl OsdTarget {
+    fn repaints(self) -> bool {
+        self == Self::RetroArch
+    }
+
+    fn for_foreground(menu_open: bool, game_info: Option<&GameInfo>, launcher: bool) -> Self {
+        if !menu_open && launcher {
+            Self::Launcher
+        } else if !menu_open && game_info.is_some_and(|info| info.has_menu) {
+            Self::RetroArch
+        } else {
+            Self::Framebuffer
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramebufferOsdAction {
+    Retire,
+    Show,
+}
+
+fn send_launcher_osd(event: OsdEvent) -> std::io::Result<()> {
+    #[cfg(unix)]
+    { event.send() }
+    #[cfg(not(unix))]
+    { let _ = event; Err(std::io::ErrorKind::Unsupported.into()) }
+}
+
+async fn present_foreground_osd<F, Fut>(
+    target: OsdTarget,
+    event: OsdEvent,
+    fraction: f32,
+    send_launcher: impl FnOnce(OsdEvent) -> std::io::Result<()>,
+    send_retroarch: F,
+    mut framebuffer: impl FnMut(FramebufferOsdAction),
+) where
+    F: FnOnce(RetroArchCommand) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if target != OsdTarget::Framebuffer {
+        // Join the fallback writer before either foreground renderer can present.
+        framebuffer(FramebufferOsdAction::Retire);
+    }
+    if target != OsdTarget::Launcher {
+        present_osd(target, event.kind, fraction, send_retroarch,
+            || framebuffer(FramebufferOsdAction::Show)).await;
+        return;
+    }
+    let result = send_launcher(event);
+    let sent = result.is_ok();
+    info!(target: "alliumd::osd", "osd launcher_msg kind={:?} percent={} seq={} sent={sent}",
+        event.kind, event.percent, event.seq);
+    if let Err(error) = result {
+        debug!(target: "alliumd::osd", "launcher OSD send failed: {error}");
+        framebuffer(FramebufferOsdAction::Show);
+    }
+}
+
+async fn present_osd<F, Fut>(
+    target: OsdTarget,
+    kind: OsdKind,
+    fraction: f32,
+    send: F,
+    show_framebuffer: impl FnOnce(),
+) where
+    F: FnOnce(RetroArchCommand) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if target == OsdTarget::Framebuffer {
+        show_framebuffer();
+        return;
+    }
+    let percent = (fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
+    let label = match kind {
+        OsdKind::Volume => "Volume",
+        OsdKind::Brightness => "Brightness",
+    };
+    let command = RetroArchCommand::ShowMsg(format!("{label} {percent}%"));
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), send(command))
+        .await;
+    let sent = match result {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            debug!(target: "alliumd::osd", "RetroArch OSD send failed: {error:#}");
+            false
+        }
+        Err(error) => {
+            debug!(target: "alliumd::osd", "RetroArch OSD send timed out: {error}");
+            false
+        }
+    };
+    info!(target: "alliumd::osd", "osd retroarch_msg kind={kind:?} percent={percent} sent={sent}");
+}
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+#[path = "osd_regression_tests.rs"]
+mod osd_regression_tests;
+
+#[cfg(test)]
+mod retroarch_osd_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[tokio::test]
+    async fn launcher_volume_change_sends_one_message_without_starting_overlay() {
+        let messages = RefCell::new(Vec::new());
+        let overlay_starts = Cell::new(0);
+        let target = OsdTarget::for_foreground(false, None, true);
+        assert_eq!(target, OsdTarget::Launcher);
+        present_foreground_osd(
+            target, OsdEvent::new(OsdKind::Volume, 0.4, 1, 7), 0.4,
+            |event| { messages.borrow_mut().push(event); Ok(()) },
+            |_| async { panic!("launcher OSD must not send RetroArch commands") },
+            |action| if action == FramebufferOsdAction::Show { overlay_starts.set(overlay_starts.get() + 1); },
+        ).await;
+        assert_eq!((messages.borrow().len(), overlay_starts.get()), (1, 0));
+        assert_eq!(messages.borrow()[0], OsdEvent {
+            kind: OsdKind::Volume, percent: 40, direction: 1, seq: 7,
+        });
+    }
+
+    #[tokio::test]
+    async fn missing_launcher_listener_falls_back_and_menu_keeps_framebuffer() {
+        let overlay_starts = Cell::new(0);
+        for _ in 0..2 {
+            present_foreground_osd(
+                OsdTarget::Launcher, OsdEvent::new(OsdKind::Brightness, 0.5, -1, 1), 0.5,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                |_| async { panic!("launcher OSD must not send RetroArch commands") },
+                |action| if action == FramebufferOsdAction::Show { overlay_starts.set(overlay_starts.get() + 1); },
+            ).await;
+        }
+        assert_eq!(overlay_starts.get(), 2);
+        assert_eq!(OsdTarget::for_foreground(true, None, true), OsdTarget::Framebuffer);
+    }
+
+    #[tokio::test]
+    async fn retroarch_volume_change_sends_one_message_without_starting_overlay() {
+        let info = GameInfo {
+            has_menu: true,
+            ..GameInfo::default()
+        };
+        let commands = RefCell::new(Vec::new());
+        let overlay_starts = Cell::new(0);
+        let mut state = AlliumDState::new();
+        state.volume = 7;
+        state.volume += 1;
+        present_osd(
+            OsdTarget::for_foreground(false, Some(&info), false),
+            OsdKind::Volume,
+            state.volume as f32 / MAX_VOLUME as f32,
+            |command| {
+                commands.borrow_mut().push(command);
+                std::future::ready(Ok(()))
+            },
+            || overlay_starts.set(overlay_starts.get() + 1),
+        )
+        .await;
+        let commands = commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0], RetroArchCommand::ShowMsg(text) if text == "Volume 40%"));
+        assert_eq!(overlay_starts.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn brightness_changes_each_send_new_message_with_plate_rounding() {
+        let commands = RefCell::new(Vec::new());
+        for fraction in [0.55, 0.60, 0.575, -0.1, 1.1] {
+            present_osd(
+                OsdTarget::RetroArch,
+                OsdKind::Brightness,
+                fraction,
+                |command| {
+                    commands.borrow_mut().push(command);
+                    std::future::ready(Ok(()))
+                },
+                || panic!("game OSD must not start the framebuffer writer"),
+            )
+            .await;
+        }
+        let commands = commands.borrow();
+        assert_eq!(commands.len(), 5);
+        for (command, percent) in commands.iter().zip([55, 60, 58, 0, 100]) {
+            assert!(matches!(command, RetroArchCommand::ShowMsg(text)
+                if text == &format!("Brightness {percent}%")));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_apps_and_daemon_menu_keep_framebuffer_osd() {
+        let retroarch = GameInfo {
+            has_menu: true,
+            ..GameInfo::default()
+        };
+        let other_game = GameInfo::default();
+        for (menu_open, info) in [
+            (false, None),
+            (false, Some(&other_game)),
+            (true, Some(&retroarch)),
+        ] {
+            let overlay_starts = Cell::new(0);
+            let target = OsdTarget::for_foreground(menu_open, info, false);
+            assert_eq!(target, OsdTarget::Framebuffer);
+            present_osd(
+                target,
+                OsdKind::Volume,
+                0.4,
+                |_| async { panic!("non-game OSD must not send RetroArch commands") },
+                || overlay_starts.set(overlay_starts.get() + 1),
+            )
+            .await;
+            assert_eq!(overlay_starts.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_message_send_does_not_fall_back_to_framebuffer() {
+        let sends = Cell::new(0);
+        present_osd(
+            OsdTarget::RetroArch,
+            OsdKind::Volume,
+            0.4,
+            |_| {
+                sends.set(sends.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!("not listening")))
+            },
+            || panic!("failed game OSD must not start the framebuffer writer"),
+        )
+        .await;
+        assert_eq!(sends.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_message_send_is_bounded_without_framebuffer_fallback() {
+        let sends = Cell::new(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            present_osd(
+                OsdTarget::RetroArch,
+                OsdKind::Brightness,
+                0.5,
+                |_| {
+                    sends.set(sends.get() + 1);
+                    std::future::pending::<Result<()>>()
+                },
+                || panic!("stalled game OSD must not start the framebuffer writer"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sends.get(), 1);
     }
 }
 

@@ -947,7 +947,7 @@ impl PreparedFrame {
         }
         Ok(())
     }
-    fn ink_paint_component(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
+    pub(super) fn ink_paint_component(&mut self, c: &Component, input: &FrameInputs) -> Result<()> {
         let opacity = c.paint.as_ref().unwrap().opacity.unwrap_or(1.0);
         if opacity == 0.0 {
             return Ok(());

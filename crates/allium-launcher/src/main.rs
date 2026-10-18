@@ -13,6 +13,7 @@ mod network_library;
 mod network_runtime;
 mod network_transfer;
 mod ota;
+mod osd;
 mod theme_adapter;
 mod view;
 

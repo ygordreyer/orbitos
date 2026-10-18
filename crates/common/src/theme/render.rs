@@ -501,6 +501,63 @@ impl PreparedFrame {
     pub fn prepare(theme: ThemeHandle, input: &FrameInputs) -> Result<Self> {
         Self::prepare_reusing(theme, input, None)
     }
+    /// Repainting clients need only the descriptor's plate, without launcher chrome.
+    pub fn prepare_osd_overlay(theme: ThemeHandle, input: &FrameInputs, repainting: bool) -> Result<PreparedOverlay> {
+        ensure!(input.screen.is_osd(), "Plate overlay requires an OSD screen");
+        let plate = repainting.then(|| theme.pack().screens[&input.screen].components.iter()
+            .find(|c| c.id == "plate").map(|c| c.rect)).flatten();
+        if !theme.pack().ink() && plate.is_none() {
+            return Ok(Self::prepare(theme, input)?.into_overlay()?.with_repainting(repainting));
+        }
+        input.validate(&theme)?;
+        let mut frame = Self::unpainted(theme.clone(), input.screen);
+        let resolved = if theme.pack().ink() { frame.ink_resolved_components(input) }
+            else { std::sync::Arc::new(theme.pack().screens[&input.screen].components.clone()) };
+        let components: Vec<_> = resolved.iter().filter(|c| plate.is_none_or(|plate|
+            c.rect.0 >= plate.0 && c.rect.1 >= plate.1
+                && c.rect.0 + c.rect.2 <= plate.0 + plate.2
+                && c.rect.1 + c.rect.3 <= plate.1 + plate.3)).cloned().collect();
+        // The prefix before the first binding is input independent. Keep paint order exact,
+        // caching expensive scrim, gradient, border and shadow work for four OSD variants.
+        type Base = (super::fonts::WeakThemeHandle, ScreenId, bool, std::sync::Arc<Pixmap>);
+        thread_local! { static BASES: std::cell::RefCell<std::collections::VecDeque<Base>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) }; }
+        let prefix = components.iter().position(|c| c.binding.is_some()).unwrap_or(components.len());
+        let cached = BASES.with(|bases| bases.borrow().iter()
+            .find(|(stamp, screen, game, _)| stamp.matches(&theme) && *screen == input.screen && *game == repainting)
+            .map(|(_, _, _, pixels)| pixels.clone()));
+        if let Some(pixels) = cached {
+            frame.pixels = crate::display::SharedPixmap(pixels);
+        } else {
+            for c in &components[..prefix] {
+                if theme.pack().ink() { frame.ink_paint_component(c, input)?; }
+                else { frame.component(c, input)?; }
+            }
+            BASES.with(|bases| {
+                let mut bases = bases.borrow_mut();
+                bases.retain(|(stamp, _, _, _)| stamp.matches(&theme));
+                if bases.len() == 4 { bases.pop_front(); }
+                bases.push_back((theme.downgrade(), input.screen, repainting, frame.pixels.0.clone()));
+            });
+        }
+        for c in &components[prefix..] {
+            if theme.pack().ink() { frame.ink_paint_component(c, input)?; }
+            else { frame.component(c, input)?; }
+        }
+        if let Some(plate) = plate {
+            // Effects may extend beyond their component rect; the game owns outside plate.
+            for y in 0..480usize {
+                let row = &mut frame.pixels.data_mut()[y * 640 * 4..(y + 1) * 640 * 4];
+                if y < plate.1 as usize || y >= (plate.1 + plate.3) as usize { row.fill(0); }
+                else {
+                    row[..plate.0 as usize * 4].fill(0);
+                    row[(plate.0 + plate.2) as usize * 4..].fill(0);
+                }
+            }
+            PreparedOverlay::from_plate(theme, input.screen, frame.pixels.into_pixmap(), plate)
+        } else {
+            Ok(frame.into_overlay()?.with_repainting(repainting))
+        }
+    }
     pub fn prepare_reusing(
         theme: ThemeHandle,
         input: &FrameInputs,

@@ -10,6 +10,7 @@ pub mod game_info;
 pub mod geom;
 pub mod locale;
 pub mod media;
+pub mod osd;
 pub mod platform;
 pub mod perf_trace;
 pub mod power;

@@ -124,3 +124,6 @@ pub const RECENT_GAMES_LIMIT: i64 = 100;
 
 /// RetroArch network command interface.
 pub const RETROARCH_UDP_SOCKET: &str = "127.0.0.1:55355";
+
+/// Daemon level notifications consumed by the foreground launcher.
+pub const LAUNCHER_OSD_SOCKET: &str = "/tmp/allium-launcher-osd.sock";
