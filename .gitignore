@@ -9,3 +9,4 @@ SDL2.dll
 .devenv.flake.nix
 devenv.lock
 local.mk
+/crates/allium-launcher/src/network_fixtures/target
