@@ -33,5 +33,6 @@ mod image_cache;
 mod blit;
 mod ink_blit_neon;
 mod text_cache;
+mod osd_cache;
 
 pub mod ink;

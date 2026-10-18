@@ -350,6 +350,16 @@ const TEXT_LIMIT: usize = 1024 * 1024;
 thread_local! {static SURFACES: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};static TEXT: RefCell<VecDeque<CachedText>>=const {RefCell::new(VecDeque::new())};}
 thread_local! { pub(super) static HERO_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 thread_local! { static OPACITY_TABLES: RefCell<VecDeque<(u32, Arc<[u8]>)>> = const { RefCell::new(VecDeque::new()) }; }
+pub(super) fn release_caches() {
+    TEXT.with(|c| *c.borrow_mut() = VecDeque::new());
+    SURFACES.with(|c| *c.borrow_mut() = VecDeque::new());
+    SHELVES.with(|c| *c.borrow_mut() = VecDeque::new());
+    GEOMETRY.with(|c| *c.borrow_mut() = VecDeque::new());
+    PREVIEW_MASK.with(|c| *c.borrow_mut() = None);
+    OPACITY_TABLES.with(|c| *c.borrow_mut() = VecDeque::new());
+    effects::release_cache();
+    retained::release_cache();
+}
 #[cfg(test)]
 pub(super) fn worker_cache_residency() -> [(usize, usize); 4] {
     let pixels = |cache: &RefCell<VecDeque<CachedText>>| {

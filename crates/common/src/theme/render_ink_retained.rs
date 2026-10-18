@@ -329,6 +329,9 @@ const HERO_LIMIT: usize = 4 * 1024 * 1024;
 thread_local! {
     static HEROES: RefCell<VecDeque<Hero>> = const { RefCell::new(VecDeque::new()) };
 }
+pub(in crate::theme::render) fn release_cache() {
+    HEROES.with(|c| *c.borrow_mut() = VecDeque::new());
+}
 pub(in crate::theme::render) fn hero_prewarm_fits(bytes: usize) -> bool {
     HEROES.with(|heroes| {
         let heroes = heroes.borrow();

@@ -75,11 +75,7 @@ impl MenuHandle {
 
         let handle = std::thread::spawn(move || -> Result<()> {
             let result = rt.block_on(async {
-                let platform = common::platform::DefaultPlatform::new()
-                    .context("initializing menu platform")?;
-                let mut app = AlliumMenu::new(platform, styles)
-                    .await
-                    .context("initializing menu app")?;
+                let mut app = None;
 
                 let mut prewarmer = MenuPrewarmer::new();
                 loop {
@@ -88,6 +84,7 @@ impl MenuHandle {
                             #[cfg(feature = "miyoo")]
                             let foreground = common::platform::cpu_tuning::foreground();
                             prewarmer.info = session.info.clone();
+                            let app = menu_app(&mut app, &styles).await?;
                             app.set_open_trace(session.trace);
                             let prepared = {
                                 let _phase = session.trace.phase("menu_prepare");
@@ -111,10 +108,10 @@ impl MenuHandle {
                         }
                         Ok(MenuRequest::Prewarm) => {
                             let _phase = common::perf_trace::menu_phase("press_prewarm");
-                            prewarmer.prepare(&mut app, true).await;
+                            prewarmer.prepare(&mut app, &styles, true).await;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            prewarmer.prepare(&mut app, false).await
+                            prewarmer.prepare(&mut app, &styles, false).await
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -135,6 +132,18 @@ impl MenuHandle {
     }
 }
 
+async fn menu_app<'a>(
+    app: &'a mut Option<AlliumMenu<DefaultPlatform>>,
+    styles: &Stylesheet,
+) -> Result<&'a mut AlliumMenu<DefaultPlatform>> {
+    if app.is_none() {
+        let platform = DefaultPlatform::new().context("initializing menu platform")?;
+        *app = Some(AlliumMenu::new(platform, styles.clone())
+            .await.context("initializing menu app")?);
+    }
+    Ok(app.as_mut().unwrap())
+}
+
 struct MenuPrewarmer {
     game: Option<(std::path::PathBuf, i64)>,
     info: Option<RetroArchInfo>,
@@ -148,16 +157,11 @@ impl MenuPrewarmer {
             game: None,
             info: None,
             modified: None,
-            runtime: ThemeRuntime::bind(
-                &ALLIUM_BASE_DIR.join("state"),
-                &ALLIUM_THEMES_DIR,
-                &ALLIUM_FONTS_DIR,
-            )
-            .ok(),
+            runtime: None,
         }
     }
 
-    async fn prepare(&mut self, app: &mut AlliumMenu<DefaultPlatform>, on_press: bool) {
+    async fn prepare(&mut self, app: &mut Option<AlliumMenu<DefaultPlatform>>, styles: &Stylesheet, on_press: bool) {
         let modified = fs::metadata(ALLIUM_GAME_INFO.as_path())
             .ok()
             .and_then(|m| m.modified().ok());
@@ -165,15 +169,36 @@ impl MenuPrewarmer {
             return;
         }
         self.modified = modified;
-        let Some(game) = fs::read(ALLIUM_GAME_INFO.as_path())
+        let game = fs::read(ALLIUM_GAME_INFO.as_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<GameInfo>(&bytes).ok())
-            .filter(|game| game.has_menu)
-        else {
+            .filter(|game| game.has_menu);
+        self.prepare_game(app, styles, game).await;
+    }
+
+    async fn prepare_game(&mut self, app: &mut Option<AlliumMenu<DefaultPlatform>>, styles: &Stylesheet, game: Option<GameInfo>) {
+        let Some(game) = game else {
             self.game = None;
             self.info = None;
+            self.runtime = None;
+            if app.take().is_some() {
+                common::theme::render::release_thread_caches();
+                common::memory::trim_heap();
+            }
             return;
         };
+        let app = match menu_app(app, styles).await {
+            Ok(app) => app,
+            Err(error) => {
+                warn!("menu initialization failed: {error:#}");
+                return;
+            }
+        };
+        if self.runtime.is_none() {
+            self.runtime = ThemeRuntime::bind(
+                &ALLIUM_BASE_DIR.join("state"), &ALLIUM_THEMES_DIR, &ALLIUM_FONTS_DIR,
+            ).ok();
+        }
         let _phase = common::perf_trace::menu_phase("game_prewarm");
         let identity = (game.path.clone(), game.start_time.timestamp_millis());
         let changed = self.game.as_ref() != Some(&identity);
@@ -1624,5 +1649,25 @@ fn pause_launcher_boost() -> Option<common::platform::cpu_tuning::InputBoostPaus
 fn restore_launcher_boost() {
     if let Err(error) = common::platform::cpu_tuning::restore_boost_lease() {
         warn!("Cannot recover launcher CPU boost: {error}");
+    }
+}
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod menu_residency_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn menu_resources_are_lazy_reused_and_released_without_a_game() {
+        let mut prewarmer = MenuPrewarmer::new();
+        let mut app = None;
+        prewarmer.prepare_game(&mut app, &Stylesheet::new(), None).await;
+        assert!(app.is_none() && prewarmer.runtime.is_none());
+        let styles = Stylesheet::load().unwrap();
+        let first = menu_app(&mut app, &styles).await.unwrap() as *mut _;
+        let second = menu_app(&mut app, &styles).await.unwrap() as *mut _;
+        assert_eq!(first, second, "game sessions reuse the prepared menu");
+        assert!(app.is_some());
+        prewarmer.prepare_game(&mut app, &styles, None).await;
+        assert!(app.is_none() && prewarmer.runtime.is_none());
     }
 }

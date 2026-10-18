@@ -206,6 +206,7 @@ struct Cache {
     entries: VecDeque<Entry>,
     bytes: usize,
 }
+pub(super) fn clear() { CACHE.with(|c| *c.borrow_mut() = Cache::default()); }
 thread_local! { static CACHE: RefCell<Cache> = RefCell::new(Cache::default()); }
 pub(super) fn draw_cached(
     dest: &mut PixmapMut<'_>,

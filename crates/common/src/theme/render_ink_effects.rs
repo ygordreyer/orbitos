@@ -85,6 +85,10 @@ struct CachedShadow {
 }
 thread_local! { static SHADOWS: RefCell<VecDeque<CachedShadow>> = const { RefCell::new(VecDeque::new()) }; }
 
+pub(super) fn release_cache() {
+    SHADOWS.with(|c| *c.borrow_mut() = VecDeque::new());
+}
+
 // Each reused line is compared by bits after hashing; collisions never imply equality.
 // Every computed output retains the original ascending-tap multiply/add order.
 struct GaussianAlpha {

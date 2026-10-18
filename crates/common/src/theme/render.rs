@@ -75,6 +75,19 @@ pub struct RetiredFrame {
     _text_boxes: Vec<(String, Rect)>,
     _damage: Vec<Rect>,
 }
+/// Release intermediate rasters on this rendering thread, preserving warm OSD backgrounds.
+pub fn release_transient_caches() {
+    ink_renderer::release_caches();
+    super::text_cache::clear();
+    super::blit::clear();
+}
+
+/// Explicit theme replacement also retires backgrounds belonging to the previous theme.
+pub fn release_thread_caches() {
+    release_transient_caches();
+    super::osd_cache::clear();
+}
+
 fn pixel_word(bytes: &[u8]) -> u32 {
     u32::from_ne_bytes(bytes[..4].try_into().unwrap())
 }
@@ -519,25 +532,13 @@ impl PreparedFrame {
                 && c.rect.1 + c.rect.3 <= plate.1 + plate.3)).cloned().collect();
         // The prefix before the first binding is input independent. Keep paint order exact,
         // caching expensive scrim, gradient, border and shadow work for four OSD variants.
-        type Base = (super::fonts::WeakThemeHandle, ScreenId, bool, std::sync::Arc<Pixmap>);
-        thread_local! { static BASES: std::cell::RefCell<std::collections::VecDeque<Base>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) }; }
         let prefix = components.iter().position(|c| c.binding.is_some()).unwrap_or(components.len());
-        let cached = BASES.with(|bases| bases.borrow().iter()
-            .find(|(stamp, screen, game, _)| stamp.matches(&theme) && *screen == input.screen && *game == repainting)
-            .map(|(_, _, _, pixels)| pixels.clone()));
-        if let Some(pixels) = cached {
-            frame.pixels = crate::display::SharedPixmap(pixels);
-        } else {
+        if !super::osd_cache::restore(&theme, input.screen, repainting, &mut frame.pixels) {
             for c in &components[..prefix] {
                 if theme.pack().ink() { frame.ink_paint_component(c, input)?; }
                 else { frame.component(c, input)?; }
             }
-            BASES.with(|bases| {
-                let mut bases = bases.borrow_mut();
-                bases.retain(|(stamp, _, _, _)| stamp.matches(&theme));
-                if bases.len() == 4 { bases.pop_front(); }
-                bases.push_back((theme.downgrade(), input.screen, repainting, frame.pixels.0.clone()));
-            });
+            super::osd_cache::insert(&theme, input.screen, repainting, frame.pixels.0.clone());
         }
         for c in &components[prefix..] {
             if theme.pack().ink() { frame.ink_paint_component(c, input)?; }

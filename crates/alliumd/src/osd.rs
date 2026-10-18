@@ -420,6 +420,8 @@ impl<P: Platform> Osd<P> {
         };
         if result.is_ok() {
             self.shown.take();
+            common::theme::render::release_transient_caches();
+            common::memory::trim_heap();
         }
         result.inspect_err(|error| info!("osd hide error={error:#}"))
     }
@@ -431,6 +433,8 @@ impl<P: Platform> Osd<P> {
                 prepare_overlay(theme.clone(), kind, "Level", 0.5, repainting)?;
             }
         }
+        common::theme::render::release_transient_caches();
+        common::memory::trim_heap();
         info!("osd warm theme={} elapsed_ms={}", theme.pack().id, start.elapsed().as_millis());
         Ok(())
     }
@@ -451,7 +455,7 @@ fn prepare_frame(
     input.hints.push(common::theme::frame::Hint { button: "B".into(), label: "Back".into() });
     PreparedFrame::prepare(theme, &input)
 }
-fn prepare_overlay(
+pub(crate) fn prepare_overlay(
     theme: ThemeHandle,
     kind: OsdKind,
     title: &str,

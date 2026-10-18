@@ -3,14 +3,17 @@
 
 mod alliumd;
 mod osd;
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod memory_profile_tests;
 
 use anyhow::Result;
 use simple_logger::SimpleLogger;
 
 use crate::alliumd::AlliumD;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    common::memory::configure_daemon_allocator();
     common::timezone::load_saved_timezone();
     let _trace_drain = allium_menu::open_trace::ShutdownDrain;
     SimpleLogger::new().env().init().unwrap();

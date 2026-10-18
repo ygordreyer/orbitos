@@ -124,3 +124,23 @@ fn details_shadow_cold_partial_full_and_cached_frames_are_identical() {
         assert!(replacement.prewarm_detail_shadow_step(&mut stale), "theme replacement must discard work");
     }
 }
+
+#[test]
+fn explicit_theme_switch_releases_previous_theme_cached_pixels() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let state = std::env::temp_dir().canonicalize().unwrap().join(format!("allium-switch-cache-{}", std::process::id()));
+    std::fs::create_dir_all(&state).unwrap();
+    let mut runtime = crate::theme::ThemeRuntime::bind(&state, &repo.join("themes"), &repo.join("static/.allium/fonts")).unwrap();
+    let handle = runtime.choose("compact-plus").unwrap().snapshot.unwrap();
+    let input = model(&handle, ScreenId::Recents, 0, &arts());
+    let frame = PreparedFrame::prepare(handle.clone(), &input).unwrap();
+    let pixels: Vec<_> = TEXT.with(|cache| cache.borrow().iter().map(|e| Arc::downgrade(&e.pixels)).collect());
+    let surfaces: Vec<_> = SURFACES.with(|cache| cache.borrow().iter().map(|e| Arc::downgrade(&e.pixels)).collect());
+    assert!(!pixels.is_empty());
+    assert!(!surfaces.is_empty());
+    drop((frame, handle, input));
+    runtime.choose("orbit-row").unwrap();
+    std::fs::remove_dir_all(state).unwrap();
+    assert!(pixels.iter().all(|p| p.upgrade().is_none()), "previous theme text pixels remain resident");
+    assert!(surfaces.iter().all(|p| p.upgrade().is_none()), "previous theme surface pixels remain resident");
+}

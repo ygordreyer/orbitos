@@ -115,6 +115,7 @@ impl Cache {
         self.entries.push_front(entry);
     }
 }
+pub(super) fn clear() { CACHE.with(|c| *c.borrow_mut() = Cache::default()); }
 thread_local! { static CACHE: RefCell<Cache> = RefCell::new(Cache::default()); }
 pub(super) fn get(
     theme: &ThemeHandle,

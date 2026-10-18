@@ -108,6 +108,7 @@ impl ThemeRuntime {
         self.option_cache.clear();
         self.menu_cache = None;
         self.store.choose_legacy()?;
+        super::render::release_thread_caches();
         let changed = self.active.is_some();
         self.active = None;
         self.status = ThemeStatus::default();
@@ -285,6 +286,9 @@ impl ThemeRuntime {
             }
         }
         self.status.effective = self.active.as_ref().map(Identity::loaded);
+        if old != self.status.effective {
+            super::render::release_thread_caches();
+        }
         self.status.diagnostic = diagnostic.clone();
         let once = if diagnostic != self.last_diagnostic {
             diagnostic.clone()
@@ -397,6 +401,7 @@ impl ThemeRuntime {
         let candidate = self.prepare_options(&id, 0, &settings)?;
         let record = self.store.select(&candidate)?;
         let selected = candidate.generation_copy(record.generation);
+        super::render::release_thread_caches();
         self.option_cache.clear();
         self.cache_option(selected.clone());
         Ok(self.preview_activation(selected))
