@@ -1644,11 +1644,15 @@ impl PreparedFrame {
         } else {
             value_geometry.metrics.0
                 .ceil()
-                .min(p.value_width_percent.map_or(r.2 as f32 * 0.38, |percent| rect.2 as f32 * percent as f32 / 100.0))
+                .min(if c.kind == Kind::SettingsRows {
+                    (rect.2 as f32 - geometry[0].metrics.0.ceil() - p.value_gap.unwrap_or(7) as f32).max(0.0)
+                } else {
+                    p.value_width_percent.map_or(r.2 as f32 * 0.38, |percent| rect.2 as f32 * percent as f32 / 100.0)
+                })
         };
         let copy_width = (rect.2 as f32
             - if value_width > 0.0 {
-                value_width + 7.0
+                value_width + p.value_gap.unwrap_or(7) as f32
             } else {
                 0.0
             })
@@ -1658,7 +1662,7 @@ impl PreparedFrame {
         let vi = value_geometry.metrics;
         let value_extent = value_width.min(vi.2 - vi.1);
         let centered = align == Align::Center && value_width > 0.0;
-        let start = r.0 as f32 + (r.2 as f32 - title_width - value_extent - 7.0) / 2.0;
+        let start = r.0 as f32 + (r.2 as f32 - title_width - value_extent - p.value_gap.unwrap_or(7) as f32) / 2.0;
         for (i, (text, style)) in lines.iter().enumerate() {
             let (x, width) = if centered && i == 0 {
                 (start, title_width)
@@ -1688,7 +1692,7 @@ impl PreparedFrame {
         }
         if value_width > 0.0 {
             let x = if centered {
-                start + title_width + 7.0
+                start + title_width + p.value_gap.unwrap_or(7) as f32
             } else {
                 (rect.0 + rect.2) as f32 - value_width
             };
@@ -2655,7 +2659,7 @@ impl PreparedFrame {
     }
     fn ink_metadata(&mut self, c: &Component, input: &FrameInputs, value: &str) -> Result<()> {
         let p = c.paint.as_ref().unwrap();
-        let records: Vec<(String, String)> = if c.binding == Some(Binding::SelectedFacts) {
+        let mut records: Vec<(String, String)> = if c.binding == Some(Binding::SelectedFacts) {
             input.facts.clone()
         } else if !input.metadata.is_empty() {
             input.metadata.clone()
@@ -2679,6 +2683,7 @@ impl PreparedFrame {
                 })
                 .collect()
         };
+        records.retain(|(_, value)| !value.trim().is_empty());
         let label = self.ink_subtype(
             c,
             &p.label.clone().unwrap_or(Run {
@@ -2700,7 +2705,11 @@ impl PreparedFrame {
             if y + val.line > c.rect.1 + c.rect.3 {
                 break;
             }
-            if stacked {
+            if l.is_empty() {
+                self.ink_text(&c.id, Rect(c.rect.0, y, c.rect.2, val.line), &val, &v,
+                    1, Align::Left, Overflow::Ellipsis, false)?;
+                y += val.line + gap;
+            } else if stacked {
                 self.ink_text(
                     &c.id,
                     Rect(c.rect.0, y, c.rect.2, label.line),
@@ -3420,7 +3429,7 @@ mod settings_fit_tests {
             let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(name)).unwrap(), &bank, 1).unwrap();
             let c = theme.pack().screens[&ScreenId::SettingsPage].components.iter()
                 .find(|c| c.binding == Some(Binding::Breadcrumb)).unwrap().clone();
-            let icon = name == "compact-plus";
+            let icon = true;
             assert_eq!(c.paint.as_ref().unwrap().breadcrumb_icon, icon);
             let mut input = FrameInputs::new(ScreenId::SettingsPage);
             let mut actual = PreparedFrame::prepare(theme.clone(), &input).unwrap();
@@ -3437,24 +3446,57 @@ mod settings_fit_tests {
     }
 
     #[test]
-    fn compact_settings_values_and_headers_fit_without_ellipsis() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
-        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes/compact-plus")).unwrap(), &bank, 1).unwrap();
-        let frame = PreparedFrame::prepare(theme.clone(), &FrameInputs::new(ScreenId::SettingsPage)).unwrap();
-        let rows = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.kind == Kind::SettingsRows).unwrap();
-        let p = rows.paint.as_ref().unwrap();
-        let ty = frame.ink_subtype(rows, p.value.as_ref().unwrap());
-        let width = ((rows.rect.2 - 2 * theme.pack().alignment.as_ref().unwrap().row_inset) * p.value_width_percent.unwrap() / 100) as u32;
-        for value in ["2026-10-18 11:30:00", "English (United States)", "Check for Updates", "‹ UTC-3:30 ›"] {
-            assert_eq!(ty.lines(value, width, 1, Overflow::Ellipsis), [value], "value must fit: {value}");
+    fn settings_values_use_width_left_by_measured_label() {
+        for name in ["compact-plus", "orbit-row", "orbit-hero", "big-picture"] {
+            let theme = crate::theme::render_navigation::tests::theme(name, "square");
+            let rows = theme.pack().screens[&ScreenId::SettingsPage].components.iter()
+                .find(|c| c.kind == Kind::SettingsRows).unwrap();
+            for (label, value) in [("Date & Time", "2026-10-18 13:04"), ("Language", "English (United States)"),
+                ("Model Name", "Miyoo Mini+ (MY354)"), ("A very long label that cannot fit", "A very long value that cannot fit either")] {
+                let input = FrameInputs::new(ScreenId::SettingsPage);
+                let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+                frame.text_boxes.clear();
+                let row = Row { id: "test".into(), label: label.into(), value: value.into(), subtitle: String::new(), enabled: true };
+                frame.ink_row(rows, &row, Rect(rows.rect.0, rows.rect.1, rows.rect.2, rows.item_extent.unwrap()), &input, false).unwrap();
+                let boxes: Vec<_> = frame.text_boxes.iter().filter(|(id, _)| id == &rows.id).map(|(_, r)| *r).collect();
+                let ty = frame.ink_type(rows, false);
+                let mut vt = ty.clone(); vt.size *= 0.82;
+                if let Some(run) = &rows.paint.as_ref().unwrap().value { vt = frame.ink_subtype(rows, run); }
+                let inset = theme.pack().alignment.as_ref().unwrap().row_inset;
+                let width = rows.rect.2 - 2 * inset;
+                let label_width = ty.metrics(&ty.value(label)).0.ceil() as u32;
+                let value_width = vt.metrics(&vt.value(value)).0.ceil() as u32;
+                let gap = rows.paint.as_ref().unwrap().value_gap.unwrap_or(7);
+                if label_width + gap + value_width <= width {
+                    assert_eq!(boxes.len(), 2, "{name}/{label}");
+                    assert!(boxes[1].2 >= value_width, "{name}/{label}: value got {:?}, needs {value_width}", boxes[1]);
+                    assert_eq!(vt.lines(value, boxes[1].2, 1, Overflow::Ellipsis), [value]);
+                    assert!(boxes[0].0 + boxes[0].2 <= boxes[1].0, "columns overlap");
+                } else {
+                    assert!(boxes.iter().all(|r| r.0 + r.2 <= rows.rect.0 + rows.rect.2));
+                }
+            }
+            let frame = PreparedFrame::prepare(theme.clone(), &FrameInputs::new(ScreenId::SettingsPage)).unwrap();
+            let title = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.binding == Some(Binding::Title)).unwrap();
+            let ty = frame.ink_type(title, false);
+            let lines = ty.lines("SYSTEM UPDATE", title.rect.2, title.max_lines.unwrap(), title.overflow.unwrap());
+            assert!(!lines.iter().any(|line| line.contains('…')));
+            assert_eq!(lines.join(" "), "SYSTEM UPDATE");
         }
-        let title = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.binding == Some(Binding::Title)).unwrap();
-        let ty = frame.ink_type(title, false);
-        let lines = ty.lines("SYSTEM UPDATE", title.rect.2, title.max_lines.unwrap(), title.overflow.unwrap());
-        assert!(!lines.iter().any(|line| line.contains('…')));
-        assert_eq!(lines.join(" "), "SYSTEM UPDATE");
     }
+
+    #[test]
+    fn metadata_hides_empty_pairs_and_draws_unlabelled_counts_once() {
+        let theme = crate::theme::render_navigation::tests::theme("compact-plus", "square");
+        let c = theme.pack().screens[&ScreenId::Library].components.iter().find(|c| c.binding == Some(Binding::SelectedMetadata)).unwrap();
+        for (records, expected) in [(vec![], 0), (vec![("Platform".into(), String::new())], 0), (vec![(String::new(), "150 games".into())], 1)] {
+            let mut input = FrameInputs::new(ScreenId::Library); input.metadata = records;
+            let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            frame.text_boxes.clear(); frame.ink_component(c, &input).unwrap();
+            assert_eq!(frame.text_boxes.iter().filter(|(id, _)| id == &c.id).count(), expected);
+        }
+    }
+
 }
 
 #[cfg(test)]

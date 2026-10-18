@@ -814,7 +814,7 @@ where
             ScreenId::Apps => locale.t("tab-apps"),
             ScreenId::Recents => locale.t("tab-recents"),
             ScreenId::SearchResults => locale.t("sort-search"),
-            _ => locale.t("tab-games"),
+            _ => self.sort.directory_title().map(str::to_owned).unwrap_or_else(|| locale.t("tab-games")),
         };
         input.text.insert(Binding::Title, title);
         input.rows.insert(

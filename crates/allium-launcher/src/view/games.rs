@@ -324,6 +324,10 @@ fn partition_entries(entries: Vec<Entry>) -> (Vec<Entry>, Vec<crate::entry::game
 }
 
 impl Sort for GamesSort {
+    fn directory_title(&self) -> Option<&str> {
+        (self.directory().path != *ALLIUM_GAMES_DIR).then_some(self.directory().name.as_str())
+    }
+
     fn button_hint(&self, locale: &Locale) -> String {
         match self {
             GamesSort::Alphabetical(_) => locale.t("sort-alphabetical"),
@@ -392,6 +396,35 @@ impl Sort for GamesSort {
 mod metadata_tests {
     use super::*;
     use crate::entry::game::Game;
+
+    #[test]
+    fn polish_capture_system_folder() {
+        use common::theme::{FontBank, ThemeHandle, runtime::ThemeSnapshot, pack::{Binding, ScreenId}, render::PreparedFrame};
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let root = std::env::temp_dir().join(format!("allium-polish-folder-{}", std::process::id()));
+        let dir = root.join("Genesis");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["Gleylancer", "Sonic the Hedgehog"] { std::fs::write(dir.join(format!("{name}.md")), b"fixture").unwrap(); }
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new(); styles.load_fonts().unwrap();
+        map.insert(styles); map.insert(Locale::new("en-US")); map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480)); map.insert(Database::in_memory().unwrap());
+        let res = Resources::new(map);
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        for id in ["compact-plus", "orbit-row"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes").join(id)).unwrap(), &bank, 1).unwrap();
+            let mut list = EntryList::new(Rect::new(0, 0, 640, 480), res.clone(), GamesSort::Alphabetical(Directory::with_name(dir.clone(), "Genesis".into()))).unwrap();
+            let mut inputs = list.theme_models(ScreenId::Library, &theme).unwrap();
+            crate::theme_adapter::shell(&mut inputs[0], &res, 1);
+            if let Ok(out) = std::env::var("ALLIUM_POLISH_FRAMES") {
+                let out = std::path::Path::new(&out).join(id); std::fs::create_dir_all(&out).unwrap();
+                PreparedFrame::prepare(theme.clone(), &inputs[0]).unwrap().pixels().save_png(out.join("system-folder.png")).unwrap();
+            }
+            assert_eq!(inputs[0].text[&Binding::Title], "Genesis");
+            assert_eq!(GamesSort::Alphabetical(Directory::default()).directory_title(), None);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn metadata_refresh_waits_for_context_menu_to_close() {

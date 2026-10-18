@@ -1316,21 +1316,25 @@ mod orbit_proof {
         app.view.proof_select_tab(1);
         press(&mut app, Key::A, &tx).await;
         let identity = state(&app)["games"].clone();
+        // Cold frames only consume cached sidecars; this proof compares loaded metadata.
+        let selected = identity["child"]["selected_path"].as_str().unwrap();
+        let details = crate::view::details::Details::new(&Game::new(selected.into()), "PlayStation");
+        assert!(details.blurb.contains("Real Racing Roots"));
         let database_path = common::constants::ALLIUM_DATABASE.as_path();
         let db_before = fs::read(database_path).unwrap();
-        for id in ["orbit", "compact", "rail"] {
+        for id in ["orbit", "compact", "orbit-row"] {
             crate::theme_adapter::choose(&app.res, Some(id)).unwrap();
             app.view.set_should_draw();
             render_theme(&mut app);
             let models = app.view.proof_game_theme_inputs();
             let semantic = &models[0].text;
-            assert!(
-                semantic[&common::theme::pack::Binding::SelectedMetadata].contains("PlayStation")
-            );
-            assert!(
-                semantic[&common::theme::pack::Binding::SelectedBlurb]
-                    .contains("Real Racing Roots")
-            );
+            if id == "orbit" {
+                assert!(semantic[&common::theme::pack::Binding::SelectedMetadata].is_empty());
+                assert!(semantic[&common::theme::pack::Binding::SelectedBlurb].is_empty());
+            } else {
+                assert!(semantic[&common::theme::pack::Binding::SelectedMetadata].contains("PlayStation"));
+                assert!(semantic[&common::theme::pack::Binding::SelectedBlurb].contains("Real Racing Roots"));
+            }
             let handle = crate::theme_adapter::snapshot(&app.res).unwrap();
             if id == "orbit" {
                 assert!(
@@ -1790,6 +1794,8 @@ mod orbit_proof {
         press(&mut app, Key::R, &tx).await;
         assert_eq!(state(&app)["selected"], 2);
         press(&mut app, Key::Right, &tx).await;
+        assert_eq!(state(&app)["selected"], 2, "Apps owns directional selection");
+        press(&mut app, Key::R, &tx).await;
         assert_eq!(state(&app)["selected"], 3);
         press(&mut app, Key::L, &tx).await;
         assert_eq!(
@@ -1798,7 +1804,8 @@ mod orbit_proof {
             "themed root Settings uses explicit shoulder tabs"
         );
         press(&mut app, Key::Left, &tx).await;
-        press(&mut app, Key::Left, &tx).await;
+        assert_eq!(state(&app)["selected"], 2, "Apps owns directional selection");
+        press(&mut app, Key::L, &tx).await;
         assert_eq!(state(&app)["selected"], 1);
         press(&mut app, Key::X, &tx).await;
         assert!(matches!(rx.try_recv().unwrap(), Command::StartSearch));

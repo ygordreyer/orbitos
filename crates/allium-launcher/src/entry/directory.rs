@@ -24,7 +24,7 @@ use crate::{
 };
 
 thread_local! {
-    static SYSTEM_COUNTS: RefCell<HashMap<PathBuf, (SystemTime, usize)>> = RefCell::new(HashMap::new());
+    static SYSTEM_COUNTS: RefCell<HashMap<PathBuf, (Option<SystemTime>, u64, usize)>> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn invalidate_system_counts() {
@@ -105,45 +105,44 @@ impl Directory {
         entries.retain_mut(|entry| {
             if let Entry::Directory(directory) = entry {
                 let virtual_system = crate::network_runtime::virtual_directory(&directory.path);
-                if virtual_system {
-                    directory.game_count = None;
-                    return true;
-                }
                 let count = directory.cached_game_count(console_mapper);
                 directory.game_count = Some(count);
-                count > 0
+                count > 0 || virtual_system
             } else { true }
         });
     }
 
     fn cached_game_count(&self, console_mapper: &ConsoleMapper) -> usize {
         let modified = fs::metadata(&self.path).and_then(|metadata| metadata.modified()).ok();
+        let catalog = crate::network_runtime::art_path_generation();
         SYSTEM_COUNTS.with(|counts| {
-            if let Some((stamp, count)) = counts.borrow().get(&self.path) {
-                if modified == Some(*stamp) { return *count; }
+            if let Some((stamp, generation, count)) = counts.borrow().get(&self.path) {
+                if modified == *stamp && catalog == *generation { return *count; }
             }
             // Stop the emptiness probe at the first playable entry. Only count a
             // populated system once, until its mtime or an explicit rescan changes.
-            let count = if self.walk_games(console_mapper, &mut HashSet::new(), 1) == 0 {
+            let count = if crate::network_runtime::virtual_directory(&self.path) {
+                self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX)
+            } else if self.walk_games(console_mapper, &mut HashSet::new(), 1) == 0 {
                 0
             } else {
                 self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX)
             };
-            if let Some(modified) = modified {
-                counts.borrow_mut().insert(self.path.clone(), (modified, count));
-            }
+            counts.borrow_mut().insert(self.path.clone(), (modified, catalog, count));
             count
         })
     }
 
     fn walk_games(&self, console_mapper: &ConsoleMapper, ancestors: &mut HashSet<PathBuf>, limit: usize) -> usize {
-        let Ok(canonical) = self.path.canonicalize() else { return 0; };
+        let canonical = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
         if !ancestors.insert(canonical.clone()) { return 0; }
         #[cfg(test)]
         super::load_work::record(|work| work.directory_reads += 1);
-        let count = fs::read_dir(&self.path).map_or(0, |entries| {
-            let mut count = 0;
-            for entry in entries.filter_map(Result::ok) {
+        let virtual_system = crate::network_runtime::virtual_directory(&self.path);
+        let mut entries = Vec::new();
+        let mut count = 0;
+        if let Ok(physical) = fs::read_dir(&self.path) {
+            for entry in physical.filter_map(Result::ok) {
                 #[cfg(test)]
                 super::load_work::record(|work| work.file_types += 1);
                 let path = entry.path();
@@ -154,15 +153,29 @@ impl Directory {
                         Err(_) => continue,
                     },
                 };
-                count += match Entry::from_scanned_path(path, is_dir, console_mapper).ok().flatten() {
-                    Some(Entry::Directory(directory)) => directory.walk_games(console_mapper, ancestors, limit - count),
-                    Some(Entry::Game(_) | Entry::App(_)) => 1,
-                    None => 0,
-                };
-                if count >= limit { break; }
+                if let Some(entry) = Entry::from_scanned_path(path, is_dir, console_mapper).ok().flatten() {
+                    if virtual_system {
+                        entries.push(entry);
+                    } else {
+                        count += match entry {
+                            Entry::Directory(directory) => directory.walk_games(console_mapper, ancestors, limit - count),
+                            Entry::Game(_) | Entry::App(_) => 1,
+                        };
+                        if count >= limit { break; }
+                    }
+                }
             }
-            count
-        });
+        }
+        if virtual_system { crate::network_runtime::merge_directory(&self.path, &mut entries); }
+        let mut seen = HashSet::new();
+        for entry in entries {
+            if !seen.insert(entry.path().to_path_buf()) { continue; }
+            count += match entry {
+                Entry::Directory(directory) => directory.walk_games(console_mapper, ancestors, limit - count),
+                Entry::Game(_) | Entry::App(_) => 1,
+            };
+            if count >= limit { break; }
+        }
         ancestors.remove(&canonical);
         count
     }
@@ -589,6 +602,29 @@ pub(crate) mod list_tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0.path).unwrap();
         }
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn library_virtual_playstation_counts_local_catalog_and_multidisc_entries() {
+        let (_fixture, game) = crate::network_runtime::tests::details_slot_fixture();
+        let system = game.path.parent().unwrap();
+        assert!(crate::network_runtime::virtual_directory(system));
+        for name in ["Local.cue", "Local.chd", "Playlist.m3u"] { fs::write(system.join(name), b"fixture").unwrap(); }
+        fs::create_dir(system.join("Multi.m3u")).unwrap();
+        fs::write(system.join("Multi.m3u/Disc.chd"), b"fixture").unwrap();
+        let mapper = ConsoleMapper::new();
+        let mut entries = vec![Entry::Directory(Directory::new(system.to_path_buf()))];
+        invalidate_system_counts();
+        Directory::retain_populated_systems(&mut entries, &mapper);
+        let Entry::Directory(directory) = &entries[0] else { panic!("system"); };
+        assert_eq!(directory.game_count, Some(5), "catalog identity is counted once, including its physical copy");
+        let before = super::super::load_work::take();
+        assert_eq!(directory.cached_game_count(&mapper), 5);
+        assert_eq!(super::super::load_work::take().directory_reads, 0, "cached root loads must not scan again: {before:?}");
+        fs::remove_file(&game.path).unwrap();
+        invalidate_system_counts();
+        assert_eq!(directory.cached_game_count(&mapper), 5, "uncached catalog game remains listed");
     }
 
     #[test]

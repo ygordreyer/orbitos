@@ -39,11 +39,18 @@ async fn parity_b_settings_pages_and_edit_previews() {
             let input = &mut models[0];
             assert_eq!(input.screen, ScreenId::SettingsPage);
             assert!(contexts.insert(input.text[&Binding::Subtitle].clone()), "each page needs distinct context");
-            assert!(input.text[&Binding::Message].contains('\n'));
+            assert!(!input.text[&Binding::Message].contains('\n'));
+            assert_eq!(input.text[&Binding::Message].matches('.').count(), 1);
             assert!(!input.text[&Binding::Breadcrumb].is_empty());
-            for c in &theme.pack().screens[&ScreenId::SettingsPage].components {
+            let components = &theme.pack().screens[&ScreenId::SettingsPage].components;
+            if components.iter().any(|c| c.id == "section-pane" || c.id == "context-sheet") {
+                for binding in [Binding::Subtitle, Binding::Message, Binding::Breadcrumb] {
+                    assert!(components.iter().any(|c| c.binding == Some(binding)), "side panels must consume page context");
+                }
+            }
+            for c in components {
                 if c.binding == Some(Binding::Breadcrumb) {
-                    assert_eq!(c.paint.as_ref().unwrap().breadcrumb_icon, theme.pack().id == "compact-plus");
+                    assert!(c.paint.as_ref().unwrap().breadcrumb_icon);
                 }
             }
             if *name == "system" {
@@ -150,5 +157,57 @@ async fn datetime_editing_hints_match_field_selection_and_value_keys() {
             assert_eq!(hints, [("Left/Right", "Change"), ("A", "Save"), ("B", "Cancel")]);
         }
         clock.handle_key_event(KeyEvent::Pressed(Key::B), tx.clone(), &mut bubble).await.unwrap();
+    }
+}
+
+#[test]
+#[ignore = "explicit 640x480 launcher polish evidence"]
+fn polish_capture_settings() {
+    for (variant, theme) in parity_variants().into_iter().filter(|(id, _)|
+        id == "compact-plus-square-orange" || id == "orbit-row-square-default") {
+        let locale = Locale::new("en-US");
+        let mut map = type_map::TypeMap::new();
+        map.insert(Locale::new("en-US"));
+        let res = Resources::new(map);
+        for (name, key, rows) in [
+            ("date-time", "settings-clock", vec![("Date & Time", "2026-10-18 13:04"), ("Timezone", "UTC-3")]),
+            ("language", "settings-language", vec![("Language", "English (United States)")]),
+            ("about", "settings-about", vec![("Product", "OrbitOS"), ("Version", common::product::VERSION), ("Build", common::product::BUILD_ID), ("Model Name", "Miyoo Mini+ (MY354)")]),
+            ("system-update", "settings-system-update-menu", vec![("Version", common::product::VERSION), ("System Update", "Manual updates")]),
+        ] {
+            let mut input = common::theme::frame::FrameInputs::new(ScreenId::SettingsPage);
+            input.text.insert(Binding::Title, locale.t(key));
+            page_context(&mut input, &locale, key);
+            input.rows.insert(Binding::SettingsRows, rows.into_iter().enumerate().map(|(i, (label,value))| common::theme::frame::Row {
+                id: format!("setting-{i}"), label: label.into(), value: value.into(), subtitle: String::new(), enabled: true,
+            }).collect());
+            input.focus = common::theme::frame::Focus { component: crate::theme_adapter::component_id(&theme, ScreenId::SettingsPage, Binding::SettingsRows), item: Some("setting-0".into()) };
+            crate::theme_adapter::shell(&mut input, &res, 3);
+            input.status = Status { clock: Some("13:04".into()), battery: Some(100), network: Some("online".into()), ..Default::default() };
+            parity_save(&variant, name, PreparedFrame::prepare(theme.clone(), &input).unwrap().pixels());
+        }
+    }
+}
+
+#[test]
+fn settings_panel_context_uses_each_pages_localized_copy_and_existing_icon() {
+    let locale = Locale::new("en-US");
+    let mut headings = std::collections::HashSet::new();
+    for (key, page, icon) in [
+        ("settings-system-update-menu", "update", "apps"), ("settings-wifi", "wifi", "wifi"),
+        ("settings-clock", "clock", "recents"), ("settings-power", "power", "power"),
+        ("settings-display", "display", "display"), ("settings-theme", "theme", "settings"),
+        ("settings-language", "language", "library"), ("settings-about", "about", "apps"),
+    ] {
+        let mut input = common::theme::frame::FrameInputs::new(ScreenId::SettingsPage);
+        page_context(&mut input, &locale, key);
+        let heading = &input.text[&Binding::Subtitle];
+        let description = &input.text[&Binding::Message];
+        assert_eq!(heading, &locale.t(&format!("settings-context-{page}-heading")));
+        assert!(headings.insert(heading.clone()), "page context must be distinct");
+        assert_eq!(description, &locale.t(&format!("settings-context-{page}-description")));
+        assert!(!description.starts_with("settings-") && !description.contains('\n'));
+        assert_eq!(description.matches('.').count(), 1, "one sentence per page");
+        assert_eq!(input.text[&Binding::Breadcrumb], icon);
     }
 }

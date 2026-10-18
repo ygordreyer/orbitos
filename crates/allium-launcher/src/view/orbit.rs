@@ -1130,6 +1130,12 @@ fn fit_art(image: Pixmap, target: Option<ArtTarget>) -> Option<Pixmap> {
     } else { Some(image) }
 }
 fn load_device_art_fitted(path: &Path, width: u32, height: u32, target: Option<ArtTarget>, logo: bool, portrait: bool) -> Option<Pixmap> {
+    let cover_logo = !logo && path.file_name().is_some_and(|name| name == "logo.png");
+    let portrait = portrait && !cover_logo;
+    let target = target.map(|mut target| {
+        if cover_logo { target.fit = common::theme::pack::Fit::Contain; }
+        target
+    });
     if portrait && target.is_none() {
         return load_device_art_fitted(path, width, height, None, logo, false).and_then(portrait::compose);
     }
@@ -1151,7 +1157,10 @@ fn load_device_art_fitted(path: &Path, width: u32, height: u32, target: Option<A
     if w == 0 || h == 0 || w > width || h > height {
         return None;
     }
-    let target = target.map(|target| if logo { target.logo(w, h) } else { target });
+    let target = target.map(|target| if logo { target.logo(w, h) } else { target })
+        .or_else(|| cover_logo.then_some(ArtTarget {
+            width: w.max(h), height: w.max(h), fit: common::theme::pack::Fit::Contain, logo_box: false,
+        }));
     let dimensions = target.map_or((w, h), |target| (target.width, target.height));
     let key = crate::art_cache::ArtKey::with_fit(path, &metadata, &bytes,
         if portrait { (1, 1) } else { (0, 0) }, dimensions, false, target.map(|target| target.fit));
@@ -2467,6 +2476,25 @@ mod performance_round_tests {
         drop(previous);
         assert_eq!(orbit.source_bytes(), 294840 + 15 * 78400);
     }
+    #[test]
+    fn directory_logo_cover_fallback_is_contained_and_centered() {
+        let root = std::env::temp_dir().join(format!("allium-polish-logo-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("logo.png");
+        let mut logo = Pixmap::new(160, 40).unwrap(); logo.fill(tiny_skia::Color::from_rgba8(220, 80, 20, 255));
+        logo.save_png(&path).unwrap();
+        for target in [None, Some(ArtTarget { width: 128, height: 128, fit: common::theme::pack::Fit::Cover, logo_box: false })] {
+            let image = load_device_art_fitted(&path, 480, 480, target, false, true).unwrap();
+            assert_eq!(image.width(), image.height());
+            assert_eq!(image.pixel(0, 0).unwrap().alpha(), 0);
+            assert_eq!(image.pixel(image.width()/2, image.height()/2).unwrap().alpha(), 255);
+            let rows: Vec<_> = (0..image.height()).filter(|y| image.pixel(image.width()/2, *y).unwrap().alpha() > 0).collect();
+            assert!(rows.len() as u32 <= image.height()/4 + 2, "logo aspect ratio survives cover fitting");
+            assert!((rows[0] + rows[rows.len()-1]).abs_diff(image.height()-1) <= 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn oversized_opened_source_is_rejected_before_payload_read() {
         let path = std::env::temp_dir().join(format!("allium-oversize-{}.png", std::process::id()));

@@ -176,6 +176,7 @@ fn short_name(mut name: &str) -> String {
 pub trait Sort: Debug + Clone {
     const HAS_BUTTON_HINTS: bool = true;
     fn button_hint(&self, locale: &Locale) -> String;
+    fn directory_title(&self) -> Option<&str> { None }
     fn next(&self) -> Self;
     fn with_directory(&self, directory: Directory) -> Self;
     fn entries(

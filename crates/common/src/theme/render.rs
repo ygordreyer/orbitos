@@ -1668,9 +1668,12 @@ impl PreparedFrame {
         } else {
             ColorRole::Text
         };
+        let row_style = self.theme.text_style(c.role.unwrap(), self.color(color));
         let value_width = if row.value.is_empty() { 0 } else {
-            self.theme.text_style(c.role.unwrap(), self.color(color)).measure(&row.value).w
-                .min(text_rect.2 * 2 / 5)
+            let available = if c.kind == Kind::SettingsRows {
+                text_rect.2.saturating_sub(row_style.measure(&row.label).w + 8)
+            } else { text_rect.2 * 2 / 5 };
+            row_style.measure(&row.value).w.min(available)
         };
         self.text(
             &c.id,

@@ -1850,3 +1850,22 @@ mod logo_cover;
 mod parity_c_tests;
 #[path = "parity_tests.rs"]
 mod parity_d;
+
+#[test]
+fn settings_builtin_values_use_remaining_row_width() {
+    let bank = FontBank::bind(&font_root()).unwrap();
+    for id in ["orbit", "compact"] {
+        let theme = ThemeHandle::prepare(ThemeSnapshot::builtin(id).unwrap(), &bank, 1).unwrap();
+        let c = theme.pack().screens[&ScreenId::SettingsPage].components.iter().find(|c| c.binding == Some(Binding::SettingsRows)).unwrap();
+        let style = theme.text_style(c.role.unwrap(), crate::display::color::Color::new(255, 255, 255));
+        let label = "Date";
+        let value = "2026-10-18 13:04:00";
+        let mut input = FrameInputs::new(ScreenId::SettingsPage);
+        input.rows.insert(Binding::SettingsRows, vec![Row { id: "clock".into(), label: label.into(), value: value.into(), subtitle: String::new(), enabled: true }]);
+        let rendered = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+        let boxes: Vec<_> = rendered.text_boxes.iter().filter(|(id, _)| id == &c.id).map(|(_, r)| *r).collect();
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes[1].2 >= style.measure(value).w, "{id}: value should fit after short label");
+        assert!(boxes[0].0 + boxes[0].2 + 8 <= boxes[1].0);
+    }
+}

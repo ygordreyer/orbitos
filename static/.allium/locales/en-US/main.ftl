@@ -223,26 +223,18 @@ library-game-count = { $count } games
 settings-update-manual = Manual updates
 settings-update-managed = Updates are managed manually for this build.
 settings-context-clock-heading = YOUR TIME
-settings-context-clock-description = Set the date and time.
-    Choose your local time zone.
+settings-context-clock-description = Set the date, time and local time zone.
 settings-context-update-heading = YOUR BUILD
-settings-context-update-description = Check your installed version.
-    Update this build manually.
+settings-context-update-description = Check the installed version before updating manually.
 settings-context-wifi-heading = YOUR NETWORK
-settings-context-wifi-description = Connect to a Wi-Fi network.
-    Manage wireless access.
+settings-context-wifi-description = Connect to Wi-Fi and manage wireless access.
 settings-context-power-heading = YOUR POWER
-settings-context-power-description = Choose sleep and power options.
-    Keep your battery lasting longer.
+settings-context-power-description = Choose sleep and power options to save battery.
 settings-context-display-heading = YOUR DISPLAY
-settings-context-display-description = Adjust brightness and colors.
-    Set a comfortable view.
+settings-context-display-description = Adjust brightness and colors for a comfortable view.
 settings-context-theme-heading = YOUR STYLE
-settings-context-theme-description = Choose your launcher theme.
-    Adjust its colors and artwork.
+settings-context-theme-description = Choose a launcher theme, colors and artwork.
 settings-context-language-heading = YOUR LANGUAGE
-settings-context-language-description = Choose your menu language.
-    Make the launcher feel familiar.
+settings-context-language-description = Choose the language used by your menus.
 settings-context-about-heading = YOUR DEVICE
-settings-context-about-description = View your installed build.
-    See device information.
+settings-context-about-description = View device information and the installed build.
