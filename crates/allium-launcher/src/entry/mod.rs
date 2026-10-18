@@ -1,5 +1,6 @@
 pub mod app;
 pub mod directory;
+pub(crate) mod display_names;
 pub mod game;
 mod gamelist;
 pub mod lazy_image;

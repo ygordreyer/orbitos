@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use crate::consoles::ConsoleMapper;
+use crate::entry::{Entry, display_names::DisplayNames};
 use crate::entry::game::Game;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -168,6 +169,9 @@ impl RecentsCarousel {
             return Ok(());
         }
 
+        let entries: Vec<_> = self.games.iter().cloned().map(Entry::Game).collect();
+        let names = DisplayNames::new(&entries);
+        let name = names.name(&entries[self.selected]).to_owned();
         let game = &mut self.games[self.selected];
 
         self.screenshot.set_path(
@@ -176,7 +180,7 @@ impl RecentsCarousel {
                 .or_else(|| game.image.image().map(Path::to_owned)),
         );
         self.screenshot.set_should_draw();
-        self.game_name.set_text(game.name.clone());
+        self.game_name.set_text(name);
         self.game_name.scroll(true);
         self.button_hints.set_should_draw();
 
@@ -351,6 +355,34 @@ impl View for RecentsCarousel {
 mod name_refresh_tests {
     use super::*;
     use crate::entry::lazy_image::LazyImage;
+
+    #[test]
+    fn carousel_collision_labels_preserve_game_names_and_clear_after_removal() {
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(Database::in_memory().unwrap());
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        let mut carousel = RecentsCarousel::new(Rect::new(0, 54, 640, 376),
+            Resources::new(map), RecentsCarouselState::default()).unwrap();
+        carousel.games = ["Game (USA).nes", "Game (Europe).nes"].into_iter().map(|file| {
+            let mut game = Game::new(file.into());
+            game.image = LazyImage::NotFound;
+            game
+        }).collect();
+        carousel.update_current_game().unwrap();
+        assert_eq!(carousel.game_name.text(), "Game (USA)");
+        carousel.navigate_down().unwrap();
+        assert_eq!(carousel.game_name.text(), "Game (Europe)");
+        assert!(carousel.games.iter().all(|game| game.name == "Game"));
+        carousel.games.remove(0);
+        carousel.selected = 0;
+        carousel.update_current_game().unwrap();
+        assert_eq!(carousel.game_name.text(), "Game");
+    }
 
     #[test]
     fn name_refresh_retries_cold_carousel_cover_and_updates_selected_image() {

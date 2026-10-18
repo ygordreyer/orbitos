@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use crate::consoles::ConsoleMapper;
+use crate::entry::display_names::DisplayNames;
 use crate::entry::{Entry, Sort};
 use crate::view::disc_picker::DiscPicker;
 use crate::view::orbit::Orbit;
@@ -221,6 +222,7 @@ where
     rect: Rect,
     res: Resources,
     entries: Vec<Entry>,
+    display_names: DisplayNames,
     media_generation: u64,
     list_revision: u64,
     recents_semantic: VecDeque<RecentsSemantic>,
@@ -341,6 +343,7 @@ where
             rect,
             res,
             entries: vec![],
+            display_names: DisplayNames::default(),
             media_generation: common::media::generation(),
             list_revision: 0,
             recents_semantic: VecDeque::new(),
@@ -374,6 +377,7 @@ where
 
     pub fn enable_orbit(&mut self) {
         self.orbit = Some(Orbit::new());
+        self.orbit.as_mut().unwrap().set_display_names(self.display_names.clone());
         if let Some(child) = self.child.as_mut() {
             child.enable_orbit();
         } else {
@@ -777,13 +781,13 @@ where
         self.build_theme_model(screen, handle, selected, first, count, None)
     }
 
-    fn semantic_row(res: &Resources, entry: &Entry) -> common::theme::frame::Row {
+    fn semantic_row(res: &Resources, entry: &Entry, names: &DisplayNames) -> common::theme::frame::Row {
         #[cfg(test)]
         SEMANTIC_ROW_BUILDS.with(|count| count.set(count.get() + 1));
         common::theme::frame::Row {
             subtitle: res.get::<ConsoleMapper>().get_console(entry.path()).map(|c| c.name.clone()).unwrap_or_default(),
             id: crate::theme_adapter::entry_id(entry.path()),
-            label: entry.name().into(),
+            label: names.name(entry).into(),
             value: if crate::network_runtime::download_id(entry.path()).is_some() {
                 "Cloud".into()
             } else {
@@ -820,7 +824,7 @@ where
         input.rows.insert(
             Binding::Entries,
             rows.unwrap_or_else(|| self.entries.iter().skip(first).take(count)
-                .map(|entry| Self::semantic_row(&self.res, entry)).collect()),
+                .map(|entry| Self::semantic_row(&self.res, entry, &self.display_names)).collect()),
         );
         if let Some(entry) = self.entries.get(selected) {
             let selected_row = selected.checked_sub(first)
@@ -838,7 +842,7 @@ where
             input.selected.insert(Binding::Entries, id);
             input
                 .text
-                .insert(Binding::SelectedTitle, entry.name().into());
+                .insert(Binding::SelectedTitle, self.display_names.name(entry).into());
             if matches!(entry, Entry::Game(_)) {
                 input.hints = vec![
                     Hint {
@@ -1048,7 +1052,7 @@ where
                 }) {
                     cache.remove(index).unwrap().1
                 } else {
-                    Self::semantic_row(&self.res, entry)
+                    Self::semantic_row(&self.res, entry, &self.display_names)
                 };
                 let output = row.clone();
                 cache.push_back((entry.path().to_path_buf(), row));
@@ -1448,15 +1452,19 @@ where
         self.entries = self
             .sort
             .entries(&self.res.get(), &self.res.get(), &self.res.get())?;
+        self.display_names = DisplayNames::new(&self.entries);
+        if let Some(orbit) = self.orbit.as_mut() {
+            orbit.set_display_names(self.display_names.clone());
+        }
         self.media_generation = common::media::generation();
         self.list.set_items(
             self.entries
                 .iter()
                 .map(|e| match e {
                     Entry::Game(game) => {
-                        format!("{}{}", if game.favorite { "♥ " } else { "" }, e.name())
+                        format!("{}{}", if game.favorite { "♥ " } else { "" }, self.display_names.name(e))
                     }
-                    _ => e.name().to_string(),
+                    _ => self.display_names.name(e).to_string(),
                 })
                 .collect(),
             self.sort.preserve_selection(),
@@ -1853,7 +1861,7 @@ where
                                     format!(
                                         "{}{}",
                                         if game.favorite { "♥ " } else { "" },
-                                        entry.name()
+                                        self.display_names.name(entry)
                                     ),
                                 );
                             }
@@ -2592,6 +2600,32 @@ pub(crate) mod ux4_tests {
         map.insert(Database::in_memory().unwrap());
         Resources::new(map)
     }
+    #[test]
+    fn collision_labels_reach_library_recents_and_search_without_reordering() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
+        let paths: Vec<PathBuf> = ["Game (USA).zip", "Game (Europe).nes", "Game (USA).nes"]
+            .into_iter().map(PathBuf::from).collect();
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), resources(),
+            PathsSort { paths: paths.clone() }).unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/compact-plus")).unwrap(), &bank, 701).unwrap();
+        let expected = ["Same title (USA) (ZIP)", "Same title (Europe)", "Same title (USA) (NES)"];
+        for screen in [ScreenId::Library, ScreenId::Recents, ScreenId::SearchResults] {
+            for _ in 0..2 {
+                let model = list.recents_theme_model(screen, &theme, 0, 0, 3);
+                let labels: Vec<_> = model.rows[&Binding::Entries].iter().map(|row| row.label.as_str()).collect();
+                assert_eq!(labels, expected);
+                assert_eq!(model.text[&Binding::SelectedTitle], expected[0]);
+            }
+        }
+        assert_eq!(list.entries.iter().map(|entry| entry.path().to_path_buf()).collect::<Vec<_>>(), paths);
+        assert!(list.entries.iter().all(|entry| entry.name() == "Same title"));
+        list.sort(PathsSort { paths: vec![paths[0].clone()] }).unwrap();
+        let model = list.base_theme_model(ScreenId::Library, &theme, 0, 0, 3);
+        assert_eq!(model.rows[&Binding::Entries][0].label, "Same title");
+    }
+
     pub(crate) fn offers_download(game: Game) -> bool {
         let mut list = EntryList::new(
             Rect::new(0, 54, 640, 376),
@@ -3646,6 +3680,10 @@ impl<S: Sort> EntryList<S> {
             .map(|entry| entry.path().to_path_buf());
         let names_changed = self.sort.refresh_names(&mut self.entries);
         if names_changed {
+            self.display_names = DisplayNames::new(&self.entries);
+            if let Some(orbit) = self.orbit.as_mut() {
+                orbit.set_display_names(self.display_names.clone());
+            }
             self.list_revision = self.list_revision.wrapping_add(1);
             let selected = selected_path
                 .as_ref()
@@ -3656,9 +3694,9 @@ impl<S: Sort> EntryList<S> {
                     .iter()
                     .map(|entry| match entry {
                         Entry::Game(game) => {
-                            format!("{}{}", if game.favorite { "♥ " } else { "" }, entry.name())
+                            format!("{}{}", if game.favorite { "♥ " } else { "" }, self.display_names.name(entry))
                         }
-                        _ => entry.name().to_string(),
+                        _ => self.display_names.name(entry).to_string(),
                     })
                     .collect(),
                 false,

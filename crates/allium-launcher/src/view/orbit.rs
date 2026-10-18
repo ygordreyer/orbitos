@@ -204,6 +204,7 @@ struct ResolvedPaths {
 
 #[derive(Debug)]
 pub struct Orbit {
+    display_names: crate::entry::display_names::DisplayNames,
     cache: VecDeque<CachedArt>,
     source_account: std::rc::Rc<std::cell::Cell<usize>>,
     generation: u64,
@@ -234,6 +235,7 @@ pub struct Orbit {
 impl Orbit {
     pub fn new() -> Self {
         Self {
+            display_names: crate::entry::display_names::DisplayNames::default(),
             cache: VecDeque::new(),
             source_account: source_account(),
             generation: art_generation(),
@@ -263,6 +265,11 @@ impl Orbit {
             #[cfg(feature = "perf-bench")]
             worker_samples: Vec::new(),
         }
+    }
+
+    pub(crate) fn set_display_names(&mut self, names: crate::entry::display_names::DisplayNames) {
+        self.display_names = names;
+        self.dirty = true;
     }
 
     pub(crate) fn defer_legacy(&mut self) {
@@ -926,7 +933,7 @@ impl Orbit {
                 small.draw(&mut display.pixmap_mut(), &status, Point::new(124, 69));
             }
             small.draw(&mut display.pixmap_mut(), "LIBRARY", Point::new(24, 69));
-            let lines = wrapped(&title, entry.name(), 340, 3);
+            let lines = wrapped(&title, self.display_names.name(entry), 340, 3);
             for (index, line) in lines.iter().enumerate() {
                 title.draw(
                     &mut display.pixmap_mut(),
@@ -1024,7 +1031,7 @@ impl Orbit {
                     Color::new(255, 255, 255),
                 );
             }
-            let label = wrapped(&caption, entry.name(), 158, 1);
+            let label = wrapped(&caption, self.display_names.name(entry), 158, 1);
             if let Some(line) = label.first() {
                 caption.draw(&mut display.pixmap_mut(), line, Point::new(x, y + 136));
             }
