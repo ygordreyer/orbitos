@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn library_long_title_stays_on_one_line_clear_of_box_art() {
+    use crate::theme::render_navigation::tests::{arts, model};
+    let title = "Advanced Busterhawk Gleylancer";
+    let arts = arts();
+    let mut failures = Vec::new();
+    for (id, theme) in themes().into_iter().filter(|(_, t)| t.pack().ink()) {
+        for screen in [ScreenId::Library, ScreenId::Recents] {
+            let components = &theme.pack().screens[&screen].components;
+            let Some(component) = components.iter().find(|c|
+                c.binding == Some(Binding::SelectedTitle)
+                    || c.binding == Some(Binding::SelectedLogo)) else { continue; };
+            let mut input = model(&theme, screen, 0, &arts);
+            input.text.insert(Binding::SelectedTitle, title.into());
+            input.art.selected_logo = None;
+            let rendered = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            if let Ok(out) = std::env::var("ALLIUM_TITLE_FRAMES") {
+                std::fs::create_dir_all(&out).unwrap();
+                rendered.pixels().save_png(std::path::Path::new(&out)
+                    .join(format!("{id}-{screen:?}.png"))).unwrap();
+            }
+            let mut frame = PreparedFrame::unpainted(theme.clone(), screen);
+            TEXT_PLAN.with(|plan| *plan.borrow_mut() = Some(Vec::new()));
+            let result = frame.ink_component(component, &input);
+            let texts = TEXT_PLAN.with(|plan| plan.borrow_mut().take().unwrap());
+            result.unwrap();
+            assert_eq!(texts.len(), 1, "{id}/{screen:?}: missing title fallback");
+            let text = &texts[0];
+            let lines = text.ty.lines(&text.value, text.rect.2, text.count, text.overflow);
+            if lines.len() != 1 {
+                failures.push(format!("{id}/{screen:?}: expected one title line, got {lines:?}"));
+            }
+            if text.ty.advance_width(&text.value) > text.rect.2 as f32 {
+                assert!(lines.last().unwrap().ends_with('…'), "{id}/{screen:?}: {lines:?}");
+            }
+            let glyphs = text.pixels().unwrap();
+            assert!(glyphs.pixels().iter().any(|p| p.alpha() > 0));
+            for art in components.iter().filter(|c|
+                c.binding == Some(Binding::SelectedCover)
+                    || c.kind == Kind::Entries && c.layout == Some(Arrangement::Shelf)) {
+                for (index, _) in glyphs.pixels().iter().enumerate().filter(|(_, p)| p.alpha() > 0) {
+                    let x = text.rect.0 + index as u32 % text.rect.2;
+                    let y = text.rect.1 + index as u32 / text.rect.2;
+                    assert!(!(x >= art.rect.0 && x < art.rect.0 + art.rect.2
+                        && y >= art.rect.1 && y < art.rect.1 + art.rect.3),
+                        "{id}/{screen:?}: title glyph at {x},{y} overlaps {} {:?}", art.id, art.rect);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn compact_plus_stacked_clock_fits_every_minute_without_ellipsis() {
     let theme = crate::theme::render_navigation::tests::theme("compact-plus", "square");
     for screen in [ScreenId::Recents, ScreenId::GameDetail] {
