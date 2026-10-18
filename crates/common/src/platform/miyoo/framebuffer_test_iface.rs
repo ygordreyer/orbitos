@@ -1655,3 +1655,157 @@ fn fragmented_repair_fallback_matches_old_history_and_all_framebuffer_bytes() {
     assert_eq!(display.iface.frame, old.iface.frame);
     assert_visible(&display, 0, "fragmented hidden page repaired after pan");
 }
+
+
+#[cfg(test)]
+fn osd_display() -> super::FramebufferDisplay {
+    let mut display = test_display(640, 480);
+    display.iface.var_screen_info.yres_virtual = 1440;
+    display.iface.fix_screen_info.visual = 2;
+    display.iface.fix_screen_info.smem_len = 640 * 1440 * 4;
+    display.iface.frame.resize(640 * 1440 * 4, 37);
+    OBSERVED.with(|state| {
+        *state.borrow_mut() = (
+            display.iface.var_screen_info.clone(),
+            display.iface.fix_screen_info.clone(),
+        )
+    });
+    display.overlay_mapping = Some(
+        super::overlay_spec(
+            &display.iface,
+            display.overlay_instance,
+            &display.iface.var_screen_info,
+            &display.iface.fix_screen_info,
+        )
+        .unwrap(),
+    );
+    display
+}
+
+#[cfg(test)]
+fn osd_pixels() -> crate::display::overlay::PreparedOverlay {
+    let mut image = tiny_skia::Pixmap::new(640, 480).unwrap();
+    for y in 10..13 {
+        for x in 10..18 {
+            let pixel = if x == 10 {
+                [128, 0, 0, 128]
+            } else {
+                [20, 60, 90, 255]
+            };
+            image.data_mut()[(y * 640 + x) * 4..(y * 640 + x + 1) * 4].copy_from_slice(&pixel);
+        }
+    }
+    crate::display::overlay::PreparedOverlay::from_legacy_frame(
+        crate::theme::ScreenId::OsdVolume,
+        image,
+        crate::theme::pack::Rect(10, 10, 8, 3),
+    )
+    .unwrap()
+}
+
+#[test]
+fn osd_rotating_app_pages_recompose_live_pixels_within_one_poll_and_hide_safely() {
+    use super::*;
+    let mut display = osd_display();
+    let prepared = osd_pixels();
+    let captured = display.capture_overlay(&prepared).unwrap();
+    let layout = overlay_layout(&display.iface, display.overlay_mapping.unwrap()).unwrap();
+    display
+        .present_overlay(&captured, OverlayContent::Composited)
+        .unwrap();
+    let page_bytes = 640 * 480 * 4;
+    let edge = ((479 - 10) * 640 + 639 - 10) * 4;
+    let opaque = edge - 4;
+    for (step, page) in [0, 2, 1, 0, 2, 1].into_iter().enumerate() {
+        let base = page * page_bytes;
+        let background = [41 + step as u8, 51, 61, 255];
+        for pixel in display.iface.frame[base..base + page_bytes].chunks_exact_mut(4) {
+            pixel.copy_from_slice(&background);
+        }
+        let before = display.iface.frame.clone();
+        assert_eq!(captured.poll(&layout, &mut display.iface.frame).unwrap(), 1);
+        let blend = |value: u8| ((value as u16 * 127 + 127) / 255) as u8;
+        assert_eq!(
+            &display.iface.frame[base + edge..base + edge + 4],
+            &[blend(background[0]), blend(51), 128 + blend(61), 255]
+        );
+        assert_eq!(
+            &display.iface.frame[base + opaque..base + opaque + 4],
+            &[90, 60, 20, 255]
+        );
+        for other in 0..3 {
+            if other != page {
+                let range = other * page_bytes..(other + 1) * page_bytes;
+                assert_eq!(display.iface.frame[range.clone()], before[range]);
+            }
+        }
+        let stamped = display.iface.frame.clone();
+        assert_eq!(captured.poll(&layout, &mut display.iface.frame).unwrap(), 0);
+        assert_eq!(display.iface.frame, stamped, "static pages need no writes");
+    }
+    display.iface.frame[page_bytes..2 * page_bytes].fill(101);
+    // A foreground write outside the sentinels must also survive masked restoration.
+    display.iface.frame[opaque..opaque + 4].copy_from_slice(&[7, 8, 9, 255]);
+    let fresh = display.iface.frame[page_bytes..2 * page_bytes].to_vec();
+    display
+        .present_overlay(&captured, OverlayContent::Original)
+        .unwrap();
+    assert_eq!(&display.iface.frame[page_bytes..2 * page_bytes], fresh);
+    assert_eq!(&display.iface.frame[opaque..opaque + 4], &[7, 8, 9, 255]);
+    assert_eq!(&display.iface.frame[edge..edge + 4], &[44, 51, 61, 255]);
+    assert_eq!(
+        &display.iface.frame[2 * page_bytes + edge..2 * page_bytes + edge + 4],
+        &[45, 51, 61, 255]
+    );
+}
+
+#[test]
+fn osd_hold_is_joined_and_does_no_polling_or_writes_after_hide() {
+    use super::*;
+    use std::sync::{Mutex, atomic::AtomicUsize, mpsc};
+    let mut display = osd_display();
+    let captured = Arc::new(display.capture_overlay(&osd_pixels()).unwrap());
+    let layout = overlay_layout(&display.iface, display.overlay_mapping.unwrap()).unwrap();
+    display
+        .present_overlay(&captured, OverlayContent::Composited)
+        .unwrap();
+    let display = Arc::new(Mutex::new(display));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::sync_channel(1);
+    let hold = RectHold::try_spawn({
+        let captured = Arc::clone(&captured);
+        let display = Arc::clone(&display);
+        let polls = Arc::clone(&polls);
+        move |stop| {
+            run_overlay_hold(stop, || {
+                let mut display = display.lock().unwrap();
+                captured.poll(&layout, &mut display.iface.frame)?;
+                polls.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.try_send(());
+                Ok(())
+            })
+        }
+    })
+    .unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    hold.stop_and_join().unwrap();
+    let count = polls.load(Ordering::SeqCst);
+    {
+        let mut display = display.lock().unwrap();
+        display
+            .present_overlay(&captured, OverlayContent::Original)
+            .unwrap();
+        display.iface.frame.fill(108);
+    }
+    std::thread::sleep(OVERLAY_POLL_INTERVAL * 3);
+    assert_eq!(polls.load(Ordering::SeqCst), count);
+    assert!(
+        display
+            .lock()
+            .unwrap()
+            .iface
+            .frame
+            .iter()
+            .all(|byte| *byte == 108)
+    );
+}

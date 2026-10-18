@@ -86,6 +86,7 @@ struct Legacy<D: Display> {
     display: D,
     plate: Plate,
     refresh: Option<LegacyRefresh>,
+    surface: Option<OverlaySurface>,
     faulted: bool,
 }
 impl<D: Display> Legacy<D> {
@@ -97,6 +98,7 @@ impl<D: Display> Legacy<D> {
             display,
             plate,
             refresh: None,
+            surface: None,
             faulted: false,
         })
     }
@@ -105,6 +107,8 @@ impl<D: Display> Legacy<D> {
             !self.faulted,
             "Legacy OSD faulted; explicit recovery required"
         );
+        OverlaySurface::replace(&mut self.display, &mut self.surface, None)
+            .inspect_err(|_| self.faulted = true)?;
         if let Some(LegacyRefresh::Continuous(hold)) = self.refresh.take()
             && let Err(error) = hold.stop_and_join()
         {
@@ -120,7 +124,6 @@ impl<D: Display> Legacy<D> {
             bar,
             radius,
         } = self.plate;
-        self.display.load(rect)?;
         fill_rounded_rect(
             &mut self.display.pixmap_mut(),
             rect,
@@ -151,7 +154,7 @@ impl<D: Display> Legacy<D> {
                 styles.ui.highlight_color,
             );
         }
-        self.display.flush_rect(rect)
+        Ok(())
     }
     fn update(
         &mut self,
@@ -161,7 +164,24 @@ impl<D: Display> Legacy<D> {
         repainting: bool,
     ) -> Result<()> {
         self.stop_writer()?;
-        if let Err(error) = self.draw(styles, kind, fraction) {
+        self.display.pixmap_mut().data_mut().fill(0);
+        self.draw(styles, kind, fraction)?;
+        let rect = self.plate.rect;
+        let candidate = PreparedOverlay::from_legacy_frame(
+            kind.screen(),
+            self.display.pixmap().to_owned(),
+            common::theme::pack::Rect(rect.x as u32, rect.y as u32, rect.w, rect.h),
+        );
+        if let Ok(candidate) = candidate
+            && self.display.check_overlay(&candidate).is_ok()
+        {
+            return OverlaySurface::replace(&mut self.display, &mut self.surface, Some(&candidate))
+                .inspect_err(|_| self.faulted = true);
+        }
+        self.display.load(rect)?;
+        if let Err(error) = self.draw(styles, kind, fraction)
+            .and_then(|()| self.display.flush_rect(rect))
+        {
             self.faulted = true;
             return Err(error);
         }
@@ -189,6 +209,10 @@ impl<D: Display> Legacy<D> {
             !self.faulted,
             "Legacy OSD faulted; explicit recovery required"
         );
+        if self.surface.is_some() {
+            return OverlaySurface::replace(&mut self.display, &mut self.surface, None)
+                .inspect_err(|_| self.faulted = true);
+        }
         match self.refresh.take() {
             Some(LegacyRefresh::Periodic { .. }) => {
                 self.display.load(self.plate.rect)?;
@@ -224,7 +248,7 @@ impl<D: Display> Themed<D> {
     fn theme(&self) -> Option<ThemeHandle> {
         self.surface
             .as_ref()
-            .map(|surface| surface.captured().snapshot().clone())
+            .and_then(|surface| surface.captured().snapshot().cloned())
     }
     fn faulted(&self) -> bool {
         self.surface.as_ref().is_some_and(OverlaySurface::faulted)

@@ -19,7 +19,7 @@ use tiny_skia::{Pixmap, PixmapMut, PixmapRef};
 use crate::display::color::Color;
 use crate::display::overlay::{
     CapturedOverlay, OverlayContent, OverlayFormat, OverlayLayout, OverlayLayoutSpec,
-    PreparedOverlay,
+    OVERLAY_POLL_INTERVAL, PreparedOverlay,
 };
 use crate::display::{Display, RectHold};
 use crate::display::packed::{PackDiagnostic, PackedRow, PackedSpans};
@@ -29,6 +29,17 @@ use crate::geom::Rect;
 /// frames on this dual-core SoC
 const STAMP_PAUSE: Duration = Duration::from_micros(100);
 static NEXT_DISPLAY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn run_overlay_hold(
+    stop: &std::sync::atomic::AtomicBool,
+    mut poll: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    while !stop.load(Ordering::Acquire) {
+        poll()?;
+        std::thread::sleep(OVERLAY_POLL_INTERVAL);
+    }
+    Ok(())
+}
 
 #[path = "framebuffer_damage.rs"]
 mod framebuffer_damage;
@@ -806,14 +817,12 @@ impl Display for FramebufferDisplay {
         )?;
         let layout = overlay_layout(&iface, open)?;
         overlay.check_layout(&layout)?;
-        let pause = overlay.stamp_pause();
         let hold = RectHold::try_spawn(move |stop| {
-            while !stop.load(Ordering::Acquire) {
+            run_overlay_hold(stop, || {
                 let current = overlay_layout(&iface, open)?;
-                overlay.present(&current, &mut iface.frame, OverlayContent::Composited)?;
-                std::thread::sleep(pause);
-            }
-            Ok(())
+                overlay.poll(&current, &mut iface.frame)?;
+                Ok(())
+            })
         })?;
         Ok(Some(hold))
     }

@@ -1,4 +1,8 @@
-use std::{mem::size_of, sync::Arc, time::Duration};
+use std::{
+    mem::size_of,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, ensure};
 use tiny_skia::Pixmap;
@@ -12,6 +16,9 @@ const MAX_SPANS: usize = 8192;
 const MAX_PAGES: usize = 3;
 const MAX_OWNED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COPY_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
+pub const OVERLAY_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// Bound reads for partial repaints that miss the sentinels to one mask per page every 8 ms.
+const OVERLAY_VERIFY_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlaySpan {
@@ -22,7 +29,7 @@ pub struct OverlaySpan {
 }
 
 struct OverlayPlane {
-    theme: ThemeHandle,
+    theme: Option<ThemeHandle>,
     screen: ScreenId,
     bounds: Rect,
     source: Box<[u8]>,
@@ -54,6 +61,24 @@ impl PreparedOverlay {
         frame: Pixmap,
         rectangles: &[Rect],
     ) -> Result<Self> {
+        Self::from_pixels(Some(theme), screen, frame, rectangles)
+    }
+
+    pub fn from_legacy_frame(screen: ScreenId, frame: Pixmap, rect: Rect) -> Result<Self> {
+        ensure!(screen.is_osd(), "Masked overlay requires an OSD ScreenId");
+        Self::from_pixels(None, screen, frame, &[rect])
+    }
+
+    fn from_pixels(
+        theme: Option<ThemeHandle>,
+        screen: ScreenId,
+        frame: Pixmap,
+        rectangles: &[Rect],
+    ) -> Result<Self> {
+        ensure!(
+            frame.width() as usize == WIDTH && frame.height() as usize == HEIGHT,
+            "Unexpected overlay canvas"
+        );
         ensure!(!rectangles.is_empty(), "Empty overlay descriptor");
         let mut left = WIDTH;
         let mut top = HEIGHT;
@@ -153,8 +178,8 @@ impl PreparedOverlay {
     pub fn spans(&self) -> &[OverlaySpan] {
         &self.0.spans
     }
-    pub fn snapshot(&self) -> &ThemeHandle {
-        &self.0.theme
+    pub fn snapshot(&self) -> Option<&ThemeHandle> {
+        self.0.theme.as_ref()
     }
     pub fn screen(&self) -> ScreenId {
         self.0.screen
@@ -372,8 +397,10 @@ impl OverlayLayout {
         let projected = overlay
             .accounted_bytes()
             .checked_add(WIDTH * HEIGHT * 4)
-            .and_then(|v| v.checked_add(self.pages * per_page * 2))
-            .and_then(|v| v.checked_add(run_count * size_of::<RunAddress>()))
+            .and_then(|v| v.checked_add((self.pages * 2 + 1) * per_page))
+            .and_then(|v| {
+                v.checked_add(run_count * size_of::<RunAddress>() + 6 * size_of::<(usize, usize)>())
+            })
             .ok_or_else(|| anyhow::anyhow!("Overlay allocation overflow"))?;
         ensure!(
             projected <= MAX_OWNED_BYTES,
@@ -401,6 +428,15 @@ struct RunAddress {
 struct PagePixels {
     original: Box<[u8]>,
     composited: Box<[u8]>,
+    stamped: bool,
+    verify_at: Instant,
+}
+
+struct OverlayState {
+    pages: Box<[PagePixels]>,
+    credit: usize,
+    refill_at: Instant,
+    next_page: usize,
 }
 
 pub enum OverlayContent {
@@ -412,7 +448,52 @@ pub struct CapturedOverlay {
     overlay: PreparedOverlay,
     layout: OverlayLayout,
     runs: Box<[RunAddress]>,
-    pages: Box<[PagePixels]>,
+    source: Box<[u8]>,
+    sentinels: Box<[(usize, usize)]>,
+    state: Mutex<OverlayState>,
+}
+
+fn sentinel_pixels(runs: &[RunAddress], row_stride: usize) -> Vec<(usize, usize)> {
+    // Increasing framebuffer addresses are written last, despite the logical 180 degree rotation.
+    let mut last_rows: Vec<_> = runs
+        .iter()
+        .map(|run| run.within_page / row_stride)
+        .collect();
+    last_rows.sort_unstable();
+    last_rows.dedup();
+    let mut sentinels = Vec::with_capacity(6);
+    for row in last_rows.into_iter().rev().take(2) {
+        let run = runs
+            .iter()
+            .filter(|run| run.within_page / row_stride == row)
+            .max_by_key(|run| run.within_page)
+            .unwrap();
+        for offset in [0, (run.byte_len / 8) * 4, run.byte_len - 4] {
+            let sentinel = (run.within_page + offset, run.packed_start + offset);
+            if !sentinels.contains(&sentinel) {
+                sentinels.push(sentinel);
+            }
+        }
+    }
+    sentinels
+}
+
+fn blend_translucent(source: &[u8], original: &[u8], target: &mut [u8]) {
+    for ((src, background), pixel) in source
+        .chunks_exact(4)
+        .zip(original.chunks_exact(4))
+        .zip(target.chunks_exact_mut(4))
+    {
+        if src[3] == 255 {
+            continue;
+        }
+        let inverse = 255u16 - src[3] as u16;
+        for channel in 0..4 {
+            pixel[channel] = (src[channel] as u16
+                + (background[channel] as u16 * inverse + 127) / 255)
+                .min(255) as u8;
+        }
+    }
 }
 
 impl CapturedOverlay {
@@ -424,41 +505,165 @@ impl CapturedOverlay {
         let runs = layout.addresses(overlay)?;
         layout.check_budget(overlay, runs.len())?;
         let per_page = overlay.covered_bytes();
+        let mut source = Vec::with_capacity(per_page);
+        for run in &runs {
+            for pixel in overlay.0.source[run.source_start..run.source_start + run.byte_len]
+                .chunks_exact(4)
+                .rev()
+            {
+                source.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        }
+        let sentinels = sentinel_pixels(&runs, layout.row_stride);
+        let now = Instant::now();
         let mut pages = Vec::with_capacity(layout.pages);
         for page in 0..layout.pages {
             let mut original = Vec::with_capacity(per_page);
-            let mut composited = Vec::with_capacity(per_page);
             let base = page * layout.page_stride;
             for run in &runs {
-                let raw = &frame[base + run.within_page..base + run.within_page + run.byte_len];
-                original.extend_from_slice(raw);
-                for (i, pixel) in raw.chunks_exact(4).enumerate() {
-                    let source = run.source_start + run.byte_len - (i + 1) * 4;
-                    let src = &overlay.0.source[source..source + 4];
-                    let inverse = 255u16 - src[3] as u16;
-                    let mix = |channel: usize| -> u8 {
-                        (src[channel] as u16 + ((pixel[2 - channel] as u16 * inverse + 127) / 255))
-                            .min(255) as u8
-                    };
-                    composited.extend_from_slice(&[
-                        mix(2),
-                        mix(1),
-                        mix(0),
-                        (src[3] as u16 + (pixel[3] as u16 * inverse + 127) / 255).min(255) as u8,
-                    ]);
-                }
+                original.extend_from_slice(
+                    &frame[base + run.within_page..base + run.within_page + run.byte_len],
+                );
             }
+            let mut composited = source.clone();
+            blend_translucent(&source, &original, &mut composited);
             pages.push(PagePixels {
                 original: original.into_boxed_slice(),
                 composited: composited.into_boxed_slice(),
+                stamped: false,
+                verify_at: now + OVERLAY_VERIFY_INTERVAL,
             });
         }
+        let credit = per_page * layout.pages;
         Ok(Self {
             overlay: overlay.clone(),
             layout,
             runs: runs.into_boxed_slice(),
-            pages: pages.into_boxed_slice(),
+            source: source.into_boxed_slice(),
+            sentinels: sentinels.into_boxed_slice(),
+            state: Mutex::new(OverlayState {
+                pages: pages.into_boxed_slice(),
+                credit,
+                refill_at: Instant::now(),
+                next_page: 0,
+            }),
         })
+    }
+
+    fn check_frame(&self, layout: &OverlayLayout, frame: &[u8]) -> Result<()> {
+        ensure!(
+            layout == &self.layout && frame.len() == self.layout.mapped_bytes,
+            "Overlay backend layout changed"
+        );
+        Ok(())
+    }
+
+    fn page_dirty(&self, page: &PagePixels, base: usize, frame: &[u8]) -> bool {
+        self.sentinels.iter().any(|&(offset, packed)| {
+            let pixel = &frame[base + offset..base + offset + 4];
+            // The checked slice bounds this unaligned load; mmap pixels can change outside Rust.
+            let live = unsafe { std::ptr::read_volatile(pixel.as_ptr().cast::<[u8; 4]>()) };
+            live != page.composited[packed..packed + 4]
+        })
+    }
+
+    fn stamp_page(&self, page: &mut PagePixels, base: usize, frame: &mut [u8]) {
+        for run in self.runs.iter() {
+            let raw = &mut frame[base + run.within_page..base + run.within_page + run.byte_len];
+            let range = run.packed_start..run.packed_start + run.byte_len;
+            let original = &mut page.original[range.clone()];
+            let composited = &mut page.composited[range.clone()];
+            for ((live, old), last) in raw
+                .chunks_exact(4)
+                .zip(original.chunks_exact_mut(4))
+                .zip(composited.chunks_exact(4))
+            {
+                // Unchanged owned pixels retain their background, avoiding repeated alpha blending.
+                // A fresh pixel equal to the previous composite keeps its older background until the app repaints it.
+                if !page.stamped || live != last {
+                    old.copy_from_slice(live);
+                }
+            }
+            blend_translucent(&self.source[range], original, composited);
+            raw.copy_from_slice(composited);
+        }
+        page.stamped = true;
+    }
+
+    pub fn poll(&self, layout: &OverlayLayout, frame: &mut [u8]) -> Result<usize> {
+        self.poll_at(layout, frame, Instant::now())
+    }
+
+    fn mask_dirty(&self, page: &PagePixels, base: usize, frame: &[u8]) -> bool {
+        self.runs.iter().any(|run| {
+            (0..run.byte_len).step_by(4).any(|offset| {
+                let at = base + run.within_page + offset;
+                let packed = run.packed_start + offset;
+                // As with sentinels, the checked slice bounds a volatile framebuffer read.
+                let pixel = &frame[at..at + 4];
+                let live = unsafe { std::ptr::read_volatile(pixel.as_ptr().cast::<[u8; 4]>()) };
+                live != page.composited[packed..packed + 4]
+            })
+        })
+    }
+
+    fn poll_at(&self, layout: &OverlayLayout, frame: &mut [u8], now: Instant) -> Result<usize> {
+        self.check_frame(layout, frame)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Overlay state poisoned"))?;
+        let refill = (now.duration_since(state.refill_at).as_nanos()
+            * MAX_COPY_BYTES_PER_SECOND as u128
+            / 1_000_000_000)
+            .min(usize::MAX as u128) as usize;
+        if refill > 0 {
+            state.credit = state
+                .credit
+                .saturating_add(refill)
+                .min(self.copy_bytes_per_pass());
+            state.refill_at = now;
+        }
+        let mut stamped = 0;
+        let first_page = state.next_page;
+        for offset in 0..state.pages.len() {
+            let index = (first_page + offset) % state.pages.len();
+            let base = index * self.layout.page_stride;
+            let verify = now >= state.pages[index].verify_at;
+            if verify {
+                state.pages[index].verify_at = now + OVERLAY_VERIFY_INTERVAL;
+            }
+            if (self.page_dirty(&state.pages[index], base, frame)
+                || (verify && self.mask_dirty(&state.pages[index], base, frame)))
+                && state.credit >= self.source.len()
+            {
+                self.stamp_page(&mut state.pages[index], base, frame);
+                state.credit -= self.source.len();
+                state.next_page = (index + 1) % state.pages.len();
+                stamped += 1;
+            }
+        }
+        Ok(stamped)
+    }
+
+    fn restore_page(&self, page: &mut PagePixels, base: usize, frame: &mut [u8]) {
+        if !page.stamped {
+            return;
+        }
+        for run in self.runs.iter() {
+            let raw = &mut frame[base + run.within_page..base + run.within_page + run.byte_len];
+            let range = run.packed_start..run.packed_start + run.byte_len;
+            for ((live, last), original) in raw
+                .chunks_exact_mut(4)
+                .zip(page.composited[range.clone()].chunks_exact(4))
+                .zip(page.original[range].chunks_exact(4))
+            {
+                if live == last {
+                    live.copy_from_slice(original);
+                }
+            }
+        }
+        page.stamped = false;
     }
 
     pub fn present(
@@ -467,20 +672,16 @@ impl CapturedOverlay {
         frame: &mut [u8],
         content: OverlayContent,
     ) -> Result<()> {
-        ensure!(
-            layout == &self.layout && frame.len() == self.layout.mapped_bytes,
-            "Overlay backend layout changed"
-        );
-        for (page_index, page) in self.pages.iter().enumerate() {
-            let base = page_index * self.layout.page_stride;
-            let source = match content {
-                OverlayContent::Composited => &page.composited,
-                OverlayContent::Original => &page.original,
-            };
-            for run in self.runs.iter() {
-                let start = base + run.within_page;
-                frame[start..start + run.byte_len]
-                    .copy_from_slice(&source[run.packed_start..run.packed_start + run.byte_len]);
+        self.check_frame(layout, frame)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Overlay state poisoned"))?;
+        for (index, page) in state.pages.iter_mut().enumerate() {
+            let base = index * self.layout.page_stride;
+            match content {
+                OverlayContent::Composited => self.stamp_page(page, base, frame),
+                OverlayContent::Original => self.restore_page(page, base, frame),
             }
         }
         Ok(())
@@ -496,24 +697,14 @@ impl CapturedOverlay {
     pub fn copy_bytes_per_pass(&self) -> usize {
         self.overlay.covered_bytes() * self.layout.pages
     }
-    pub fn stamp_pause(&self) -> Duration {
-        let bytes = self.copy_bytes_per_pass() as u64;
-        let micros = bytes
-            .saturating_mul(1_000_000)
-            .div_ceil(MAX_COPY_BYTES_PER_SECOND)
-            .max(100);
-        Duration::from_micros(micros)
-    }
     pub fn accounted_bytes(&self) -> usize {
         self.overlay.accounted_bytes()
-            + self
-                .pages
-                .iter()
-                .map(|p| p.original.len() + p.composited.len())
-                .sum::<usize>()
+            + self.source.len()
+            + self.source.len() * self.layout.pages * 2
             + self.runs.len() * size_of::<RunAddress>()
+            + self.sentinels.len() * size_of::<(usize, usize)>()
     }
-    pub fn snapshot(&self) -> &ThemeHandle {
+    pub fn snapshot(&self) -> Option<&ThemeHandle> {
         self.overlay.snapshot()
     }
     pub fn screen(&self) -> ScreenId {
@@ -770,6 +961,162 @@ mod tests {
     }
 
     #[test]
+    fn overlay_poll_uses_last_memory_rows_and_preserves_owned_translucent_pixels() {
+        let overlay = painted();
+        let layout = OverlayLayout::checked(spec(3, 2, 8)).unwrap();
+        let mut frame = vec![30; layout.mapped_bytes];
+        let captured = CapturedOverlay::capture(&overlay, layout.clone(), &frame).unwrap();
+        let mut last_rows: Vec<_> = captured.runs.iter()
+            .map(|run| run.within_page / layout.row_stride).collect();
+        last_rows.sort_unstable();
+        last_rows.dedup();
+        last_rows.reverse();
+        last_rows.truncate(2);
+        assert!(captured.sentinels.iter().all(|&(offset, _)|
+            last_rows.contains(&(offset / layout.row_stride))));
+        captured
+            .present(&layout, &mut frame, OverlayContent::Composited)
+            .unwrap();
+        let unchanged_edge = pixel_at(&layout, 0, 20, 20);
+        let original_edge = frame[unchanged_edge..unchanged_edge + 4].to_vec();
+        let changed_edge = pixel_at(&layout, 0, 1, 1);
+        frame[changed_edge..changed_edge + 4].copy_from_slice(&[50, 60, 70, 255]);
+        assert_eq!(captured.poll(&layout, &mut frame).unwrap(), 1);
+        assert_eq!(&frame[changed_edge..changed_edge + 4], &[25, 30, 163, 255]);
+        assert_eq!(&frame[unchanged_edge..unchanged_edge + 4], original_edge);
+        captured
+            .present(&layout, &mut frame, OverlayContent::Original)
+            .unwrap();
+        assert_eq!(&frame[changed_edge..changed_edge + 4], &[50, 60, 70, 255]);
+        assert_eq!(&frame[unchanged_edge..unchanged_edge + 4], &[30; 4]);
+    }
+
+    fn verification_plate() -> PreparedOverlay {
+        let mut image = Pixmap::new(640, 480).unwrap();
+        for y in 10..16 {
+            for x in 10..18 {
+                let rgba = if x == 10 { [128, 0, 0, 128] } else { [20, 60, 90, 255] };
+                image.data_mut()[(y * 640 + x) * 4..(y * 640 + x + 1) * 4]
+                    .copy_from_slice(&rgba);
+            }
+        }
+        PreparedOverlay::from_legacy_frame(ScreenId::OsdVolume, image, Rect(10, 10, 8, 6))
+            .unwrap()
+    }
+
+    #[test]
+    fn overlay_hide_restores_all_owned_pixels_after_partial_repaint() {
+        let overlay = verification_plate();
+        let layout = OverlayLayout::checked(spec(3, 2, 8)).unwrap();
+        for overwrite_sentinel in [true, false] {
+            let mut frame = vec![30; layout.mapped_bytes];
+            let mut expected = frame.clone();
+            let captured = CapturedOverlay::capture(&overlay, layout.clone(), &frame).unwrap();
+            captured.present(&layout, &mut frame, OverlayContent::Composited).unwrap();
+            let offset = if overwrite_sentinel {
+                captured.sentinels[0].0
+            } else {
+                pixel_at(&layout, 0, 11, 15)
+            };
+            assert_eq!(captured.sentinels.iter().any(|&(at, _)| at == offset), overwrite_sentinel);
+            for page in 0..3 {
+                let at = page * layout.page_stride + offset;
+                let fresh = [71 + page as u8, 81, 91, 255];
+                frame[at..at + 4].copy_from_slice(&fresh);
+                expected[at..at + 4].copy_from_slice(&fresh);
+            }
+            captured.present(&layout, &mut frame, OverlayContent::Original).unwrap();
+            assert_eq!(frame, expected, "all owned pixels restored, fresh pixels untouched: sentinel={overwrite_sentinel}");
+            let state = captured.state.lock().unwrap();
+            for (page, pixels) in state.pages.iter().enumerate() {
+                for run in captured.runs.iter() {
+                    for offset in (0..run.byte_len).step_by(4) {
+                        let at = page * layout.page_stride + run.within_page + offset;
+                        let packed = run.packed_start + offset;
+                        assert_ne!(&frame[at..at + 4], &pixels.composited[packed..packed + 4],
+                            "no plate remnants after hide");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_verification_repairs_repeated_lower_row_repaints_within_eight_ms() {
+        let overlay = verification_plate();
+        let layout = OverlayLayout::checked(spec(3, 2, 8)).unwrap();
+        let mut frame = vec![30; layout.mapped_bytes];
+        let captured = CapturedOverlay::capture(&overlay, layout.clone(), &frame).unwrap();
+        captured.present(&layout, &mut frame, OverlayContent::Composited).unwrap();
+        let start = captured.state.lock().unwrap().pages[0].verify_at - OVERLAY_VERIFY_INTERVAL;
+        let edge = pixel_at(&layout, 0, 10, 15);
+        let opaque = pixel_at(&layout, 0, 11, 15);
+        assert!(captured.sentinels.iter().all(|&(at, _)| at != edge && at != opaque));
+        for millisecond in 1..=64 {
+            let background = [40 + millisecond as u8, 51, 61, 255];
+            for page in 0..3 {
+                for offset in [edge, opaque] {
+                    let at = page * layout.page_stride + offset;
+                    frame[at..at + 4].copy_from_slice(&background);
+                }
+            }
+            let now = start + Duration::from_millis(millisecond);
+            let repaired = captured.poll_at(&layout, &mut frame, now).unwrap();
+            if millisecond % 8 == 0 {
+                assert_eq!(repaired, 3, "each page repaired within the verification period");
+                let blend = |value: u8| ((value as u16 * 127 + 127) / 255) as u8;
+                for page in 0..3 {
+                    let base = page * layout.page_stride;
+                    assert_eq!(&frame[base + edge..base + edge + 4],
+                        &[blend(background[0]), blend(51), 128 + blend(61), 255]);
+                    assert_eq!(&frame[base + opaque..base + opaque + 4], &[90, 60, 20, 255]);
+                }
+            } else {
+                assert_eq!(repaired, 0, "sentinels unchanged between full-mask checks");
+            }
+        }
+        let stamped = frame.clone();
+        for millisecond in 65..=96 {
+            assert_eq!(captured.poll_at(&layout, &mut frame,
+                start + Duration::from_millis(millisecond)).unwrap(), 0,
+                "unchanged pages cause no writes, including full-mask checks");
+            assert_eq!(frame, stamped);
+        }
+        captured.present(&layout, &mut frame, OverlayContent::Original).unwrap();
+        for page in 0..3 {
+            let base = page * layout.page_stride;
+            for offset in [edge, opaque] {
+                assert_eq!(&frame[base + offset..base + offset + 4], &[104, 51, 61, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_poll_keeps_copy_budget_for_repeated_rewrites() {
+        let overlay = painted();
+        let layout = OverlayLayout::checked(spec(3, 0, 0)).unwrap();
+        let mut frame = vec![30; layout.mapped_bytes];
+        let captured = CapturedOverlay::capture(&overlay, layout.clone(), &frame).unwrap();
+        captured
+            .present(&layout, &mut frame, OverlayContent::Composited)
+            .unwrap();
+        frame.fill(50);
+        assert_eq!(captured.poll(&layout, &mut frame).unwrap(), 3);
+        frame.fill(70);
+        {
+            let mut state = captured.state.lock().unwrap();
+            state.credit = 0;
+            state.refill_at = Instant::now() + Duration::from_secs(1);
+        }
+        let before = frame.clone();
+        assert_eq!(captured.poll(&layout, &mut frame).unwrap(), 0);
+        assert_eq!(frame, before);
+        captured.state.lock().unwrap().refill_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(captured.poll(&layout, &mut frame).unwrap(), 3);
+        assert!(captured.state.lock().unwrap().credit < captured.source.len());
+    }
+
+    #[test]
     fn overlay_bounds_format_and_capacity_reject_before_mutation() {
         let overlay = painted();
         for pages in 1..=3 {
@@ -909,7 +1256,7 @@ mod tests {
         let frame = vec![71u8; layout.mapped_bytes];
         let captured = CapturedOverlay::capture(&overlay, layout, &frame).unwrap();
         assert!(captured.accounted_bytes() < MAX_OWNED_BYTES);
-        assert!(captured.stamp_pause() >= Duration::from_micros(100_000));
+        assert_eq!(captured.state.lock().unwrap().credit, 640 * 480 * 4 * 3);
         let transparent = PreparedOverlay::from_rects(
             handle(),
             ScreenId::OsdVolume,
