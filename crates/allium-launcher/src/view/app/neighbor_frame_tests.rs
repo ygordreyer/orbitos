@@ -385,6 +385,71 @@ async fn prepack2_details_round_trip_and_early_neighbor_present() {
 }
 
 #[cfg(feature = "perf-bench")]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(orbit_fixture)]
+async fn idle_navigation_completion_clears_work_in_both_directions() {
+    use common::{database::Database, platform::{DefaultPlatform, Platform}};
+    use std::time::{Duration, Instant};
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+    let root = common::constants::ALLIUM_GAMES_DIR.join("integration-idle-navigation-completion");
+    std::fs::create_dir_all(&root).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    let database = Database::in_memory().unwrap();
+    for index in 0..6 {
+        let path = root.join(format!("Game {index:02}.chd"));
+        std::fs::write(&path, []).unwrap();
+        let game: common::database::NewGame = crate::entry::game::Game::new(path).into();
+        database.update_games(&[game.clone()]).unwrap();
+        database.increment_play_count(&game).unwrap();
+    }
+    let mut styles = Stylesheet::new();
+    styles.load_fonts().unwrap();
+    styles.recents.use_recents_carousel = false;
+    let mut map = type_map::TypeMap::new();
+    map.insert(styles);
+    map.insert(Locale::new("en-US"));
+    map.insert(crate::consoles::ConsoleMapper::new());
+    map.insert(common::geom::Size::new(640, 480));
+    map.insert(database);
+    let res = Resources::new(map);
+    res.insert(Some(theme()));
+    let rect = Rect::new(0, 54, 640, 376);
+    let views = (
+        Recents::load_or_new(rect, res.clone(), None).unwrap(),
+        Games::load_or_new(rect, res.clone(), None).unwrap(),
+        Apps::load_or_new(rect, res.clone(), None).unwrap(),
+        Settings::new(rect, res.clone(), Default::default()).unwrap(),
+    );
+    let mut app = App::new(Rect::new(0, 0, 640, 480), res, views, 0,
+        DefaultPlatform::new().unwrap().battery().unwrap()).unwrap();
+    let mut probe = common::platform::PresenterProbe::new(640, 480);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.idle_media_step() {
+        assert!(Instant::now() < deadline, "media did not settle");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    app.prepare_theme().unwrap();
+    app.draw_prepared_theme(probe.display()).unwrap();
+    assert!(app.navigation_warm_ready());
+    for direction in [1, -1] {
+        app.navigation_direction = direction;
+        let mut work = None;
+        let mut warm_steps = 0;
+        for _ in 0..1000 {
+            app.idle_navigation_step(probe.display(), &mut work, &mut warm_steps, || false).unwrap();
+            if warm_steps == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(warm_steps, 2, "warming did not converge: direction={direction}");
+        assert!(work.is_none(), "finished warming retained work: direction={direction}");
+    }
+}
+
+#[cfg(feature = "perf-bench")]
 #[test]
 fn nbr_reuses_eligibility_in_both_slots_and_directions_with_identical_presentation() {
     for name in ["compact", "compact-plus"] {

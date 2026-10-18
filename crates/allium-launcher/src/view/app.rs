@@ -987,7 +987,10 @@ where
     ) -> Result<()> {
         if self.prepack_neighbors(display, &mut input_pending)? { return Ok(()); }
         if *steps < 2 && self.prewarm_navigation_step_with_pending(work,
-            if *steps == 0 { 1 } else { -1 }, input_pending)? { *steps += 1; }
+            if *steps == 0 { 1 } else { -1 }, input_pending)? {
+            *steps += 1;
+            if *steps == 2 { *work = None; }
+        }
         Ok(())
     }
 
