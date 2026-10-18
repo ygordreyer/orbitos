@@ -624,6 +624,10 @@ where
             if !self.theme_dirty {
                 return Ok(false);
             }
+            if !frame.is_opaque() {
+                // The saved background is pristine; blending over the last menu compounds its scrim.
+                display.load(display.bounding_box())?;
+            }
             frame.paint(display);
             self.theme_dirty = false;
             return Ok(true);

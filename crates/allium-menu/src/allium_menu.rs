@@ -184,28 +184,12 @@ impl AlliumMenu<DefaultPlatform> {
                 tokio::time::sleep_until(deadline.into()).await;
             }
         }
-        {
-            let _phase = trace.phase("framebuffer_capture");
-            let _scope = trace.scope();
-            self.display.sync()?;
-        }
-        {
-            let _phase = trace.phase("snapshot_clone");
-            self.display.save()?;
-        }
-        if self.res.get::<Option<ThemeHandle>>().is_none() {
-            let styles = self.res.get::<Stylesheet>().display_style();
-            self.display.map_pixels(|pixel| {
-                pixel.blend(styles.menu.background_color.overlay(pixel), 192)
-            })?;
-        }
-        if self.res.get::<Option<ThemeHandle>>().is_some() {
-            let _phase = trace.phase("snapshot_share");
-            self.display.save_unchanged()?;
-        } else {
-            let _phase = trace.phase("snapshot_compare");
-            self.display.save()?;
-        }
+        capture_menu_background(
+            &mut self.display,
+            self.res.get::<Option<ThemeHandle>>().is_some(),
+            &self.res.get::<Stylesheet>(),
+            trace,
+        )?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         self.run_event_loop_with_queue(tx, rx).await
@@ -415,6 +399,35 @@ async fn capture_after_settle(
     display.sync()
 }
 
+fn capture_menu_background(
+    display: &mut impl Display,
+    themed: bool,
+    styles: &Stylesheet,
+    trace: crate::open_trace::OpenTrace,
+) -> Result<()> {
+    {
+        let _phase = trace.phase("framebuffer_capture");
+        let _scope = trace.scope();
+        display.sync()?;
+    }
+    {
+        let _phase = trace.phase("snapshot_clone");
+        display.save()?;
+    }
+    if themed {
+        let _phase = trace.phase("snapshot_share");
+        display.save_unchanged()?;
+    } else {
+        let styles = styles.display_style();
+        display.map_pixels(|pixel| {
+            pixel.blend(styles.menu.background_color.overlay(pixel), 192)
+        })?;
+        let _phase = trace.phase("snapshot_compare");
+        display.save()?;
+    }
+    Ok(())
+}
+
 fn reset_active_background_for_legacy(
     display: &mut impl Display,
     styles: &Stylesheet,
@@ -517,6 +530,100 @@ mod orbit_global_proof {
         fn pop(&mut self) -> bool {
             self.saved.pop();
             !self.saved.is_empty()
+        }
+    }
+
+    #[cfg(not(any(feature = "miyoo", feature = "simulator")))]
+    #[tokio::test]
+    async fn menu_scrim_is_single_pass_on_open_repaints_and_reopen() {
+        use common::theme::{FontBank, ScreenId, frame::FrameInputs, render::PreparedFrame,
+            runtime::ThemeSnapshot};
+        use tiny_skia::{PixmapPaint, Transform};
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let mut styles = Stylesheet::load().unwrap();
+        styles.status_bar.show_clock = false;
+        for name in ["compact", "orbit", "compact-plus", "big-picture", "orbit-hero", "orbit-row"] {
+            let snapshot = if matches!(name, "compact" | "orbit") {
+                ThemeSnapshot::builtin(name).unwrap()
+            } else {
+                ThemeSnapshot::load(&repo.join("themes").join(name)).unwrap()
+            };
+            let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+            let overlay = PreparedFrame::prepare(
+                theme.clone(), &FrameInputs::new(ScreenId::IngameMenu),
+            ).unwrap();
+            assert!(!overlay.is_opaque(), "{name} must exercise translucent composition");
+            let mut platform = DefaultPlatform::new().unwrap();
+            let mut display = platform.display().unwrap();
+            display.record_presentations();
+            let mut map = TypeMap::new();
+            map.insert(styles.clone());
+            map.insert(Locale::new("en-US"));
+            map.insert(Into::<geom::Size>::into(display.size()));
+            map.insert(GameInfo { name: "Scrim regression".into(), ..Default::default() });
+            map.insert(Some(theme));
+            let res = Resources::new(map);
+
+            for session in 0..2 {
+                let mut game = Pixmap::new(640, 480).unwrap();
+                for (i, pixel) in game.pixels_mut().iter_mut().enumerate() {
+                    *pixel = tiny_skia::Color::from_rgba8(
+                        (i % 256) as u8, ((i / 640 + session * 71) % 256) as u8,
+                        ((i / 17 + session * 43) % 256) as u8, 255,
+                    ).premultiply().to_color_u8();
+                }
+                display.pixmap_mut().data_mut().copy_from_slice(game.data());
+                let mut expected = game.clone();
+                expected.draw_pixmap(0, 0, overlay.pixels().as_ref(), &PixmapPaint::default(),
+                    Transform::identity(), None);
+                let mut menu = IngameMenu::new(
+                    display.bounding_box(), IngameMenuState::default(), res.clone(),
+                    platform.battery().unwrap(), Some(RetroArchInfo {
+                        max_disk_slots: 1, disk_slot: 0, state_slot: Some(session as i8),
+                    }),
+                );
+                menu.refresh_theme().unwrap();
+                capture_menu_background(&mut display, true, &styles,
+                    crate::open_trace::OpenTrace::start()).unwrap();
+                assert_eq!(display.pixmap().data(), game.data(), "{name}: capture must not dim");
+                let (tx, _rx) = tokio::sync::mpsc::channel(100);
+                for repaint in 0..16 {
+                    if repaint == 8 {
+                        let mut next = IngameMenu::new(
+                            display.bounding_box(), IngameMenuState::default(), res.clone(),
+                            platform.battery().unwrap(), Some(RetroArchInfo {
+                                max_disk_slots: 1, disk_slot: 0, state_slot: Some(7),
+                            }),
+                        );
+                        next.reuse_theme_frame(&mut menu);
+                        menu = next;
+                        menu.refresh_theme().unwrap();
+                    } else if repaint > 1 {
+                        menu.handle_key_event(KeyEvent::Pressed(if repaint % 2 == 0 {
+                            Key::Up
+                        } else { Key::Down }), tx.clone(), &mut VecDeque::new()).await.unwrap();
+                        menu.refresh_theme().unwrap();
+                    }
+                    assert!(menu.draw(&mut display, &styles).unwrap());
+                    let pixels = display.pixmap();
+                    for y in 40..400 {
+                        let start = (y * 640 + 20) * 4;
+                        let end = (y * 640 + if name == "compact-plus" { 210 } else { 40 }) * 4;
+                        assert_eq!(&pixels.data()[start..end], &expected.data()[start..end],
+                            "{name}: session {session}, repaint {repaint}, row {y}");
+                    }
+                    assert!(!menu.draw(&mut display, &styles).unwrap(), "clean draw must be skipped");
+                    // A status refresh can repaint before the first navigation event.
+                    menu.set_should_draw();
+                }
+                restore_display_after_menu(&mut display).unwrap();
+                assert_eq!(display.pixmap().data(), game.data(), "{name}: close restores game");
+                assert!(!display.pop(), "{name}: close releases both saved frames");
+                display.take_presented_frames();
+            }
         }
     }
 
@@ -705,6 +812,29 @@ mod orbit_global_proof {
             std::time::Instant::now() >= deadline,
             "flush preceded settle deadline"
         );
+    }
+
+    #[test]
+    fn legacy_menu_background_keeps_one_dim_and_original_restore() {
+        let styles = Stylesheet::load().unwrap();
+        let mut display = StackDisplay::new();
+        let original = display.pixmap.clone();
+        let mut expected = StackDisplay::new();
+        let display_styles = styles.display_style();
+        expected.map_pixels(|pixel| {
+            pixel.blend(display_styles.menu.background_color.overlay(pixel), 192)
+        }).unwrap();
+
+        capture_menu_background(&mut display, false, &styles,
+            crate::open_trace::OpenTrace::start()).unwrap();
+        assert_eq!(display.saved.len(), 2);
+        assert_eq!(display.pixmap.data(), expected.pixmap.data());
+        display.clear(Color::new(255, 0, 0)).unwrap();
+        display.load(display.bounding_box()).unwrap();
+        assert_eq!(display.pixmap.data(), expected.pixmap.data());
+        restore_display_after_menu(&mut display).unwrap();
+        assert!(display.saved.is_empty());
+        assert_eq!(display.pixmap.data(), original.data());
     }
 
     #[test]
