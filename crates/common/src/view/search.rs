@@ -64,7 +64,7 @@ impl SearchView {
         &self.state
     }
 
-    async fn check_database(&self, commands: &Sender<Command>) -> Result<bool> {
+    async fn check_database(&self, commands: &Sender<Command>) -> Result<()> {
         if !self.res.get::<Database>().has_indexed()? {
             let toast = self.res.get::<Locale>().t("populating-database");
             commands.send(Command::Toast(toast, None)).await?;
@@ -72,9 +72,8 @@ impl SearchView {
             commands
                 .send(Command::Toast(String::new(), Some(Duration::ZERO)))
                 .await?;
-            return Ok(false);
         }
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -140,9 +139,8 @@ impl View for SearchView {
                 _ => true,
             });
 
-            if let Some(query) = query
-                && self.check_database(&commands).await?
-            {
+            if let Some(query) = query {
+                self.check_database(&commands).await?;
                 self.state = SearchState::Searching;
                 commands.send(Command::Search(query)).await?;
             }
@@ -169,4 +167,47 @@ impl View for SearchView {
     }
 
     fn set_position(&mut self, _point: Point) {}
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::platform::Key;
+
+    async fn submit_search(indexed: bool) -> Vec<Command> {
+        let res = Resources::new(type_map::TypeMap::new());
+        let database = Database::in_memory().unwrap();
+        if indexed { database.set_has_indexed(true).unwrap(); }
+        assert_eq!(database.has_indexed().unwrap(), indexed);
+        res.insert(database);
+        res.insert(Locale::new("en-US"));
+        res.insert(Stylesheet::new());
+        let mut search = SearchView::new(res);
+        search.activate_with_value("ko".into());
+        let (send, mut recv) = tokio::sync::mpsc::channel(8);
+        let mut bubble = VecDeque::new();
+        assert!(search.handle_key_event(KeyEvent::Pressed(Key::Start), send, &mut bubble).await.unwrap());
+        assert!(bubble.is_empty());
+        assert!(matches!(recv.try_recv(), Ok(Command::Redraw)));
+        let mut commands = Vec::new();
+        while let Ok(command) = recv.try_recv() { commands.push(command); }
+        commands
+    }
+
+    #[tokio::test]
+    async fn search_first_index_queues_typed_query_after_populate() {
+        let commands = submit_search(false).await;
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(&commands[0], Command::Toast(_, None)));
+        assert!(matches!(&commands[1], Command::PopulateDb));
+        assert!(matches!(&commands[2], Command::Toast(text, Some(duration)) if text.is_empty() && duration.is_zero()));
+        assert!(matches!(&commands[3], Command::Search(query) if query == "ko"));
+    }
+
+    #[tokio::test]
+    async fn search_indexed_database_queues_only_typed_query() {
+        let commands = submit_search(true).await;
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0], Command::Search(query) if query == "ko"));
+    }
 }

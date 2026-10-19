@@ -32,6 +32,7 @@ where
     alignment: Alignment,
     width: Option<u32>,
     truncated_text: Option<String>,
+    suffix_len: usize,
     color: StylesheetColor,
     stroke_color: StylesheetColor,
     font_size: f32,
@@ -54,6 +55,7 @@ where
             alignment,
             width,
             truncated_text: None,
+            suffix_len: 0,
             color: StylesheetColor::Foreground,
             stroke_color: StylesheetColor::Stroke,
             font_size: 1.0,
@@ -102,6 +104,15 @@ where
         self
     }
 
+    pub fn suffix_len(&mut self, len: usize) -> &mut Self {
+        if self.suffix_len != len {
+            self.suffix_len = len;
+            self.truncated_text = None;
+            self.dirty = true;
+        }
+        self
+    }
+
     pub fn font_size(&mut self, font_size: f32) -> &mut Self {
         self.font_size = font_size;
         self
@@ -129,7 +140,7 @@ where
         self.rect = Some(rect);
 
         if let Some(width) = self.width {
-            if let Some(scrolling) = self.scrolling.as_ref() {
+            if let Some(scrolling) = self.scrolling.as_ref().filter(|_| self.suffix_len == 0) {
                 let scroll_text = self
                     .text
                     .as_ref()
@@ -149,32 +160,15 @@ where
                 }
                 self.truncated_text = Some(truncated.trim_end().to_string());
             } else {
-                let ellipsis_width = text_style.measure("...").w;
-
-                let text_width = text_style.measure(self.text.as_ref()).w;
-                let mut truncated = false;
-                let text_str = self.text.as_ref();
-
-                if text_width > width {
-                    let mut current = text_str.to_string();
-                    while text_style.measure(&current).w + ellipsis_width > width
-                        && !current.is_empty()
-                    {
-                        let mut n = current.len() - 1;
-                        while !current.is_char_boundary(n) {
-                            n -= 1;
-                        }
-                        current = current[..n].to_string();
-                        truncated = true;
-                    }
-                    if truncated {
-                        self.truncated_text = Some(format!("{}...", current.trim_end()));
-                    } else {
-                        self.truncated_text = Some(text_str.to_string());
-                    }
+                let layout = |text: &str| crate::display::font::ellipsize(text, width, |text| text_style.measure(text).w);
+                self.truncated_text = if self.suffix_len == 0 {
+                    Some(layout(self.text.as_ref()))
                 } else {
-                    self.truncated_text = Some(text_str.to_string());
-                }
+                    crate::display::font::fit_suffix(
+                        self.text.as_ref(), self.suffix_len, width as f32, "...",
+                        |text| text_style.measure(text).w as f32, |text| vec![layout(text)],
+                    ).pop()
+                };
             }
         } else {
             self.truncated_text = Some(self.text.as_ref().to_owned());
@@ -203,6 +197,7 @@ where
     S: AsRef<str> + PartialEq + Send,
 {
     fn update(&mut self, dt: Duration) {
+        if self.suffix_len > 0 { return; }
         let Some(scrolling) = self.scrolling.as_mut() else {
             return;
         };

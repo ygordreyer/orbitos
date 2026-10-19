@@ -67,6 +67,7 @@ fn frameprep_exact_inputs_reject_every_model_dependency_and_live_art_change() {
         ("rows", |m| m.rows.get_mut(&Binding::Entries).unwrap().reverse()),
         ("cloud", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].value = "Cloud".into()),
         ("row enabled", |m| m.rows.get_mut(&Binding::Entries).unwrap()[0].enabled = false),
+        ("selected entry kind", |m| m.selected_is_folder = !m.selected_is_folder),
         ("selected", |m| { m.selected.insert(Binding::Entries, "other".into()); }),
         ("pagination", |m| m.pagination = Some(crate::theme::frame::Pagination { page: 3, total: 4 })),
         ("detail lines", |m| m.detail_lines.push(crate::theme::frame::DetailLine { text: "a".into(), heading: true, gap_before: 1 })),

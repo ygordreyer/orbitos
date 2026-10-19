@@ -7,7 +7,7 @@ use regex::Regex;
 use super::Entry;
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct DisplayNames(HashMap<PathBuf, (String, String)>);
+pub(crate) struct DisplayNames(HashMap<PathBuf, (String, String, usize)>);
 
 impl DisplayNames {
     pub(crate) fn new(entries: &[Entry]) -> Self {
@@ -15,18 +15,27 @@ impl DisplayNames {
             static ref PARENS: Regex = Regex::new(r"\([^()]*\)").unwrap();
             static ref BRACKETS: Regex = Regex::new(r"\[[^\[\]]*\]").unwrap();
         }
-        let mut groups: HashMap<String, Vec<&Entry>> = HashMap::new();
+        let game_paths = entries.iter().filter_map(|entry| match entry {
+            Entry::Game(game) => Some(game.path.clone()),
+            _ => None,
+        }).collect();
+        let mut groups: HashMap<String, HashMap<PathBuf, Vec<&Entry>>> = HashMap::new();
         for entry in entries {
-            if matches!(entry, Entry::Game(_)) {
-                groups.entry(key(entry.name())).or_default().push(entry);
+            if let Entry::Game(game) = entry {
+                groups.entry(key(entry.name())).or_default()
+                    .entry(game.display_identity_in(&game_paths)).or_default().push(entry);
             }
         }
         let mut names = HashMap::new();
-        for games in groups.values().filter(|games| games.len() > 1) {
+        for aliases in groups.values().filter(|games| games.len() > 1) {
+            let identities: Vec<_> = aliases.iter().collect();
+            let games: Vec<_> = identities.iter().map(|(identity, entries)| {
+                entries.iter().find(|entry| entry.path() == identity.as_path()).unwrap_or(&entries[0])
+            }).copied().collect();
             let mut suffixes = vec![String::new(); games.len()];
             for pattern in [&*PARENS, &*BRACKETS] {
-                let parts: Vec<Vec<String>> = games.iter().map(|entry| {
-                    let stem = entry.path().file_stem().unwrap_or_default().to_string_lossy();
+                let parts: Vec<Vec<String>> = identities.iter().map(|(path, _)| {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                     pattern.find_iter(&stem).map(|part| part.as_str().to_owned()).collect()
                 }).collect();
                 for indices in collisions(&suffixes) {
@@ -61,10 +70,10 @@ impl DisplayNames {
                     }
                 }
             }
-            for (entry, mut suffix) in games.iter().zip(suffixes) {
+            for (i, (entry, mut suffix)) in games.iter().zip(suffixes).enumerate() {
                 // An absent revision has no differing group to display. Keep its region as context.
                 if suffix.is_empty() {
-                    let stem = entry.path().file_stem().unwrap_or_default().to_string_lossy();
+                    let stem = identities[i].0.file_stem().unwrap_or_default().to_string_lossy();
                     suffix = PARENS.find_iter(&stem).map(|part| part.as_str()).collect::<Vec<_>>().join(" ");
                     if suffix.is_empty() {
                         let extension = entry.path().extension().unwrap_or_default().to_string_lossy().to_uppercase();
@@ -74,16 +83,23 @@ impl DisplayNames {
                     }
                 }
                 if !suffix.is_empty() {
-                    names.insert(entry.path().to_path_buf(), (entry.name().to_owned(), format!("{} {suffix}", entry.name().trim())));
+                    for alias in identities[i].1 {
+                        names.insert(alias.path().to_path_buf(), (alias.name().to_owned(), format!("{} {suffix}", alias.name().trim()), suffix.len() + 1));
+                    }
                 }
             }
         }
         Self(names)
     }
 
+    pub(crate) fn suffix_len(&self, entry: &Entry) -> usize {
+        self.0.get(entry.path()).filter(|(original, _, _)| original == entry.name())
+            .map_or(0, |(_, _, len)| *len)
+    }
+
     pub(crate) fn name<'a>(&'a self, entry: &'a Entry) -> &'a str {
-        self.0.get(entry.path()).filter(|(original, _)| original == entry.name())
-            .map(|(_, name)| name.as_str()).unwrap_or_else(|| entry.name())
+        self.0.get(entry.path()).filter(|(original, _, _)| original == entry.name())
+            .map(|(_, name, _)| name.as_str()).unwrap_or_else(|| entry.name())
     }
 }
 
@@ -126,6 +142,58 @@ mod tests {
     fn labels(entries: &[Entry]) -> Vec<String> {
         let display = DisplayNames::new(entries);
         entries.iter().map(|entry| display.name(entry).to_owned()).collect()
+    }
+
+    #[test]
+    fn fix20_aliases_share_one_collision_identity_and_real_regions_still_differ() {
+        let folder = "PS/Kowai (Japan)";
+        let cue = "PS/Kowai (Japan)/Kowai (Japan).cue";
+        let games = entries(&[folder, cue], &["Kowai", "Kowai"]);
+        assert_eq!(labels(&games), ["Kowai", "Kowai"]);
+        let games = entries(&[folder, cue, "PS/Kowai (Europe).chd"], &["Kowai", "Kowai", "Kowai"]);
+        assert_eq!(labels(&games), ["Kowai (Japan)", "Kowai (Japan)", "Kowai (Europe)"]);
+        common::media::set_game_containers([("PS/Kowai (Japan)/disc.cue".into(), folder.into())]);
+        let games = entries(&[folder, "PS/Kowai (Japan)/disc.cue"], &["Kowai", "Kowai"]);
+        crate::entry::load_work::take();
+        assert_eq!(labels(&games), ["Kowai", "Kowai"]);
+        assert_eq!(crate::entry::load_work::take(), Default::default());
+        let games = entries(&["PS/Kowai (Japan)/disc.cue", "PS/Kowai (Europe).chd"], &["Kowai", "Kowai"]);
+        assert_eq!(labels(&games), ["Kowai (Japan)", "Kowai (Europe)"]);
+        common::media::set_game_containers(std::iter::empty());
+    }
+
+    #[test]
+    fn fix20b_list_folder_and_ancestor_container_share_collision_identity() {
+        let folder = "fix20b-display/Folder Title (Japan)";
+        let launch = "fix20b-display/Folder Title (Japan)/disc.cue";
+        let games = entries(&[folder, launch], &["Folder Title", "Folder Title"]);
+        crate::entry::load_work::take();
+        assert_eq!(labels(&games), ["Folder Title", "Folder Title"]);
+        assert_eq!(crate::entry::load_work::take(), Default::default());
+        let nested = "fix20b-display/Folder Title (Japan)/nested/disc.cue";
+        common::media::set_game_containers([(nested.into(), folder.into())]);
+        let games = entries(&[nested, "fix20b-display/Folder Title (Europe).chd"], &["Folder Title", "Folder Title"]);
+        assert_eq!(labels(&games), ["Folder Title (Japan)", "Folder Title (Europe)"]);
+        common::media::set_game_containers(std::iter::empty());
+        let games = entries(&["PS/Multiple/Disc (Japan).chd", "PS/Multiple/Disc (Europe).chd"], &["Disc", "Disc"]);
+        assert_eq!(labels(&games), ["Disc (Japan)", "Disc (Europe)"]);
+    }
+
+    #[test]
+    fn fix23_suffix_metadata_keeps_long_region_twins_distinct() {
+        let title = "Radical Rex: Shred Pre-historic pavement";
+        let games = entries(&["Radical Rex (USA).sfc", "Radical Rex (Europe).zip"], &[title, title]);
+        let names = DisplayNames::new(&games);
+        let fitted: Vec<_> = games.iter().map(|entry| {
+            let value = names.name(entry);
+            common::display::font::fit_suffix(value, names.suffix_len(entry), 30.0, "...",
+                |text| text.chars().count() as f32,
+                |text| vec![common::display::font::ellipsize(text, 30, |text| text.chars().count() as u32)])[0].clone()
+        }).collect();
+        assert_eq!(fitted, ["Radical Rex: Shred Pr... (USA)", "Radical Rex: Shred... (Europe)"]);
+        assert!(fitted.iter().all(|text| text.chars().count() <= 30));
+        let games = entries(&["Unique (USA).sfc"], &[title]);
+        assert_eq!(DisplayNames::new(&games).suffix_len(&games[0]), 0);
     }
 
     #[test]

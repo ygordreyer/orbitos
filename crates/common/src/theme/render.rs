@@ -878,6 +878,12 @@ impl PreparedFrame {
         align: Align,
         overflow: Overflow,
     ) -> Result<()> {
+        self.text_options_suffix(id, rect, role, color, value, lines, align, overflow, 0)
+    }
+    fn text_options_suffix(
+        &mut self, id: &str, rect: Rect, role: Role, color: ColorRole, value: &str,
+        lines: u32, align: Align, overflow: Overflow, suffix_len: usize,
+    ) -> Result<()> {
         let _phase = crate::perf_trace::phase(crate::perf_trace::Phase::Text);
         let cache_key = super::text_cache::Key::new(
             &self.theme,
@@ -888,7 +894,7 @@ impl PreparedFrame {
             lines,
             align,
             overflow,
-        );
+        ).with_suffix(suffix_len);
         if let Some((scratch, map)) = super::text_cache::get(&self.theme, &cache_key) {
             map.draw(
                 &mut self.pixels.as_mut(),
@@ -909,7 +915,10 @@ impl PreparedFrame {
         } else {
             (value, lines)
         };
-        let wrapped = wrap(&style, value, rect.2, lines as usize);
+        let wrapped = crate::display::font::fit_suffix(
+            value, suffix_len, rect.2 as f32, "…", |text| style.measure(text).w as f32,
+            |text| wrap(&style, text, rect.2, lines as usize),
+        );
         let scratch_bytes = rect.2 as usize * rect.3 as usize * 4;
         ensure!(
             scratch_bytes + self.pixels.data().len() <= 2 * 1024 * 1024,
@@ -977,12 +986,13 @@ impl PreparedFrame {
         }
     }
     fn transform_image(theme: &ThemeHandle, key: &super::image_cache::ImageKey, source: &std::sync::Arc<Pixmap>) -> Result<std::sync::Arc<Pixmap>> {
-        let mut image = super::runtime::fit_image(
-            source,
-            key.width,
-            key.height,
-            key.fit,
-        )?;
+        let logo = theme.pack().component(key.screen, &key.component)
+            .is_some_and(|c| c.logo || c.binding == Some(Binding::SelectedLogo));
+        let mut image = if logo {
+            super::art::fit_logo(source, key.width, key.height)?
+        } else {
+            super::runtime::fit_image(source, key.width, key.height, key.fit)?
+        };
         super::runtime::blur(&mut image, key.blur)?;
         super::runtime::rounded(&mut image, key.radius);
         if key.fade_edge == Some(FadeEdge::Left) {
@@ -1116,25 +1126,38 @@ impl PreparedFrame {
         );
     }
     fn logo_rect(c: &Component, source: &Pixmap) -> Rect {
-        let target = super::art::Target { width: c.rect.2, height: c.rect.3, fit: super::pack::Fit::Contain, logo_box: true }
+        let rect = c.logo_rect.unwrap_or(c.rect);
+        let target = super::art::Target { width: rect.2, height: rect.3, fit: super::pack::Fit::Contain, logo_box: true, cover_box: false }
             .logo(source.width(), source.height());
         let (width, height) = (target.width, target.height);
         let align = c.align.or_else(|| c.paint.as_ref().and_then(|p| p.anchor)).unwrap_or(Align::Left);
-        let x = c.rect.0 + match align {
+        let x = rect.0 + match align {
             Align::Left => 0,
-            Align::Center => (c.rect.2 - width) / 2,
-            Align::Right => c.rect.2 - width,
+            Align::Center => (rect.2 - width) / 2,
+            Align::Right => rect.2 - width,
         };
-        Rect(x, c.rect.1 + (c.rect.3 - height) / 2, width, height)
+        Rect(x, rect.1 + (rect.3 - height) / 2, width, height)
     }
     fn ink_image_component(&self, c: &Component) -> Component {
         let mut image = c.clone();
-        if c.binding != Some(Binding::SelectedHero) {
+        if c.binding != Some(Binding::SelectedHero) && c.fit.is_none() {
             image.fit = Some(if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {
                 super::pack::Fit::Cover
             } else { super::pack::Fit::Contain });
         }
         image
+    }
+    fn ink_image_rect(c: &Component, source: &Pixmap) -> Rect {
+        let rect = c.rect;
+        if !matches!(c.binding, Some(Binding::SelectedCover | Binding::NextCover))
+            || c.fit != Some(super::pack::Fit::Contain) {
+            return rect;
+        }
+        let fitted = super::art::Target { width: rect.2, height: rect.3,
+            fit: super::pack::Fit::Contain, logo_box: false, cover_box: true }
+            .logo(source.width(), source.height());
+        Rect(rect.0 + (rect.2 - fitted.width) / 2,
+            rect.1 + (rect.3 - fitted.height) / 2, fitted.width, fitted.height)
     }
     fn logo(&mut self, c: &Component, input: &FrameInputs) -> Result<bool> {
         if super::logo_suppressed_by_cover(c, input) {
@@ -1143,9 +1166,16 @@ impl PreparedFrame {
         let Some(source) = input.art.selected_logo.as_ref() else {
             return Ok(false);
         };
-        if ink_renderer::collecting_text() { return Ok(true); }
-        let rect = Self::logo_rect(c, source);
         let mut slot = c.clone();
+        if input.text.get(&Binding::Subtitle).is_some_and(|s| !s.is_empty()) {
+            slot.logo_rect = None;
+        }
+        let band = slot.logo_rect.unwrap_or(slot.rect);
+        if !super::art::logo_readable(source.width(), source.height(), band.2, band.3) {
+            return Ok(false);
+        }
+        if ink_renderer::collecting_text() { return Ok(true); }
+        let rect = Self::logo_rect(&slot, source);
         slot.fit = Some(super::pack::Fit::Contain);
         slot.radius = Some(0);
         let pixels = self.image_pixels(rect, source, &slot)?;
@@ -1170,7 +1200,7 @@ impl PreparedFrame {
                         .cloned()
                         .unwrap_or_default()
                 };
-                self.text_options(
+                self.text_options_suffix(
                     &c.id,
                     c.rect,
                     c.role.unwrap(),
@@ -1179,6 +1209,7 @@ impl PreparedFrame {
                     c.max_lines.unwrap(),
                     c.align.unwrap(),
                     c.overflow.unwrap(),
+                    input.suffix_len(&value),
                 )?;
             }
             Kind::Image => {
@@ -1272,7 +1303,7 @@ impl PreparedFrame {
                 let value = input
                     .hints
                     .iter()
-                    .map(|h| format!("{} {}", h.button, h.label))
+                    .map(|h| format!("{} {}", h.button, input.hint_label(&h.button, &h.label)))
                     .collect::<Vec<_>>()
                     .join("   ");
                 self.text(&c.id, c.rect, c.role.unwrap(), c.color.unwrap(), &value, 1)?;
@@ -1398,7 +1429,7 @@ impl PreparedFrame {
                 } else {
                     style.measure(&hint.button).w + 10
                 };
-                let label = style.measure(&hint.label).w;
+                let label = style.measure(input.hint_label(&hint.button, &hint.label)).w;
                 (badge, label, badge + 6 + label)
             })
             .collect();
@@ -1458,7 +1489,7 @@ impl PreparedFrame {
                 Rect(x + badge + 6, y, label.max(1), 20),
                 role,
                 c.color.unwrap(),
-                &hint.label,
+                input.hint_label(&hint.button, &hint.label),
                 1,
             )?;
             x += width + 14;
@@ -1484,7 +1515,7 @@ impl PreparedFrame {
         let desired: Vec<_> = input
             .hints
             .iter()
-            .map(|hint| style.measure(&hint.label).w)
+            .map(|hint| style.measure(input.hint_label(&hint.button, &hint.label)).w)
             .collect();
         let count = input.hints.len() as u32;
         let fixed = badges.iter().sum::<u32>() + count * 4 + count.saturating_sub(1) * 8;
@@ -1512,7 +1543,7 @@ impl PreparedFrame {
         }
         for (index, hint) in input.hints.iter().enumerate() {
             let button = hint.button.as_str();
-            let label = hint.label.as_str();
+            let label = input.hint_label(&hint.button, &hint.label);
             let badge = badges[index];
             let label_width = labels[index];
             let width = badge + 4 + label_width;
@@ -1733,7 +1764,7 @@ impl PreparedFrame {
             } else { text_rect.2 * 2 / 5 };
             row_style.measure(&row.value).w.min(available)
         };
-        self.text(
+        self.text_options_suffix(
             &c.id,
             Rect(
                 text_rect.0, text_rect.1,
@@ -1743,7 +1774,7 @@ impl PreparedFrame {
             c.role.unwrap(),
             color,
             &row.label,
-            1,
+            1, Align::Left, Overflow::Wrap, input.suffix_len(&row.label),
         )?;
         if value_width > 0 {
             self.text_options(
@@ -1837,6 +1868,7 @@ impl PreparedFrame {
             self.retained_layout && retained::eligible(input) && input.art.next_cover.is_some();
         let key = tiles::Key {
             label: "",
+            suffix_len: 0,
             source: input.art.next_cover.as_ref(),
             focused: false,
             preview: true,
@@ -1977,6 +2009,7 @@ impl PreparedFrame {
         let caption = self.shelf_caption(c, x);
         let key = tiles::Key {
             label: &row.label,
+            suffix_len: input.suffix_len(&row.label),
             source: input.art.entries.get(&row.id),
             focused,
             preview: false,
@@ -1996,13 +2029,13 @@ impl PreparedFrame {
                 c.art_size.unwrap() + 2 * c.padding.unwrap(),
             );
             self.shelf_art(c, case, row, input, focused)?;
-            self.text(
+            self.text_options_suffix(
                 &c.id,
                 caption,
                 c.role.unwrap(),
                 ColorRole::Text,
                 &row.label,
-                c.caption_lines.unwrap(),
+                c.caption_lines.unwrap(), Align::Left, Overflow::Wrap, input.suffix_len(&row.label),
             )?;
             if cache_tile {
                 self.tiles.capture(key, &self.pixels, tile_rect);
@@ -2608,3 +2641,11 @@ mod dense_damage_tests {
 #[cfg(test)]
 #[path = "render_neighbor_tests.rs"]
 mod neighbor_tests;
+
+#[cfg(test)]
+#[path = "context_logo_tests.rs"]
+mod context_logo_tests;
+
+#[cfg(test)]
+#[path = "fix25_cover_tests.rs"]
+mod fix25_cover_tests;

@@ -172,6 +172,11 @@ fn detail_heading(theme: &ThemeHandle, c: &Component) -> Type {
 }
 impl PreparedFrame {
     pub(super) fn ink_baseline(
+        &mut self, id: &str, rect: Rect, ty: &Type, text: &str, align: Align, baseline: f32,
+    ) -> Result<()> {
+        self.ink_baseline_suffix(id, rect, ty, text, align, baseline, 0)
+    }
+    pub(super) fn ink_baseline_suffix(
         &mut self,
         id: &str,
         rect: Rect,
@@ -179,6 +184,7 @@ impl PreparedFrame {
         text: &str,
         align: Align,
         baseline: f32,
+        suffix_len: usize,
     ) -> Result<()> {
         let color = self.color(ty.color);
         let baseline = baseline - rect.1 as f32;
@@ -188,6 +194,7 @@ impl PreparedFrame {
             ty.tracking.to_bits(), ty.upper, align, rect.2, rect.3,
             baseline.to_bits(), color, ty.literal_color, text,
         );
+        let input_key = if suffix_len > 0 { format!("{input_key}:suffix={suffix_len}") } else { input_key };
         let weak = self.theme.weak();
         let collecting = collecting_text();
         // The input key determines ellipsis and x; the suffix records x's exact bits without remeasuring hits.
@@ -209,8 +216,9 @@ impl PreparedFrame {
             if !collecting { crate::perf_trace::count(crate::perf_trace::Count::TextMiss, 1); }
             let _text = crate::perf_trace::recording()
                 .then(|| crate::perf_trace::phase(crate::perf_trace::Phase::Text));
+            let suffix_len = if suffix_len == 0 { 0 } else { ty.value(&text[text.len() - suffix_len..]).len() };
             let value = ty
-                .lines(&ty.value(text), rect.2, 1, Overflow::Ellipsis)
+                .suffix_lines(&ty.value(text), rect.2, 1, Overflow::Ellipsis, suffix_len)
                 .pop()
                 .unwrap_or_default();
             let (_, left, right) = ty.metrics(&value);
@@ -229,7 +237,7 @@ impl PreparedFrame {
                 TEXT_PLAN.with(|plan| plan.borrow_mut().as_mut().unwrap().push(TextRaster {
                     key: key.clone(), ty: ty.clone(), value, rect, count: 1, align,
                     overflow: Overflow::Ellipsis, center: false, guide: false,
-                    baseline: Some((x, baseline)), color, synopsis: false,
+                    baseline: Some((x, baseline)), color, synopsis: false, suffix_len,
                 }));
             }
             if !collecting && bytes <= TEXT_LIMIT && !HERO_SCRATCH.get() {
@@ -298,7 +306,13 @@ impl PreparedFrame {
         .or_else(|| p.action_style.as_ref().and_then(|s| s.border.as_ref()))
         .or(p.border.as_ref());
         if let Some(b) = border {
-            self.ink_border(c.rect, b.color, b.width, c.radius.unwrap_or(0), b.alpha);
+            let source = match c.binding {
+                Some(Binding::SelectedCover) => input.art.selected_cover.as_ref(),
+                Some(Binding::NextCover) => input.art.next_cover.as_ref(),
+                _ => None,
+            };
+            let rect = source.map_or(c.rect, |source| Self::ink_image_rect(c, source));
+            self.ink_border(rect, b.color, b.width, c.radius.unwrap_or(0), b.alpha);
         }
         self.targets.push(Target {
             component: c.id.clone(),

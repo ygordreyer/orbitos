@@ -360,13 +360,14 @@ impl Details {
             self.pages.len()
         )
     }
-    pub(crate) fn frame_input(&self, handle: &common::theme::ThemeHandle, title: &str,
+    pub(crate) fn frame_input(&self, handle: &common::theme::ThemeHandle, title: &str, suffix_len: usize,
         focus: common::theme::frame::Focus) -> common::theme::frame::FrameInputs {
         use common::theme::{frame::{FrameInputs, Hint, Row}, pack::{Binding, ScreenId}};
         let mut detail = FrameInputs::new(ScreenId::GameDetail);
         detail.pagination = Some(common::theme::frame::Pagination { page: self.page + 1, total: self.pages.len() });
         detail.detail_lines = self.section_pages.get(self.page).cloned().unwrap_or_default();
         detail.text.insert(Binding::SelectedTitle, title.into());
+        if suffix_len > 0 { detail.suffix_lengths.insert(title.into(), suffix_len); }
         detail
             .text
             .insert(Binding::SelectedMetadata, self.metadata.clone());

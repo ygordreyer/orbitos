@@ -29,6 +29,7 @@ thread_local! {
 
 pub(crate) fn invalidate_system_counts() {
     SYSTEM_COUNTS.with(|counts| counts.borrow_mut().clear());
+    super::library::invalidate();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct Directory {
     pub image: LazyImage,
     #[serde(skip)]
     pub game_count: Option<usize>,
+    #[serde(skip)]
+    pub(crate) game: Option<Box<Game>>,
 }
 
 impl Ord for Directory {
@@ -63,6 +66,7 @@ impl Default for Directory {
             path: ALLIUM_GAMES_DIR.to_owned(),
             image: LazyImage::Unknown(ALLIUM_GAMES_DIR.to_owned()),
             game_count: None,
+            game: None,
         }
     }
 }
@@ -82,6 +86,7 @@ impl Directory {
             path,
             image,
             game_count: None,
+            game: None,
         }
     }
 
@@ -98,6 +103,7 @@ impl Directory {
             path,
             image,
             game_count: None,
+            game: None,
         }
     }
 
@@ -112,22 +118,14 @@ impl Directory {
         });
     }
 
-    fn cached_game_count(&self, console_mapper: &ConsoleMapper) -> usize {
+    pub(super) fn cached_game_count(&self, console_mapper: &ConsoleMapper) -> usize {
         let modified = fs::metadata(&self.path).and_then(|metadata| metadata.modified()).ok();
         let catalog = crate::network_runtime::art_path_generation();
         SYSTEM_COUNTS.with(|counts| {
             if let Some((stamp, generation, count)) = counts.borrow().get(&self.path) {
                 if modified == *stamp && catalog == *generation { return *count; }
             }
-            // Stop the emptiness probe at the first playable entry. Only count a
-            // populated system once, until its mtime or an explicit rescan changes.
-            let count = if crate::network_runtime::virtual_directory(&self.path) {
-                self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX)
-            } else if self.walk_games(console_mapper, &mut HashSet::new(), 1) == 0 {
-                0
-            } else {
-                self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX)
-            };
+            let count = self.walk_games(console_mapper, &mut HashSet::new(), usize::MAX);
             counts.borrow_mut().insert(self.path.clone(), (modified, catalog, count));
             count
         })
@@ -136,6 +134,14 @@ impl Directory {
     fn walk_games(&self, console_mapper: &ConsoleMapper, ancestors: &mut HashSet<PathBuf>, limit: usize) -> usize {
         let canonical = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
         if !ancestors.insert(canonical.clone()) { return 0; }
+        if limit != 1 {
+            let count = super::library::count_entries(self, console_mapper).into_iter().map(|entry| match entry {
+                Entry::Directory(directory) => directory.walk_games(console_mapper, ancestors, usize::MAX),
+                Entry::Game(_) | Entry::App(_) => 1,
+            }).sum();
+            ancestors.remove(&canonical);
+            return count;
+        }
         #[cfg(test)]
         super::load_work::record(|work| work.directory_reads += 1);
         let virtual_system = crate::network_runtime::virtual_directory(&self.path);
@@ -202,9 +208,6 @@ impl Directory {
         let games = gamelist.games.into_iter().filter_map(|game| {
             let path = self.path.join(&game.path).canonicalize().ok()?;
             if !super::listed_path(&path) { return None; }
-            if path.is_dir() && !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u")) {
-                return Some(Entry::Directory(Directory::with_name(path, game.name)));
-            }
             let extension = game
                 .path
                 .extension()
@@ -226,7 +229,8 @@ impl Directory {
                 None => LazyImage::Unknown(path.clone()),
             };
 
-            Some(Entry::Game(Game {
+            let folder = path.is_dir() && !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u"));
+            let game = Game {
                 path,
                 name: game.name,
                 full_name,
@@ -240,7 +244,15 @@ impl Directory {
                 genres: game.genres,
                 favorite: false,
                 screenshot_path: None,
-            }))
+            };
+            if folder {
+                let mut directory = Directory::with_name(game.path.clone(), game.name.clone());
+                directory.image = game.image.clone();
+                directory.game = Some(Box::new(game));
+                Some(Entry::Directory(directory))
+            } else {
+                Some(Entry::Game(game))
+            }
         });
 
         let folders = gamelist.folders.into_iter().filter_map(|folder| {
@@ -312,11 +324,18 @@ impl Directory {
                 (path, is_dir, exists)
             })
             .collect();
+        let physical: Vec<_> = scanned.iter().filter_map(|(path, is_dir, _)| {
+            Entry::from_scanned_path(path.clone(), *is_dir, console_mapper).ok().flatten()
+        }).collect();
         let inventory: HashSet<_> = scanned
             .iter()
             .filter(|(_, _, exists)| *exists)
             .map(|(path, _, _)| path.as_path())
             .collect();
+        if self.path != *ALLIUM_GAMES_DIR {
+            let present: Vec<_> = physical.iter().filter(|entry| inventory.contains(entry.path())).cloned().collect();
+            super::library::remember(&self.path, &present);
+        }
         let mut entries = Vec::with_capacity(scanned.len());
 
         #[cfg(test)]
@@ -371,6 +390,13 @@ impl Directory {
                                         genres: game.genres.clone(),
                                         favorite: game.favorite,
                                     }),
+                                    Entry::Directory(directory) => {
+                                        let mut game = directory.game.as_deref().cloned()
+                                            .unwrap_or_else(|| Game::new(directory.path.clone()));
+                                        game.name = directory.name.clone();
+                                        game.image = directory.image.clone();
+                                        Some(game.into())
+                                    }
                                     _ => None,
                                 })
                                 .collect();
@@ -399,33 +425,51 @@ impl Directory {
             .map(|(path, _, _)| path.as_path()).collect();
         let mut games = HashMap::with_capacity(rows.len());
         for row in rows {
-            if !super::listed_path(&row.path) || directories.contains(row.path.as_path())
-                && !row.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u")) { continue; }
+            if !super::listed_path(&row.path) { continue; }
             games.insert(row.path.clone(), GameMetadata::from(&row));
             let exists = inventory_contains_or_exists(&inventory, &row.path);
             if exists || crate::network_runtime::registered(&row.path) {
-                entries.push(Entry::Game(Game::from_db_present(row)));
+                if directories.contains(row.path.as_path())
+                    && !row.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("m3u")) {
+                    let mut directory = Directory::with_name(row.path.clone(), row.name.clone());
+                    directory.image = LazyImage::from_path(&row.path, row.image);
+                    entries.push(Entry::Directory(directory));
+                } else {
+                    entries.push(Entry::Game(Game::from_db_present(row)));
+                }
             }
         }
         drop(inventory);
         drop(directories);
-        entries.extend(
-            scanned
-                .into_iter()
-                .filter_map(|(path, is_dir, _)| {
-                    Entry::from_scanned_path(path, is_dir, console_mapper)
-                        .ok()
-                        .flatten()
-                })
-                .sorted()
-                .dedup_by(|a, b| a.name() == b.name()),
-        );
+        entries.extend(physical.into_iter().sorted());
 
         crate::network_runtime::merge_directory(&self.path, &mut entries);
         let mut uniques = HashSet::with_capacity(entries.len());
         entries.retain(|entry| super::listed_path(entry.path()) && uniques.insert(entry.path().to_path_buf()));
+        super::library::filter_games(&mut entries, console_mapper);
         if self.path == *ALLIUM_GAMES_DIR {
             Self::retain_populated_systems(&mut entries, console_mapper);
+        } else {
+            super::library::resolve_folders(&mut entries, console_mapper, database)?;
+            let mut paths = HashSet::new();
+            entries.retain(|entry| paths.insert(entry.path().to_path_buf()));
+        }
+
+        let nested: Vec<_> = entries.iter().filter_map(|entry| match entry {
+            Entry::Game(game) if game.path.parent() != Some(self.path.as_path()) => Some(game.path.as_path()),
+            _ => None,
+        }).collect();
+        if !nested.is_empty() {
+            #[cfg(test)]
+            super::load_work::record(|work| work.sql += 1);
+            let mut rows: HashMap<_, _> = database.select_games(&nested)?.into_iter().flatten()
+                .map(|row| (row.path.clone(), row)).collect();
+            for entry in &mut entries {
+                if let Some(row) = rows.remove(entry.path()) {
+                    games.insert(row.path.clone(), GameMetadata::from(&row));
+                    *entry = Entry::Game(Game::from_db_present(row));
+                }
+            }
         }
 
         // Imports and physical entries can be absent from the bulk result, including
@@ -478,10 +522,13 @@ impl Directory {
         invalidate_system_counts();
         let entries = self.entries(database, console_mapper, locale)?;
 
-        for entry in &entries {
+        for entry in super::library::inventory(&self.path, console_mapper).unwrap_or_default() {
             match entry {
-                Entry::Directory(dir) => queue.push_back(dir.clone()),
-                Entry::Game(_) | Entry::App(_) => {}
+                Entry::Directory(dir) => queue.push_back(dir),
+                Entry::Game(game) if game.extension.eq_ignore_ascii_case("m3u") && game.path.is_dir() => {
+                    queue.push_back(Directory::new(game.path));
+                }
+                _ => {}
             }
         }
 
@@ -602,6 +649,128 @@ pub(crate) mod list_tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0.path).unwrap();
         }
+    }
+
+    fn single_disc_catalog_folders(cached: bool) {
+        use crate::network_library::{NetworkGame, Payload};
+        use sha2::{Digest, Sha256};
+        let fixture = Fixture::new();
+        let root = &fixture.0.path;
+        let ps = root.join("Roms/PS");
+        let mut games = Vec::new();
+        let titles = ["Mizzurna Falls: The Chilling Cut", "Mega Man Legends 2 PSP Improvements (v1.1)"];
+        let mut xml = "<gameList>".to_owned();
+        for (id, folder, title, stem, tracks) in [
+            ("mizzurna", "Mizzurna Falls - The Chilling Cut (Owl)", "Mizzurna Falls: The Chilling Cut", "Mizzurna Falls - The Chilling Cut (Owl)", 1),
+            ("megaman", "Mega Man Legends 2 PSP Improvements (v1.1)", "Mega Man Legends 2 PSP Improvements (v1.1)", "Mega Man Legends 2 (USA)", 2),
+        ] {
+            let path = ps.join(folder);
+            fs::create_dir_all(&path).unwrap();
+            let revision = "b".repeat(64);
+            let cue = format!("{stem}.cue");
+            let mut payloads = Vec::new();
+            let mut cue_text = String::new();
+            for track in 1..=tracks {
+                let bin = if tracks == 1 { format!("{stem}.bin") } else { format!("{stem} (Track {track}).bin") };
+                cue_text.push_str(&format!("FILE \"{bin}\" BINARY\r\n  TRACK {track:02} MODE2/2352\r\n    INDEX 01 00:00:00\r\n"));
+                payloads.push((bin, "rom", b"fixture ROM".to_vec()));
+            }
+            payloads.push((cue.clone(), "cue", cue_text.into_bytes()));
+            let files = payloads.into_iter().enumerate().map(|(index, (name, role, body))| {
+                fs::write(path.join(&name), &body).unwrap();
+                Payload {
+                    id: format!("file{index}"), relative_path: name, bytes: body.len() as u64,
+                    sha256: crate::network_transfer::digest_hex(Sha256::digest(&body).as_slice()), role: role.into(),
+                    http_route: format!("/v1/files/{id}/{revision}/file{index}"),
+                }
+            }).collect();
+            xml.push_str(&format!("<game><path>./{folder}</path><name>{title}</name></game>"));
+            games.push(NetworkGame {
+                id: id.into(), display_title: folder.into(), platform: "PS".into(), bundle_revision: revision,
+                cache_path: format!("Roms/PS/{folder}"), game_path: format!("Roms/PS/{folder}/{cue}"),
+                launch_path: format!("Roms/PS/{folder}/{cue}"), install_kind: "directory".into(), files, discs: vec![],
+            });
+            if !cached { fs::remove_dir_all(&path).unwrap(); }
+        }
+        xml.push_str("</gameList>");
+        fs::write(ps.join("gamelist.xml"), xml).unwrap();
+        let collection = ps.join("Collection");
+        fs::create_dir_all(&collection).unwrap();
+        for name in ["One.chd", "Two.chd"] { fs::write(collection.join(name), b"rom").unwrap(); }
+        let _runtime = crate::network_runtime::tests::library_catalog_fixture(root, games.clone(), cached);
+        for (game, title) in games.iter().zip(titles) {
+            if cached {
+                let path = root.join(&game.cache_path);
+                fs::create_dir(path.join("Imgs")).unwrap();
+                for name in ["cover.png", "alternate.png"] { fs::write(path.join("Imgs").join(name), b"art").unwrap(); }
+                let cue = Path::new(&game.game_path).file_name().unwrap().to_str().unwrap();
+                let child_xml = format!("<gameList><game><path>{cue}</path><name>{title}</name></game></gameList>");
+                for name in ["gamelist.xml", "gamelist.xml.before-art2"] { fs::write(path.join(name), &child_xml).unwrap(); }
+                fs::File::open(path).unwrap().set_modified(SystemTime::now() - std::time::Duration::from_secs(10)).unwrap();
+            }
+        }
+        fs::File::open(&collection).unwrap().set_modified(SystemTime::now() - std::time::Duration::from_secs(10)).unwrap();
+        let database = Database::in_memory().unwrap();
+        let mapper = ConsoleMapper::library_fixture();
+        let directory = Directory::new(ps);
+        let locale = Locale::new("en-US");
+        common::media::with_name_indexes(|| common::media::check_directory(&directory.path));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (game, title) in games.iter().zip(titles) {
+            while common::media::cached_name(&root.join(&game.game_path)).as_deref() != Some(title) {
+                assert!(std::time::Instant::now() < deadline, "gamelist name index must finish");
+                common::media::poll_name_indexes();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        invalidate_system_counts();
+        for load in 0..2 {
+            load_work::take();
+            let entries = directory.entries(&database, &mapper, &locale).unwrap();
+            assert_eq!(entries.len(), 3);
+            for (descriptor, title) in games.iter().zip(titles) {
+                let identity = root.join(if cached { &descriptor.cache_path } else { &descriptor.game_path });
+                let entry = entries.iter().find(|entry| entry.path() == identity).unwrap();
+                let Entry::Game(game) = entry else { panic!("single-disc catalog folder must collapse: {entry:?}"); };
+                assert_eq!(game.name, title);
+                assert!(crate::network_runtime::registered(&game.path));
+                assert_eq!(crate::network_runtime::has_download(&game.path), !cached);
+                assert_eq!(super::super::library::launch_path(&game.path, &mapper).unwrap(), root.join(&descriptor.launch_path));
+                if !cached {
+                    assert!(crate::network_runtime::guard_launch(&game.path).is_err());
+                }
+            }
+            let Entry::Directory(folder) = entries.iter().find(|entry| entry.path() == collection).unwrap() else { panic!("two games must navigate"); };
+            assert_eq!(folder.game_count, Some(2));
+            assert_eq!(directory.cached_game_count(&mapper), 4, "catalog identities and physical copies count once");
+            let work = load_work::take();
+            if load == 1 {
+                assert_eq!(work.directory_reads, 1, "warm navigation reuses inventories and counts");
+                assert_eq!(work.descriptor_reads, 0, "warm navigation reuses cue references");
+            }
+        }
+        drop(_runtime);
+        if cached {
+            invalidate_system_counts();
+            let entries = directory.entries(&database, &mapper, &locale).unwrap();
+            for (game, title) in games.iter().zip(titles) {
+                assert!(entries.iter().any(|entry| matches!(entry, Entry::Game(local)
+                    if local.path == root.join(&game.cache_path) && local.name == title)), "local-only folders also collapse");
+            }
+            assert_eq!(directory.cached_game_count(&mapper), 4);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn library_single_disc_local_and_catalog_folders_collapse() {
+        single_disc_catalog_folders(true);
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn library_single_disc_uncached_catalog_folders_are_games() {
+        single_disc_catalog_folders(false);
     }
 
     #[test]
@@ -1038,7 +1207,8 @@ pub(crate) mod list_tests {
                 directory_reads: 1,
                 metadata: 27,
                 file_types: 0,
-                sql: 26
+                sql: 26,
+                descriptor_reads: 0
             }
         );
         assert_eq!(
@@ -1047,7 +1217,8 @@ pub(crate) mod list_tests {
                 directory_reads: 1,
                 metadata: 0,
                 file_types: 12,
-                sql: 2
+                sql: 2,
+                descriptor_reads: 0
             }
         );
     }

@@ -93,6 +93,12 @@ impl ConsoleMapper {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn library_fixture() -> Self {
+        let config: ConsoleConfig = toml::from_str(include_str!("../../../static/.allium/config/consoles.toml")).unwrap();
+        Self { cores: HashMap::new(), consoles: config.consoles }
+    }
+
     pub fn load_config(&mut self) -> Result<()> {
         let consoles = std::fs::read_to_string(ALLIUM_CONFIG_CONSOLES.as_path()).map_err(|e| {
             anyhow!(
@@ -182,6 +188,37 @@ impl ConsoleMapper {
         None
     }
 
+    pub(crate) fn library_console(&self, path: &Path) -> Option<&Console> {
+        path.ancestors().find_map(|parent| self.get_console_by_dir(parent))
+    }
+
+    pub(crate) fn accepts_game(&self, path: &Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        self.consoles.iter().any(|console| {
+            console.file_name.iter().any(|file| file.eq_ignore_ascii_case(&name))
+                || name.split('.').skip(1).any(|extension| {
+                    console.extensions.iter().any(|ext| ext.eq_ignore_ascii_case(extension))
+                })
+        }) || name.split('.').skip(1).any(|extension| {
+            // extract_cores.py omits formats shared by several systems.
+            ["bin", "rom", "m3u", "cue", "iso", "img", "chd", "ccd", "zip", "7z",
+                "dsk", "cas", "mx1", "mx2", "bs", "dmg", "fig", "tap", "atr"].iter()
+                .any(|ext| ext.eq_ignore_ascii_case(extension))
+        }) || !path.extension().is_some_and(|extension| {
+            ["txt", "png", "jpg", "jpeg", "gif", "webp", "xml", "json", "nfo", "pdf",
+                "sav", "srm", "state", "cfg", "ini", "log", "db", "sbi", "msu", "pcm"].iter()
+                .any(|ext| extension.eq_ignore_ascii_case(ext))
+        }) && (self.consoles.is_empty() || self.get_console(path).is_some_and(|console| {
+            path.ancestors().any(|ancestor| {
+                let name = ancestor.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                console.patterns.iter().any(|pattern| {
+                    let pattern = pattern.to_lowercase();
+                    name == pattern || name.contains(&format!("({pattern})"))
+                })
+            })
+        }))
+    }
+
     pub fn launch_game(
         &self,
         database: &Database,
@@ -195,11 +232,11 @@ impl ConsoleMapper {
             database.update_game_path(&old, &game.path)?;
         }
 
-        let content_path = crate::discs::content_path(&game.path)?;
+        ensure!(game.path.exists(), "Game file is missing");
+        let content_path = crate::entry::library::launch_path(&game.path, self)?;
         let image = game.image().map(Path::to_path_buf);
-        database.increment_play_count(&game.clone().into())?;
 
-        let console = self.get_console(game.path.as_path());
+        let console = self.get_console(&content_path);
         let Some(console) = console else {
             bail!(
                 "Console for game \"{}\" does not exist.",
@@ -207,11 +244,11 @@ impl ConsoleMapper {
             );
         };
         let Some(core_name) = game.core.as_ref().or_else(|| console.cores.first()) else {
-            return Ok(None);
+            bail!("No core is configured for this system");
         };
         let Some(core) = self.cores.get(core_name) else {
             error!("Core \"{}\" does not exist.", core_name);
-            return Ok(None);
+            bail!("Configured core is missing");
         };
         let game_info = match &core.core {
             CoreType::RetroArch(libretro_core) => GameInfo::new(
@@ -242,13 +279,14 @@ impl ConsoleMapper {
                 core_name.clone(),
                 image,
                 path.to_string_lossy().to_string(),
-                vec![game.path.display().to_string()],
+                vec![content_path.display().to_string()],
                 false,
                 core.swap,
             ),
         };
         debug!("Saving game info: {:?}", game_info);
         game_info.save()?;
+        database.increment_play_count(&game.clone().into())?;
         Ok(Some(Command::Exec(game_info.command())))
     }
 
@@ -291,11 +329,48 @@ impl ConsoleMapper {
     }
 }
 
+pub(crate) fn launch_feedback(result: Result<Option<Command>>) -> Option<Command> {
+    match result {
+        Ok(Some(command)) => Some(command),
+        result => {
+            let message = match result {
+                Err(error) => { error!("Game launch failed: {error:#}"); error.to_string() }
+                _ => "No core is configured for this game".into(),
+            };
+            Some(Command::Toast(format!("Unable to launch: {message}"), Some(std::time::Duration::from_secs(5))))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use super::*;
+
+    #[test]
+    fn launch_failures_report_missing_file_and_core_without_recording_a_play() {
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let database = Database::in_memory().unwrap();
+        let mut mapper = ConsoleMapper::library_fixture();
+        let path = fixture.0.path.join("GB/Game.gb");
+        let mut game = Game::new(path.clone());
+        let result = mapper.launch_game(&database, &mut game, false);
+        let Some(Command::Toast(text, duration)) = launch_feedback(result) else { panic!("missing file must show a toast"); };
+        assert!(text.contains("file is missing"));
+        assert_eq!(duration, Some(std::time::Duration::from_secs(5)));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"rom").unwrap();
+        for configured in [true, false] {
+            if !configured { mapper.consoles.iter_mut().for_each(|console| console.cores.clear()); }
+            let result = mapper.launch_game(&database, &mut game, false);
+            let Some(Command::Toast(text, _)) = launch_feedback(result) else { panic!("missing core must show a toast"); };
+            assert!(text.contains("core"));
+            assert!(database.select_game(&path).unwrap().is_none());
+        }
+        let error = std::process::Command::new(fixture.0.path.join("missing-executable")).spawn().unwrap_err();
+        assert!(matches!(launch_feedback(Err(error.into())), Some(Command::Toast(_, Some(_)))));
+    }
 
     // A child process keeps configuration overrides away from other tests' lazy globals.
     fn isolated_config_test(name: &str) -> bool {
@@ -316,6 +391,17 @@ mod tests {
             .unwrap();
         assert!(status.success(), "isolated console configuration test failed");
         true
+    }
+
+    #[test]
+    fn library_accepts_launchable_formats_across_console_boundaries() {
+        let mapper = ConsoleMapper::library_fixture();
+        for path in ["Roms/PORTS/Game.sh", "Roms/EIGHTHUNDRED/Game.atr", "Roms/GB/Doukutsu.exe", "Roms/NGP/rom", "Roms/EIGHTHUNDRED/Game.atx"] {
+            assert!(mapper.accepts_game(Path::new(path)), "{path}");
+        }
+        for path in ["Roms/GB/readme.txt", "Roms/GB/cover.webp", "Roms/GB/game.sav", "Roms/GB/game.srm"] {
+            assert!(!mapper.accepts_game(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

@@ -24,8 +24,10 @@ pub(super) struct Key<'a> {
     lines: u32,
     align: Align,
     overflow: Overflow,
+    suffix_len: usize,
 }
 impl<'a> Key<'a> {
+    pub fn with_suffix(mut self, len: usize) -> Self { self.suffix_len = len; self }
     pub fn text_value(&self) -> &str {
         &self.text
     }
@@ -49,6 +51,7 @@ impl<'a> Key<'a> {
             lines,
             align,
             overflow,
+            suffix_len: 0,
         }
     }
 }
@@ -150,6 +153,7 @@ pub(super) fn insert(
         lines: key.lines,
         align: key.align,
         overflow: key.overflow,
+        suffix_len: key.suffix_len,
     };
     CACHE.with(|c| {
         c.borrow_mut().insert(Entry {
@@ -181,6 +185,7 @@ mod tests {
             lines: 1,
             align: Align::Left,
             overflow: Overflow::Wrap,
+            suffix_len: 0,
         };
         for _ in 0..100 {
             cache.insert(Entry {

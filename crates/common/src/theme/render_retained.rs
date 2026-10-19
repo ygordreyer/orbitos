@@ -130,6 +130,10 @@ pub(super) fn restore_model(saved: &Inputs) -> Option<FrameInputs> {
     Some(model)
 }
 
+pub(super) fn cover_source(saved: &Inputs) -> Option<Arc<Pixmap>> {
+    saved.art.cover.as_ref()?.upgrade()
+}
+
 pub(super) fn capture(input: &FrameInputs) -> Inputs {
     let mut saved = input.clone();
     saved.art = Default::default();
@@ -156,6 +160,7 @@ pub(super) fn allocation_bytes(input: &FrameInputs) -> usize {
         + rows.iter().map(|r| r.id.capacity() + r.label.capacity() + r.subtitle.capacity() + r.value.capacity()).sum::<usize>();
     std::mem::size_of::<FrameInputs>() + input.raster_revision.as_ref().map_or(0, String::capacity)
         + input.text.iter().chain(&input.selected).map(|(_, v)| 512 + v.capacity()).sum::<usize>()
+        + input.suffix_lengths.keys().map(|s| 512 + s.capacity()).sum::<usize>()
         + input.rows.iter().map(|(_, r)| 512 + rows(r)).sum::<usize>()
         + input.navigation.iter().map(|(_, r)| 512 + rows(r)).sum::<usize>()
         + input.detail_lines.capacity() * std::mem::size_of::<super::super::frame::DetailLine>()
@@ -230,12 +235,14 @@ fn same_rows(a: &Vec<Row>, b: &Vec<Row>) -> bool {
 pub(super) fn same_model(a: &FrameInputs, b: &FrameInputs) -> bool {
     use super::super::frame::{DetailLine, Focus, Hint, Status};
     // Exhaustive patterns make every new model field an explicit proof decision.
-    let FrameInputs { screen, raster_revision, text, rows, selected, pagination, detail_lines,
+    let FrameInputs { screen, raster_revision, text, suffix_lengths, rows, selected, selected_is_folder, pagination, detail_lines,
         metadata, facts, navigation, focus, hints, suppress_hints, status, progress,
         keyboard, keyboard_cursor, art } = b;
     let Focus { component, item } = focus;
     let Status { clock, battery, charging, network } = status;
     a.screen == *screen
+        && a.suffix_lengths == *suffix_lengths
+        && a.selected_is_folder == *selected_is_folder
         && same_map(&a.selected, selected, |a, b| same_text(a, b))
         && same_text(&a.focus.component, component) && same_optional_text(&a.focus.item, item)
         && a.pagination == *pagination && a.suppress_hints == *suppress_hints
@@ -286,6 +293,7 @@ fn same_art(a: Option<&Weak<Pixmap>>, b: Option<&Arc<Pixmap>>) -> bool {
 }
 pub(super) fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool {
     let a = &previous.model;
+    if a.suffix_lengths != b.suffix_lengths && matches!(c.kind, Kind::Text | Kind::Entries | Kind::Image) { return true; }
     if c.logo_when_no_cover
         && (previous.art.cover.is_some()
             || a.selected.get(&Binding::Entries)
@@ -296,6 +304,12 @@ pub(super) fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool
     {
         return true;
     }
+    if c.logo_rect.is_some()
+        && a.text.get(&Binding::Subtitle).is_some_and(|s| !s.is_empty())
+            != b.text.get(&Binding::Subtitle).is_some_and(|s| !s.is_empty())
+    {
+        return true;
+    }
     match c.kind {
         Kind::Text => {
             (c.logo && !same_art(previous.art.logo.as_ref(), b.art.selected_logo.as_ref()))
@@ -303,7 +317,7 @@ pub(super) fn changed(c: &Component, previous: &Inputs, b: &FrameInputs) -> bool
                     && a.text.get(&c.binding.unwrap()) != b.text.get(&c.binding.unwrap()))
         }
         Kind::Status => a.status != b.status,
-        Kind::Hints => a.hints != b.hints,
+        Kind::Hints => a.hints != b.hints || a.selected_is_folder != b.selected_is_folder,
         Kind::Image => match c.binding {
             Some(Binding::SelectedLogo) => {
                 !same_art(previous.art.logo.as_ref(), b.art.selected_logo.as_ref())
@@ -413,6 +427,7 @@ fn list_damage(c: &Component, a: &Inputs, b: &FrameInputs, damage: &mut Vec<Rect
     }
     for (index, (old, new)) in old.iter().zip(new).enumerate() {
         if old != new
+            || a.model.suffix_len(&old.label) != b.suffix_len(&new.label)
             || row_state(c, old, &a.model) != row_state(c, new, b)
             || !same_art(a.art.entries.get(&new.id), b.art.entries.get(&new.id))
         {

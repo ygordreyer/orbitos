@@ -192,7 +192,8 @@ fn recents_and_details_shadow_tiles_share_the_existing_cache_budget() {
     SHADOWS.with(|cache| {
         let cache = cache.borrow();
         assert_eq!(cache.len(), 5);
-        assert_eq!(cache.iter().map(|entry| entry.pixels.data().len()).sum::<usize>(), 1_531_136);
+        assert!(cache.iter().map(|entry| entry.pixels.data().len()).sum::<usize>() <= 1_531_136,
+            "fitted cover shadows must stay within the original square-shadow budget");
     });
 }
 

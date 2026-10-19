@@ -1,6 +1,6 @@
 //! Private cache jobs, identity-bound checkpoints and no-replace installs.
 #![allow(dead_code)]
-use crate::network_fs::{AnchoredFile, AnchoredFs, Identity};
+use crate::network_fs::{AnchoredFile, AnchoredFs, Identity, StateAdmissionDenied};
 use crate::network_library::{
     CacheState, Catalog, METADATA_MARGIN, NetworkGame, PartialAllocation, RESERVE_BYTES, plan_space,
 };
@@ -37,6 +37,10 @@ pub struct FilesystemSpace;
 impl SpaceProbe for FilesystemSpace {
     fn observe(&self, fs: &AnchoredFs) -> Result<Space> {
         fs.check_root()?;
+        #[cfg(test)]
+        if let Some((free_bytes, allocation_unit)) = fs.test_observed_space() {
+            return Ok(Space { free_bytes, allocation_unit });
+        }
         let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         ensure!(
             unsafe { libc::fstatvfs(fs.root_fd(), info.as_mut_ptr()) } == 0,
@@ -407,10 +411,17 @@ fn save_json(root: &AnchoredFs, path: &Path, value: &impl Serialize) -> Result<(
     let expected = owned_metadata_identity(root, path, &value)?;
     let bytes = serde_json::to_vec(&value)?;
     ensure!(bytes.len() <= 1024 * 1024, "Metadata too large");
-    let mut file = root.create(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    root.replace_metadata(&temporary, path, expected)
+    root.admit_state_write(bytes.len() as u64)?;
+    let mut file = root.create_state(&temporary)?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        root.replace_metadata(&temporary, path, expected)
+    })();
+    if result.as_ref().is_err_and(StateAdmissionDenied::matches) {
+        file.remove_owned()?;
+    }
+    result
 }
 fn promote_metadata(root: &AnchoredFs, source: &Path, target: &Path) -> Result<()> {
     let mut file = regular(root, source, false)?;
@@ -425,18 +436,8 @@ struct CacheLock {
 }
 impl CacheLock {
     fn acquire(root: &AnchoredFs, path: &Path) -> Result<Self> {
-        let file = match root.create(path) {
+        let file = match regular(root, path, true) {
             Ok(mut file) => {
-                file.write_all(b"allium-network-cache\n")?;
-                file.sync_all()?;
-                file
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) =>
-            {
-                let mut file = regular(root, path, true)?;
                 let mut contents = String::new();
                 Read::by_ref(&mut file)
                     .take(64)
@@ -445,6 +446,23 @@ impl CacheLock {
                     contents == "allium-network-cache\n",
                     "Unregistered cache lock"
                 );
+                file
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                root.admit_state_write(20)?;
+                let mut file = root.create_state(path)?;
+                let result = (|| -> Result<()> {
+                    file.write_all(b"allium-network-cache\n")?;
+                    file.sync_all()
+                })();
+                if result.as_ref().is_err_and(StateAdmissionDenied::matches) {
+                    file.remove_owned()?;
+                }
+                result?;
                 file
             }
             Err(error) => return Err(error.into()),
@@ -465,10 +483,17 @@ impl ExclusiveFile {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Lease parent missing"))?;
         let fs = AnchoredFs::new_lease(parent, reserve_device)?;
-        match fs.create(path) {
+        fs.admit_state_write(20)?;
+        match fs.create_state(path) {
             Ok(mut file) => {
-                file.write_all(b"allium-network-cache\n")?;
-                file.sync_all()?;
+                let result = (|| -> Result<()> {
+                    file.write_all(b"allium-network-cache\n")?;
+                    file.sync_all()
+                })();
+                if result.as_ref().is_err_and(StateAdmissionDenied::matches) {
+                    file.remove_owned()?;
+                }
+                result?;
                 Ok(Some(Self { file }))
             }
             Err(error)
@@ -494,6 +519,8 @@ pub struct CacheConfig {
     pub stay_awake: Option<PathBuf>,
     pub expected_root: Identity,
     binding: AnchoredFs,
+    #[cfg(test)]
+    verification_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 impl CacheConfig {
     pub fn bind(root: PathBuf, stay_awake: Option<PathBuf>) -> Result<Self> {
@@ -505,6 +532,8 @@ impl CacheConfig {
             stay_awake,
             expected_root: fs.root_identity()?,
             binding: fs,
+            #[cfg(test)]
+            verification_hook: Default::default(),
         })
     }
 }
@@ -514,7 +543,7 @@ pub struct Cache {
     #[cfg(test)]
     commit_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
-    verification_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(crate) verification_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 #[derive(Debug, Clone)]
 pub struct Progress {
@@ -526,6 +555,8 @@ pub struct Progress {
 impl Cache {
     pub fn new(config: CacheConfig) -> Result<Self> {
         let fs = config.binding.clone();
+        #[cfg(test)]
+        let verification_hook = config.verification_hook.clone();
         ensure!(
             config.root == fs.root_path() && fs.root_identity()? == config.expected_root,
             "Configured root binding changed"
@@ -537,7 +568,7 @@ impl Cache {
             #[cfg(test)]
             commit_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
-            verification_hook: std::sync::Mutex::new(None),
+            verification_hook,
         })
     }
     #[cfg(test)]
@@ -547,6 +578,10 @@ impl Cache {
     #[cfg(test)]
     pub fn test_after_stage_verification(&self, hook: impl FnOnce() + Send + 'static) {
         *self.commit_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_space(&self, free: u64, unit: u64) {
+        self.fs.test_space(free, unit);
     }
     fn state(&self) -> PathBuf {
         self.config.root.join(".allium/state/network-library")
@@ -777,7 +812,7 @@ impl Cache {
             verified_files: game.files.len(),
         })
     }
-    fn cached_ready(
+    pub(crate) fn cached_ready(
         &self,
         game: &NetworkGame,
         cancel: &Cancellation,
@@ -834,17 +869,37 @@ impl Cache {
             .verify_files(game, true, cancel)
             .context("Conflicting or changed installed member; existing files preserved")?;
         cancel.check()?;
-        self.publish_ready(game, &handles, lock)?;
+        if let Err(error) = self.publish_ready(game, &handles, lock) {
+            if game.install_kind != "directory" || !StateAdmissionDenied::matches(&error) {
+                return Err(error);
+            }
+        }
         self.ready_state(game, cancel)
     }
     pub fn ready(&self, game: &NetworkGame, cancel: &Cancellation) -> Result<CacheState> {
         if let Some(state) = self.cached_ready(game, cancel)? {
             return Ok(state);
         }
-        let lock = CacheLock::acquire(&self.fs, &self.state().join("active.lock"))?;
-        let _awake = self.awake_lease()?;
-        self.recover_metadata(game, cancel, &lock)?;
-        self.verify_ready(game, cancel, &lock)
+        let lock = match CacheLock::acquire(&self.fs, &self.state().join("active.lock")) {
+            Ok(lock) => Some(lock),
+            Err(error) if game.install_kind == "directory"
+                && StateAdmissionDenied::matches(&error) && self.local_install(game)? => None,
+            Err(error) => return Err(error),
+        };
+        let _awake = match self.awake_lease() {
+            Err(error) if game.install_kind == "directory"
+                && StateAdmissionDenied::matches(&error) => None,
+            result => result?,
+        };
+        if let Some(lock) = lock {
+            self.recover_metadata(game, cancel, &lock)?;
+            self.verify_ready(game, cancel, &lock)
+        } else {
+            // Only a complete registered folder can run without persisting its upgrade.
+            let handles = self.verify_files(game, true, cancel)?;
+            self.verified_metadata(game, &handles)?;
+            self.ready_state(game, cancel)
+        }
     }
     fn install(
         &self,
@@ -1038,24 +1093,17 @@ impl Cache {
                 });
             }
         }
+        let plan = plan_space(game, observation.allocation_unit, &allocations, observation.free_bytes)?;
         ensure!(
-            plan_space(
-                game,
-                observation.allocation_unit,
-                &allocations,
-                observation.free_bytes
-            )?
-            .shortage_bytes
-                == 0,
-            "Insufficient space"
+            plan.shortage_bytes == 0,
+            "{}", crate::network_fs::space_message(plan.required_free_bytes, observation.free_bytes)
         );
         Ok(())
     }
     fn check_reserve(&self, space: &dyn SpaceProbe) -> Result<()> {
-        ensure!(
-            space.observe(&self.fs)?.free_bytes >= RESERVE_BYTES + METADATA_MARGIN,
-            "Reserve lost before install"
-        );
+        let free = space.observe(&self.fs)?.free_bytes;
+        let needed = RESERVE_BYTES + METADATA_MARGIN;
+        ensure!(free >= needed, "{}", crate::network_fs::space_message(needed, free));
         Ok(())
     }
     fn transfer_file(
@@ -1438,6 +1486,22 @@ impl Cache {
         handles: &[VerifiedFile],
         _lock: &CacheLock,
     ) -> Result<()> {
+        let metadata = self.verified_metadata(game, handles)?;
+        save_json(
+            &self.fs,
+            &self.index(game),
+            &ReadyRecord {
+                version: 1,
+                game: game.clone(),
+                metadata: Some(metadata),
+            },
+        )
+    }
+    fn verified_metadata(
+        &self,
+        game: &NetworkGame,
+        handles: &[VerifiedFile],
+    ) -> Result<Vec<PayloadMetadata>> {
         let metadata = handles
             .iter()
             .zip(&game.files)
@@ -1454,15 +1518,7 @@ impl Cache {
             metadata.len() == game.files.len(),
             "Incomplete verified install"
         );
-        save_json(
-            &self.fs,
-            &self.index(game),
-            &ReadyRecord {
-                version: 1,
-                game: game.clone(),
-                metadata: Some(metadata),
-            },
-        )
+        Ok(metadata)
     }
     pub fn install_state(&self, game: &NetworkGame) -> Result<InstallState> {
         let mut missing = false;
@@ -1486,6 +1542,12 @@ impl Cache {
             InstallState::Complete
         })
     }
+    pub(crate) fn local_install(&self, game: &NetworkGame) -> Result<bool> {
+        Ok(self.has_index(game)?
+            && self.install_state(game)? == InstallState::Complete
+            && !self.fs.exists(&self.index(game).with_extension("new"))?
+            && !self.fs.exists(&self.job(game).join("job.new"))?)
+    }
     pub fn target_exists(&self, game: &NetworkGame) -> Result<bool> {
         self.fs.exists(&self.config.root.join(&game.cache_path))
     }
@@ -1506,8 +1568,7 @@ impl Cache {
             return Ok(false);
         };
         let resume = resume.to_string_lossy().to_lowercase();
-        let mut paths = game.targets()?;
-        paths.push(PathBuf::from(&game.game_path));
+        let paths = game.identity_paths()?;
         Ok(paths
             .iter()
             .any(|path| self.config.root.join(path).to_string_lossy().to_lowercase() == resume))
@@ -2010,7 +2071,7 @@ fn admit_transfer(observed: Space, incoming: u64) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Transfer space overflow"))?;
     ensure!(
         observed.free_bytes >= required,
-        "Space lost during transfer"
+        "{}", crate::network_fs::space_message(required, observed.free_bytes)
     );
     Ok(())
 }
@@ -2889,6 +2950,28 @@ mod dl8_tests {
     }
 
     #[test]
+    fn fix18_reserve_and_transfer_errors_explain_needed_and_available_space() {
+        let fixture = Fixture::new("fix18-space-message", false);
+        let cache = fixture.cache();
+        struct Fixed;
+        impl SpaceProbe for Fixed {
+            fn observe(&self, _: &AnchoredFs) -> Result<Space> {
+                Ok(Space { free_bytes: 1_948_752 * 1024, allocation_unit: 4096 })
+            }
+        }
+        assert_eq!(cache.check_reserve(&Fixed).unwrap_err().to_string(),
+            "Not enough free space: needs 2.1 GB, 1.9 GB free");
+        let error = admit_transfer(Space { free_bytes: 1_948_752 * 1024, allocation_unit: 4096 }, 1024).unwrap_err();
+        assert_eq!(error.to_string(), "Not enough free space: needs 2.1 GB, 1.9 GB free");
+        cache.test_space(1_948_752 * 1024, 4096);
+        assert_eq!(cache.fs.admit_write(0).unwrap_err().to_string(), error.to_string());
+        cache.test_space(0, 4096);
+        let denied = cache.fs.admit_state_write(0).unwrap_err();
+        assert!(StateAdmissionDenied::matches(&denied));
+        assert_eq!(denied.to_string(), "Not enough free space: needs 1.0 GB, 0.0 MB free");
+    }
+
+    #[test]
     fn dl8_transfer_and_admission_boundaries() {
         let f = Fixture::new("reserve", false);
         let cache = f.cache();
@@ -2983,11 +3066,64 @@ mod dl8_tests {
         let target = f
             .root
             .join(".allium/state/network-library/installed/writer.json");
-        fs.test_space(floor + cost - 1, 4096);
+        let state_floor = crate::network_library::STATE_FLOOR_BYTES;
+        fs.test_space(state_floor + cost + 4096 - 1, 4096);
         assert!(save_json(fs, &target, &record).is_err());
         assert!(!target.with_extension("new").exists());
-        fs.test_space(floor + cost + 4096, 4096);
+        fs.test_space(state_floor + cost + 4096, 4096);
         save_json(fs, &target, &record).unwrap();
+        fs.test_space(state_floor + cost - 1, 4096);
+        assert!(StateAdmissionDenied::matches(&fs.admit_state_write(0).unwrap_err()));
+        fs.test_space(state_floor + cost, 4096);
+        let temporary = target.with_extension("new");
+        let mut file = fs.create_state(&temporary).unwrap();
+        assert!(StateAdmissionDenied::matches(&anyhow::Error::from(file.write_all(b"x").unwrap_err())));
+        fs.test_space(state_floor + cost + 4096, 4096);
+        file.write_all(b"x").unwrap();
+        file.remove_owned().unwrap();
+        assert!(fs.create(&f.root.join("still-data.bin")).is_err());
+        assert!(fs.create_state(&f.root.join("not-state.json")).is_err());
+    }
+    #[test]
+    fn folder_ready_keeps_record_when_publication_admission_changes_after_sync() {
+        let f = Fixture::new("state-publication-floor", false);
+        let cache = f.cache();
+        cache.adopt_existing(&f.game, &Cancellation::default()).unwrap();
+        let index = cache.index(&f.game);
+        let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("metadata");
+        let before = serde_json::to_vec(&record).unwrap();
+        fs::write(&index, &before).unwrap();
+        let binding = cache.fs.clone();
+        cache.fs.test_after_file_sync(move || binding.test_space(0, 4096));
+        cache.ready(&f.game, &Cancellation::default()).unwrap();
+        assert_eq!(fs::read(&index).unwrap(), before);
+        assert!(!index.with_extension("new").exists());
+        assert!(!cache.state().join("jobs").exists());
+    }
+    #[test]
+    fn folder_ready_below_state_floor_preserves_lock_errors_and_tmpfs_exemption() {
+        let f = Fixture::new("state-lock-errors", false);
+        let cache = f.cache();
+        cache.adopt_existing(&f.game, &Cancellation::default()).unwrap();
+        let index = cache.index(&f.game);
+        let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("metadata");
+        fs::write(&index, serde_json::to_vec(&record).unwrap()).unwrap();
+        let lock_path = cache.state().join("active.lock");
+        let lock = CacheLock::acquire(&cache.fs, &lock_path).unwrap();
+        cache.fs.test_space(0, 4096);
+        let error = cache.ready(&f.game, &Cancellation::default()).unwrap_err();
+        assert_eq!(error.to_string(), "Cache job already active");
+        drop(lock);
+        fs::write(&lock_path, b"unknown lock").unwrap();
+        let error = cache.ready(&f.game, &Cancellation::default()).unwrap_err();
+        assert_eq!(error.to_string(), "Unregistered cache lock");
+        let lease = AnchoredFs::new_lease(&f.root, cache.config.expected_root.device + 1).unwrap();
+        lease.test_space(0, 4096);
+        let mut file = lease.create_state(&f.root.join("awake")).unwrap();
+        file.write_all(b"awake").unwrap();
+        file.remove_owned().unwrap();
     }
     #[test]
     fn dl8_metadata_mismatch_and_legacy_upgrade() {

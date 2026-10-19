@@ -61,7 +61,9 @@ impl PreparedFrame {
                                 _ => &input.art.selected_cover,
                             };
                             let Some(source) = source else { continue; };
-                            (self.ink_image_component(c), c.rect, source)
+                            let component = self.ink_image_component(c);
+                            let rect = Self::ink_image_rect(&component, source);
+                            (component, rect, source)
                         } else { continue; };
                         let key = self.image_key(ScreenId::GameDetail, rect, &component, component.radius.unwrap_or(0));
                         images.push_back((key, source.clone()));

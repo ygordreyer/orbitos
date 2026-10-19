@@ -50,7 +50,7 @@ fn hero_banner(id: &str, screen: ScreenId) -> bool {
 #[test]
 fn media_logo_cover_exclusion_all_packs_variants_and_views() {
     let bank = FontBank::bind(&font_root()).unwrap();
-    let logo = art(96, 24, tiny_skia::Color::from_rgba8(250, 10, 80, 255));
+    let logo = art(384, 24, tiny_skia::Color::from_rgba8(250, 10, 80, 255));
     let cover = art(96, 128, tiny_skia::Color::from_rgba8(20, 90, 180, 255));
     let hero = art(160, 90, tiny_skia::Color::from_rgba8(30, 50, 70, 255));
     let mut violations = Vec::new();
@@ -170,7 +170,7 @@ fn media_logo_cover_exclusion_all_packs_variants_and_views() {
 #[test]
 fn media_logo_cover_shelf_keeps_hero_title_with_selected_cover() {
     let bank = FontBank::bind(&font_root()).unwrap();
-    let logo = art(96, 24, tiny_skia::Color::from_rgba8(250, 10, 80, 255));
+    let logo = art(384, 24, tiny_skia::Color::from_rgba8(250, 10, 80, 255));
     let cover = art(96, 128, tiny_skia::Color::from_rgba8(20, 90, 180, 255));
     for (id, snapshot) in variants() {
         let theme = ThemeHandle::prepare(snapshot, &bank, 904).unwrap();

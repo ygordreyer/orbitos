@@ -122,11 +122,16 @@ impl RecentsCarousel {
     }
 
     fn load_games(res: &Resources) -> Result<Vec<Game>> {
-        common::media::defer_cold_sources();
         let database = res.get::<Database>();
-        let db_games = database.select_last_played(RECENT_GAMES_LIMIT)?;
+        #[cfg(test)]
+        crate::entry::load_work::record(|work| work.sql += 1);
+        let mut db_games = database.select_last_played(RECENT_GAMES_LIMIT)?;
+        crate::entry::load_name_sources(db_games.iter().map(|game| game.path.as_path()));
 
         let mut games = Vec::new();
+        db_games.retain(|game| crate::entry::listed_path(&game.path));
+        let game_paths = db_games.iter().map(|game| game.path.clone()).collect();
+        let mut identities = std::collections::HashSet::new();
 
         for game in db_games {
             let extension = game
@@ -155,16 +160,30 @@ impl RecentsCarousel {
                 screenshot_path: game.screenshot_path,
             };
             game.hydrate_name();
-            games.push(game);
+            if identities.insert(game.display_identity_in(&game_paths)) { games.push(game); }
         }
 
         Ok(games)
+    }
+
+    pub(crate) fn reload(&mut self) -> Result<()> {
+        let selected_path = self.games.get(self.selected).map(|game| game.path.clone());
+        let games = Self::load_games(&self.res)?;
+        self.selected = selected_path.as_ref()
+            .and_then(|path| games.iter().position(|game| &game.path == path))
+            .unwrap_or(self.selected)
+            .min(games.len().saturating_sub(1));
+        self.games = games;
+        self.update_current_game()?;
+        self.set_should_draw();
+        Ok(())
     }
 
     fn update_current_game(&mut self) -> Result<()> {
         if self.games.is_empty() {
             self.screenshot.set_path(None);
             self.game_name.scroll(false);
+            self.game_name.suffix_len(0);
             self.game_name.set_text(String::new());
             return Ok(());
         }
@@ -180,6 +199,7 @@ impl RecentsCarousel {
                 .or_else(|| game.image.image().map(Path::to_owned)),
         );
         self.screenshot.set_should_draw();
+        self.game_name.suffix_len(names.suffix_len(&entries[self.selected]));
         self.game_name.set_text(name);
         self.game_name.scroll(true);
         self.button_hints.set_should_draw();
@@ -213,10 +233,10 @@ impl RecentsCarousel {
             if crate::network_runtime::begin(game, false)? {
                 return Ok(());
             }
-            let command =
+            let command = crate::consoles::launch_feedback(
                 self.res
                     .get::<ConsoleMapper>()
-                    .launch_game(&self.res.get(), game, false)?;
+                    .launch_game(&self.res.get(), game, false));
             if let Some(cmd) = command {
                 commands.send(cmd).await?;
             }
@@ -355,6 +375,155 @@ impl View for RecentsCarousel {
 mod name_refresh_tests {
     use super::*;
     use crate::entry::lazy_image::LazyImage;
+
+    #[test]
+    fn carousel_reload_clears_removed_game_and_its_presentation() {
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let path = fixture.0.path.join("Recent.gb");
+        std::fs::write(&path, b"rom").unwrap();
+        let database = Database::in_memory().unwrap();
+        database.increment_play_count(&Game::new(path.clone()).into()).unwrap();
+        let mut map = type_map::TypeMap::new();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(database.clone());
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        let mut carousel = RecentsCarousel::new(Rect::new(0, 54, 640, 376),
+            Resources::new(map), RecentsCarouselState::default()).unwrap();
+        assert_eq!(carousel.games.len(), 1);
+        database.reset_game(&path).unwrap();
+        carousel.dirty = false;
+        carousel.reload().unwrap();
+        assert!(carousel.games.is_empty());
+        assert_eq!(carousel.selected, 0);
+        assert_eq!(carousel.game_name.text(), "");
+        assert!(serde_json::to_value(&carousel.screenshot).unwrap()["path"].is_null());
+        assert!(carousel.dirty);
+    }
+
+    #[test]
+    fn carousel_filters_indexed_syncthing_conflicts_and_control_contents() {
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let database = Database::in_memory().unwrap();
+        for name in ["Real.gb", "Game.sync-conflict-20250415-202527-JENTCHY.zip", ".stfolder/Control.gb", ".stversions/Version.gb"] {
+            let path = fixture.0.path.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"rom").unwrap();
+            database.increment_play_count(&Game::new(path).into()).unwrap();
+        }
+        let mut map = type_map::TypeMap::new();
+        map.insert(database);
+        let games = RecentsCarousel::load_games(&Resources::new(map)).unwrap();
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].path, fixture.0.path.join("Real.gb"));
+    }
+
+    #[test]
+    fn carousel_build_loads_cold_gamelist_names_for_catalog_folder_rows() {
+        common::media::invalidate();
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let system = fixture.0.path.join("Roms/PS");
+        let folder = system.join("Clock Tower - The First Fear (Japan)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let database = Database::in_memory().unwrap();
+        let mut game = Game::new(folder.clone());
+        game.name = "Clock Tower: The First Fear (Japan)".into();
+        game.image = LazyImage::NotFound;
+        database.increment_play_count(&game.into()).unwrap();
+        std::fs::write(system.join("gamelist.xml"),
+            "<gameList><game><path>./Clock Tower - The First Fear (Japan)</path><name>Clock Tower (Special Edition)</name></game></gameList>").unwrap();
+        let mut map = type_map::TypeMap::new();
+        map.insert(database.clone());
+        let mut games = RecentsCarousel::load_games(&Resources::new(map)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            common::media::poll_name_indexes();
+            games[0].hydrate_name();
+            if games[0].name == "Clock Tower (Special Edition)" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "carousel name did not hydrate");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::entry::load_work::take();
+        for _ in 0..8 {
+            assert!(!games[0].hydrate_name());
+        }
+        assert_eq!(crate::entry::load_work::take(), Default::default());
+        assert_eq!(database.select_game(&folder).unwrap().unwrap().name, "Clock Tower: The First Fear (Japan)");
+        common::media::invalidate();
+    }
+
+    #[test]
+    fn fix18_carousel_old_cue_uses_parent_title_and_keeps_history() {
+        common::media::invalidate();
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let system = fixture.0.path.join("Roms/PS");
+        let basename = "Clock Tower - The First Fear (Japan)";
+        let folder = system.join(basename);
+        std::fs::create_dir_all(&folder).unwrap();
+        let cue = folder.join(format!("{basename}.cue"));
+        std::fs::write(&cue, b"FILE \"disc.bin\" BINARY\n").unwrap();
+        std::fs::write(folder.join("disc.bin"), b"rom").unwrap();
+        std::fs::write(system.join("gamelist.xml"), format!(
+            "<gameList><game><path>./{basename}</path><name>Clock Tower: The First Fear</name></game></gameList>"
+        )).unwrap();
+        let database = Database::in_memory().unwrap();
+        let mut old = Game::new(cue.clone());
+        old.name = basename.into();
+        old.image = LazyImage::NotFound;
+        database.increment_play_count(&old.into()).unwrap();
+        let mut map = type_map::TypeMap::new();
+        map.insert(database.clone());
+        let mut games = RecentsCarousel::load_games(&Resources::new(map)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while common::media::cached_name(&folder).is_none() {
+            common::media::poll_name_indexes();
+            assert!(std::time::Instant::now() < deadline, "parent title never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(games.len(), 1);
+        games[0].hydrate_name();
+        assert_eq!(games[0].path, cue);
+        assert_eq!(games[0].name, "Clock Tower: The First Fear");
+        crate::entry::load_work::take();
+        for _ in 0..8 { assert!(!games[0].hydrate_name()); }
+        assert_eq!(crate::entry::load_work::take(), Default::default());
+        assert_eq!(database.select_game(&cue).unwrap().unwrap().name, basename);
+        common::media::invalidate();
+    }
+
+    #[test]
+    fn fix20_carousel_folder_alias_does_not_leak_suffix() {
+        let res = crate::view::entry_list::ux4_tests::fix20_recents_resources();
+        let mut carousel = RecentsCarousel::new(Rect::new(0, 54, 640, 376), res, RecentsCarouselState::default()).unwrap();
+        assert_eq!(carousel.game_name.text(), "Kowai Shashin: Shinrei shashin kitan");
+        assert_eq!(carousel.games.len(), 9);
+        carousel.reload().unwrap();
+        assert_eq!(carousel.games.len(), 9);
+        assert_eq!(carousel.game_name.text(), "Kowai Shashin: Shinrei shashin kitan");
+    }
+
+    #[test]
+    fn fix20b_carousel_different_stem_and_nested_aliases_render_once() {
+        for nested in [false, true] {
+            for launch_most_recent in [false, true] {
+                let (res, expected) = crate::view::entry_list::ux4_tests::fix20b_recents_resources(nested, launch_most_recent);
+                let mut carousel = RecentsCarousel::new(Rect::new(0, 54, 640, 376), res, RecentsCarouselState::default()).unwrap();
+                assert_eq!(carousel.game_name.text(), "Folder Title");
+                assert_eq!(carousel.games.len(), 9);
+                assert_eq!(carousel.games[0].path, expected);
+                carousel.reload().unwrap();
+                assert_eq!(carousel.games.len(), 9);
+                assert_eq!(carousel.games[0].path, expected);
+                assert_eq!(carousel.game_name.text(), "Folder Title");
+            }
+        }
+        common::media::set_game_containers(std::iter::empty());
+    }
 
     #[test]
     fn carousel_collision_labels_preserve_game_names_and_clear_after_removal() {

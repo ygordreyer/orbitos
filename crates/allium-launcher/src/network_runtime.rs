@@ -111,6 +111,7 @@ pub enum Action {
 }
 enum Task {
     Play(NetworkGame),
+    Verify(NetworkGame),
     Prefill(NetworkGame),
     Adopt(NetworkGame),
     Unload(NetworkGame),
@@ -364,9 +365,7 @@ fn catalog_path_index(catalog: &Catalog, root: &Path) -> Option<HashMap<PathBuf,
     let mut index = HashMap::new();
     let mut bytes = 0;
     for (at, game) in catalog.games.iter().enumerate() {
-        for relative in std::iter::once(PathBuf::from(&game.game_path))
-            .chain(game.targets().unwrap_or_default())
-        {
+        for relative in game.identity_paths().unwrap_or_default() {
             let path = root.join(relative);
             if !index.contains_key(&path) {
                 bytes += path.as_os_str().len() + 192;
@@ -384,10 +383,8 @@ fn descriptor_scan(catalog: &Catalog, root: &Path, path: &Path) -> Option<Networ
         .games
         .iter()
         .find(|game| {
-            root.join(&game.game_path) == path
-                || game
-                    .targets()
-                    .is_ok_and(|targets| targets.iter().any(|target| root.join(target) == path))
+            game.identity_paths()
+                .is_ok_and(|paths| paths.iter().any(|target| root.join(target) == path))
         })
         .cloned()
 }
@@ -397,6 +394,10 @@ impl Runtime {
             return index.get(path).map(|i| self.catalog.games[*i].clone());
         }
         descriptor_scan(&self.catalog, &self.config.root, path)
+    }
+    fn folder_identity(&self, game: &NetworkGame, path: &Path) -> bool {
+        !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("m3u"))
+            && game.folder_paths().any(|folder| self.config.root.join(folder) == path)
     }
     fn game(&self, id: &str) -> Option<NetworkGame> {
         self.catalog.games.iter().find(|g| g.id == id).cloned()
@@ -460,6 +461,15 @@ impl Runtime {
                             cache.run(&game, &endpoint, &worker_cancel, &FilesystemSpace, &tx)?;
                             Ok(Output::Ready)
                         }
+                        Task::Verify(game) => {
+                            let cancel = crate::network_cache::verification_reporting(
+                                &worker_cancel,
+                                &game,
+                                &tx,
+                            );
+                            cache.ready(&game, &cancel)?;
+                            Ok(Output::Ready)
+                        }
                         Task::Prefill(game) => {
                             cache.run(&game, &endpoint, &worker_cancel, &FilesystemSpace, &tx)?;
                             Ok(Output::Prefilled(game.id))
@@ -492,7 +502,7 @@ impl Runtime {
                                         let path = path.to_string_lossy().to_lowercase();
                                         root.join(&game.game_path).to_string_lossy().to_lowercase()
                                             == path
-                                            || game.targets().is_ok_and(|targets| {
+                                            || game.identity_paths().is_ok_and(|targets| {
                                                 targets.iter().any(|target| {
                                                     root.join(target)
                                                         .to_string_lossy()
@@ -534,9 +544,17 @@ impl Runtime {
         if self.job.is_some() {
             return Ok(true);
         }
+        let cache = Cache::new(self.config.clone())?;
+        let local_install = cache.local_install(&descriptor)?;
+        let local_folder = self.folder_identity(&descriptor, &game.path) && local_install;
+        if local_folder && cache.cached_ready(&descriptor, &Cancellation::default())?.is_some() {
+            self.status.insert(descriptor.id, "Cached".into());
+            return Ok(false);
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.permit = None;
-        if game.path != self.config.root.join(&descriptor.game_path) {
+        if game.path != self.config.root.join(&descriptor.game_path)
+            && !self.folder_identity(&descriptor, &game.path) {
             game = self.virtual_game(&descriptor);
         }
         self.pending = Some(Pending {
@@ -545,8 +563,9 @@ impl Runtime {
             reset,
             disc: None,
         });
-        let cache = Cache::new(self.config.clone())?;
-        if cache.unloading(&descriptor)? {
+        if local_install {
+            self.start(Task::Verify(descriptor))?;
+        } else if cache.unloading(&descriptor)? {
             self.modal = Some(Modal::ConfirmUnload(descriptor.id));
             self.dirty = true;
         } else if !cache.has_index(&descriptor)? && cache.target_exists(&descriptor)? {
@@ -895,6 +914,10 @@ fn descriptor_ref<'a>(runtime: &'a Runtime, path: &Path) -> Option<&'a NetworkGa
     }
     runtime.catalog.games.iter().find(|game| {
         path.components().eq(runtime.config.root.components().chain(Path::new(&game.game_path).components()))
+            || path.components().eq(runtime.config.root.components().chain(Path::new(&game.cache_path).components()))
+            || game.folder_paths().any(|folder| {
+                path.components().eq(runtime.config.root.components().chain(folder.components()))
+            })
             || game.files.iter().any(|file| {
                 let target = runtime.config.root.components().chain(Path::new(&game.cache_path).components());
                 if game.install_kind == "file" {
@@ -941,7 +964,14 @@ pub fn guard_launch(path: &Path) -> Result<()> {
         "Network library startup failed; PlayStation launch is blocked until configuration is repaired"
     );
     with(Ok(()), |runtime| {
-        if runtime.descriptor(path).is_some() {
+        if let Some(game) = runtime.descriptor(path) {
+            if runtime.permit.as_deref() != Some(path) && runtime.folder_identity(&game, path) {
+                let cache = Cache::new(runtime.config.clone())?;
+                if cache.local_install(&game)?
+                    && cache.cached_ready(&game, &Cancellation::default())?.is_some() {
+                    return Ok(());
+                }
+            }
             ensure!(
                 runtime.permit.as_deref() == Some(path),
                 "Network game must be fully verified through Play before launch"
@@ -979,7 +1009,7 @@ pub fn refresh_history(database: &common::database::Database) -> Result<()> {
         for game in &r.catalog.games {
             paths.push(r.config.root.join(&game.game_path));
             paths.extend(
-                game.targets()?
+                game.identity_paths()?
                     .into_iter()
                     .map(|path| r.config.root.join(path)),
             );
@@ -1113,6 +1143,11 @@ pub fn merge_directory(directory: &Path, entries: &mut Vec<Entry>) {
         for descriptor in &r.catalog.games {
             let identity = r.config.root.join(&descriptor.game_path);
             let cache_path = r.config.root.join(&descriptor.cache_path);
+            if descriptor.install_kind == "directory" && identity != cache_path
+                && entries.iter().any(|entry| entry.path() == cache_path
+                    && (matches!(entry, Entry::Directory(_)) || cache_path.is_dir())) {
+                continue;
+            }
             entries.retain(|entry| entry.path() != cache_path || entry.path() == identity);
             if let Some(Entry::Game(game)) =
                 entries.iter_mut().find(|entry| entry.path() == identity)
@@ -1144,12 +1179,14 @@ pub fn search(query: &str, entries: &mut Vec<Entry>) {
     }
     let query = query.to_lowercase();
     with((), |r| {
+        let present = entries.iter().filter_map(|entry| r.descriptor(entry.path()).map(|game| game.id))
+            .collect::<HashSet<_>>();
         for descriptor in &r.catalog.games {
             let identity = r.config.root.join(&descriptor.game_path);
             let name = common::media::cached_name(&identity).unwrap_or_default();
             if (descriptor.display_title.to_lowercase().contains(&query)
                 || name.to_lowercase().contains(&query))
-                && !entries.iter().any(|e| e.path() == identity)
+                && !present.contains(&descriptor.id)
             {
                 entries.push(Entry::Game(r.virtual_game(descriptor)));
             }
@@ -1164,19 +1201,47 @@ pub fn draw(display: &mut <DefaultPlatform as Platform>::Display, styles: &Style
 }
 pub(crate) fn draw_with_style<'a>(
     display: &mut <DefaultPlatform as Platform>::Display,
-    mut styles: impl FnMut() -> &'a Stylesheet,
+    styles: impl FnMut() -> &'a Stylesheet,
 ) -> bool {
-    if draw_startup_block(display, &mut styles) {
+    draw_with_theme(display, styles, None)
+}
+thread_local! {
+    static POPUP_FRAME: RefCell<Option<common::theme::render::PreparedFrame>> = const { RefCell::new(None) };
+}
+fn error_popup_rect(line_count: usize) -> Rect {
+    let height = (90 + 22 * line_count.min(12) as u32).clamp(112, 340);
+    Rect::new(90, (480 - height) as i32 / 2, 460, height)
+}
+
+fn paint_popup(
+    display: &mut <DefaultPlatform as Platform>::Display,
+    theme: &common::theme::ThemeHandle,
+    input: &common::theme::frame::FrameInputs,
+) -> bool {
+    POPUP_FRAME.with(|cache| {
+        let mut frame = cache.borrow_mut();
+        match common::theme::render::PreparedFrame::prepare_reusing(theme.clone(), input, frame.take()) {
+            Ok(prepared) => { prepared.paint(display); *frame = Some(prepared); true }
+            Err(error) => { log::warn!("Network dialog theme unavailable: {error}"); false }
+        }
+    })
+}
+pub(crate) fn draw_with_theme<'a>(
+    display: &mut <DefaultPlatform as Platform>::Display,
+    mut styles: impl FnMut() -> &'a Stylesheet,
+    theme: Option<&common::theme::ThemeHandle>,
+) -> bool {
+    if draw_startup_block(display, &mut styles, theme) {
         return true;
     }
     with(false, |r| {
         let Some(modal) = r.modal.as_mut() else {
+            POPUP_FRAME.with(|cache| *cache.borrow_mut() = None);
             return false;
         };
-        let styles = styles();
         if let Modal::Discs { picker, .. } = modal {
-            picker.draw(display, styles);
-            footer(display, styles, "A Start disc    B Cancel");
+            picker.draw(display, styles());
+            footer(display, styles(), "A Start disc    B Cancel");
             return true;
         }
         let titles = if matches!(modal, Modal::ConfirmImport(_) | Modal::ConfirmUnload(_) | Modal::Storage { .. }) {
@@ -1197,24 +1262,6 @@ pub(crate) fn draw_with_style<'a>(
                 })
                 .collect::<HashMap<_, _>>()
         } else { HashMap::new() };
-        fill_rect(
-            &mut display.pixmap_mut(),
-            Rect::new(
-                0,
-                crate::view::orbit::HEADER_HEIGHT,
-                640,
-                crate::view::orbit::CONTENT_HEIGHT,
-            ),
-            Color::rgba(22, 37, 30, 145),
-        );
-        fill_rounded_rect(
-            &mut display.pixmap_mut(),
-            Rect::new(90, 74, 460, 340),
-            14,
-            Color::new(243, 244, 238),
-        );
-        let title = font(styles, 28, Color::new(35, 48, 51));
-        let body = font(styles, 17, Color::new(35, 48, 51));
         let (header, message, hints) = match modal {
             Modal::Working(m) => ("Network library", m.clone(), "B Cancel"),
             Modal::Completed => (
@@ -1277,16 +1324,65 @@ pub(crate) fn draw_with_style<'a>(
             }
             Modal::Discs { .. } => unreachable!(),
         };
-        title.draw(&mut display.pixmap_mut(), header, Point::new(108, 93));
-        let mut y = 142;
-        for line in message.lines() {
-            for line in wrapped(&body, line, 424, 10) {
-                if y > 365 {
-                    break;
+        if let Some(theme) = theme {
+            use common::theme::{frame::{FrameInputs, Hint, Row}, pack::{Binding, ScreenId}};
+            let mut input = FrameInputs::new(ScreenId::NetworkDialog);
+            input.text.insert(Binding::Title, header.into());
+            input.text.insert(Binding::Message, message.clone());
+            input.hints = hints.split("  ").filter_map(|hint| {
+                let (button, label) = hint.trim().split_once(' ')?;
+                Some(Hint { button: button.into(), label: label.into() })
+            }).collect();
+            input.progress = if matches!(modal, Modal::Working(_)) {
+                r.progress_fraction.map(|p| p.clamp(0.0, 1.0) as f32)
+            } else { None };
+            if let Modal::Storage { ids, selected } = modal {
+                let capacity = crate::theme_adapter::capacity(theme, ScreenId::NetworkDialog, Binding::StorageEntries).max(1);
+                let first = *selected / capacity * capacity;
+                input.text.insert(Binding::Message, if ids.is_empty() { message.clone() } else { String::new() });
+                input.rows.insert(Binding::StorageEntries, ids.iter().skip(first).take(capacity).map(|id| Row {
+                    id: id.clone(), label: titles.get(id).unwrap_or(id).clone(),
+                    subtitle: String::new(), value: String::new(), enabled: true,
+                }).collect());
+                if let Some(id) = ids.get(*selected) {
+                    input.selected.insert(Binding::StorageEntries, id.clone());
+                    input.focus = common::theme::frame::Focus {
+                        component: crate::theme_adapter::component_id(theme, ScreenId::NetworkDialog, Binding::StorageEntries),
+                        item: Some(id.clone()),
+                    };
                 }
-                body.draw(&mut display.pixmap_mut(), &line, Point::new(108, y));
-                y += 22;
             }
+            if paint_popup(display, theme, &input) { return true; }
+        }
+        let styles = styles();
+        fill_rect(
+            &mut display.pixmap_mut(),
+            Rect::new(
+                0,
+                crate::view::orbit::HEADER_HEIGHT,
+                640,
+                crate::view::orbit::CONTENT_HEIGHT,
+            ),
+            Color::rgba(22, 37, 30, 145),
+        );
+        let title = font(styles, 28, Color::new(35, 48, 51));
+        let body = font(styles, 17, Color::new(35, 48, 51));
+        let lines: Vec<_> = message.lines().flat_map(|line| wrapped(&body, line, 424, 10)).collect();
+        let card = if matches!(modal, Modal::Error(_)) {
+            error_popup_rect(lines.len())
+        } else { Rect::new(90, 74, 460, 340) };
+        fill_rounded_rect(
+            &mut display.pixmap_mut(),
+            card,
+            14,
+            Color::new(243, 244, 238),
+        );
+        title.draw(&mut display.pixmap_mut(), header, Point::new(108, card.y + 19));
+        let mut y = card.y + 68;
+        for line in lines {
+            if y > card.y + card.h as i32 - 40 { break; }
+            body.draw(&mut display.pixmap_mut(), &line, Point::new(108, y));
+            y += 22;
         }
         if matches!(modal, Modal::Working(_)) {
             fill_rounded_rect(
@@ -1311,11 +1407,21 @@ pub(crate) fn draw_with_style<'a>(
 fn draw_startup_block<'a>(
     display: &mut <DefaultPlatform as Platform>::Display,
     styles: impl FnOnce() -> &'a Stylesheet,
+    theme: Option<&common::theme::ThemeHandle>,
 ) -> bool {
     let visible =
         STARTUP.with(|cell| matches!(&*cell.borrow(), Startup::Blocked { modal: true, .. }));
     if !visible {
         return false;
+    }
+    let message = "PlayStation launch is paused until the network library configuration is repaired. Your files remain untouched. Press B to return to the library, Apps or Settings.";
+    if let Some(theme) = theme {
+        use common::theme::{frame::{FrameInputs, Hint}, pack::{Binding, ScreenId}};
+        let mut input = FrameInputs::new(ScreenId::NetworkDialog);
+        input.text.insert(Binding::Title, "Library unavailable".into());
+        input.text.insert(Binding::Message, message.into());
+        input.hints = vec![Hint { button: "B".into(), label: "Back".into() }];
+        if paint_popup(display, theme, &input) { return true; }
     }
     let styles = styles();
     fill_rect(
@@ -1340,7 +1446,6 @@ fn draw_startup_block<'a>(
         Point::new(108, 93),
     );
     let body = font(styles, 17, Color::new(35, 48, 51));
-    let message = "PlayStation launch is paused until the network library configuration is repaired. Your files remain untouched. Press B to return to the library, Apps or Settings.";
     for (index, line) in wrapped(&body, message, 424, 8).iter().enumerate() {
         body.draw(
             &mut display.pixmap_mut(),
@@ -1373,6 +1478,7 @@ pub(crate) mod tests {
     include!("network_runtime_dl11_tests.rs");
     include!("network_runtime_dl12_bench.rs");
     include!("network_runtime_dl17b_tests.rs");
+    include!("network_runtime_folder_tests.rs");
     use super::*;
     use crate::network_library::Payload;
     use sha2::{Digest, Sha256};
@@ -1383,6 +1489,29 @@ pub(crate) mod tests {
         settle();
         let game = Game::new(fixture.root.join(&fixture.game.game_path));
         (fixture, game)
+    }
+    pub(crate) fn library_catalog_fixture(root: &Path, games: Vec<NetworkGame>, cached: bool) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RUNTIME.with(|cell| *cell.borrow_mut() = None);
+                STARTUP.with(|cell| *cell.borrow_mut() = Startup::Legacy);
+                common::media::set_game_containers(std::iter::empty());
+            }
+        }
+        let state = root.join(".allium/state/network-library");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("config.json"),
+            r#"{"version":1,"library_id":"proof","address":"127.0.0.1:9"}"#).unwrap();
+        let catalog = Catalog { version: 1, library_id: "proof".into(), revision: "a".repeat(64), games };
+        std::fs::write(state.join("catalog.json"), serde_json::to_vec(&catalog).unwrap()).unwrap();
+        if cached {
+            let cache = Cache::new(CacheConfig::bind(root.to_path_buf(), None).unwrap()).unwrap();
+            for game in &catalog.games { cache.adopt_existing(game, &Cancellation::default()).unwrap(); }
+        }
+        initialize(root.to_path_buf()).unwrap();
+        settle();
+        Reset
     }
     pub(crate) fn set_semcache_cached(path: &Path, cached: bool) {
         with((), |runtime| {
@@ -1421,6 +1550,7 @@ pub(crate) mod tests {
             std::iter::once(PathBuf::from(&game.game_path)).chain(game.targets().unwrap())
         }).map(|path| r.config.root.join(path)).collect::<Vec<_>>());
         paths.extend([f.root.join("unknown.chd"), f.root.join("Roms/PS/Directory"),
+            f.root.join("Roms/PS/Directory/nested"),
             f.root.join("Roms/PS/DirectoryOther/other.chd"), PathBuf::from("outside.chd")]);
         for indexed in [true, false] {
             with((), |r| r.path_index = if indexed { catalog_path_index(&r.catalog, &r.config.root) } else { None });
@@ -1624,6 +1754,53 @@ pub(crate) mod tests {
         settle();
         assert!(action().is_none());
         assert!(guard_launch(&game.path).is_err());
+    }
+    #[test]
+    fn fix20_legacy_error_popup_fits_content_and_centers() {
+        for (lines, height) in [(0, 112), (1, 112), (3, 156), (100, 340)] {
+            let card = error_popup_rect(lines);
+            assert_eq!(card.h, height);
+            assert_eq!(card.y * 2 + card.h as i32, 480);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn fix19_network_popup_uses_descriptor_and_retains_progress_and_error() {
+        use common::theme::{FontBank, ThemeHandle, runtime::ThemeSnapshot, frame::FrameInputs,
+            pack::{Binding, ScreenId}, render::PreparedFrame};
+        let f = StartupFixture::new("fix19-popup"); f.configured();
+        initialize(f.root.clone()).unwrap(); settle();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        let raw = Stylesheet::default();
+        for id in ["compact-plus", "orbit-hero", "orbit-row", "big-picture"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(id)).unwrap(), &bank, 19).unwrap();
+            let styles = crate::theme_adapter::drawing_style(&raw, Some(&theme));
+            for (error, fraction) in [(false, 0.25), (false, 0.5), (true, 0.5)] {
+                with((), |r| { r.modal = Some(if error { Modal::Error("Verification failed".into()) } else { Modal::Working("Verifying".into()) }); r.progress_fraction = Some(fraction); });
+                let mut input = FrameInputs::new(ScreenId::NetworkDialog);
+                input.text.insert(Binding::Title, if error { "Unable to continue" } else { "Network library" }.into());
+                input.text.insert(Binding::Message, if error { "Verification failed" } else { "Verifying" }.into());
+                input.hints = vec![common::theme::frame::Hint { button: "B".into(), label: if error { "Back" } else { "Cancel" }.into() }];
+                input.progress = if error { None } else { Some(fraction as f32) };
+                let mut expected = DefaultPlatform::new().unwrap().display().unwrap();
+                expected.clear(Color::new(70, 80, 90)).unwrap();
+                PreparedFrame::prepare(theme.clone(), &input).unwrap().paint(&mut expected);
+                for _ in 0..2 {
+                    let mut actual = DefaultPlatform::new().unwrap().display().unwrap();
+                    actual.clear(Color::new(70, 80, 90)).unwrap();
+                    #[cfg(feature = "perf-bench")]
+                    let io = common::perf_trace::frontend_io_ops();
+                    assert!(draw_with_theme(&mut actual, || &styles, Some(&theme)));
+                    #[cfg(feature = "perf-bench")]
+                    assert_eq!(common::perf_trace::frontend_io_ops(), io);
+                    if let Ok(stage) = std::env::var("ALLIUM_FIX19_CAPTURE") {
+                        actual.pixmap().to_owned().save_png(format!("/private/tmp/allium-fix19-popup-{id}-{}-{stage}.png", if error { "error" } else { "working" })).unwrap();
+                    } else { assert!(actual.pixmap().data() == expected.pixmap().data(), "{id} error={error}: popup bypassed descriptor"); }
+                }
+            }
+        }
     }
     struct StartupFixture {
         root: PathBuf,
@@ -1890,6 +2067,8 @@ pub(crate) mod tests {
         let mut app = app.unwrap();
         initialize(f.root.clone()).unwrap();
         let styles = Stylesheet::load().unwrap();
+        let bank = common::theme::FontBank::bind(&common::constants::ALLIUM_FONTS_DIR).unwrap();
+        let theme = common::theme::ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
         let (progress_tx, progress) = mpsc::sync_channel(1);
         let (result_tx, result) = mpsc::sync_channel(1);
         progress_tx
@@ -1912,7 +2091,7 @@ pub(crate) mod tests {
         });
         assert!(poll());
         let mut working = DefaultPlatform::new().unwrap().display().unwrap();
-        assert!(draw(&mut working, &styles));
+        assert!(draw_with_theme(&mut working, || &styles, Some(&theme)));
         assert!(!poll());
 
         let finish = async {
@@ -1948,18 +2127,22 @@ pub(crate) mod tests {
         assert!(!poll(), "event loop must consume the redraw without input");
         let actual = app.proof_frame();
         let mut expected = DefaultPlatform::new().unwrap().display().unwrap();
-        let terminal_modal_drawn = draw(&mut expected, &styles);
+        let terminal_modal_drawn = draw_with_theme(&mut expected, || &styles, Some(&theme));
         assert_eq!(terminal_modal_drawn, !cancel);
-        for y in 94..374 {
-            let row = y * 640 * 4 + 108 * 4..y * 640 * 4 + 532 * 4;
+        let mut compared = 0;
+        for (index, pixel) in actual.data().chunks_exact(4).enumerate() {
+            let at = index * 4;
+            let reference = if cancel { working.pixmap() } else { expected.pixmap() };
+            if reference.data()[at + 3] != 255 { continue; }
+            let expected = &reference.data()[at..at + 4];
             if cancel {
-                if actual.data()[row.clone()] != working.pixmap().data()[row] {
-                    return;
-                }
+                if pixel != expected { return; }
             } else {
-                assert_eq!(actual.data()[row.clone()], expected.pixmap().data()[row]);
+                assert_eq!(pixel, expected, "opaque dialog pixel {index}");
+                compared += 1;
             }
         }
+        if !cancel { assert!(compared > 0); }
         assert!(!cancel, "cancelled Working modal remained on screen");
     }
     #[cfg(not(any(feature = "miyoo", feature = "simulator")))]

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 pub const RESERVE_BYTES: u64 = 2_162_688 * 1024;
+pub const STATE_FLOOR_BYTES: u64 = 1_048_576 * 1024;
 pub const METADATA_MARGIN: u64 = 64 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Catalog {
@@ -111,6 +112,17 @@ fn claim_ownership(
     Ok(())
 }
 impl NetworkGame {
+    pub fn folder_paths(&self) -> impl Iterator<Item = &Path> {
+        Path::new(&self.launch_path).ancestors().skip(1).take_while(|path| {
+            self.install_kind == "directory" && path.starts_with(&self.cache_path)
+        })
+    }
+    pub fn identity_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = self.targets()?;
+        paths.extend([PathBuf::from(&self.game_path), PathBuf::from(&self.cache_path)]);
+        paths.extend(self.folder_paths().map(Path::to_path_buf));
+        Ok(paths)
+    }
     pub fn targets(&self) -> Result<Vec<PathBuf>> {
         let cache = rom_path(&self.cache_path)?;
         self.files

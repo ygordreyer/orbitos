@@ -31,13 +31,14 @@ pub(super) fn paint_bounds(c: &Component) -> Rect {
         let extent = c.item_extent.unwrap_or(c.rect.2).max(c.rect.3) + 2 * pad;
         pad += ((extent as f32 * (scale - 1.0).max(0.0)) / 2.0).ceil() as u32 + 2;
     }
-    let x = c.rect.0.saturating_sub(pad);
-    let y = c.rect.1.saturating_sub(pad);
+    let rect = c.logo_rect.unwrap_or(c.rect);
+    let x = rect.0.saturating_sub(pad);
+    let y = rect.1.saturating_sub(pad);
     Rect(
         x,
         y,
-        (c.rect.0 + c.rect.2 + pad).min(640) - x,
-        (c.rect.1 + c.rect.3 + pad).min(480) - y,
+        (rect.0 + rect.2 + pad).min(640) - x,
+        (rect.1 + rect.3 + pad).min(480) - y,
     )
 }
 
@@ -347,7 +348,7 @@ impl PreparedFrame {
     pub fn detail_shadow_warm(&self) -> DetailShadowWarm {
         let mut keys = VecDeque::new();
         if self.can_prewarm_navigation() && self.theme.pack().ink() {
-            // Details shadows use pack geometry, independent of metadata and pagination.
+            let cover = self.previous_input.as_ref().and_then(super::super::retained::cover_source);
             // Conditional/dynamic components are left to their real render-time model.
             if let Some(screen) = self.theme.pack().screens.get(&ScreenId::GameDetail) {
                 for c in &screen.components {
@@ -361,7 +362,10 @@ impl PreparedFrame {
                     };
                     if visible {
                         if let Some(shadow) = &paint.shadow {
-                            if let Some((key, _, _)) = self.shadow_key(c.rect, c.radius.unwrap_or(0), shadow) {
+                            let rect = if c.binding == Some(Binding::SelectedCover) {
+                                cover.as_ref().map_or(c.rect, |source| Self::ink_image_rect(c, source))
+                            } else { c.rect };
+                            if let Some((key, _, _)) = self.shadow_key(rect, c.radius.unwrap_or(0), shadow) {
                                 if !keys.contains(&key) { keys.push_back(key); }
                             }
                         }

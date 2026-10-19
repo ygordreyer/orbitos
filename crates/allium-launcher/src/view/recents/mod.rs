@@ -42,6 +42,13 @@ pub enum Recents {
 }
 
 impl Recents {
+    pub(crate) fn reload(&mut self) -> Result<()> {
+        match self {
+            Self::List(list) => list.reload(),
+            Self::Carousel(carousel) => carousel.reload(),
+        }
+    }
+
     pub(crate) fn idle_media_step(&mut self, handle: &common::theme::ThemeHandle) -> bool {
         match self {
             Self::List(list) => list.idle_media_step(handle),

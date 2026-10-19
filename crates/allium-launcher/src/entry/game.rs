@@ -48,11 +48,43 @@ pub struct Game {
 }
 
 impl Game {
+    /// Cache-only identity shared by folder rows and their launch-file history aliases.
+    pub(crate) fn display_identity(&self) -> PathBuf {
+        if let Some(container) = common::media::game_container(&self.path)
+            .filter(|container| self.path.starts_with(container)) {
+            return container;
+        }
+        if let Some(parent) = self.path.parent() {
+            let same_stem = ["cue", "m3u", "chd", "pbp", "iso"].iter()
+                .any(|extension| self.extension.eq_ignore_ascii_case(extension))
+                && self.path.file_stem() == parent.file_name();
+            if same_stem { return parent.to_path_buf(); }
+        }
+        self.path.clone()
+    }
+
+    pub(crate) fn display_identity_in(&self, game_paths: &std::collections::HashSet<PathBuf>) -> PathBuf {
+        // A folder represented as a game proves an alias without scanning its children.
+        self.path.ancestors().skip(1).find(|parent| game_paths.contains(*parent))
+            .map(Path::to_path_buf).unwrap_or_else(|| self.display_identity())
+    }
+
     pub(crate) fn hydrate_name(&mut self) -> bool {
-        if let Some(name) =
-            common::media::cached_name(&self.path).filter(|name| !name.trim().is_empty())
-            && (self.name != name || self.full_name != name)
-        {
+        let cached = common::media::cached_name(&self.path)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                let parent = self.path.parent()?;
+                // Match the media cache's same-stem container rule without probing storage.
+                let same_stem = ["cue", "m3u", "chd", "pbp", "iso"].iter()
+                    .any(|extension| self.extension.eq_ignore_ascii_case(extension))
+                    && self.path.file_stem() == parent.file_name();
+                (same_stem || common::media::game_container(&self.path).as_deref() == Some(parent))
+                    .then(|| common::media::cached_name(parent)).flatten()
+                    .filter(|name| !name.trim().is_empty())
+            });
+        let from_gamelist = cached.is_some();
+        let name = cached.unwrap_or_else(|| short_name(&self.name));
+        if self.name != name || (from_gamelist && self.full_name != name) {
             self.name = name.clone();
             self.full_name = name;
             true

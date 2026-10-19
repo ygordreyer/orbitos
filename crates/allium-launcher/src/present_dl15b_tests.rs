@@ -104,7 +104,7 @@ async fn dl15b_network_overlay_end_presents_launcher() {
         &app.res.get::<Stylesheet>(),
         crate::theme_adapter::snapshot(&app.res).as_ref(),
     );
-    assert!(crate::network_runtime::draw(&mut reference, &styles));
+    assert!(crate::network_runtime::draw_with_theme(&mut reference, || &styles, crate::theme_adapter::snapshot(&app.res).as_ref()));
     let expected = reference.pixmap().to_owned();
     assert!(expected.data() != baseline.data());
     for _ in 0..3 {
@@ -138,7 +138,7 @@ pub(crate) fn network_reference(
         &app.res.get::<Stylesheet>(),
         crate::theme_adapter::snapshot(&app.res).as_ref(),
     );
-    assert!(crate::network_runtime::draw(&mut reference, &styles));
+    assert!(crate::network_runtime::draw_with_theme(&mut reference, || &styles, crate::theme_adapter::snapshot(&app.res).as_ref()));
     reference.pixmap().to_owned()
 }
 

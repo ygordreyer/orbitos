@@ -1793,7 +1793,7 @@ fn review_builtin_game_heading_slots_are_logo_capable() {
 #[test]
 fn media_logos_replace_selected_headings_and_fall_back_per_theme() {
     let bank=FontBank::bind(&font_root()).unwrap();
-    let mut logo=tiny_skia::Pixmap::new(96,24).unwrap();logo.fill(tiny_skia::Color::from_rgba8(250,10,80,255));let logo=Arc::new(logo);
+    let mut logo=tiny_skia::Pixmap::new(384,24).unwrap();logo.fill(tiny_skia::Color::from_rgba8(250,10,80,255));let logo=Arc::new(logo);
     let mut themes=Vec::new();
     for base in ["orbit-hero","orbit-row","big-picture","compact-plus"] {for suffix in ["","-tall"] {let id=format!("{base}{suffix}");themes.push((id.clone(),ThemeSnapshot::load_with_settings(&ink_pack_root().join(base), &std::collections::BTreeMap::from([("cover_shape".into(), if suffix.is_empty() { "square" } else { "tall" }.into())])).unwrap()));}}
     for id in ["orbit","compact"] {themes.push((id.into(),ThemeSnapshot::builtin(id).unwrap()));}

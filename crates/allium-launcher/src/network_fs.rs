@@ -1,6 +1,6 @@
 //! Cache filesystem operations rooted in held, identity-bound directory descriptors.
 #![allow(dead_code)]
-use crate::network_library::{METADATA_MARGIN, RESERVE_BYTES};
+use crate::network_library::{METADATA_MARGIN, RESERVE_BYTES, STATE_FLOOR_BYTES};
 use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
@@ -118,6 +118,36 @@ struct Inner {
 }
 #[derive(Clone)]
 pub struct AnchoredFs(Arc<Inner>);
+#[derive(Debug)]
+pub(crate) struct StateAdmissionDenied {
+    needed: u64,
+    free: u64,
+}
+pub(crate) fn space_message(needed: u64, free: u64) -> String {
+    let size = |bytes: u64| {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    };
+    format!("Not enough free space: needs {}, {} free", size(needed), size(free))
+}
+impl std::fmt::Display for StateAdmissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&space_message(self.needed, self.free))
+    }
+}
+impl std::error::Error for StateAdmissionDenied {}
+impl StateAdmissionDenied {
+    pub(crate) fn matches(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.is::<Self>() || cause.downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<Self>())
+        })
+    }
+}
 impl AnchoredFs {
     pub fn new(root: &Path) -> Result<Self> {
         Self::new_bound(root, None)
@@ -178,6 +208,12 @@ impl AnchoredFs {
         Ok(Identity::metadata(&self.0.root.metadata()?))
     }
     pub fn admit_write(&self, incoming: u64) -> Result<()> {
+        self.admit_write_kind(incoming, false)
+    }
+    pub fn admit_state_write(&self, incoming: u64) -> Result<()> {
+        self.admit_write_kind(incoming, true)
+    }
+    fn admit_write_kind(&self, incoming: u64, state: bool) -> Result<()> {
         self.check_root()?;
         // A stay-awake lease on tmpfs does not consume SD capacity.
         if self
@@ -189,7 +225,7 @@ impl AnchoredFs {
         }
         #[cfg(test)]
         if let Some((free, unit)) = *self.0.space.lock().unwrap() {
-            return admit_allocation(free, unit, incoming);
+            return admit_allocation(free, unit, incoming, state);
         }
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         ensure!(
@@ -202,11 +238,15 @@ impl AnchoredFs {
         let free = (stat.f_bavail as u64)
             .checked_mul(unit)
             .ok_or_else(|| anyhow::anyhow!("Free-space overflow"))?;
-        admit_allocation(free, unit, incoming)
+        admit_allocation(free, unit, incoming, state)
     }
     #[cfg(test)]
     pub(crate) fn test_space(&self, free: u64, unit: u64) {
         *self.0.space.lock().unwrap() = Some((free, unit));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_observed_space(&self) -> Option<(u64, u64)> {
+        *self.0.space.lock().unwrap()
     }
     pub fn root_fd(&self) -> i32 {
         self.0.root.as_raw_fd()
@@ -380,10 +420,13 @@ impl AnchoredFs {
         }
     }
     fn open_flags(&self, path: &Path, flags: i32) -> Result<AnchoredFile> {
+        self.open_flags_kind(path, flags, false)
+    }
+    fn open_flags_kind(&self, path: &Path, flags: i32, state_write: bool) -> Result<AnchoredFile> {
         let (parent, child) = self.parent(path)?;
         self.before_operation();
         if flags & libc::O_CREAT != 0 {
-            self.admit_write(0)?;
+            self.admit_write_kind(0, state_write)?;
         }
         let file = file_from_result(unsafe {
             libc::openat(
@@ -396,6 +439,7 @@ impl AnchoredFs {
         ensure!(file.metadata()?.is_file(), "Expected regular file");
         let identity = Identity::metadata(&file.metadata()?);
         let result = AnchoredFile {
+            state_write,
             fs: self.clone(),
             path: path.to_owned(),
             parent,
@@ -424,6 +468,12 @@ impl AnchoredFs {
     }
     pub fn create(&self, path: &Path) -> Result<AnchoredFile> {
         self.open_flags(path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+    }
+    pub fn create_state(&self, path: &Path) -> Result<AnchoredFile> {
+        ensure!(self.0.reserve_device.is_some()
+            || self.relative(path)?.starts_with(".allium/state/network-library"),
+            "State-only write policy");
+        self.open_flags_kind(path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, true)
     }
     pub fn sync_directory(&self, path: &Path) -> Result<()> {
         let file = self.walk(path, false)?;
@@ -570,6 +620,9 @@ impl AnchoredFs {
         self.rename_verified(&pinned, target)
     }
     pub fn rename_verified(&self, pinned: &PinnedSource, target: &Path) -> Result<()> {
+        self.rename_verified_kind(pinned, target, false)
+    }
+    fn rename_verified_kind(&self, pinned: &PinnedSource, target: &Path, state: bool) -> Result<()> {
         ensure!(Arc::ptr_eq(&self.0, &pinned.fs.0), "Foreign source binding");
         pinned.validate()?;
         let source = &pinned.path;
@@ -580,7 +633,7 @@ impl AnchoredFs {
         let b = name(&name_to)?;
         self.before_operation();
         pinned.validate()?;
-        self.admit_write(0)?;
+        self.admit_write_kind(0, state)?;
         #[cfg(target_os = "linux")]
         let result = unsafe {
             libc::syscall(
@@ -658,12 +711,13 @@ impl AnchoredFs {
                     identity: held.identity,
                     _held: Arc::new(held.file.try_clone()?),
                 };
-                return self.rename_verified(&pinned, target);
+                return self.rename_verified_kind(&pinned, target, true);
             }
-            return self.rename_no_replace(source, target);
+            let pinned = self.pin_source(source)?;
+            return self.rename_verified_kind(&pinned, target, true);
         }
         self.before_operation();
-        self.admit_write(0)?;
+        self.admit_state_write(0)?;
         if let Some(held) = held {
             held.validate()?;
             named_identity(&to, &b, expected.unwrap())?;
@@ -708,6 +762,7 @@ impl PinnedSource {
     }
 }
 pub struct AnchoredFile {
+    state_write: bool,
     created: bool,
     fs: AnchoredFs,
     path: PathBuf,
@@ -731,7 +786,8 @@ impl AnchoredFile {
         self.validate()?;
         self.fs.before_operation();
         if len > self.file.metadata()?.len() {
-            self.fs.admit_write(len - self.file.metadata()?.len())?;
+            ensure!(!self.state_write || len <= 1024 * 1024, "Metadata too large");
+            self.fs.admit_write_kind(len - self.file.metadata()?.len(), self.state_write)?;
         }
         self.file.set_len(len)?;
         self.validate()
@@ -790,9 +846,18 @@ impl Write for AnchoredFile {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.validate().map_err(std::io::Error::other)?;
         self.fs.before_operation();
+        if self.state_write && self.file.stream_position()?.saturating_add(bytes.len() as u64) > 1024 * 1024 {
+            return Err(std::io::Error::other("Metadata too large"));
+        }
         self.fs
-            .admit_write(bytes.len() as u64)
-            .map_err(std::io::Error::other)?;
+            .admit_write_kind(bytes.len() as u64, self.state_write)
+            .map_err(|error| {
+                if error.is::<StateAdmissionDenied>() {
+                    std::io::Error::other(error.downcast::<StateAdmissionDenied>().unwrap())
+                } else {
+                    std::io::Error::other(error)
+                }
+            })?;
         self.file.write(bytes)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -811,7 +876,7 @@ impl AsRawFd for AnchoredFile {
     }
 }
 
-fn admit_allocation(free: u64, unit: u64, incoming: u64) -> Result<()> {
+fn admit_allocation(free: u64, unit: u64, incoming: u64, state: bool) -> Result<()> {
     ensure!(unit > 0, "Zero allocation unit");
     let needed = incoming
         .checked_add(unit - 1)
@@ -819,8 +884,11 @@ fn admit_allocation(free: u64, unit: u64, incoming: u64) -> Result<()> {
         .and_then(|n| n.checked_mul(unit))
         .and_then(|n| n.checked_add(unit))
         .and_then(|n| n.checked_add(METADATA_MARGIN))
-        .and_then(|n| n.checked_add(RESERVE_BYTES))
+        .and_then(|n| n.checked_add(if state { STATE_FLOOR_BYTES } else { RESERVE_BYTES }))
         .ok_or_else(|| anyhow::anyhow!("Space admission overflow"))?;
-    ensure!(free >= needed, "Storage floor would be crossed");
+    if free < needed && state {
+        return Err(StateAdmissionDenied { needed, free }.into());
+    }
+    ensure!(free >= needed, "{}", space_message(needed, free));
     Ok(())
 }

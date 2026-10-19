@@ -160,11 +160,22 @@ pub struct Item {
 #[serde(deny_unknown_fields)]
 pub struct ActionContent {
     pub label: String,
+    /// Optional label for a selected non-game entry; absent preserves `label`.
+    pub folder_label: Option<String>,
     pub role: Role,
     pub fill: ColorRole,
     pub color: ColorRole,
     pub key: Option<String>,
     pub gap: Option<u32>,
+}
+impl ActionContent {
+    pub(crate) fn label_for_folder(&self, selected_is_folder: bool) -> &str {
+        if selected_is_folder {
+            self.folder_label.as_deref().unwrap_or(&self.label)
+        } else {
+            &self.label
+        }
+    }
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

@@ -18,6 +18,7 @@ pub struct ScrollList {
     rect: Rect,
     /// All entries.
     items: Vec<String>,
+    suffix_lengths: Vec<usize>,
     /// Visible entries.
     children: Vec<Label<String>>,
     alignment: Alignment,
@@ -50,6 +51,7 @@ impl ScrollList {
             res,
             rect,
             items: Vec::new(),
+            suffix_lengths: Vec::new(),
             children: Vec::new(),
             alignment,
             entry_height,
@@ -80,7 +82,13 @@ impl ScrollList {
         self.dirty = true;
     }
 
+    pub fn set_suffix_lengths(&mut self, lengths: Vec<usize>) {
+        self.suffix_lengths = lengths;
+        self.update_children();
+    }
+
     pub fn set_items(&mut self, items: Vec<String>, preserve_selection: bool) {
+        self.suffix_lengths.clear();
         if items.is_empty() {
             self.items = items;
             self.children.clear();
@@ -211,6 +219,7 @@ impl ScrollList {
     fn update_children(&mut self) {
         for (i, child) in self.children.iter_mut().enumerate() {
             child.set_text(self.items[self.top + i].to_owned());
+            child.suffix_len(self.suffix_lengths.get(self.top + i).copied().unwrap_or(0));
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod directory;
 pub(crate) mod display_names;
 pub mod game;
 mod gamelist;
+pub(crate) mod library;
 pub mod lazy_image;
 
 use std::ffi::OsStr;
@@ -73,6 +74,7 @@ impl Entry {
         if file_name == "media"
             || file_name == "Imgs"
             || file_name == "Guides"
+            || file_name == "Manuals"
             || file_name == "gamelist.xml"
             || file_name == "miyoogamelist.xml"
             || file_name == "neogeo.zip"
@@ -141,10 +143,17 @@ impl Entry {
 }
 
 pub(crate) fn listed_path(path: &Path) -> bool {
+    if path.components().any(|part| part.as_os_str().to_str().is_some_and(|name| {
+        name.contains(".sync-conflict-") || name == ".stfolder" || name == ".stversions"
+    })) {
+        return false;
+    }
     !path.file_name().and_then(OsStr::to_str).is_some_and(|name| name.starts_with(['.', '_']) || (name.starts_with('~') && path.is_dir()) || name.eq_ignore_ascii_case("~Import.sh")) && !path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
         ["miyoocmd", "xml", "json", "txt", "db", "nfo", "sbi", "msu", "pcm"].iter().any(|excluded| ext.eq_ignore_ascii_case(excluded))
     }) && !path.file_name().and_then(OsStr::to_str).is_some_and(|name| {
         ["metadata", "systeminfo", "cover.png", "icon.png", "logo.png", "background.png", "system.png"].iter().any(|excluded| name.eq_ignore_ascii_case(excluded))
+            || ["gamelist.xml.", "miyoogamelist.xml."].iter().any(|prefix|
+                name.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
     }) && !path.components().any(|part| {
         ["media", "Imgs", "Guides"].iter().any(|name| part.as_os_str().eq_ignore_ascii_case(name))
     })
@@ -193,6 +202,17 @@ pub trait Sort: Debug + Clone {
     }
 
     fn preserve_selection(&self) -> bool;
+}
+
+pub(crate) fn load_name_sources<'a>(paths: impl IntoIterator<Item = &'a Path>) {
+    common::media::defer_cold_sources();
+    let parents: std::collections::BTreeSet<_> = paths.into_iter().filter_map(Path::parent).collect();
+    // Model builds admit cold sources once; warm reloads retain the resident indexes.
+    common::media::with_name_indexes(|| {
+        for parent in parents {
+            common::media::check_directory(parent);
+        }
+    });
 }
 
 pub(crate) fn hydrate_names(entries: &mut [Entry]) -> bool {
@@ -309,6 +329,7 @@ pub(crate) mod load_work {
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub struct Counts {
         pub directory_reads: usize,
+        pub descriptor_reads: usize,
         pub metadata: usize,
         pub file_types: usize,
         pub sql: usize,

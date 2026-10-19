@@ -210,6 +210,10 @@ impl InkTextLayout {
         let v = self.font.v_metrics(Scale::uniform(self.size as f32));
         (self.line as f32 - v.ascent + v.descent) / 2.0 + v.ascent
     }
+    fn suffix_lines(&self, value: &str, width: u32, count: u32, overflow: Overflow, suffix_len: usize) -> Vec<String> {
+        crate::display::font::fit_suffix(value, suffix_len, width as f32, "…",
+            |text| self.advance_width(text), |text| self.lines(text, width, count, overflow))
+    }
     fn lines(&self, value: &str, width: u32, count: u32, overflow: Overflow) -> Vec<String> {
         #[cfg(test)]
         LAYOUT_CALLS.with(|n| n.set(n.get() + 1));
@@ -495,11 +499,12 @@ pub(super) struct TextRaster {
     baseline: Option<(f32, f32)>,
     color: Color,
     synopsis: bool,
+    suffix_len: usize,
 }
 impl TextRaster {
     pub(super) fn bytes(&self) -> usize { self.rect.2 as usize * self.rect.3 as usize * 4 + self.key.len() }
     pub(super) fn pixels(&self) -> Result<Arc<Pixmap>> {
-        let Self { ty, value, rect, count, align, overflow, center, guide, baseline, color, .. } = self;
+        let Self { ty, value, rect, count, align, overflow, center, guide, baseline, color, suffix_len, .. } = self;
         if let Some((x, baseline)) = baseline {
             let mut pix = ink_pixmap(rect.2, rect.3)?;
             raster(&mut pix, ty, value, *x, *baseline, *color);
@@ -508,7 +513,7 @@ impl TextRaster {
         let lines = if *guide {
             ty.guide_lines(value, rect.2, ty.guide_line_count(rect.3, *count))
         } else {
-            ty.lines(value, rect.2, *count, *overflow)
+            ty.suffix_lines(value, rect.2, *count, *overflow, *suffix_len)
         };
         let mut pix = ink_pixmap(rect.2, rect.3)?;
         let cap = ty.cap();
@@ -581,7 +586,7 @@ impl PreparedFrame {
         overflow: Overflow,
         center: bool,
     ) -> Result<()> {
-        self.ink_text_impl(id, rect, ty, value, count, align, overflow, center, false)
+        self.ink_text_impl(id, rect, ty, value, count, align, overflow, center, false, 0)
     }
     fn ink_text_impl(
         &mut self,
@@ -594,11 +599,13 @@ impl PreparedFrame {
         overflow: Overflow,
         center: bool,
         guide: bool,
+        suffix_len: usize,
     ) -> Result<()> {
         if rect.2 == 0 || rect.3 == 0 || value.is_empty() {
             return Ok(());
         }
         check_ink_dimensions(rect.2, rect.3)?;
+        let suffix_len = if suffix_len == 0 { 0 } else { ty.value(&value[value.len() - suffix_len..]).len() };
         let value = if guide {
             value.to_owned()
         } else {
@@ -620,8 +627,9 @@ impl PreparedFrame {
         ) + &format!(":{}:{}:{}", rect.2, rect.3, count);
         let key = format!("{key}:{:?}", ty.literal_color);
         let key = if guide { key + ":guide" } else { key };
+        let key = if suffix_len > 0 { format!("{key}:suffix={suffix_len}") } else { key };
         let request = || TextRaster {
-            key: key.clone(), ty: ty.clone(), value: value.clone(), rect, count, align, overflow, center, guide, baseline: None,
+            key: key.clone(), ty: ty.clone(), value: value.clone(), rect, count, align, overflow, center, guide, suffix_len, baseline: None,
             color: ty.literal_color.unwrap_or_else(|| self.color(ty.color)),
             synopsis: self.theme.pack().screens[&self.screen].components.iter()
                 .any(|c| c.id == id && c.binding == Some(Binding::SelectedBlurb)),
@@ -930,6 +938,7 @@ impl PreparedFrame {
                     .is_none_or(|w| (w == "populated") == state)
             });
             self.ink_empty_stack(&mut components);
+            self.ink_compact_network_dialog(&mut components, input);
             self.ink_fit_dialog(&mut components, input);
             let components = Arc::new(components);
             self.ink_components = Some((input.screen, state, components.clone()));
@@ -1009,6 +1018,44 @@ impl PreparedFrame {
             }
         }
         Ok(())
+    }
+    fn ink_compact_network_dialog(&self, components: &mut Vec<Component>, input: &FrameInputs) {
+        if input.screen != ScreenId::NetworkDialog { return; }
+        if [Binding::StorageEntries, Binding::Actions].iter()
+            .any(|binding| input.rows.get(binding).is_some_and(|rows| !rows.is_empty())) {
+            // Fixed layouts reserve the message rectangle above storage and action rows.
+            for c in components.iter_mut().filter(|c| c.binding == Some(Binding::Message)) {
+                let lines = (c.rect.3 / self.ink_type(c, false).line).max(1);
+                c.max_lines = Some(c.max_lines.unwrap_or(1).min(lines));
+            }
+            return;
+        }
+        let Some(panel) = components.iter()
+            .find(|c| c.kind == Kind::Panel && c.paint.as_ref().unwrap().fit_content)
+            .map(|c| c.rect) else { return; };
+        components.retain(|c| !inside(panel, c.rect) || match c.kind {
+            Kind::Entries | Kind::DialogActions => false,
+            Kind::Progress => input.progress.is_some(),
+            Kind::Text => c.binding.and_then(|binding| input.text.get(&binding)).is_some_and(|text| !text.is_empty()),
+            _ => true,
+        });
+        let mut flow: Vec<_> = components.iter().enumerate()
+            .filter(|(_, c)| inside(panel, c.rect) && matches!(c.kind, Kind::Text | Kind::Progress))
+            .map(|(i, c)| (i, c.rect)).collect();
+        flow.sort_by_key(|(_, rect)| rect.1);
+        let mut previous = None;
+        for (i, original) in flow {
+            let c = &mut components[i];
+            if let Some((end, original_end)) = previous {
+                c.rect.1 = end + original.1.saturating_sub(original_end).clamp(8, 16);
+            }
+            if c.kind == Kind::Text {
+                let ty = self.ink_type(c, false);
+                let text = &input.text[&c.binding.unwrap()];
+                c.rect.3 = ty.lines(&ty.value(text), c.rect.2, c.max_lines.unwrap_or(1), c.overflow.unwrap_or(Overflow::Ellipsis)).len() as u32 * ty.line;
+            }
+            previous = Some((c.rect.1 + c.rect.3, original.1 + original.3));
+        }
     }
     fn ink_fit_dialog(&self, components: &mut [Component], input: &FrameInputs) {
         if let Some(empty) = components
@@ -1091,7 +1138,7 @@ impl PreparedFrame {
             }
             let height = ((bottom - panel.rect.1) as f32 + top)
                 .round()
-                .clamp(1.0, 480.0) as u32;
+                .clamp(if input.screen == ScreenId::NetworkDialog { 96.0 } else { 1.0 }, 480.0) as u32;
             let y = (480 - height) / 2;
             let delta = y as i32 - panel.rect.1 as i32;
             for c in components.iter_mut() {
@@ -1203,6 +1250,7 @@ impl PreparedFrame {
                         c.overflow.unwrap_or(Overflow::Wrap),
                         false,
                         c.binding == Some(Binding::GuideText),
+                        input.suffix_len(&value),
                     )?;
                 }
             }
@@ -1218,7 +1266,7 @@ impl PreparedFrame {
                         .map(String::as_str)
                         .unwrap_or("");
                     let ty = self.ink_type(c, false);
-                    self.ink_text(
+                    self.ink_text_impl(
                         &c.id,
                         c.rect,
                         &ty,
@@ -1226,7 +1274,7 @@ impl PreparedFrame {
                         1,
                         p.anchor.unwrap_or(Align::Center),
                         Overflow::Ellipsis,
-                        true,
+                        true, false, input.suffix_len(title),
                     )?;
                 } else {
                     let src = match c.binding {
@@ -1235,15 +1283,16 @@ impl PreparedFrame {
                         _ => input.art.selected_cover.as_ref(),
                     };
                     if let Some(source) = src {
-                        if let Some(shadow) = &p.shadow {
-                            self.ink_shadow(c.rect, c.radius.unwrap_or(0), shadow);
-                        }
                         let image_c = self.ink_image_component(c);
-                        let image = self.image_pixels(c.rect, source, &image_c)?;
-                        self.draw_image(c.rect, &image);
+                        let rect = Self::ink_image_rect(&image_c, source);
+                        if let Some(shadow) = &p.shadow {
+                            self.ink_shadow(rect, c.radius.unwrap_or(0), shadow);
+                        }
+                        let image = self.image_pixels(rect, source, &image_c)?;
+                        self.draw_image(rect, &image);
                         if let Some(b) = &p.border {
                             self.ink_border(
-                                c.rect,
+                                rect,
                                 b.color,
                                 b.width,
                                 c.radius.unwrap_or(0),
@@ -1269,7 +1318,8 @@ impl PreparedFrame {
                     } else {
                         0
                     };
-                    let (advance, left, right) = ty.metrics(&ty.value(&action.label));
+                    let label = action.label_for_folder(input.selected_is_folder);
+                    let (advance, left, right) = ty.metrics(&ty.value(label));
                     let ink_width = (right - left).ceil() as u32;
                     let label_width = (advance.ceil() as u32).max(ink_width);
                     let total = badge + gap + ink_width;
@@ -1304,7 +1354,7 @@ impl PreparedFrame {
                         &c.id,
                         Rect(x, c.rect.1, label_width, c.rect.3),
                         &ty,
-                        &action.label,
+                        label,
                         1,
                         Align::Left,
                         Overflow::Ellipsis,
@@ -1686,7 +1736,7 @@ impl PreparedFrame {
                     },
                 )
             };
-            self.ink_baseline(
+            self.ink_baseline_suffix(
                 &c.id,
                 Rect(
                     x.round().max(0.0) as u32,
@@ -1698,6 +1748,7 @@ impl PreparedFrame {
                 text,
                 align,
                 baselines[i],
+                if i == 0 { input.suffix_len(text) } else { 0 },
             )?;
         }
         if value_width > 0.0 {
@@ -1794,13 +1845,13 @@ impl PreparedFrame {
             if preview {
                 image_c.blur_radius = p.peek.as_ref().and_then(|p| p.blur);
             }
-            image_c.fit = Some(
+            image_c.fit = c.fit.or(Some(
                 if self.theme.pack().alignment.as_ref().unwrap().cover_shape == "square" {
                     crate::theme::pack::Fit::Cover
                 } else {
                     crate::theme::pack::Fit::Contain
                 },
-            );
+            ));
             let image = self.image_pixels_with_radius(
                 rect,
                 source,
@@ -2026,7 +2077,7 @@ impl PreparedFrame {
                 .max(c.rect.0)
                 .min(right.saturating_sub(width).max(c.rect.0));
             let line_y = cy + h.saturating_sub(c.caption_lines.unwrap_or(1) * ty.line);
-            self.ink_text(
+            self.ink_text_impl(
                 &c.id,
                 Rect(cx, line_y, width, h.min(c.rect.1 + c.rect.3 - line_y)),
                 &ty,
@@ -2038,7 +2089,7 @@ impl PreparedFrame {
                 } else {
                     Overflow::Wrap
                 },
-                false,
+                false, false, input.suffix_len(&row.label),
             )?;
         }
         if !preview && row.enabled {
@@ -2595,7 +2646,7 @@ impl PreparedFrame {
                 }
             })
             .collect();
-        let wanted: Vec<u32> = hints.iter().map(|h| measure(&h.label)).collect();
+        let wanted: Vec<u32> = hints.iter().map(|h| measure(input.hint_label(&h.button, &h.label))).collect();
         let one_row = c.max_lines == Some(1);
         let (badge_gap, group_gap) = if one_row { (4, 8) } else { (6, 14) };
         let mut labels = wanted.clone();
@@ -2661,7 +2712,7 @@ impl PreparedFrame {
                 &c.id,
                 Rect(rect.0 + badges[i] + badge_gap, rect.1, labels[i], 20),
                 &ty,
-                &hints[i].label,
+                input.hint_label(&hints[i].button, &hints[i].label),
                 false,
             )?;
         }
@@ -2836,6 +2887,72 @@ thread_local! { static GUIDE_GLYPH_VISITS: std::cell::Cell<usize> = const { std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fix20_network_error_panel_fits_wrapped_message_and_centers() {
+        use crate::theme::frame::Hint;
+        for id in ["big-picture", "compact-plus", "orbit-hero", "orbit-row"] {
+            let theme = crate::theme::render_navigation::tests::theme(id, "square");
+            let mut input = FrameInputs::new(ScreenId::NetworkDialog);
+            input.text.insert(Binding::Title, "Unable to continue".into());
+            input.text.insert(Binding::Message, "Not enough free space: needs 2.1 GB, 1.8 GB free".into());
+            input.hints = vec![Hint { button: "A".into(), label: "Manage storage".into() }, Hint { button: "B".into(), label: "Back".into() }];
+            let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            if id == "big-picture" {
+                if let Ok(stage) = std::env::var("ALLIUM_FIX20_CAPTURE") {
+                    frame.pixels().save_png(format!("/private/tmp/allium-fix20-{stage}.png")).unwrap();
+                }
+            }
+            let cs = frame.ink_resolved_components(&input);
+            let panel = cs.iter().find(|c| c.paint.as_ref().unwrap().fit_content).unwrap();
+            let message = cs.iter().find(|c| c.binding == Some(Binding::Message)).unwrap();
+            let ty = frame.ink_type(message, false);
+            let lines = ty.lines(&input.text[&Binding::Message], message.rect.2, message.max_lines.unwrap(), message.overflow.unwrap());
+            println!("fix20 {id}: error panel {:?}, message {:?}", panel.rect, message.rect);
+            assert!(panel.rect.3 >= 96 && panel.rect.3 <= 180, "{id}: {:?}", panel.rect);
+            assert!((panel.rect.1 as i32 * 2 + panel.rect.3 as i32 - 480).abs() <= 1);
+            assert_eq!(message.rect.3, lines.len() as u32 * ty.line, "{id}: measured message height");
+            assert!(message.rect.1 + message.rect.3 <= panel.rect.1 + panel.rect.3);
+            assert!(!cs.iter().any(|c| matches!(c.kind, Kind::Progress | Kind::DialogActions) && inside(panel.rect, c.rect)), "empty controls reserve height");
+            input.text.insert(Binding::Message, "Not enough free space. Please manage the local storage before downloading this large game. Your saves and artwork will be preserved.".into());
+            let mut reused = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+            let cs = reused.ink_resolved_components(&input);
+            let grown = cs.iter().find(|c| c.paint.as_ref().unwrap().fit_content).unwrap();
+            assert!(grown.rect.3 >= panel.rect.3);
+            assert_eq!(reused.pixels().data(), PreparedFrame::prepare(theme.clone(), &input).unwrap().pixels().data());
+            let startup = "PlayStation launch is paused until the network library configuration is repaired. Your files remain untouched. Press B to return to the library, Apps or Settings.";
+            for text in [startup.to_owned(), "Verification failed: the downloaded PlayStation disc does not match the catalog checksum. Please check the network library configuration and try again before launching this game.".into()] {
+                input.text.insert(Binding::Message, text.clone());
+                let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+                let cs = frame.ink_resolved_components(&input);
+                let panel = cs.iter().find(|c| c.paint.as_ref().unwrap().fit_content).unwrap();
+                let message = cs.iter().find(|c| c.binding == Some(Binding::Message)).unwrap();
+                let ty = frame.ink_type(message, false);
+                let lines = ty.lines(&ty.value(&text), message.rect.2, message.max_lines.unwrap(), message.overflow.unwrap());
+                let unbounded = ty.lines(&ty.value(&text), message.rect.2, u32::MAX, Overflow::Wrap);
+                assert_eq!(lines, unbounded, "{id}: every wrapped line is painted");
+                assert!(!lines.join(" ").contains('…'), "{id}: no ellipsis");
+                assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>(), "{id}: every word");
+                assert_eq!(message.rect.3, lines.len() as u32 * ty.line);
+                assert!(message.rect.1 + message.rect.3 <= panel.rect.1 + panel.rect.3);
+                assert!((panel.rect.1 as i32 * 2 + panel.rect.3 as i32 - 480).abs() <= 1);
+                let hints = cs.iter().find(|c| c.kind == Kind::Hints).unwrap();
+                assert!(panel.rect.1 + panel.rect.3 <= hints.rect.1.min(480), "{id}: panel above hints");
+            }
+            for binding in [Binding::StorageEntries, Binding::Actions] {
+                input.rows.insert(binding, vec![crate::theme::frame::Row { id: "storage".into(), label: "Cached game".into(), subtitle: String::new(), value: String::new(), enabled: true }]);
+                let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+                let cs = frame.ink_resolved_components(&input);
+                let message = cs.iter().find(|c| c.binding == Some(Binding::Message)).unwrap();
+                let rows = cs.iter().find(|c| c.binding == Some(binding)).unwrap();
+                let ty = frame.ink_type(message, false);
+                let lines = ty.lines(&input.text[&Binding::Message], message.rect.2, message.max_lines.unwrap(), message.overflow.unwrap());
+                assert!(lines.len() as u32 * ty.line <= message.rect.3, "{id}: fixed message bounds");
+                assert!(message.rect.1 + message.rect.3 <= rows.rect.1, "{id}: message above {binding:?}");
+                input.rows.remove(&binding);
+            }
+        }
+    }
+
     #[test]
     fn status_scratch_preserves_unique_and_shared_frame_storage() {
         let theme = crate::theme::render_navigation::tests::theme("orbit-hero", "square");
@@ -3245,6 +3362,85 @@ mod tests {
         }
         assert_eq!(ink_pixmap(640, 480).unwrap().data().len(), 640 * 480 * 4);
     }
+
+    #[test]
+    fn fix19_hints_follow_selected_kind_in_all_packs_and_retained_frames() {
+        use crate::theme::frame::Hint;
+        for id in ["compact-plus", "orbit-hero", "orbit-row", "big-picture"] {
+            for screen in [ScreenId::Library, ScreenId::Recents, ScreenId::SearchResults] {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+                let bank = crate::theme::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+                let theme = ThemeHandle::prepare(ThemeSnapshot::load(&root.join("themes").join(id)).unwrap(), &bank, 19).unwrap();
+                let mut input = FrameInputs::new(screen);
+                input.rows.insert(Binding::Entries, vec![Row { id: "game".into(), label: "Game".into(), subtitle: String::new(), value: String::new(), enabled: true }]);
+                input.selected.insert(Binding::Entries, "game".into());
+                input.hints = vec![Hint { button: "A".into(), label: "Play".into() }];
+                let mut frame = None;
+                for folder in [false, true, false] {
+                    input.selected_is_folder = folder;
+                    let texts = ink_renderer::collect_detail_text(theme.clone(), &input).unwrap();
+                    let rect = theme.pack().screens[&screen].components.iter().find(|c| c.kind == Kind::Hints).unwrap().rect;
+                    let labels: Vec<_> = texts.iter().filter(|t| t.rect.1 >= rect.1 && t.rect.1 < rect.1 + rect.3).map(|t| t.value.to_lowercase()).collect();
+                    let expected = if folder { "open" } else { "play" };
+                    assert!(labels.iter().any(|s| s == expected), "{id}/{screen:?} folder={folder}: {labels:?}");
+                    assert!(!labels.iter().any(|s| s == if folder { "play" } else { "open" }));
+                    frame = Some(PreparedFrame::prepare_reusing(theme.clone(), &input, frame).unwrap());
+                    let reference = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+                    assert!(frame.as_ref().unwrap().pixels().data() == reference.pixels().data());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hero_action_folder_labels_render_and_invalidate_cached_frames() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = crate::theme::fonts::FontBank::bind(&root.join("static/.allium/fonts")).unwrap();
+        for (base, folder, game) in [("orbit-hero", "Open", "Play"), ("big-picture", "OPEN", "PLAY")] {
+            for shape in ["square", "tall"] {
+                for legacy in [false, true] {
+                    let settings = std::collections::BTreeMap::from([("cover_shape".into(), shape.into())]);
+                    let mut snapshot = ThemeSnapshot::load_with_settings(&root.join("themes").join(base), &settings).unwrap();
+                    let c = Arc::get_mut(&mut snapshot.0).unwrap().pack.screens.get_mut(&ScreenId::Library).unwrap()
+                        .components.iter_mut().find(|c| c.paint.as_ref().is_some_and(|p| p.action_content.is_some())).unwrap();
+                    let action_rect = c.rect;
+                    let action = c.paint.as_mut().unwrap().action_content.as_mut().unwrap();
+                    assert_eq!(action.folder_label.as_deref(), Some(folder));
+                    if legacy {
+                        let mut json = serde_json::to_value(&*action).unwrap();
+                        json.as_object_mut().unwrap().remove("folder_label");
+                        *action = serde_json::from_value(json).unwrap();
+                    }
+                    assert_eq!(action.label_for_folder(false), game);
+                    assert_eq!(action.label_for_folder(true), if legacy { game } else { folder });
+                    let theme = ThemeHandle::prepare(snapshot, &bank, 1).unwrap();
+                    let mut input = FrameInputs::new(ScreenId::Library);
+                    let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+                    let game_pixels = frame.pixels().data().to_vec();
+                    for selected_is_folder in [true, false, true] {
+                        input.selected_is_folder = selected_is_folder;
+                        let texts = collect_detail_text(theme.clone(), &input).unwrap();
+                        let texts: Vec<_> = texts.iter().filter(|text| text.rect.0 >= action_rect.0
+                            && text.rect.1 >= action_rect.1 && text.rect.0 + text.rect.2 <= action_rect.0 + action_rect.2
+                            && text.rect.1 + text.rect.3 <= action_rect.1 + action_rect.3).collect();
+                        let expected = if selected_is_folder && !legacy { folder } else { game };
+                        assert!(texts.iter().any(|text| text.value == expected));
+                        assert!(!texts.iter().any(|text| text.value == if expected == game { folder } else { game }));
+                        frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+                        let reference = crate::theme::render::navigation_reference(theme.clone(), &input).unwrap();
+                        assert!(frame.pixels().data() == reference.pixels().data(), "{base}/{shape}: cached label is stale");
+                        let same_action = (action_rect.1..action_rect.1 + action_rect.3).all(|y| {
+                            let at = ((y * 640 + action_rect.0) * 4) as usize;
+                            let end = at + action_rect.2 as usize * 4;
+                            frame.pixels().data()[at..end] == game_pixels[at..end]
+                        });
+                        assert_eq!(same_action, legacy || !selected_is_folder);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn parity_c_image_action_keeps_complete_play_label() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3512,3 +3708,48 @@ mod settings_fit_tests {
 #[cfg(test)]
 #[path = "ingame_menu_tests.rs"]
 mod ingame_menu_tests;
+
+#[cfg(test)]
+mod fix23_tests {
+    use super::*;
+
+    #[test]
+    fn fix23_ink_suffix_fitting_and_retained_invalidation() {
+        use crate::theme::render_navigation::tests::{arts, model, theme};
+        for id in ["compact", "compact-plus", "orbit-row"] {
+            let theme = theme(id, "square");
+            for screen in [ScreenId::Library, ScreenId::SearchResults, ScreenId::Recents] {
+                let mut input = model(&theme, screen, 0, &arts());
+                let title = "Radical Rex: Shred Pre-historic pavement";
+                for (row, suffix) in input.rows.get_mut(&Binding::Entries).unwrap().iter_mut().zip([" (USA)", " (Europe)"]) {
+                    row.label = format!("{title}{suffix}");
+                    input.suffix_lengths.insert(row.label.clone(), suffix.len());
+                }
+                let value = input.rows[&Binding::Entries][0].label.clone();
+                input.text.insert(Binding::SelectedTitle, value);
+                input.art.selected_logo = None;
+                let mut plain = input.clone();
+                plain.suffix_lengths.clear();
+                let before = PreparedFrame::prepare(theme.clone(), &plain).unwrap();
+                let updated = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(before)).unwrap();
+                let reference = uncached(|| PreparedFrame::prepare(theme.clone(), &input)).unwrap();
+                assert_eq!(updated.pixels().data(), reference.pixels().data(), "{id}/{screen:?}");
+                if theme.pack().ink() {
+                    let c = theme.pack().screens[&screen].components.iter().find(|c| c.kind == Kind::Entries).unwrap();
+                    let ty = ink_text_layout(&theme, c, false);
+                    let fitted: Vec<_> = input.rows[&Binding::Entries].iter().take(2).map(|row| {
+                        let value = ty.value(&row.label);
+                        let len = input.suffix_len(&row.label);
+                        let lines = ty.suffix_lines(&value, 200, 1, Overflow::Ellipsis, len);
+                        assert!(lines[0].ends_with(&value[value.len() - len..]));
+                        assert!(lines[0].contains('…'));
+                        assert!(ty.advance_width(&lines[0]) <= 200.0);
+                        assert_eq!(ty.suffix_lines(&value, 10, 1, Overflow::Ellipsis, len), ty.lines(&value, 10, 1, Overflow::Ellipsis));
+                        lines[0].clone()
+                    }).collect();
+                    assert_ne!(fitted[0], fitted[1]);
+                }
+            }
+        }
+    }
+}

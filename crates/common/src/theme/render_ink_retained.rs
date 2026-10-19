@@ -171,6 +171,7 @@ struct PanelKey {
     descriptor: Rc<str>,
     raster_revision: Option<String>,
     text: std::collections::BTreeMap<Binding, String>,
+    suffix_lengths: std::collections::BTreeMap<String, usize>,
     rows: std::collections::BTreeMap<Binding, Vec<Row>>,
     selected: std::collections::BTreeMap<Binding, String>,
     pagination: Option<crate::theme::frame::Pagination>,
@@ -190,7 +191,7 @@ struct PanelKey {
 impl PanelKey {
     fn new(descriptor: &Rc<str>, input: &FrameInputs) -> Self {
         Self { descriptor: descriptor.clone(), raster_revision: input.raster_revision.clone(),
-            text: input.text.clone(), rows: input.rows.clone(), selected: input.selected.clone(),
+            text: input.text.clone(), suffix_lengths: input.suffix_lengths.clone(), rows: input.rows.clone(), selected: input.selected.clone(),
             pagination: input.pagination, detail_lines: input.detail_lines.clone(),
             metadata: input.metadata.clone(), facts: input.facts.clone(),
             navigation: input.navigation.clone(), focus: input.focus.clone(), hints: input.hints.clone(),
@@ -204,6 +205,7 @@ impl PanelKey {
         // BTreeMap node overhead is bounded conservatively, including unused node slots.
         self.descriptor.len() + self.raster_revision.as_ref().map_or(0, String::capacity)
             + self.text.iter().chain(&self.selected).map(|(_, v)| 1024 + v.capacity()).sum::<usize>()
+            + self.suffix_lengths.keys().map(|s| 1024 + s.capacity()).sum::<usize>()
             + self.rows.iter().map(|(_, rs)| 1024 + rs.capacity() * std::mem::size_of::<Row>()
                 + rs.iter().map(row_bytes).sum::<usize>()).sum::<usize>()
             + self.navigation.iter().map(|(_, rs)| 1024 + rs.capacity() * std::mem::size_of::<Row>()
@@ -236,7 +238,7 @@ fn component_bytes(c: &Component) -> usize {
             bytes += items.capacity() * std::mem::size_of::<crate::theme::ink::Item>()
                 + items.iter().map(|i| [&i.id, &i.icon, &i.button, &i.label].into_iter().map(string).sum::<usize>()).sum::<usize>();
         }
-        if let Some(a) = &p.action_content { bytes += a.label.capacity() + string(&a.key); }
+        if let Some(a) = &p.action_content { bytes += a.label.capacity() + string(&a.folder_label) + string(&a.key); }
         if let Some(g) = &p.gradient { bytes += g.stops.capacity() * std::mem::size_of::<crate::theme::ink::Stop>(); }
         for surface in [&p.action_style, &p.primary_style, &p.action_focus_style].into_iter().flatten() {
             if let Some(g) = &surface.gradient { bytes += g.stops.capacity() * std::mem::size_of::<crate::theme::ink::Stop>(); }
@@ -309,6 +311,7 @@ fn row_model(c: &Component, input: &FrameInputs, index: usize) -> FrameInputs {
     let binding = c.binding.unwrap();
     let row = &input.rows[&binding][index];
     model.rows.insert(binding, vec![row.clone()]);
+    if let Some(&len) = input.suffix_lengths.get(&row.label) { model.suffix_lengths.insert(row.label.clone(), len); }
     model.focus = input.focus.clone();
     if let Some(selected) = input.selected.get(&binding) {
         model.selected.insert(binding, selected.clone());
@@ -433,8 +436,16 @@ pub(super) fn union(a: Rect, b: Rect) -> Rect {
 }
 fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
     let mut out = FrameInputs::new(input.screen);
+    if c.paint.as_ref().is_some_and(|p| p.action_content.as_ref().is_some_and(|a| a.folder_label.is_some())) {
+        out.selected_is_folder = input.selected_is_folder;
+    }
     if c.logo || c.binding == Some(Binding::SelectedLogo) {
         out.art.selected_logo = input.art.selected_logo.clone();
+    }
+    if c.logo_rect.is_some() {
+        // Reuse a scalar dependency for subtitle presence; title ops have no hints.
+        out.suppress_hints = input.text.get(&Binding::Subtitle)
+            .is_some_and(|s| !s.is_empty());
     }
     if c.logo_when_no_cover {
         // Only cover presence hides the logo, so a reused bool stands in for it: no ID clone or map insert per op.
@@ -547,6 +558,7 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
         }
         Kind::Status => out.status = input.status.clone(),
         Kind::Hints => {
+            out.selected_is_folder = input.selected_is_folder;
             out.hints = input.hints.clone();
             out.suppress_hints = input.suppress_hints;
         }
@@ -560,6 +572,9 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
         if c.paint.as_ref().is_some_and(|p| p.action.is_some()) && input.focus.component == c.id {
             out.focus.component = c.id.clone();
         }
+    }
+    for value in out.text.values().chain(out.rows.values().flatten().map(|row| &row.label)) {
+        if let Some(&len) = input.suffix_lengths.get(value) { out.suffix_lengths.insert(value.clone(), len); }
     }
     out
 }

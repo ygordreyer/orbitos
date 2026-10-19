@@ -232,8 +232,9 @@ pub(super) mod tests {
         let targets = crate::theme::art::Targets::for_screens(theme.pack(), &[input.screen]);
         let fit = |source: &Arc<Pixmap>, target: Option<crate::theme::art::Target>, logo: bool| {
             if let Some(target) = target {
-                let target = if logo { target.logo(source.width(), source.height()) } else { target };
-                let pixels = crate::theme::runtime::fit_image(source, target.width, target.height, target.fit).unwrap();
+                let target = if logo || target.cover_box { target.logo(source.width(), source.height()) } else { target };
+                let pixels = if logo { crate::theme::art::fit_logo(source, target.width, target.height).unwrap() }
+                    else { crate::theme::runtime::fit_image(source, target.width, target.height, target.fit).unwrap() };
                 let identity = crate::theme::runtime::fit_image(&pixels, target.width, target.height, target.fit).unwrap();
                 assert_eq!(pixels.data(), identity.data(), "identity fit changed bytes");
                 Arc::new(pixels)

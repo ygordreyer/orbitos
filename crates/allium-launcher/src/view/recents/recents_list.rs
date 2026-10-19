@@ -32,6 +32,10 @@ pub struct RecentsList {
 }
 
 impl RecentsList {
+    pub(crate) fn reload(&mut self) -> Result<()> {
+        self.list.reload()
+    }
+
     pub(crate) fn normalized_recents_key(&self, handle: &common::theme::ThemeHandle,
         direction: Option<isize>, status: &common::theme::frame::Status,
     ) -> Option<super::super::entry_list::NormalizedRecentsKey> {
@@ -269,7 +273,8 @@ impl Sort for RecentsSort {
         _console_mapper: &ConsoleMapper,
         _locale: &Locale,
     ) -> Result<Vec<Entry>> {
-        common::media::defer_cold_sources();
+        #[cfg(test)]
+        crate::entry::load_work::record(|work| work.sql += 1);
         let games = match self {
             RecentsSort::LastPlayed => database.select_last_played(RECENT_GAMES_LIMIT),
             RecentsSort::MostPlayed => database.select_most_played(RECENT_GAMES_LIMIT),
@@ -278,7 +283,7 @@ impl Sort for RecentsSort {
             RecentsSort::Search(query) => database.search(query, RECENT_GAMES_LIMIT),
         };
 
-        let games = match games {
+        let mut games = match games {
             Ok(games) => games,
             Err(err) => {
                 log::error!("Failed to select games: {}", err);
@@ -286,9 +291,12 @@ impl Sort for RecentsSort {
             }
         };
 
+        crate::entry::load_name_sources(games.iter().map(|game| game.path.as_path()));
+        games.retain(|game| crate::entry::listed_path(&game.path));
+        let game_paths = games.iter().map(|game| game.path.clone()).collect();
+        let mut identities = std::collections::HashSet::new();
         Ok(games
             .into_iter()
-            .filter(|game| crate::entry::listed_path(&game.path))
             .map(|game| {
                 let extension = game
                     .path
@@ -318,6 +326,10 @@ impl Sort for RecentsSort {
                 };
                 game.hydrate_name();
                 Entry::Game(game)
+            })
+            .filter(|entry| match entry {
+                Entry::Game(game) => identities.insert(game.display_identity_in(&game_paths)),
+                _ => true,
             })
             .collect())
     }

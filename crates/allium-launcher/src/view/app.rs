@@ -479,6 +479,7 @@ where
     status_point: Point,
     views: (Recents, Games, Apps, Settings),
     selected: usize,
+    recents_database_revision: u64,
     tabs: Row<Label<String>>,
     search_results: Option<SearchResultsView>,
     search_view: SearchView,
@@ -597,8 +598,10 @@ where
         drop(styles);
         drop(locale);
 
+        let recents_database_revision = res.get::<common::database::Database>().revision();
         Ok(Self {
             rect,
+            recents_database_revision,
             res: res.clone(),
             views,
             selected,
@@ -862,6 +865,9 @@ where
     }
 
     fn tab_change(&mut self, selected: usize) {
+        if selected == 0 && self.selected != selected {
+            self.refresh_recents();
+        }
         if self.selected == 1 && selected != 1 && crate::theme_adapter::legacy_orbit(&self.res) {
             self.status_bar.set_position(self.status_point);
             self.status_bar.set_should_draw();
@@ -884,6 +890,17 @@ where
             .color(StylesheetColor::TabSelected)
             .stroke_color(StylesheetColor::TabSelectedStroke);
         // self.title.set_text(self.title());
+    }
+
+    fn refresh_recents(&mut self) {
+        let revision = self.res.get::<common::database::Database>().revision();
+        if self.recents_database_revision == revision {
+            return;
+        }
+        match self.views.0.reload() {
+            Ok(()) => self.recents_database_revision = revision,
+            Err(error) => warn!("Refresh recents: {error:#}"),
+        }
     }
 
     fn root_tab_navigation_ready(&self) -> bool {
@@ -2331,6 +2348,119 @@ mod tests {
         prepare_theme_inputs(&mut models, &resources(), 1, &Status::default());
 
         assert!(models.is_empty());
+    }
+}
+
+#[cfg(all(test, not(any(feature = "miyoo", feature = "simulator"))))]
+mod recents_refresh_tests {
+    use super::*;
+    use crate::consoles::ConsoleMapper;
+    use crate::entry::{directory::list_tests::Fixture, game::Game, load_work};
+    use crate::view::entry_list::{EntryList, EntryListState};
+    use crate::view::{games::GamesSort, recents::RecentsSort};
+    use common::database::Database;
+
+    type TestApp = App<<DefaultPlatform as Platform>::Battery>;
+
+    fn fixture(carousel: bool, sort: RecentsSort) -> (Fixture, TestApp, Database) {
+        let fixture = Fixture::new();
+        let database = Database::in_memory().unwrap();
+        fixture.games(1, &database);
+        let game = Game::new(fixture.0.path.join("Game 00000.chd"));
+        database.increment_play_count(&game.into()).unwrap();
+        let mut styles = Stylesheet::new();
+        styles.load_fonts().unwrap();
+        styles.recents.use_recents_carousel = carousel;
+        let mut map = type_map::TypeMap::new();
+        map.insert(styles);
+        map.insert(Locale::new("en-US"));
+        map.insert(ConsoleMapper::new());
+        map.insert(common::geom::Size::new(640, 480));
+        map.insert(database.clone());
+        let res = Resources::new(map);
+        let rect = Rect::new(0, 54, 640, 376);
+        let recents = Recents::load_or_new(rect, res.clone(), Some(RecentsState::List(EntryListState {
+            sort, selected: 0, selected_path: None, child: None,
+        }))).unwrap();
+        let library = EntryList::new(rect, res.clone(), GamesSort::Alphabetical(fixture.0.clone())).unwrap();
+        let views = (
+            recents,
+            Games::new(rect, res.clone(), library).unwrap(),
+            Apps::load_or_new(rect, res.clone(), None).unwrap(),
+            Settings::new(rect, res.clone(), Default::default()).unwrap(),
+        );
+        let app = App::new(Rect::new(0, 0, 640, 480), res, views, 1,
+            DefaultPlatform::new().unwrap().battery().unwrap()).unwrap();
+        (fixture, app, database)
+    }
+
+    fn selected_recent(app: &TestApp) -> Option<std::path::PathBuf> {
+        let RecentsState::List(state) = app.views.0.save() else { panic!("expected recent list") };
+        state.selected_path
+    }
+
+    async fn library_menu_action(app: &mut TestApp, down: usize) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let mut bubble = VecDeque::new();
+        for key in std::iter::once(Key::Select).chain(std::iter::repeat_n(Key::Down, down)).chain([Key::A]) {
+            app.views.1.handle_key_event(KeyEvent::Pressed(key), tx.clone(), &mut bubble).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recents_activation_removes_game_removed_by_library_menu() {
+        let (fixture, mut app, database) = fixture(false, RecentsSort::LastPlayed);
+        let path = fixture.0.path.join("Game 00000.chd");
+        assert_eq!(selected_recent(&app), Some(path.clone()));
+        library_menu_action(&mut app, 3).await;
+        assert_eq!(database.select_game(&path).unwrap().unwrap().last_played, 0);
+        assert_eq!(selected_recent(&app), Some(path));
+        load_work::take();
+        app.prev();
+        assert_eq!(app.selected, 0);
+        assert!(selected_recent(&app).is_none());
+        assert_eq!(load_work::take().sql, 1);
+        app.next();
+        app.prev();
+        assert_eq!(load_work::take().sql, 0);
+    }
+
+    #[tokio::test]
+    async fn recents_activation_refreshes_favorites_changed_by_library_menu() {
+        let (fixture, mut app, _) = fixture(false, RecentsSort::Favorites);
+        assert!(selected_recent(&app).is_none());
+        library_menu_action(&mut app, 0).await;
+        app.prev();
+        assert_eq!(selected_recent(&app), Some(fixture.0.path.join("Game 00000.chd")));
+        app.next();
+        library_menu_action(&mut app, 0).await;
+        app.prev();
+        assert!(selected_recent(&app).is_none());
+    }
+
+    #[test]
+    fn recents_activation_without_database_change_does_not_query_either_variant() {
+        for carousel in [false, true] {
+            let (_fixture, mut app, _) = fixture(carousel, RecentsSort::LastPlayed);
+            load_work::take();
+            for _ in 0..3 {
+                app.prev();
+                app.next();
+            }
+            assert_eq!(load_work::take().sql, 0, "carousel={carousel}");
+        }
+    }
+
+    #[test]
+    fn recents_activation_refreshes_carousel_once_after_history_change() {
+        let (fixture, mut app, database) = fixture(true, RecentsSort::LastPlayed);
+        database.reset_game(&fixture.0.path.join("Game 00000.chd")).unwrap();
+        load_work::take();
+        app.prev();
+        assert_eq!(load_work::take().sql, 1);
+        app.next();
+        app.prev();
+        assert_eq!(load_work::take().sql, 0);
     }
 }
 

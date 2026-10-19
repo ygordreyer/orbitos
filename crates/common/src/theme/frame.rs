@@ -72,8 +72,11 @@ pub struct FrameInputs {
     /// Opaque controller revisions, including changes that resolve to equal visible values.
     pub raster_revision: Option<String>,
     pub text: BTreeMap<Binding, String>,
+    pub suffix_lengths: BTreeMap<String, usize>,
     pub rows: BTreeMap<Binding, Vec<Row>>,
     pub selected: BTreeMap<Binding, String>,
+    /// Set by the controller for a selected non-game entry, without querying its path.
+    pub selected_is_folder: bool,
     pub pagination: Option<Pagination>,
     pub detail_lines: Vec<DetailLine>,
     pub metadata: Vec<(String, String)>,
@@ -125,8 +128,10 @@ impl FrameInputs {
             screen,
             raster_revision: None,
             text: BTreeMap::new(),
+            suffix_lengths: BTreeMap::new(),
             rows: BTreeMap::new(),
             selected: BTreeMap::new(),
+            selected_is_folder: false,
             pagination: None,
             detail_lines: vec![],
             metadata: vec![],
@@ -141,6 +146,20 @@ impl FrameInputs {
             keyboard_cursor: (0, 0),
             art: Art::default(),
         }
+    }
+    pub fn suffix_len(&self, value: &str) -> usize {
+        self.suffix_lengths.get(value).copied().unwrap_or(0)
+    }
+    pub(crate) fn hint_label<'a>(&self, button: &str, label: &'a str) -> &'a str {
+        if button == "A" && matches!(label, "Play" | "PLAY" | "Open" | "OPEN" | "Open game")
+            && matches!(self.screen, ScreenId::Library | ScreenId::Recents | ScreenId::SearchResults) {
+            match (self.selected_is_folder, matches!(label, "PLAY" | "OPEN")) {
+                (true, true) => "OPEN",
+                (false, true) => "PLAY",
+                (true, false) => "Open",
+                (false, false) => "Play",
+            }
+        } else { label }
     }
     pub fn validate(&self, theme: &super::fonts::ThemeHandle) -> Result<()> {
         ensure!(self.raster_revision.as_ref().is_none_or(|r| r.len() <= 2048),
@@ -171,6 +190,9 @@ impl FrameInputs {
                 "Metadata run budget exceeded"
             );
         }
+        ensure!(self.suffix_lengths.len() <= 17 && self.suffix_lengths.iter().all(|(text, &len)|
+            text.len() <= 2048 && len > 0 && len <= text.len() && text.is_char_boundary(text.len() - len)),
+            "Invalid text suffixes");
         for (binding, value) in &self.text {
             ensure!(
                 matches!(

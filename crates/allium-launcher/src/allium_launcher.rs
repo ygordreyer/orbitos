@@ -284,7 +284,7 @@ impl AlliumLauncher<DefaultPlatform> {
                     Ok(match action {
                         crate::network_runtime::Action::Launch(mut game, reset) => {
                             if !reset
-                                && let Some(playlist) = crate::discs::discover(&game.path)?
+                                && let Some(playlist) = crate::entry::library::discover_discs(&game.path, &self.res.get::<ConsoleMapper>())?
                                 && playlist.discs.len() > 1
                             {
                                 crate::network_runtime::open_discs(game, playlist);
@@ -642,7 +642,7 @@ impl AlliumLauncher<DefaultPlatform> {
 
         let network_drawn = if network_dirty || drawn {
             let _stage = common::perf_trace::stage(common::perf_trace::Stage::NetworkOverlay);
-            crate::network_runtime::draw_with_style(&mut self.display, styles)
+            crate::network_runtime::draw_with_theme(&mut self.display, styles, crate::theme_adapter::snapshot(&self.res).as_ref())
         } else { false };
         drawn |= network_drawn;
         *overlay_was_drawn = network_drawn || self.toast.is_some();
@@ -745,31 +745,35 @@ impl AlliumLauncher<DefaultPlatform> {
                 self.display.clear(Color::new(0, 0, 0))?;
                 self.display.flush()?;
                 #[cfg(feature = "miyoo")]
-                {
+                let exec_error = {
                     use std::os::unix::process::CommandExt;
                     common::platform::cpu_tuning::set(common::platform::cpu_tuning::Workload::Game);
                     common::perf_trace::lifecycle(common::perf_trace::IMMINENT_EXEC);
-                    let _ = cmd.exec();
+                    let error = cmd.exec();
                     common::platform::cpu_tuning::set(
                         common::platform::cpu_tuning::Workload::Frontend,
                     );
-                }
+                    error
+                };
                 #[cfg(not(feature = "miyoo"))]
-                {
+                let exec_error = {
                     #[cfg(unix)]
                     {
                         use std::os::unix::process::CommandExt;
                         common::perf_trace::lifecycle(common::perf_trace::IMMINENT_EXEC);
-                        let _ = process::Command::new("/bin/sh")
+                        process::Command::new("/bin/sh")
                             .arg("-c")
                             .arg("make simulator bin=allium-menu")
-                            .exec();
+                            .exec()
                     }
 
                     #[cfg(not(unix))]
-                    process::exit(0);
-                }
+                    process::exit(0)
+                };
+                error!("Game launch failed: {exec_error}");
                 self.restore_launcher()?;
+                self.toast = Some(Toast::new("Unable to launch game".into(), Some(Duration::from_secs(5))));
+                self.toast_deadline = Some(Instant::now() + Duration::from_secs(5));
             }
             Command::ReloadStylesheet(styles, needs_relayout) => {
                 crate::view::details::invalidate_metadata();
@@ -849,6 +853,7 @@ impl AlliumLauncher<DefaultPlatform> {
                 self.restore_launcher()?;
             }
             Command::PopulateDb => {
+                crate::entry::directory::invalidate_system_counts();
                 crate::view::details::invalidate_metadata();
                 #[cfg(feature = "miyoo")]
                 {

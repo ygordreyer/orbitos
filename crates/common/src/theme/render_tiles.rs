@@ -8,12 +8,14 @@ const BYTE_LIMIT: usize = 1024 * 1024;
 const ENTRY_LIMIT: usize = 9;
 pub(super) struct Key<'a> {
     pub label: &'a str,
+    pub suffix_len: usize,
     pub source: Option<&'a Arc<Pixmap>>,
     pub focused: bool,
     pub preview: bool,
 }
 struct Tile {
     label: String,
+    suffix_len: usize,
     source: Option<Weak<Pixmap>>,
     focused: bool,
     preview: bool,
@@ -22,6 +24,7 @@ struct Tile {
 impl Tile {
     fn matches(&self, key: &Key<'_>, rect: Rect) -> bool {
         self.label == key.label
+            && self.suffix_len == key.suffix_len
             && self.focused == key.focused
             && self.preview == key.preview
             && self.pixels.width() == rect.2
@@ -88,6 +91,7 @@ impl Cache {
         }
         self.entries.push_front(Tile {
             label: key.label.into(),
+            suffix_len: key.suffix_len,
             source: key.source.map(Arc::downgrade),
             focused: key.focused,
             preview: key.preview,

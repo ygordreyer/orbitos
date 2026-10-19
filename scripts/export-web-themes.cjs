@@ -3,9 +3,49 @@
 const fs=require('fs'),path=require('path');
 const source=path.resolve(process.argv[2]||'../miyoo-ui-sim');
 const output=path.resolve(process.argv[3]||'themes');
+const folderLabels={'orbit-hero':'Open','big-picture':'OPEN'};
+// Native logo headers can use the subtitle band without changing text typography.
+function logoHeader(spec){
+ const title=spec?.components?.find(c=>c.logo&&c.binding==='title');
+ const subtitle=spec?.components?.find(c=>c.binding==='subtitle');
+ if(title&&subtitle){
+  const [x,y,w,h]=title.rect,[sx,sy,sw,sh]=subtitle.rect;
+  title.logo_rect=[x,y,Math.max(x+w,sx+sw)-x,Math.max(y+h,sy+sh)-y];
+ }
+}
+if(process.argv.includes('--logo-headers-only')){
+ const choicesPath=path.join(output,'choices.json'),choices=JSON.parse(fs.readFileSync(choicesPath));
+ for(const id of ['orbit-hero','orbit-row','big-picture','compact-plus']){
+  const file=path.join(output,id,'theme.json'),pack=JSON.parse(fs.readFileSync(file));
+  logoHeader(pack.screens.context_menu);
+  for(const setting of pack.settings||[])for(const option of setting.options)logoHeader(option.patch?.screens?.context_menu);
+  const bytes=Buffer.from(JSON.stringify(pack));fs.writeFileSync(file,bytes);
+  choices.find(choice=>choice.id===id).manifest_bytes=bytes.length;
+ }
+ fs.writeFileSync(choicesPath,JSON.stringify(choices,null,2)+'\n');
+ console.log('Updated native context menu logo headers in all four packs and setting patches');
+ process.exit(0);
+}
+// Refresh native-only action labels without importing unrelated web layout changes.
+if(process.argv.includes('--folder-labels-only')){
+ function refresh(value,label){
+  if(!value||typeof value!=='object')return;
+  if(value.action_content)value.action_content.folder_label=label;
+  for(const child of Object.values(value))refresh(child,label);
+ }
+ const choicesPath=path.join(output,'choices.json'),choices=JSON.parse(fs.readFileSync(choicesPath));
+ for(const [id,label] of Object.entries(folderLabels)){
+  const file=path.join(output,id,'theme.json'),pack=JSON.parse(fs.readFileSync(file));
+  refresh(pack,label);const bytes=Buffer.from(JSON.stringify(pack));fs.writeFileSync(file,bytes);
+  choices.find(choice=>choice.id===id).manifest_bytes=bytes.length;
+ }
+ fs.writeFileSync(choicesPath,JSON.stringify(choices,null,2)+'\n');
+ console.log('Updated native folder labels: '+Object.keys(folderLabels).join(', '));
+ process.exit(0);
+}
 const L=require(path.join(source,'dist/theme-layout.js'));
 L.setSchema(JSON.parse(fs.readFileSync(path.join(source,'dist/themes/theme.schema.json'))));
-const old=new Set('id kind rect asset_id binding role color radius max_lines overflow align fit layout visible_count item_extent gap padding art_size caption_height caption_lines frame_color focus_color focus_style focus_width glow_radius group max_items fade_edge clip_shape fade_width battery_style blur_radius mask_asset_id presentation logo logo_when_no_cover'.split(' '));
+const old=new Set('id kind rect asset_id binding role color radius max_lines overflow align fit layout visible_count item_extent gap padding art_size caption_height caption_lines frame_color focus_color focus_style focus_width glow_radius group max_items fade_edge clip_shape fade_width battery_style blur_radius mask_asset_id presentation logo logo_when_no_cover logo_rect'.split(' '));
 const typeKeys=['font','size','line_height','weight','letter_spacing','transform','color'];
 const report=[],styleRefs=new Map();
 function exportVariant(original,shape,selected={}){
@@ -21,6 +61,7 @@ function exportVariant(original,shape,selected={}){
      if(key.startsWith('_')||key==='shapes'||typeKeys.includes(key)&&key!=='color'||key==='focus_weight'||key==='items')continue;
      if(old.has(key))out[key]=value;else paint[key]=value;
     }
+    if(paint.action_content&&folderLabels[id])paint.action_content={...paint.action_content,folder_label:folderLabels[id]};
     if(c.role){
      paint.run=Object.fromEntries(typeKeys.filter(k=>c[k]!==undefined&&c[k]!==original.tokens.typography[c.role][k]).map(k=>[k,c[k]]));
      if(Object.keys(paint.run).length===0)delete paint.run;
@@ -33,6 +74,7 @@ function exportVariant(original,shape,selected={}){
     if(c.kind==='keyboard')paint.keyboard_layout='qwerty';
     out.paint=paint;return out;
    });
+   if(screen==='context_menu')logoHeader(spec);
    if(spec.components.some(c=>c.binding==='selected_cover')){
     for(const c of spec.components)if(c.logo||c.binding==='selected_logo')c.logo_when_no_cover=true;
    }

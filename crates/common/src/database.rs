@@ -99,6 +99,11 @@ impl Database {
         })
     }
 
+    /// A query-free revision shared by clones of this database connection.
+    pub fn revision(&self) -> u64 {
+        self.conn.as_ref().map_or(0, |conn| conn.total_changes())
+    }
+
     pub fn migrations<'a>() -> Migrations<'a> {
         Migrations::new(vec![
         M::up("
@@ -235,8 +240,11 @@ CREATE INDEX idx_games_last_played ON games(last_played);
 
     pub fn update_game_path(&self, old: &Path, new: &Path) -> Result<()> {
         let conn = self.conn.as_ref().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        // The parent path and its sessions must move together before checking foreign keys.
+        tx.pragma_update(None, "defer_foreign_keys", true)?;
 
-        let result = conn
+        let result = tx
             .prepare_cached("UPDATE games SET path = ? WHERE path = ?")?
             .execute(params![
                 new.display().to_string(),
@@ -245,10 +253,8 @@ CREATE INDEX idx_games_last_played ON games(last_played);
 
         // Handle UNIQUE constraint violation by merging rows
         if let Err(rusqlite::Error::SqliteFailure(err, _)) = result
-            && err.code == rusqlite::ErrorCode::ConstraintViolation
+            && err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
         {
-            let tx = conn.unchecked_transaction()?;
-
             let (conflicting_play_count, conflicting_play_time, conflicting_favorite): (
                 i64,
                 i64,
@@ -283,12 +289,16 @@ CREATE INDEX idx_games_last_played ON games(last_played);
                     new.display().to_string(),
                     old.display().to_string()
                 ])?;
-
-            tx.commit()?;
-            return Ok(());
+        } else {
+            result?;
         }
 
-        result?;
+        tx.prepare_cached("UPDATE game_sessions SET game_path = ? WHERE game_path = ?")?
+            .execute(params![
+                new.display().to_string(),
+                old.display().to_string()
+            ])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -639,12 +649,12 @@ ON CONFLICT(path) DO UPDATE SET play_count = games.play_count + 1, last_played =
         Ok(())
     }
 
-    /// Deletes all games that have no play time, play count.
+    /// Deletes unplayed games without session history.
     pub fn delete_all_unplayed_games(&self) -> Result<()> {
         self.conn
             .as_ref()
             .unwrap()
-            .prepare_cached("DELETE FROM games WHERE last_played = 0 AND play_time = 0")?
+            .prepare_cached("DELETE FROM games WHERE last_played = 0 AND play_time = 0 AND NOT EXISTS (SELECT 1 FROM game_sessions WHERE game_path = games.path)")?
             .execute([])?;
 
         Ok(())
@@ -883,6 +893,124 @@ mod tests {
             genres: Vec::new(),
             favorite: false,
         }
+    }
+
+    #[test]
+    fn rebuild_preserves_reset_game_history() -> Result<()> {
+        let db = Database::in_memory()?;
+        db.conn
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA foreign_keys = ON;")?;
+        let game = new_game("roms/reset.rom");
+        let unplayed = new_game("roms/unplayed.rom");
+        db.increment_play_count(&game)?;
+        db.record_game_session(&game.path, 10, 70, 60)?;
+        db.update_games(&[unplayed.clone()])?;
+        let sessions = db.select_sessions_by_day(10, 0)?;
+        db.reset_game(&game.path)?;
+        let reset = db.select_game(&game.path)?.unwrap();
+        assert_eq!(
+            (reset.play_count, reset.play_time, reset.last_played),
+            (0, Duration::zero(), 0)
+        );
+
+        for _ in 0..2 {
+            db.delete_all_directories()?;
+            db.delete_all_unplayed_games()?;
+            assert!(db.select_game(&unplayed.path)?.is_none());
+            assert_eq!(db.select_game(&game.path)?, Some(reset.clone()));
+            db.update_games(&[game.clone()])?;
+            assert_eq!(db.select_sessions_by_day(10, 0)?, sessions);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_moves_sessions_to_free_game_path() -> Result<()> {
+        let db = Database::in_memory()?;
+        db.conn
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA foreign_keys = ON;")?;
+        let game = new_game("roms/old.rom");
+        let new = Path::new("roms/new.rom");
+        db.increment_play_count(&game)?;
+        db.record_game_session(&game.path, 10, 70, 60)?;
+        let mut expected_game = db.select_game(&game.path)?.unwrap();
+        let mut expected_sessions = db.select_sessions_by_day(10, 0)?;
+        expected_game.path = new.to_path_buf();
+        expected_sessions[0].game_path = new.to_path_buf();
+
+        db.update_game_path(&game.path, new)?;
+        assert!(db.select_game(&game.path)?.is_none());
+        assert_eq!(db.select_game(new)?, Some(expected_game));
+        assert_eq!(db.select_sessions_by_day(10, 0)?, expected_sessions);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_merges_game_paths_with_sessions_on_both() -> Result<()> {
+        let db = Database::in_memory()?;
+        db.conn
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA foreign_keys = ON;")?;
+        let old = new_game("roms/old.rom");
+        let mut new = new_game("roms/new.rom");
+        new.favorite = true;
+        db.increment_play_count(&old)?;
+        db.increment_play_count(&new)?;
+        db.set_favorite(&new)?;
+        db.record_game_session(&old.path, 10, 70, 60)?;
+        db.record_game_session(&new.path, 80, 110, 30)?;
+        let mut expected_sessions = db.select_sessions_by_day(10, 0)?;
+        for session in &mut expected_sessions {
+            session.game_path = new.path.clone();
+        }
+
+        db.update_game_path(&old.path, &new.path)?;
+        assert!(db.select_game(&old.path)?.is_none());
+        let merged = db.select_game(&new.path)?.unwrap();
+        assert_eq!(
+            (merged.play_count, merged.play_time),
+            (2, Duration::seconds(90))
+        );
+        assert!(merged.favorite);
+        assert_eq!(db.select_all_games()?.len(), 1);
+        assert_eq!(db.select_sessions_by_day(10, 0)?, expected_sessions);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_path_update_rolls_back_when_session_move_fails() -> Result<()> {
+        for conflict in [false, true] {
+            let db = Database::in_memory()?;
+            let conn = db.conn.as_ref().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            let old = new_game("roms/old.rom");
+            let new = new_game("roms/new.rom");
+            db.increment_play_count(&old)?;
+            db.record_game_session(&old.path, 10, 70, 60)?;
+            if conflict {
+                db.increment_play_count(&new)?;
+                db.record_game_session(&new.path, 80, 110, 30)?;
+            }
+            let games = db.select_all_games()?;
+            let sessions = db.select_sessions_by_day(10, 0)?;
+            conn.execute_batch("CREATE TRIGGER reject_session_move BEFORE UPDATE OF game_path ON game_sessions BEGIN SELECT RAISE(ABORT, 'session move rejected'); END;")?;
+
+            let error = db.update_game_path(&old.path, &new.path).unwrap_err();
+            assert!(error.to_string().contains("session move rejected"), "{error}");
+            assert_eq!(db.select_all_games()?, games);
+            assert_eq!(db.select_sessions_by_day(10, 0)?, sessions);
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.query_row("PRAGMA defer_foreign_keys", [], |r| r.get::<_, i64>(0))?,
+                0
+            );
+        }
+        Ok(())
     }
 
     #[test]

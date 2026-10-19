@@ -682,7 +682,8 @@ where
             && c.paint.as_ref().is_some_and(|p| p.section_style.is_some())).then(||
                 crate::view::details::DetailsSnapshot::cached(game)).flatten().map(|snapshot| {
             let game = game.clone();
-            let title = self.entries[selected].name().to_owned();
+            let title = self.display_names.name(&self.entries[selected]).to_owned();
+            let suffix_len = self.display_names.suffix_len(&self.entries[selected]);
             let platform = self.res.get::<ConsoleMapper>().get_console(&game.path)
                 .map(|c| c.name.clone()).unwrap_or_default();
             let theme = handle.clone();
@@ -691,7 +692,7 @@ where
                 // Section pagination excludes history, so no UI-thread database query is needed.
                 let mut details = crate::view::details::Details::from_snapshot(&game, &platform, snapshot);
                 details.reflow(&theme);
-                let mut input = details.frame_input(&theme, &title, focus);
+                let mut input = details.frame_input(&theme, &title, suffix_len, focus);
                 input.art = base.art;
                 input.status = base.status;
                 input.navigation = base.navigation;
@@ -826,7 +827,12 @@ where
             rows.unwrap_or_else(|| self.entries.iter().skip(first).take(count)
                 .map(|entry| Self::semantic_row(&self.res, entry, &self.display_names)).collect()),
         );
+        for entry in self.entries.iter().skip(first).take(count).chain(self.entries.get(selected)) {
+            let len = self.display_names.suffix_len(entry);
+            if len > 0 { input.suffix_lengths.insert(self.display_names.name(entry).into(), len); }
+        }
         if let Some(entry) = self.entries.get(selected) {
+            input.selected_is_folder = !matches!(entry, Entry::Game(_));
             let selected_row = selected.checked_sub(first)
                 .and_then(|index| input.rows[&Binding::Entries].get(index));
             let id = selected_row.map(|row| row.id.clone())
@@ -876,6 +882,11 @@ where
                         label: "Sort".into(),
                     });
                 }
+            }
+            if input.selected_is_folder {
+                input.hints = [("A", "Open"), ("B", "Back"), ("L/R", "Mode")].into_iter()
+                    .map(|(button, label)| Hint { button: button.into(),
+                        label: if button == "B" { self.res.get::<Locale>().t("button-back") } else { label.into() } }).collect();
             }
             let needs_info = handle.pack().screens[&screen].components.iter().any(|c| {
                 matches!(
@@ -1158,7 +1169,10 @@ where
                 let targets = Self::detail_targets(handle);
                 targets[self.detail_action % targets.len()].clone()
             } else { Default::default() };
-            let mut detail = details.frame_input(handle, self.entries.get(selected).map_or("", Entry::name), focus);
+            let (title, suffix_len) = self.entries.get(selected)
+                .map(|entry| (self.display_names.name(entry), self.display_names.suffix_len(entry)))
+                .unwrap_or_default();
+            let mut detail = details.frame_input(handle, title, suffix_len, focus);
             detail.art = orbit.theme_art(&self.entries, selected, first, count);
             models.push(detail);
         }
@@ -1390,7 +1404,7 @@ where
                         return Ok(());
                     }
                     if self.orbit.is_some() {
-                        match crate::discs::discover(&game.path) {
+                        match crate::entry::library::discover_discs(&game.path, &self.res.get::<ConsoleMapper>()) {
                             Ok(Some(playlist)) if playlist.discs.len() > 1 => {
                                 self.disc_picker = Some(DiscPicker::new(playlist));
                                 self.orbit.as_mut().unwrap().redraw();
@@ -1408,11 +1422,11 @@ where
                             _ => {}
                         }
                     }
-                    let command = self.res.get::<ConsoleMapper>().launch_game(
+                    let command = crate::consoles::launch_feedback(self.res.get::<ConsoleMapper>().launch_game(
                         &self.res.get(),
                         game,
                         false,
-                    )?;
+                    ));
                     if let Some(cmd) = command {
                         commands.send(cmd).await?;
                     }
@@ -1436,6 +1450,16 @@ where
                 .set_text(self.sort.button_hint(&self.res.get::<Locale>()));
             self.button_hints.set_should_draw();
         }
+        Ok(())
+    }
+
+    pub(crate) fn reload(&mut self) -> Result<()> {
+        let state = self.save();
+        self.load_entries()?;
+        let selected = state.selected_path.as_ref()
+            .and_then(|path| self.entries.iter().position(|entry| entry.path() == path))
+            .unwrap_or(state.selected);
+        self.select(selected.min(self.entries.len().saturating_sub(1)));
         Ok(())
     }
 
@@ -1470,6 +1494,7 @@ where
             self.sort.preserve_selection(),
         );
 
+        self.list.set_suffix_lengths(self.entries.iter().map(|entry| self.display_names.suffix_len(entry)).collect());
         self.prepare_orbit();
         Ok(())
     }
@@ -1889,11 +1914,11 @@ where
                                         self.menu = None;
                                         return Ok(true);
                                     }
-                                    let command = self.res.get::<ConsoleMapper>().launch_game(
+                                    let command = crate::consoles::launch_feedback(self.res.get::<ConsoleMapper>().launch_game(
                                         &self.res.get(),
                                         game,
                                         true,
-                                    )?;
+                                    ));
                                     if let Some(cmd) = command {
                                         commands.send(cmd).await?;
                                     }
@@ -2258,6 +2283,23 @@ mod perf_fix_tests {
         assert_eq!(models[0].text[&Binding::SelectedMetadata], "47 games");
         assert_eq!(models[0].metadata, [(String::new(), "47 games".into())]);
         assert_eq!(theme.pack().screens[&ScreenId::Library].components.iter().filter(|c| c.binding == Some(Binding::SelectedTitle)).count(), 1);
+
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let system = fixture.0.path.join("PS");
+        let folder = system.join("Collection");
+        std::fs::create_dir_all(&folder).unwrap();
+        for index in 0..12 {
+            std::fs::write(folder.join(format!("Game {index}.chd")), b"rom").unwrap();
+        }
+        list.entries = Directory::new(system).entries(&Database::in_memory().unwrap(),
+            &ConsoleMapper::library_fixture(), &Locale::new("en-US")).unwrap();
+        crate::entry::load_work::take();
+        for _ in 0..2 {
+            list.select(0);
+            let models = list.theme_models(ScreenId::Library, &theme).unwrap();
+            assert_eq!(models[0].text[&Binding::SelectedMetadata], "12 games");
+        }
+        assert_eq!(crate::entry::load_work::take().directory_reads, 0);
     }
 
     #[test]
@@ -2601,6 +2643,153 @@ pub(crate) mod ux4_tests {
         Resources::new(map)
     }
     #[test]
+    fn hero_action_model_distinguishes_directory_and_game_selection() {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::ScreenId};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/orbit-hero")).unwrap(), &bank, 1).unwrap();
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), resources(),
+            PathsSort { paths: vec![PathBuf::from("hero-label/Game.sfc")] }).unwrap();
+        list.entries.push(Entry::Directory(Directory::new(PathBuf::from("hero-label/ROMHACKS"))));
+        for screen in [ScreenId::Library, ScreenId::Recents, ScreenId::SearchResults] {
+            for (selected, folder, label) in [(0, false, "Play"), (1, true, "Open")] {
+                let model = list.base_theme_model(screen, &theme, selected, 0, 2);
+                assert_eq!(model.selected_is_folder, folder);
+                assert_eq!(model.hints.iter().find(|hint| hint.button == "A").unwrap().label, label);
+            }
+        }
+    }
+
+    pub(crate) fn fix20_recents_resources() -> Resources {
+        let res = resources();
+        let database = res.get::<Database>();
+        let stem = "Kowai Shashin - Shinrei Shashin Kitan (Japan)";
+        let folder = PathBuf::from("fix20-recents/PS").join(stem);
+        let mut paths = vec![folder.clone()];
+        paths.extend((0..8).map(|i| PathBuf::from(format!("fix20-recents/PS/Other {i}.chd"))));
+        paths.push(folder.join(format!("{stem}.cue")));
+        paths.push(PathBuf::from("fix20-recents/PS/.hidden (Europe).chd"));
+        for (i, path) in paths.into_iter().enumerate().rev() {
+            let mut game = Game::new(path);
+            if i == 0 || i >= 9 { game.name = "Kowai Shashin: Shinrei shashin kitan".into(); }
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            database.increment_play_count(&game.into()).unwrap();
+        }
+        drop(database);
+        res
+    }
+
+    #[test]
+    fn fix20_recents_folder_alias_outside_row_window_does_not_leak_suffix() {
+        use crate::view::recents::RecentsSort;
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
+        let res = fix20_recents_resources();
+        assert_eq!(res.get::<Database>().select_last_played(100).unwrap().len(), 11);
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, RecentsSort::LastPlayed).unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 20).unwrap();
+        let model = list.recents_theme_model(ScreenId::Recents, &theme, 0, 0, 9);
+        assert_eq!(model.rows[&Binding::Entries][0].label, "Kowai Shashin: Shinrei shashin kitan");
+        assert_eq!(list.entries.len(), 9, "one row per history identity, hidden entries excluded");
+        assert_eq!(model.rows[&Binding::Entries].len(), 9);
+        assert!(list.entries.iter().all(|entry| entry.path().extension().is_none_or(|ext| ext != "cue")));
+    }
+
+    pub(crate) fn fix20b_recents_resources(nested: bool, launch_most_recent: bool) -> (Resources, PathBuf) {
+        let res = resources();
+        let folder = PathBuf::from(format!("fix20b-recents-{nested}-{launch_most_recent}/PS/Folder Title (Japan)"));
+        let launch = folder.join(if nested { "nested/disc.cue" } else { "disc.cue" });
+        if nested { common::media::set_game_containers([(launch.clone(), folder.clone())]); }
+        let expected = if launch_most_recent { launch.clone() } else { folder.clone() };
+        let mut paths = vec![expected.clone()];
+        paths.extend((0..8).map(|i| folder.parent().unwrap().join(format!("Other {i}.chd"))));
+        paths.push(if launch_most_recent { folder.clone() } else { launch.clone() });
+        for path in paths.into_iter().rev() {
+            let mut game = Game::new(path.clone());
+            if path == folder || path == launch { game.name = "Folder Title".into(); }
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            res.get::<Database>().increment_play_count(&game.into()).unwrap();
+        }
+        (res, expected)
+    }
+
+    #[test]
+    fn fix20b_recents_different_stem_and_nested_aliases_render_once() {
+        use crate::view::recents::RecentsSort;
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 21).unwrap();
+        for nested in [false, true] {
+            for launch_most_recent in [false, true] {
+                let (res, expected) = fix20b_recents_resources(nested, launch_most_recent);
+                let database = res.get::<Database>().clone();
+                let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, RecentsSort::LastPlayed).unwrap();
+                let model = list.recents_theme_model(ScreenId::Recents, &theme, 0, 0, 9);
+                assert_eq!(model.rows[&Binding::Entries][0].label, "Folder Title", "nested={nested}, launch first={launch_most_recent}");
+                assert_eq!(model.text[&Binding::SelectedTitle], "Folder Title");
+                assert_eq!(list.entries.len(), 9);
+                assert_eq!(model.rows[&Binding::Entries].len(), 9);
+                assert_eq!(list.entries[0].path(), expected);
+                assert_eq!(database.select_last_played(100).unwrap().len(), 10, "history paths remain intact");
+                list.reload().unwrap();
+                assert_eq!(list.entries.len(), 9);
+                assert_eq!(list.entries[0].path(), expected);
+            }
+        }
+        common::media::set_game_containers(std::iter::empty());
+    }
+
+    #[test]
+    fn fix20b_recents_nested_container_without_folder_row_keeps_region_labels() {
+        use crate::view::recents::RecentsSort;
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
+        let folder = PathBuf::from("fix20b-container/PS/Folder Title (Japan)");
+        let launch = folder.join("nested/disc.cue");
+        common::media::set_game_containers([(launch.clone(), folder)]);
+        let res = resources();
+        for path in [PathBuf::from("fix20b-container/PS/Folder Title (Europe).chd"), launch.clone()] {
+            let mut game = Game::new(path);
+            game.name = "Folder Title".into();
+            game.image = crate::entry::lazy_image::LazyImage::NotFound;
+            res.get::<Database>().increment_play_count(&game.into()).unwrap();
+        }
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, RecentsSort::LastPlayed).unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 22).unwrap();
+        let model = list.recents_theme_model(ScreenId::Recents, &theme, 0, 0, 9);
+        assert_eq!(model.rows[&Binding::Entries].iter().map(|row| row.label.as_str()).collect::<Vec<_>>(), ["Folder Title (Japan)", "Folder Title (Europe)"]);
+        assert_eq!(list.entries[0].path(), launch);
+        common::media::set_game_containers(std::iter::empty());
+    }
+
+    #[test]
+    fn fix20_recents_distinct_region_files_keep_rendered_suffixes() {
+        use crate::view::recents::RecentsSort;
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
+        let root = std::env::temp_dir().join(format!("allium-fix20-regions-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let res = resources();
+        for region in ["Japan", "Europe"] {
+            let path = root.join(format!("Kowai ({region}).chd"));
+            std::fs::write(&path, b"fixture").unwrap();
+            let mut game = Game::new(path);
+            game.name = "Kowai Shashin: Shinrei shashin kitan".into();
+            res.get::<Database>().increment_play_count(&game.into()).unwrap();
+        }
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), res, RecentsSort::LastPlayed).unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes/big-picture")).unwrap(), &bank, 20).unwrap();
+        let model = list.recents_theme_model(ScreenId::Recents, &theme, 0, 0, 9);
+        assert_eq!(model.rows[&Binding::Entries].iter().map(|row| row.label.as_str()).collect::<Vec<_>>(),
+            ["Kowai Shashin: Shinrei shashin kitan (Europe)", "Kowai Shashin: Shinrei shashin kitan (Japan)"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn collision_labels_reach_library_recents_and_search_without_reordering() {
         use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle, pack::{Binding, ScreenId}};
         let paths: Vec<PathBuf> = ["Game (USA).zip", "Game (Europe).nes", "Game (USA).nes"]
@@ -2624,6 +2813,75 @@ pub(crate) mod ux4_tests {
         list.sort(PathsSort { paths: vec![paths[0].clone()] }).unwrap();
         let model = list.base_theme_model(ScreenId::Library, &theme, 0, 0, 3);
         assert_eq!(model.rows[&Binding::Entries][0].label, "Same title");
+    }
+
+    fn fix24_details_titles(twins: bool) {
+        use common::theme::{fonts::FontBank, runtime::ThemeSnapshot, ThemeHandle,
+            frame::FrameInputs, pack::{Binding, ScreenId}, render::PreparedFrame};
+        let fixture = crate::entry::directory::list_tests::Fixture::new();
+        let paths: Vec<_> = if twins { vec!["Radical Rex (USA).sfc", "Radical Rex (Europe).sfc"] }
+            else { vec!["Radical Rex (USA).sfc"] }.into_iter().map(|name| fixture.0.path.join(name)).collect();
+        for path in &paths { std::fs::write(path, b"fixture").unwrap(); }
+        let records = paths.iter().map(|path| format!("<game><path>./{}</path><desc>Fixture synopsis.</desc></game>",
+            path.file_name().unwrap().to_str().unwrap())).collect::<String>();
+        std::fs::write(fixture.0.path.join("gamelist.xml"), format!("<gameList>{records}</gameList>")).unwrap();
+        let mut list = EntryList::new(Rect::new(0, 54, 640, 376), resources(), PathsSort { paths }).unwrap();
+        let title = "Radical Rex: Shred Pre-historic pavement";
+        for entry in &mut list.entries {
+            let Entry::Game(game) = entry else { unreachable!() };
+            game.name = title.into();
+        }
+        list.display_names = DisplayNames::new(&list.entries);
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let bank = FontBank::bind(&repo.join("static/.allium/fonts")).unwrap();
+        for id in ["compact-plus", "big-picture"] {
+            let theme = ThemeHandle::prepare(ThemeSnapshot::load(&repo.join("themes").join(id)).unwrap(), &bank, 24).unwrap();
+            list.res.insert(Some(theme.clone()));
+            for screen in [ScreenId::Library, ScreenId::SearchResults, ScreenId::Recents] {
+                for selected in 0..list.entries.len() {
+                    list.select(selected);
+                    let Entry::Game(game) = &list.entries[selected] else { unreachable!() };
+                    let mut details = crate::view::details::Details::new(game, "");
+                    details.reflow(&theme);
+                    let expected = if twins { format!("{title} ({})", ["USA", "Europe"][selected]) } else { title.into() };
+                    let suffix_len = expected.len() - title.len();
+                    let warm = if theme.pack().ink() {
+                        let plan = list.details_warm_model(&theme, screen).unwrap();
+                        Some(plan.details_text.unwrap()(FrameInputs::new(ScreenId::GameDetail)).unwrap())
+                    } else { None };
+                    list.details = Some(details);
+                    let models = list.theme_models(screen, &theme).unwrap();
+                    assert_eq!(models[0].rows[&Binding::Entries][selected].label, expected);
+                    let detail = models.last().unwrap();
+                    for input in std::iter::once(detail).chain(warm.as_ref()) {
+                        assert_eq!(input.text[&Binding::SelectedTitle], expected, "{id}/{screen:?}");
+                        assert_eq!(input.suffix_len(&expected), suffix_len);
+                        assert_eq!(input.suffix_lengths.len(), usize::from(twins));
+                        input.validate(&theme).unwrap();
+                    }
+                    if !twins {
+                        let mut before = detail.clone();
+                        before.text.insert(Binding::SelectedTitle, list.entries[selected].name().into());
+                        before.suffix_lengths.clear();
+                        assert_eq!(PreparedFrame::prepare(theme.clone(), detail).unwrap().pixels().data(),
+                            PreparedFrame::prepare(theme.clone(), &before).unwrap().pixels().data());
+                    }
+                    list.details = None;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn fix24_details_region_twins_use_row_title_and_suffix_length() {
+        fix24_details_titles(true);
+    }
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn fix24_details_unsuffixed_title_and_pixels_are_unchanged() {
+        fix24_details_titles(false);
     }
 
     pub(crate) fn offers_download(game: Game) -> bool {
@@ -3701,6 +3959,7 @@ impl<S: Sort> EntryList<S> {
                     .collect(),
                 false,
             );
+            self.list.set_suffix_lengths(self.entries.iter().map(|entry| self.display_names.suffix_len(entry)).collect());
             self.list.select(selected);
         }
         if names_changed || media_changed {

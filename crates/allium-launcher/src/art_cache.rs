@@ -13,7 +13,7 @@ use std::{
 use tiny_skia::Pixmap;
 
 const MAGIC: &[u8; 8] = b"ALORART\0";
-const TRANSFORM_VERSION: u32 = 4;
+const TRANSFORM_VERSION: u32 = 6;
 const HEADER_BYTES: usize = 84;
 const DISK_BYTES: u64 = 512 * 1024 * 1024;
 // Art writes only need room to keep the card usable, not the network-library ROM reserve.

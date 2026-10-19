@@ -630,3 +630,102 @@ impl FontTextStyleBuilder {
         self.style
     }
 }
+
+// suffix_len includes the separating space and counts UTF-8 bytes.
+pub fn fit_suffix(
+    value: &str, suffix_len: usize, width: f32, ellipsis: &str,
+    measure: impl Fn(&str) -> f32, layout: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let lines = layout(value);
+    if suffix_len == 0 { return lines; }
+    let Some(at) = value.len().checked_sub(suffix_len).filter(|&at| value.is_char_boundary(at)) else { return lines; };
+    let suffix = &value[at..];
+    if lines.last().is_some_and(|line| line.ends_with(suffix.trim_start()))
+        || measure(suffix.trim_start()) > width {
+        return lines;
+    }
+    let mut fitted = layout(value[..at].trim_end());
+    let Some(last) = fitted.last_mut() else { return lines; };
+    if measure(&format!("{ellipsis}{suffix}")) > width {
+        *last = suffix.trim_start().to_owned();
+        return fitted;
+    }
+    *last = last.trim_end_matches(ellipsis).trim_end().to_owned();
+    loop {
+        let candidate = format!("{}{ellipsis}{suffix}", last.trim_end());
+        if measure(&candidate) <= width {
+            *last = candidate;
+            return fitted;
+        }
+        if last.pop().is_none() { return lines; }
+    }
+}
+
+pub fn ellipsize(value: &str, width: u32, measure: impl Fn(&str) -> u32) -> String {
+    if measure(value) > width {
+        let ellipsis_width = measure("...");
+        let mut current = value.to_owned();
+        let mut truncated = false;
+        while measure(&current) + ellipsis_width > width && !current.is_empty() {
+            current.pop();
+            truncated = true;
+        }
+        if truncated { return format!("{}...", current.trim_end()); }
+    }
+    value.to_owned()
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::*;
+
+    fn style() -> FontTextStyle {
+        FontTextStyleBuilder::new(Font::try_from_bytes(include_bytes!("../../../../static/.allium/fonts/Nunito.ttf")).unwrap())
+            .font_size(20).build()
+    }
+
+    #[test]
+    fn fix23_long_twins_keep_suffixes_within_width() {
+        let style = style();
+        let labels: Vec<_> = [" (USA)", " (Europe)"].iter().map(|suffix| {
+            let value = format!("Radical Rex: Shred Pre-historic pavement{suffix}");
+            let result = fit_suffix(&value, suffix.len(), 220.0, "...",
+                |text| style.measure(text).w as f32,
+                |text| vec![ellipsize(text, 220, |text| style.measure(text).w)]);
+            assert!(result[0].starts_with("Radical Rex"));
+            assert!(result[0].ends_with(&format!("...{suffix}")));
+            assert!(style.measure(&result[0]).w <= 220);
+            result[0].clone()
+        }).collect();
+        assert_ne!(labels[0], labels[1]);
+    }
+
+    #[test]
+    fn fix23_unsuffixed_layout_is_unchanged() {
+        let style = style();
+        for text in ["Short", "Radical Rex: Shred Pre-historic pavement", "café 日本語 and more words"] {
+            for width in [0, 10, 150, 500] {
+                let layout = |text: &str| vec![ellipsize(text, width, |text| style.measure(text).w)];
+                assert_eq!(fit_suffix(text, 0, width as f32, "...", |text| style.measure(text).w as f32, layout), layout(text));
+                let layout = |text: &str| crate::theme::render::wrap(&style, text, width, 2);
+                assert_eq!(fit_suffix(text, 0, width as f32, "…", |text| style.measure(text).w as f32, layout), layout(text));
+            }
+        }
+    }
+
+    #[test]
+    fn fix23_suffix_alone_fits_without_room_for_ellipsis() {
+        let value = "Radical Rex (Europe)";
+        let measure = |text: &str| text.chars().count() as f32;
+        assert_eq!(fit_suffix(value, " (Europe)".len(), 8.0, "...", measure,
+            |text| vec![ellipsize(text, 8, |text| measure(text) as u32)]), ["(Europe)"]);
+    }
+
+    #[test]
+    fn fix23_oversize_suffix_falls_back() {
+        let style = style();
+        let value = "Radical Rex (Europe)";
+        let layout = |text: &str| vec![ellipsize(text, 20, |text| style.measure(text).w)];
+        assert_eq!(fit_suffix(value, " (Europe)".len(), 20.0, "...", |text| style.measure(text).w as f32, layout), layout(value));
+    }
+}

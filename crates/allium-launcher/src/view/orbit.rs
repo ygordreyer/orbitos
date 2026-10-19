@@ -535,6 +535,7 @@ impl Orbit {
                 };
                 let image = if fallback && self.ink_art
                     && self.tall_art
+                    && !self.targets.cover.is_some_and(|target| target.cover_box)
                     && common::media::cached_resolve(entry.path(), common::media::Kind::TallCover)
                         .is_none()
                 {
@@ -933,7 +934,11 @@ impl Orbit {
                 small.draw(&mut display.pixmap_mut(), &status, Point::new(124, 69));
             }
             small.draw(&mut display.pixmap_mut(), "LIBRARY", Point::new(24, 69));
-            let lines = wrapped(&title, self.display_names.name(entry), 340, 3);
+            let lines = common::display::font::fit_suffix(
+                self.display_names.name(entry), self.display_names.suffix_len(entry), 340.0, "...",
+                |text| title.measure(text).w as f32,
+                |text| wrapped(&title, text, 340, 3),
+            );
             for (index, line) in lines.iter().enumerate() {
                 title.draw(
                     &mut display.pixmap_mut(),
@@ -1031,7 +1036,11 @@ impl Orbit {
                     Color::new(255, 255, 255),
                 );
             }
-            let label = wrapped(&caption, self.display_names.name(entry), 158, 1);
+            let label = common::display::font::fit_suffix(
+                self.display_names.name(entry), self.display_names.suffix_len(entry), 158.0, "...",
+                |text| caption.measure(text).w as f32,
+                |text| wrapped(&caption, text, 158, 1),
+            );
             if let Some(line) = label.first() {
                 caption.draw(&mut display.pixmap_mut(), line, Point::new(x, y + 136));
             }
@@ -1133,14 +1142,18 @@ fn load_device_art(path: &Path, width: u32, height: u32) -> Option<Pixmap> {
 }
 fn fit_art(image: Pixmap, target: Option<ArtTarget>) -> Option<Pixmap> {
     if let Some(target) = target {
+        let target = if target.cover_box { target.logo(image.width(), image.height()) } else { target };
         common::theme::runtime::fit_image(&image, target.width, target.height, target.fit).ok()
     } else { Some(image) }
 }
 fn load_device_art_fitted(path: &Path, width: u32, height: u32, target: Option<ArtTarget>, logo: bool, portrait: bool) -> Option<Pixmap> {
     let cover_logo = !logo && path.file_name().is_some_and(|name| name == "logo.png");
-    let portrait = portrait && !cover_logo;
+    let portrait = portrait && !cover_logo && !target.is_some_and(|target| target.cover_box);
     let target = target.map(|mut target| {
-        if cover_logo { target.fit = common::theme::pack::Fit::Contain; }
+        if cover_logo {
+            target.fit = common::theme::pack::Fit::Contain;
+            target.cover_box = false;
+        }
         target
     });
     if portrait && target.is_none() {
@@ -1164,9 +1177,9 @@ fn load_device_art_fitted(path: &Path, width: u32, height: u32, target: Option<A
     if w == 0 || h == 0 || w > width || h > height {
         return None;
     }
-    let target = target.map(|target| if logo { target.logo(w, h) } else { target })
+    let target = target.map(|target| if logo || target.cover_box && !cover_logo { target.logo(w, h) } else { target })
         .or_else(|| cover_logo.then_some(ArtTarget {
-            width: w.max(h), height: w.max(h), fit: common::theme::pack::Fit::Contain, logo_box: false,
+            width: w.max(h), height: w.max(h), fit: common::theme::pack::Fit::Contain, logo_box: false, cover_box: false,
         }));
     let dimensions = target.map_or((w, h), |target| (target.width, target.height));
     let key = crate::art_cache::ArtKey::with_fit(path, &metadata, &bytes,
@@ -1185,7 +1198,11 @@ fn load_device_art_fitted(path: &Path, width: u32, height: u32, target: Option<A
     if target.is_some() { common::perf_trace::count(common::perf_trace::Count::ArtFittedMiss, 1); }
     let image = decode_art_bytes(&bytes, (0, 0))?;
     let image = if portrait { portrait::compose(image)? } else { image };
-    let image = fit_art(image, target)?;
+    let image = if logo {
+        if let Some(target) = target {
+            common::theme::art::fit_logo(&image, target.width, target.height).ok()?
+        } else { image }
+    } else { fit_art(image, target)? };
     if art_job_current() {
         if let Some(key) = key {
             key.store(cache_dir, &image);
@@ -2139,7 +2156,7 @@ pub(super) mod refresh_tests {
                 0 => orbit.set_cover_shape(!orbit.tall_art),
                 1 => orbit.set_ink_art(!orbit.ink_art),
                 _ => orbit.set_art_targets(ArtTargets { cover: Some(ArtTarget { width: 12, height: 16,
-                    fit: common::theme::pack::Fit::Cover, logo_box: false }), ..ArtTargets::default() }),
+                    fit: common::theme::pack::Fit::Cover, logo_box: false, cover_box: false }), ..ArtTargets::default() }),
             }
             assert!(saved.restore(&orbit, &theme, orbit.targets).is_none(), "configuration field {field}");
         }
@@ -2187,7 +2204,7 @@ pub(super) mod refresh_tests {
         rejects!("cover shape", tall, orbit.tall_art = !orbit.tall_art);
         rejects!("ink mode", ink, orbit.ink_art = !orbit.ink_art);
         rejects!("configured targets", targets, orbit.targets.cover = Some(ArtTarget { width: 12, height: 16,
-            fit: common::theme::pack::Fit::Cover, logo_box: false }));
+            fit: common::theme::pack::Fit::Cover, logo_box: false, cover_box: false }));
         let saved = orbit.art_snapshot(&theme, &art);
         let mut requested = orbit.targets;
         requested.cover.as_mut().unwrap().width += 1;
@@ -2490,7 +2507,7 @@ mod performance_round_tests {
         let path = root.join("logo.png");
         let mut logo = Pixmap::new(160, 40).unwrap(); logo.fill(tiny_skia::Color::from_rgba8(220, 80, 20, 255));
         logo.save_png(&path).unwrap();
-        for target in [None, Some(ArtTarget { width: 128, height: 128, fit: common::theme::pack::Fit::Cover, logo_box: false })] {
+        for target in [None, Some(ArtTarget { width: 128, height: 128, fit: common::theme::pack::Fit::Cover, logo_box: false, cover_box: false })] {
             let image = load_device_art_fitted(&path, 480, 480, target, false, true).unwrap();
             assert_eq!(image.width(), image.height());
             assert_eq!(image.pixel(0, 0).unwrap().alpha(), 0);
@@ -3464,9 +3481,9 @@ mod latency_tests {
         use common::theme::pack::Fit;
         let mut orbit = Orbit::new();
         let lower = ArtTargets { hero: Some(ArtTarget { width: 192, height: 408,
-            fit: Fit::Cover, logo_box: false }), ..ArtTargets::default() };
+            fit: Fit::Cover, logo_box: false, cover_box: false }), ..ArtTargets::default() };
         let upper = ArtTargets { hero: Some(ArtTarget { width: 256, height: 328,
-            fit: Fit::Cover, logo_box: false }), ..ArtTargets::default() };
+            fit: Fit::Cover, logo_box: false, cover_box: false }), ..ArtTargets::default() };
         let task = WarmArt::Hero(Entry::Game(crate::entry::game::Game::new("/artkeep/missing.chd".into())));
         for targets in [lower, upper] {
             orbit.completed_tasks.push_back(CompletedTask { targets, key: task.key(),
@@ -3490,8 +3507,8 @@ mod latency_tests {
         use common::theme::pack::Fit;
         let mut orbit = Orbit::new();
         let path = PathBuf::from("same-source");
-        let a = ArtTarget { width: 160, height: 160, fit: Fit::Cover, logo_box: false };
-        let b = ArtTarget { width: 104, height: 156, fit: Fit::Contain, logo_box: false };
+        let a = ArtTarget { width: 160, height: 160, fit: Fit::Cover, logo_box: false, cover_box: false };
+        let b = ArtTarget { width: 104, height: 156, fit: Fit::Contain, logo_box: false, cover_box: false };
         for target in [a, b, ArtTarget { fit: Fit::Contain, ..a }] {
             assert!(orbit.insert_cached(CachedArt { path: path.clone(), target: Some(target),
                 image: Some(std::sync::Arc::new(Pixmap::new(target.width, target.height).unwrap())) }));
@@ -4288,5 +4305,63 @@ mod pipeline_tests {
         assert_eq!(account.load(std::sync::atomic::Ordering::Acquire), RESULT_PIXEL_BYTES);
         drop(second);
         assert_eq!(account.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod fix25_tests {
+    use super::*;
+    use common::theme::{art::Targets, pack::{Binding, Fit, Pack, ScreenId}};
+
+    #[test]
+    #[serial_test::serial(orbit_fixture)]
+    fn fix25_cached_contain_covers_preserve_edges_and_fit_dimensions() {
+        let root = std::env::temp_dir().join(format!("allium-fix25-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pack = Pack::parse(include_bytes!("../../../../themes/compact-plus/theme.json")).unwrap();
+        for (w, h, sizes) in [(480, 341, [(160, 114), (176, 125)]),
+            (320, 480, [(107, 160), (117, 176)]), (480, 480, [(160, 160), (176, 176)])] {
+            let path = root.join(format!("{w}x{h}.png"));
+            let mut source = Pixmap::new(w, h).unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let pixel = if x < 12 { [255, 0, 0, 255] } else if x >= w - 12 { [0, 255, 0, 255] }
+                        else if y < 12 { [0, 0, 255, 255] } else if y >= h - 12 { [255, 255, 0, 255] }
+                        else { [80, 40, 20, 255] };
+                    source.data_mut()[((y * w + x) * 4) as usize..][..4].copy_from_slice(&pixel);
+                }
+            }
+            source.save_png(&path).unwrap();
+            for (screen, size) in [ScreenId::Library, ScreenId::GameDetail].into_iter().zip(sizes) {
+                let c = pack.screens[&screen].components.iter().find(|c| c.binding == Some(Binding::SelectedCover)).unwrap();
+                let target = Targets::from_components(&pack, [c]).cover;
+                assert_eq!(target.unwrap().fit, Fit::Contain);
+                for _ in 0..2 {
+                    let image = load_device_art_fitted(&path, 480, 480, target, false, false).unwrap();
+                    assert_eq!((image.width(), image.height()), size);
+                    assert_eq!(image.pixel(0, size.1 / 2).unwrap().red(), 255);
+                    assert_eq!(image.pixel(size.0 - 1, size.1 / 2).unwrap().green(), 255);
+                    assert_eq!(image.pixel(size.0 / 2, 0).unwrap().blue(), 255);
+                    assert_eq!(image.pixel(size.0 / 2, size.1 - 1).unwrap().red(), 255);
+                    let fitted = target.unwrap().logo(w, h);
+                    let bytes = std::fs::read(&path).unwrap();
+                    let key = crate::art_cache::ArtKey::with_fit(&path, &std::fs::metadata(&path).unwrap(),
+                        &bytes, (0, 0), (fitted.width, fitted.height), false, Some(Fit::Contain)).unwrap();
+                    let disk = key.load(common::constants::ALLIUM_ORBIT_ART_CACHE_DIR.as_path()).unwrap();
+                    assert_eq!(disk.data(), image.data());
+                    if w == h {
+                        let before = common::theme::runtime::fit_image(&source, c.rect.2, c.rect.3, Fit::Cover).unwrap();
+                        assert_eq!(image.data(), before.data());
+                    }
+                }
+            }
+        }
+        let path = root.join("480x341.png");
+        let c = pack.screens[&ScreenId::GameDetail].components.iter().find(|c| c.binding == Some(Binding::SelectedHero)).unwrap();
+        let target = Targets::from_components(&pack, [c]).hero;
+        let actual = load_device_art_fitted(&path, 640, 480, target, false, false).unwrap();
+        let before = common::theme::runtime::fit_image(&Pixmap::load_png(&path).unwrap(), c.rect.2, c.rect.3, Fit::Cover).unwrap();
+        assert_eq!(actual.data(), before.data());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
