@@ -1504,7 +1504,7 @@ mod tests {
         orbit.prepare(&entries, 0);
         let cover = orbit
             .image(&entries[0], "covers")
-            .expect("existing owned real-art fixture");
+            .expect("existing synthetic artwork fixture");
         assert_eq!((cover.width(), cover.height()), (132, 132));
         let hero = orbit.image(&entries[0], "heroes").unwrap();
         assert_eq!((hero.width(), hero.height()), (390, 189));
@@ -3387,7 +3387,7 @@ mod latency_tests {
         let logo = components.iter().find(|c| c["binding"] == "selected_logo").unwrap();
         assert_eq!(hero["rect"], serde_json::json!([24, 56, 592, 176]));
         assert_eq!(logo["rect"], serde_json::json!([104, 96, 432, 80]));
-        // Ink keeps MEDIA.md sources, not component-sized rasters. Selected cover aliases a row.
+        // Ink keeps docs/media.md sources, not component-sized rasters. Selected cover aliases a row.
         let sizes: Vec<_> = [(640, 480), (480, 200)].into_iter()
             .chain(std::iter::repeat_n((480, 480), count + 1)).collect();
         let visible_bytes: usize = sizes.iter().map(|(w, h)| w * h * 4).sum();

@@ -87,8 +87,8 @@ fn parity_save_overlay(variant: &str, name: &str, frame: &common::theme::render:
         ..Default::default()
     };
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    for (index, stem) in ["wipeout", "r4", "ctr"].into_iter().enumerate() {
-        let source = tiny_skia::Pixmap::load_png(repo.join(format!("test-fixtures/real-art/{stem}-cover.png"))).unwrap();
+    for (index, stem) in ["sample-d", "sample-b", "sample-a"].into_iter().enumerate() {
+        let source = tiny_skia::Pixmap::load_png(repo.join(format!("test-fixtures/synthetic-art/{stem}-cover.png"))).unwrap();
         let scale = (320.0 / source.width() as f32).min(320.0 / source.height() as f32).min(1.0);
         let mut cover = tiny_skia::Pixmap::new((source.width() as f32 * scale).round() as u32, (source.height() as f32 * scale).round() as u32).unwrap();
         cover.draw_pixmap(0, 0, source.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::from_scale(scale, scale), None);

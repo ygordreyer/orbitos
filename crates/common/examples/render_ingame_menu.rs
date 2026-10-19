@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                 .into();
             let rendered = PreparedFrame::prepare(theme.clone(), &input)?;
             let mut pixels = common::theme::runtime::fit_image(
-                &tiny_skia::Pixmap::load_png(repo.join("test-fixtures/real-art/r4-hero.png"))?,
+                &tiny_skia::Pixmap::load_png(repo.join("test-fixtures/synthetic-art/sample-b-hero.png"))?,
                 640,
                 480,
                 common::theme::pack::Fit::Cover,

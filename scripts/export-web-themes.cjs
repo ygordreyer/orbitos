@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Export one native pack per theme with descriptor settings and resolved geometry.
 const fs=require('fs'),path=require('path');
-const source=path.resolve(process.argv[2]||'../miyoo-ui-sim');
-const output=path.resolve(process.argv[3]||'themes');
+const args=process.argv.slice(2).filter(arg=>!arg.startsWith('--'));
+const sourceInput=args[0]||process.env.ORBIT_WEB_SIM_DIST;
+const source=sourceInput?path.resolve(sourceInput):null;
+const output=path.resolve(args[1]||'themes');
 const folderLabels={'orbit-hero':'Open','big-picture':'OPEN'};
 // Native logo headers can use the subtitle band without changing text typography.
 function logoHeader(spec){
@@ -43,8 +45,12 @@ if(process.argv.includes('--folder-labels-only')){
  console.log('Updated native folder labels: '+Object.keys(folderLabels).join(', '));
  process.exit(0);
 }
-const L=require(path.join(source,'dist/theme-layout.js'));
-L.setSchema(JSON.parse(fs.readFileSync(path.join(source,'dist/themes/theme.schema.json'))));
+if(!source){
+ console.error('Usage: node scripts/export-web-themes.cjs <web-dist> [output], or set ORBIT_WEB_SIM_DIST');
+ process.exit(2);
+}
+const L=require(path.join(source,'theme-layout.js'));
+L.setSchema(JSON.parse(fs.readFileSync(path.join(source,'themes/theme.schema.json'))));
 const old=new Set('id kind rect asset_id binding role color radius max_lines overflow align fit layout visible_count item_extent gap padding art_size caption_height caption_lines frame_color focus_color focus_style focus_width glow_radius group max_items fade_edge clip_shape fade_width battery_style blur_radius mask_asset_id presentation logo logo_when_no_cover logo_rect'.split(' '));
 const typeKeys=['font','size','line_height','weight','letter_spacing','transform','color'];
 const report=[],styleRefs=new Map();
@@ -95,7 +101,7 @@ function difference(base,next){
  return patch;
 }
 for(const id of ['orbit-hero','orbit-row','big-picture','compact-plus']){
- const original=JSON.parse(fs.readFileSync(path.join(source,'dist/themes',id,'theme.json')));L.seal(original);
+ const original=JSON.parse(fs.readFileSync(path.join(source,'themes',id,'theme.json')));L.seal(original);
  const defaults=L.selectedSettings(original),pack=exportVariant(original,defaults.cover_shape||'square',defaults);
  pack.settings=(original.settings||[]).map(setting=>({id:setting.id,label:setting.label,default:setting.default,options:setting.options.map(option=>({id:option.id,label:option.label,patch:option.id===setting.default?{}:difference(pack,exportVariant(original,setting.id==='cover_shape'?option.id:defaults.cover_shape,{...defaults,[setting.id]:option.id}))}))}));
  // Color options replace all nine keys, even when one happens to match the base.
@@ -105,7 +111,7 @@ for(const id of ['orbit-hero','orbit-row','big-picture','compact-plus']){
  fs.writeFileSync(path.join(dir,'theme.json'),bytes);
  const assets=new Map(Object.values(pack.assets).map(asset=>[asset.path,asset]));
  for(const setting of pack.settings)for(const option of setting.options)for(const asset of Object.values(option.patch.assets||{}))if(asset)assets.set(asset.path,asset);
- for(const asset of assets.values()){const to=path.join(dir,asset.path);fs.mkdirSync(path.dirname(to),{recursive:true});fs.copyFileSync(path.join(source,'dist/themes',id,asset.path),to)}
+ for(const asset of assets.values()){const to=path.join(dir,asset.path);fs.mkdirSync(path.dirname(to),{recursive:true});fs.copyFileSync(path.join(source,'themes',id,asset.path),to)}
  report.push({id:pack.id,name:pack.name,settings:pack.settings.map(({id})=>id),manifest_bytes:bytes.length});
 }
 fs.writeFileSync(path.join(output,'choices.json'),JSON.stringify(report,null,2)+'\n');

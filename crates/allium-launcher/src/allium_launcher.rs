@@ -1010,12 +1010,12 @@ mod orbit_proof {
     }
 
     fn prepare_art() {
-        let source = std::path::PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_ART").unwrap());
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-fixtures/synthetic-art");
         let target = ALLIUM_GAMES_DIR.join("PS/Imgs");
         std::fs::create_dir_all(&target).unwrap();
         for (stem, asset) in [
-            ("R4 - Ridge Racer Type 4 (USA)", "r4"),
-            ("Silent Hill (USA)", "silent"),
+            ("R4 - Ridge Racer Type 4 (USA)", "sample-b"),
+            ("Silent Hill (USA)", "sample-c"),
         ] {
             let cover = image::open(source.join(format!("{asset}-cover.png")))
                 .unwrap()
@@ -1081,15 +1081,15 @@ mod orbit_proof {
         assert!(!ALLIUM_SD_ROOT.starts_with("/Volumes"));
         prepare_art();
         let asset_source =
-            std::path::PathBuf::from(std::env::var("ALLIUM_ORBIT_PROOF_ART").unwrap());
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-fixtures/synthetic-art");
         let ctr = ALLIUM_GAMES_DIR.join("PS/Crash Team Racing (USA).chd");
         fs::write(&ctr, b"host routing fixture, not a ROM").unwrap();
-        image::open(asset_source.join("ctr-cover.png"))
+        image::open(asset_source.join("sample-a-cover.png"))
             .unwrap()
             .resize_exact(101, 101, image::imageops::FilterType::Lanczos3)
             .save(ALLIUM_GAMES_DIR.join("PS/Imgs/Crash Team Racing (USA).orbit.png"))
             .unwrap();
-        image::open(asset_source.join("ctr-hero.png"))
+        image::open(asset_source.join("sample-a-hero.png"))
             .unwrap()
             .resize_to_fill(360, 210, image::imageops::FilterType::Lanczos3)
             .save(ALLIUM_GAMES_DIR.join("PS/Imgs/Crash Team Racing (USA).hero.png"))

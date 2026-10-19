@@ -170,16 +170,16 @@ fn frame(screen: ScreenId) -> FrameInputs {
         .collect();
     f.keyboard_cursor = (5, 2);
     if let Ok(art) = std::env::var("ALLIUM_THEME_REAL_ART") {
-        let cover = tiny_skia::Pixmap::load_png(Path::new(&art).join("r4-cover.png")).unwrap();
-        let hero = tiny_skia::Pixmap::load_png(Path::new(&art).join("r4-hero.png")).unwrap();
+        let cover = tiny_skia::Pixmap::load_png(Path::new(&art).join("sample-b-cover.png")).unwrap();
+        let hero = tiny_skia::Pixmap::load_png(Path::new(&art).join("sample-b-hero.png")).unwrap();
         f.art.selected_cover = Some(Arc::new(
             super::runtime::fit_image(&cover, 164, 164, super::pack::Fit::Contain).unwrap(),
         ));
         f.art.selected_hero = Some(Arc::new(hero));
         for (id, file) in [
-            ("wipeout", "wipeout-cover.png"),
-            ("r4", "r4-cover.png"),
-            ("ctr", "ctr-cover.png"),
+            ("wipeout", "sample-d-cover.png"),
+            ("r4", "sample-b-cover.png"),
+            ("ctr", "sample-a-cover.png"),
         ] {
             let source = tiny_skia::Pixmap::load_png(Path::new(&art).join(file)).unwrap();
             f.art.entries.insert(
@@ -1297,8 +1297,8 @@ fn orbit_game_reference_polish_real_art_proof() {
         ("A", "Play"), ("START", "Details"), ("X", "Search"),
         ("SELECT", "Context"), ("B", "Back"), ("L/R", "Recents / Apps"), ("Y", "Sort"),
     ].into_iter().map(|(button, label)| Hint { button: button.into(), label: label.into() }).collect();
-    let art = std::env::var("ALLIUM_THEME_REAL_ART").expect("Real art directory required for game proof");
-    let next_art = tiny_skia::Pixmap::load_png(Path::new(&art).join("ctr-cover.png")).unwrap();
+    let art = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-fixtures/synthetic-art");
+    let next_art = tiny_skia::Pixmap::load_png(Path::new(&art).join("sample-a-cover.png")).unwrap();
     input.art.next_cover = Some(Arc::new(
         super::runtime::fit_image(&next_art, 140, 140, super::pack::Fit::Cover).unwrap(),
     ));
@@ -1460,10 +1460,18 @@ fn theme_v2_clean_library_preserves_semantic_metadata_for_v1_external_packs() {
 #[test]
 fn ux4_seven_menu_rows_fit_builtin_and_external_pack() {
     let bank = FontBank::bind(&font_root()).unwrap();
-    let external = std::env::var("ALLIUM_UX4_PACK").unwrap();
+    let external = std::env::temp_dir().canonicalize().unwrap()
+        .join(format!("allium-seven-row-pack-{}", std::process::id()));
+    std::fs::create_dir_all(external.join("assets")).unwrap();
+    std::fs::write(external.join("theme.json"), super::pack::Pack::builtin_bytes("orbit").unwrap()).unwrap();
+    for asset in ["accent-band.png", "next-disc-mask.png"] {
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/theme/packs").join(asset), external.join("assets").join(asset)).unwrap();
+    }
+    let external_snapshot = ThemeSnapshot::load(&external).unwrap();
+    std::fs::remove_dir_all(&external).unwrap();
     for base in [
         ThemeSnapshot::builtin("orbit").unwrap(),
-        ThemeSnapshot::load(Path::new(&external)).unwrap(),
+        external_snapshot,
     ] {
         let theme = ThemeHandle::prepare(base, &bank, 1).unwrap();
         for screen in [ScreenId::ContextMenu, ScreenId::IngameMenu] {

@@ -13,7 +13,7 @@ FEATURES ?=
 -include local.mk
 
 .PHONY: all
-all: dist build package-build $(DIST_DIR)/RetroArch/retroarch $(DIST_DIR)/.allium/bin/dufs $(DIST_DIR)/.allium/bin/collie $(DIST_DIR)/.allium/bin/dropbear $(DIST_DIR)/.allium/bin/syncthing $(DIST_DIR)/.allium/cores/drastic/drastic $(DIST_DIR)/Themes migrations strip-all
+all: dist build package-build $(DIST_DIR)/RetroArch/retroarch $(DIST_DIR)/.allium/bin/dufs $(DIST_DIR)/.allium/bin/collie $(DIST_DIR)/.allium/bin/dropbear $(DIST_DIR)/.allium/bin/syncthing $(DIST_DIR)/.allium/cores/drastic/drastic $(DIST_DIR)/Themes/.upstream migrations strip-all
 
 .PHONY: clean
 clean:
@@ -38,6 +38,7 @@ simulator: simulator-env
 dist:
 	mkdir -p $(DIST_DIR)
 	rsync -a --exclude='.gitkeep' static/. $(DIST_DIR)
+	rsync -a themes/ $(DIST_DIR)/Themes/
 
 third-party/my283:
 	wget -O third-party/my283.tar.xz https://github.com/shauninman/miyoomini-toolchain-buildroot/raw/main/support/my283.tar.xz
@@ -135,11 +136,13 @@ $(DIST_DIR)/.allium/cores/drastic/drastic:
 	rm /tmp/drastic.zip
 
 THEMES_URL := https://github.com/goweiwen/Allium-Themes.git
-$(DIST_DIR)/Themes:
+$(DIST_DIR)/Themes/.upstream:
 	TEMP_DIR=$$(mktemp -d) && \
 		git clone --depth 1 "$(THEMES_URL)" "$$TEMP_DIR" && \
 		rsync -a "$$TEMP_DIR/Themes/" "$(DIST_DIR)/Themes/" && \
 		rm -rf "$$TEMP_DIR"
+	rsync -a themes/ $(DIST_DIR)/Themes/
+	touch $@
 
 .PHONY: lint
 lint:
@@ -179,9 +182,9 @@ deploy-all:
 ifndef SDCARD_PATH
 	$(error SDCARD_PATH is not set. Create a local.mk file with SDCARD_PATH=/path/to/sdcard or set it as an environment variable)
 endif
-	@echo "Deploying full dist to $(SDCARD_PATH)..."
+	@echo "Mirroring .allium, .tmp_update, Apps and Themes to $(SDCARD_PATH)..."
 	rsync --progress --modify-window=1 --update --recursive --times --verbose --delete $(DIST_DIR)/.allium $(DIST_DIR)/.tmp_update $(DIST_DIR)/Apps $(DIST_DIR)/Themes $(SDCARD_PATH)/
-	@echo "Full deployment complete! Remember to eject your SD card properly."
+	@echo "Selected directories mirrored. Remember to eject your SD card properly."
 
 .PHONY: toolchain
 toolchain:

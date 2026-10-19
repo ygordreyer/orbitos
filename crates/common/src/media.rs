@@ -1,4 +1,4 @@
-//! Shared read-only MEDIA.md lookup. Cache misses as well as successful paths.
+//! Shared read-only media lookup, specified in docs/media.md. Cache misses as well as successful paths.
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,

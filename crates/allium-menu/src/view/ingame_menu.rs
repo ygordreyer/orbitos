@@ -1535,7 +1535,7 @@ mod parity_b_tests {
         )
         .unwrap();
         let image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-fixtures/real-art/r4-cover.png");
+            .join("../../test-fixtures/synthetic-art/sample-b-cover.png");
         let tall_path = temp.join("PS/media/covers-tall/r4.png");
         fs::create_dir_all(tall_path.parent().unwrap()).unwrap();
         fs::write(temp.join("PS/gamelist.xml"), "<gameList><game><path>./r4.chd</path><name>R4 - Ridge Racer Type 4</name><releasedate>19981203T000000</releasedate></game></gameList>").unwrap();

@@ -1,168 +1,77 @@
-# Allium
+# OrbitOS
 
-[![Discord](https://img.shields.io/discord/1442105622320513137?style=flat&logo=discord&logoColor=white&label=Discord)](https://discord.gg/eSvVqe6c8n)
+OrbitOS is a fork of [Allium by goweiwen (Wei Wen Goh) and contributors](https://github.com/goweiwen/Allium), based on commit `316d9eb`. The fork repository is [ygordreyer/orbitos](https://github.com/ygordreyer/orbitos).
 
-Allium is a custom launcher for the Miyoo Mini, Miyoo Mini Plus, and Miyoo Mini Flip handheld devices, similar to [OnionOS](https://github.com/OnionUI/Onion) and [MiniUI](https://github.com/shauninman/MiniUI).
+This is an alpha, named **v0.1.0-alpha**. Only the **Miyoo Mini Plus** is verified. Other devices supported by Allium, including the Miyoo Mini and Miyoo Mini Flip, are untested with OrbitOS.
 
-## Project Goals
+The binaries still use the inherited package version `1.0.2`, and About still displays the channel `stable`. Those strings do not describe this fork's release maturity.
 
-The goal of Allium is to replace MainUI (stock UI) with a faster and more user-friendly UI.
-- Fast
-- Clean, user-friendly UI
-- RetroArch (with Netplay, achievements)
-- Box art
-- Support running on both Miyoo Mini, Miyoo Mini Plus, and Miyoo Mini Flip without changes
+## Features
 
-## Help and Documentation
+### Themes and interface
 
-Please refer to this README.md and the [Wiki](https://github.com/goweiwen/Allium/wiki) for information on how to setup and use Allium.
+- Four native themes: Orbit Hero, Orbit Row, Big Picture and Compact+. Each supports Square and Tall covers. Compact+ also has four color schemes.
+- Themed Library, Recents, Search, Apps, Settings, keyboard, game Details, context menus, guide reader and volume/brightness overlays.
+- Saved theme choices and per-theme options, with descriptor validation and fallback handling.
+- START opens game Details with available metadata, descriptions and play history.
 
-[<img width="250" height="250" alt="icons8-book-250" src="https://github.com/user-attachments/assets/c643a3e2-834d-4377-9b7a-0aa879e86ea7" />](https://github.com/goweiwen/Allium/wiki)
+### Library and media
 
+- Favorites, Recents and play activity inherited from Allium.
+- Unsupported files and CUE/M3U members are hidden from game lists. Folders with one launchable game can appear as a single game.
+- Duplicate display names gain distinguishing filename tags. Search merges local and configured network games, removes folder/member aliases and ranks title matches before developer/publisher matches.
+- Read-only media lookup supports square/tall covers, logos, backgrounds, screenshots, gamelist metadata and legacy artwork paths. Artwork loads in background work and uses memory and disk caches.
 
-# Screenshots
+### In-game menu
 
-<div>
-    <img alt="Main menu" src="assets/screenshots/main-menu.png" width="49%">
-    <img alt="Recents carousel" src="assets/screenshots/recents-carousel.png" width="49%">
-    <img alt="Ingame menu" src="assets/screenshots/ingame-menu.png" width="49%">
-    <img alt="Guide" src="assets/screenshots/guide.png" width="49%">
-    <img alt="Settings" src="assets/screenshots/settings.png" width="49%">
-    <img alt="Themes" src="assets/screenshots/themes.png" width="49%">
-    <img alt="Localization" src="assets/screenshots/localization.png" width="49%">
-</div>
+- Themed presentation of Allium's continue, save, load, reset, guide, settings and quit actions.
+- Guide pagination and Unicode cursor/search fixes, clean paused-game snapshots and volume/brightness overlays.
+- M3U startup disc selection for up to eight discs, restricted to PCSX ReARMed and the required shared-save configuration.
+
+### Network library
+
+- An optional, manually configured PlayStation catalog with persistent cards and cache status.
+- Cancellable downloads, HTTP Range resume, SHA-256 verification at completion and a sampled-fingerprint cached-launch fast path.
+- Explicit verification/adoption of existing files and manual unload through Manage storage. There is no automatic eviction.
+
+### Rendering and system handling
+
+- Software rendering with retained frames, cached text/artwork, idle preparation of adjacent Recents and Details frames, and framebuffer damage updates.
+- Background battery/Wi-Fi status sampling, batched database work and separate frontend/game CPU governor settings with input-triggered boosts.
+- Existing Allium Wi-Fi, file transfer, Syncthing, language, clock, display and power controls remain available.
+
+See [themes](docs/themes.md), [media](docs/media.md), [network library](docs/network-library.md) and the [changelog](CHANGELOG.md) for details. No measured FPS, latency or battery-life improvement is claimed here.
 
 ## Installation
 
-Allium supports both the Miyoo Mini, Miyoo Mini Plus,and Miyoo Mini Flip on the same SD card.
+A prebuilt OrbitOS package is not published yet. The [`v0.1.0-alpha` release](https://github.com/ygordreyer/orbitos/releases) carries the source only. Build the package as described in [development](docs/development.md). An upstream Allium archive installs upstream Allium, not OrbitOS.
 
-[Check out the wiki page for a more detailed set of instructions.](https://github.com/goweiwen/Allium/wiki/1.-Installation-Instructions)
+### Fresh SD card
 
-### First Install
-1. Format the SD card to [FAT32](https://github.com/anzz1/DotUI-X/wiki/fat32format).
-2. Download the latest release and extract into your SD card. e.g. `E:/`.
-3. Eject the disk (**important!**).
+1. Format the card as FAT32.
+2. Extract the complete package into the card root, including hidden directories. It contains `.allium`, `.tmp_update`, `Apps`, `RetroArch`, `Themes`, `BIOS`, `Roms` and `Saves`.
+3. Add your own games and any required BIOS files. The package does not supply a game library.
+4. Eject the card safely, insert it into the Miyoo Mini Plus and boot. Keep power connected while first-boot migrations run.
 
-### Updating
-1. Download the latest release and extract these folders into your SD card. e.g. `E:/`:
-    - .allium
-    - .tmp_update
-    - Apps
-    - RetroArch
-3. Eject the disk (**important!**).
+### Over an existing Allium installation
 
-## Features
-- Supports stock/Onion/DotUI SD card layout
-- Works without configuration
-- Box art (250px wide, PNG, JPG, GIF)
-- Supports gameslist.xml with nested folders
-- Favorites
-- Recents list (sort by last played or playtime)
-- Alternative recents view with save-state screenshot previews
-- Search games by name
-- Activity tracker
-- [RetroArch for all supported cores](https://github.com/goweiwen/Allium/wiki/Console-Mapper)
-- Volume & Brightness (menu + l/r/u/d) control
-- In-game menu (save & load with screenshots, reset, access RetroArch menu, [guide](https://github.com/goweiwen/Allium/wiki/In-game-Guide-Walkthrough-Reader), disk changer, quit)
-- Automatic resume when powering off/on
-- Suspend
-- Settings page
-    - OTA update
-    - WiFi (IP Address, NTP, Telnet, FTP, SyncThing)
-    - Date, time, timezone
-    - Change LCD settings
-    - Customize theme colours, font
-    - Change system language
-- Theme manager
-    - Built-in themes
+1. Power off the device and back up the card. Preserve the previous `.allium`, `.tmp_update`, `Apps`, `RetroArch`, `Themes` and `Saves`, including `Saves/CurrentProfile/allium.db`.
+2. Extract the OrbitOS package elsewhere. Copy `.allium`, `.tmp_update`, `Apps`, `RetroArch` and `Themes` to the card root, replacing matching files. Include hidden directories. Preserve your games, BIOS files and saves.
+3. Eject safely and boot. Boot scripts and the database can apply migrations.
 
-## Planned Features
-(roughly in order of priority)
-- Metadata/box art scraper
-- Activity tracker
-    - Track play sessions using RTC
-- Battery history
-- UI improvements:
-    - Folder icon
-    - Volume indicator
-    - Brightness indicator
-    - Error toast (e.g. no core found for game)
-- Seamless netplay from ingame menu
+### Upgrade OrbitOS
 
-## Development
+Back up the same directories before each upgrade, then overlay the five software directories listed above from the new OrbitOS package. Keep the backup until the new installation has been checked on the device.
 
-Allium comes with a simulator that can be used for development.
+System Update is **manual-only**. The retained update backend still points at upstream Allium releases, not OrbitOS. It is not an OrbitOS update channel. The boot updater also retains support for a manually supplied `allium-ota.zip`.
 
-### Requirements
-1. `make`, `cargo`, `zip`, `clang` (`libclang-dev`), `patchelf`
-3. [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) and `zig`: `pip install cargo-zigbuild`
+### Roll back
 
-On Mac, quick set up with:
+Rollback is manual. There is no rollback target or packaged rollback tool. With the device powered off, restore the previous `.allium` and `.tmp_update`, plus the matching backed-up `Apps`, `RetroArch` and `Themes`. Restore the pre-upgrade database/state and any other replaced files from the backup. Replacing only the launcher does not undo database migrations. Compatibility of an upgraded database with older binaries is not established.
 
-```
-./scripts/setup-mac.sh
-```
+## Build and development
 
-### Architecture
-Allium is split into several binaries:
-- `alliumd` (daemon that handles launcher/game/menu launching, vol/brightness hotkeys, poweroff)
-- `allium-launcher` (main menu, including games, recents, settings)
-- `allium-menu` (ingame menu, including guide reader)
-- `activity-tracker` (gui for looking at game activity/playtime)
-- `screenshot`
-- `say` (draws text onto the screen, using Allium's theme settings and exits)
-- `show` (draws an image to screen, or darkens the screen and exits)
-- `show-hotkeys` (draws a list of hotkeys onto the screen and exits)
-- `myctl` (manipulates hardware like volume. This relies on the MM's proprietary libraries.)
-
-Shared code is located in the `common` crate.
-
-### Simulator
-There is no simulator for `alliumd` (no UI, only logic).
-```
-# Run main menu (allium-launcher)
-make simulator bin=allium-launcher
-
-# Run ingame menu (allium-menu)
-make simulator bin=allium-menu
-```
-
-### Building
-
-Running `make` will build Allium and RetroArch, then copy the built and static files into `dist/`.
-```
-make all
-```
-
-### Deploying to Hardware
-
-For quick testing on real hardware, you can use the deployment targets:
-
-1. Create a `local.mk` file (git-ignored) in the project root:
-```bash
-cp local.mk.example local.mk
-```
-
-2. Edit `local.mk` and set your SD card path:
-```makefile
-SDCARD_PATH=/path/to/sdcard  # Adjust for your mount point
-```
-
-3. Deploy just update files to existing Allium SD Card:
-```bash
-make deploy
-```
-
-Or deploy everything to a fresh SD Card:
-```bash
-make deploy-all
-```
-
-Alternatively, set `SDCARD_PATH` as an environment variable:
-```bash
-SDCARD_PATH=/path/to/sdcard make deploy
-```
-
+The device build uses Rust nightly, cargo-zigbuild, Zig and a Docker toolchain. `make all` assembles `dist/`; it does not create a ZIP. See [development](docs/development.md) for requirements, host tests, simulator use, deployment scope and packaging commands.
 
 ## Acknowledgements
 
@@ -173,40 +82,8 @@ Allium is only possible thanks to the Miyoo Mini community, including but not li
 - shauninman: Allium is heavily inspired by [MiniUI](https://github.com/shauninman/MiniUI)'s simplicity and clean design
 - [steward-fu](https://github.com/steward-fu): miraculous DraStic port
 - Early adopters and testers of Allium
-- [Icons8.com](icons8.com) for the icons used in the wiki.
+- [Icons8.com](https://icons8.com) for the icons used in the wiki.
 
-## Community
+## License
 
-Need help? Want to contribute? Join the Allium community on Discord:
-
-👉 https://discord.gg/eSvVqe6c8n
-
-## Download completion diagnostics
-
-When the install target is missing, Download is available even if the retained
-index says Cached. After transfer, the existing dialog shows Verifying while
-the worker checks SHA-256 hashes and publishes the install.
-
-On the Miyoo, enable the existing trace flag before restarting the launcher:
-
-```sh
-touch /tmp/allium-perf-trace
-```
-
-Reproduce the download without pressing a key after the transfer. Collect
-`/tmp/allium-network-trace.log` and `/tmp/allium-perf-trace.log` before reboot.
-The network log records worker result delivery, result polling, Completed or
-Failed modal changes, dirty returns, frame drawing and successful flush return.
-It also records every event-loop wake and, while a job or modal exists, every
-loop iteration, including `active` and the wake cause (`frame_timer`, `network_timer`, `input`,
-`command`, `signal`, or `other`). `monotonic_us` joins events across threads;
-`pid` and `thread` identify their source. A worker send and a UI receive can be
-logged in either order when the threads run concurrently.
-
-Both logs are capped at 256 KiB. The network log rolls over to retain recent
-events during long verification, so its oldest events can disappear. The
-performance log keeps its existing stop-at-cap behavior. Tracing adds no timers
-or wakeups. With the flag absent it performs no event formatting, allocation,
-clock reads or log writes. Remove the flag and restart the launcher to disable
-tracing; flag detection is cached for the process lifetime. A successful flush
-return proves the platform call returned, not that the LCD physically updated.
+OrbitOS retains Allium's [MIT license](LICENSE), including the copyright notice for Wei Wen Goh. Bundled fonts and third-party components retain their own license files.

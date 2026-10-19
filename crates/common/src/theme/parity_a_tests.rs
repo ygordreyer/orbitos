@@ -228,15 +228,18 @@ fn audit_input(
     f
 }
 #[test]
-#[ignore = "Explicit evidence capture requires PARITY_AUDIT_ROOT and PARITY_A_OUTPUT"]
+#[ignore = "Explicit capture requires ORBIT_WEB_SIM_DIST, PARITY_AUDIT_ROOT and PARITY_A_OUTPUT"]
 fn parity_a_capture_all_options() {
+    let Some(web) = std::env::var_os("ORBIT_WEB_SIM_DIST").map(PathBuf::from) else {
+        eprintln!("Skipping capture: ORBIT_WEB_SIM_DIST is unset");
+        return;
+    };
     let root = PathBuf::from(std::env::var("PARITY_AUDIT_ROOT").unwrap());
     let out = PathBuf::from(std::env::var("PARITY_A_OUTPUT").unwrap());
     let data: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("vm-models.json")).unwrap()).unwrap();
     let mut assets: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("model-assets.json")).unwrap()).unwrap();
-    let web = Path::new("../orbit-web-sim/dist");
     for record in data["records"].as_array().unwrap() {
         if let Some(src) = record["model"]["selected_logo"]
             .as_str()
