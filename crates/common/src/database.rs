@@ -465,12 +465,13 @@ publisher = excluded.publisher, genres = excluded.genres")?;
 
         let conn = self.conn.as_ref().unwrap();
 
-        let mut stmt = conn.prepare_cached("SELECT games.name, games.path, image, play_count, play_time, last_played, core, rating, release_date, games.developer, games.publisher, genres, favorite, screenshot_path FROM games JOIN games_fts ON games.id = games_fts.rowid WHERE games_fts MATCH ? LIMIT ?")?;
+        let mut stmt = conn.prepare_cached("SELECT games.name, games.path, image, play_count, play_time, last_played, core, rating, release_date, games.developer, games.publisher, genres, favorite, screenshot_path FROM games JOIN games_fts ON games.id = games_fts.rowid WHERE games_fts MATCH ?1 ORDER BY games_fts.rowid NOT IN (SELECT rowid FROM games_fts WHERE games_fts MATCH ?2), games_fts.rowid LIMIT ?3")?;
 
-        let query =
-            format!("name:\"{query}\" * OR developer:\"{query}\" * OR publisher:\"{query}\" *");
+        // Title matches come first so developer or publisher matches never push them past the limit.
+        let name_query = format!("name:\"{query}\" *");
+        let query = format!("{name_query} OR developer:\"{query}\" * OR publisher:\"{query}\" *");
         let results = stmt
-            .query_map(params![query, limit], map_game)?
+            .query_map(params![query, name_query, limit], map_game)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -1729,6 +1730,23 @@ CREATE TRIGGER ignore_session BEFORE INSERT ON game_sessions BEGIN SELECT RAISE(
 
         let results = database.search("nintendo", 100).unwrap();
         assert_eq!(results[0].path, games[1].path);
+
+        // A title match outranks developer matches even when the limit cuts the list.
+        let mut extra: Vec<NewGame> = (0..3).map(|i| NewGame {
+            name: format!("Racer {i}"),
+            path: PathBuf::from(format!("test_directory/Racer {i}.rom")),
+            developer: Some("Bit Managers".to_owned()),
+            ..games[0].clone()
+        }).collect();
+        extra.push(NewGame {
+            name: "Secret of Mana".to_owned(),
+            path: PathBuf::from("test_directory/Secret of Mana.rom"),
+            developer: Some("Square".to_owned()),
+            ..games[0].clone()
+        });
+        database.update_games(&extra).unwrap();
+        let results = database.search("mana", 1).unwrap();
+        assert_eq!(results[0].name, "Secret of Mana");
     }
 
     #[test]

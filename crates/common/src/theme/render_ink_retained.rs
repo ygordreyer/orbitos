@@ -573,8 +573,10 @@ fn dependencies(c: &Component, input: &FrameInputs) -> FrameInputs {
             out.focus.component = c.id.clone();
         }
     }
-    for value in out.text.values().chain(out.rows.values().flatten().map(|row| &row.label)) {
-        if let Some(&len) = input.suffix_lengths.get(value) { out.suffix_lengths.insert(value.clone(), len); }
+    if !input.suffix_lengths.is_empty() {
+        for value in out.text.values().chain(out.rows.values().flatten().map(|row| &row.label)) {
+            if let Some(&len) = input.suffix_lengths.get(value) { out.suffix_lengths.insert(value.clone(), len); }
+        }
     }
     out
 }
@@ -1706,6 +1708,34 @@ impl PreparedFrame {
 mod navigation_plan_tests {
     use super::*;
     use crate::theme::render_navigation::tests::{arts, model, theme};
+
+    #[test]
+    fn unchanged_suffix_rows_reuse_retained_components() {
+        let arts = arts();
+        for id in ["orbit-hero", "big-picture", "compact-plus"] {
+            let theme = theme(id, "square");
+            let mut input = model(&theme, ScreenId::Library, 0, &arts);
+            for row in input.rows.get_mut(&Binding::Entries).unwrap() {
+                row.label.push_str(" (Rev 1.1)");
+                input.suffix_lengths.insert(row.label.clone(), " (Rev 1.1)".len());
+            }
+            let mut frame = PreparedFrame::prepare(theme.clone(), &input).unwrap();
+            assert!(frame.ink_cache.entries.iter().any(|entry| !entry.dependencies.model.suffix_lengths.is_empty()), "{id}");
+            let saved: Vec<_> = frame.ink_cache.entries.iter()
+                .map(|entry| (entry.component.clone(), entry.dependencies.clone(), entry.before.clone()))
+                .collect();
+            for _ in 0..3 {
+                frame = PreparedFrame::prepare_reusing(theme.clone(), &input, Some(frame)).unwrap();
+                assert!(frame.damage.is_empty(), "{id} unchanged suffix rows repainted");
+                assert_eq!(frame.ink_cache.entries.len(), saved.len());
+                for (entry, (component, dependencies, before)) in frame.ink_cache.entries.iter().zip(&saved) {
+                    assert!(Rc::ptr_eq(&entry.component, component), "{id}");
+                    assert!(Rc::ptr_eq(&entry.dependencies, dependencies), "{id}");
+                    assert!(Rc::ptr_eq(&entry.before, before), "{id}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn navigation_plan_reuses_descriptors_on_focus_and_clock_changes() {

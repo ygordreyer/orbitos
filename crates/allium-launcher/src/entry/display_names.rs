@@ -32,11 +32,21 @@ impl DisplayNames {
             let games: Vec<_> = identities.iter().map(|(identity, entries)| {
                 entries.iter().find(|entry| entry.path() == identity.as_path()).unwrap_or(&entries[0])
             }).copied().collect();
+            let stems: Vec<_> = identities.iter().map(|(path, entries)| {
+                // Folder identities keep dotted tags such as "(v1.1)": only a plain extension is stripped.
+                let plain_extension = path.extension().map(|extension| extension.to_string_lossy())
+                    .is_some_and(|extension| extension.len() <= 5 && extension.bytes().all(|b| b.is_ascii_alphanumeric()));
+                let name = if !plain_extension || entries.iter().any(|entry| entry.path() != path.as_path()) {
+                    path.file_name()
+                } else {
+                    path.file_stem()
+                };
+                name.unwrap_or_default().to_string_lossy()
+            }).collect();
             let mut suffixes = vec![String::new(); games.len()];
             for pattern in [&*PARENS, &*BRACKETS] {
-                let parts: Vec<Vec<String>> = identities.iter().map(|(path, _)| {
-                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                    pattern.find_iter(&stem).map(|part| part.as_str().to_owned()).collect()
+                let parts: Vec<Vec<String>> = stems.iter().map(|stem| {
+                    pattern.find_iter(stem).map(|part| part.as_str().to_owned()).collect()
                 }).collect();
                 for indices in collisions(&suffixes) {
                     let width = indices.iter().map(|&i| parts[i].len()).max().unwrap_or(0);
@@ -73,8 +83,7 @@ impl DisplayNames {
             for (i, (entry, mut suffix)) in games.iter().zip(suffixes).enumerate() {
                 // An absent revision has no differing group to display. Keep its region as context.
                 if suffix.is_empty() {
-                    let stem = identities[i].0.file_stem().unwrap_or_default().to_string_lossy();
-                    suffix = PARENS.find_iter(&stem).map(|part| part.as_str()).collect::<Vec<_>>().join(" ");
+                    suffix = PARENS.find_iter(&stems[i]).map(|part| part.as_str()).collect::<Vec<_>>().join(" ");
                     if suffix.is_empty() {
                         let extension = entry.path().extension().unwrap_or_default().to_string_lossy().to_uppercase();
                         if !extension.is_empty() {
@@ -206,6 +215,20 @@ mod tests {
     fn revision_collision_omits_shared_region() {
         let games = entries(&["Island (USA) (Rev 1).nes", "Island (USA) (Rev 2).nes"], &["Island", "Island"]);
         assert_eq!(labels(&games), ["Island (Rev 1)", "Island (Rev 2)"]);
+    }
+
+    #[test]
+    fn dotted_container_revisions_remain_distinct_with_folder_aliases() {
+        let files = ["PS/Game (Rev 1.1)/Game (Rev 1.1).cue", "PS/Game (Rev 1.2)/Game (Rev 1.2).cue"];
+        let games = entries(&files, &["Game", "Game"]);
+        assert_eq!(labels(&games), ["Game (Rev 1.1)", "Game (Rev 1.2)"]);
+        let games = entries(&["PS/Game (Rev 1.1)", files[0], "PS/Game (Rev 1.2)", files[1]],
+            &["Game", "Game", "Game", "Game"]);
+        assert_eq!(labels(&games), ["Game (Rev 1.1)", "Game (Rev 1.1)", "Game (Rev 1.2)", "Game (Rev 1.2)"]);
+        let games = entries(&["PS/Game (Rev 1.1).cue", "PS/Game (Rev 1.2).cue"], &["Game", "Game"]);
+        assert_eq!(labels(&games), ["Game (Rev 1.1)", "Game (Rev 1.2)"]);
+        let games = entries(&["PS/Game (Europe) (v1.0)", "PS/Game (Europe) (v1.1)"], &["Game", "Game"]);
+        assert_eq!(labels(&games), ["Game (v1.0)", "Game (v1.1)"]);
     }
 
     #[test]
